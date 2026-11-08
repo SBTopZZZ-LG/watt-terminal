@@ -1,0 +1,587 @@
+//! The observer: the agent's view of the session.
+//!
+//! The PTY pump never waits for this module. It pushes bytes into `ObsQueue`, which is byte-bounded.
+//! When the queue would overflow, the queued bytes are dropped and a `Resync` marker takes their place.
+//! The observer then rebuilds its parser, reports `Desynced`, and trusts events again at the next
+//! prompt. Terminal output is unaffected: the renderer receives every byte separately.
+
+use std::collections::VecDeque;
+use std::num::NonZeroU16;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+
+use serde::Serialize;
+use vt100::capture::{basic_formatted_to_plain, BasicFormattedCaptureState, RowContents};
+use vt100::{Callbacks, Parser};
+
+use crate::core::record::{Cwd, OutputBuilder, RawCapture, Record, RecordStatus, RecordSummary, Source};
+use crate::core::scanner::{Event, Found, Scanner};
+
+/// Bytes the observer may hold before it desyncs. Matches the design in plan.md.
+pub const OBSERVER_QUEUE_CAP: usize = 4 << 20;
+/// No integration event within this long after spawn means the shell is not observable (`Raw`).
+pub const INTEGRATION_TIMEOUT: Duration = Duration::from_secs(5);
+/// A submitted line that never reaches C is released after this long, so the gate cannot stick.
+pub const SUBMIT_TIMEOUT: Duration = Duration::from_millis(1500);
+
+// ---------- queue ----------
+
+pub enum ObsMsg {
+    Bytes(Vec<u8>),
+    Resize { rows: u16, cols: u16 },
+    /// Queued bytes were dropped before this point. Rebuild the parser.
+    Resync,
+    Eof,
+}
+
+#[derive(Default)]
+struct QueueState {
+    q: VecDeque<ObsMsg>,
+    queued_bytes: usize,
+    overflow_events: u64,
+    dropped_bytes: u64,
+}
+
+pub struct ObsQueue {
+    state: Mutex<QueueState>,
+    cv: Condvar,
+}
+
+impl ObsQueue {
+    pub fn new() -> Self {
+        ObsQueue { state: Mutex::new(QueueState::default()), cv: Condvar::new() }
+    }
+
+    /// Never blocks. On overflow, drops queued bytes and leaves one `Resync` marker. Resize and
+    /// Resync messages are kept, so the parser's size stays right.
+    pub fn push_bytes(&self, bytes: Vec<u8>) {
+        let mut s = self.lock();
+        if s.queued_bytes + bytes.len() <= OBSERVER_QUEUE_CAP {
+            s.queued_bytes += bytes.len();
+            s.q.push_back(ObsMsg::Bytes(bytes));
+        } else {
+            s.overflow_events += 1;
+            s.dropped_bytes += (s.queued_bytes + bytes.len()) as u64;
+            s.q.retain(|m| matches!(m, ObsMsg::Resize { .. } | ObsMsg::Resync));
+            s.queued_bytes = 0;
+            if !matches!(s.q.back(), Some(ObsMsg::Resync)) {
+                s.q.push_back(ObsMsg::Resync);
+            }
+        }
+        drop(s);
+        self.cv.notify_one();
+    }
+
+    /// Resize and Eof: small, never dropped.
+    pub fn push_control(&self, msg: ObsMsg) {
+        self.lock().q.push_back(msg);
+        self.cv.notify_one();
+    }
+
+    pub fn pop(&self) -> ObsMsg {
+        let mut s = self.lock();
+        loop {
+            if let Some(msg) = s.q.pop_front() {
+                if let ObsMsg::Bytes(b) = &msg {
+                    s.queued_bytes -= b.len();
+                }
+                return msg;
+            }
+            s = self.cv.wait(s).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// (overflow_events, dropped_bytes)
+    pub fn overflow_stats(&self) -> (u64, u64) {
+        let s = self.lock();
+        (s.overflow_events, s.dropped_bytes)
+    }
+
+    fn lock(&self) -> MutexGuard<'_, QueueState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+// ---------- status types ----------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputState {
+    /// Waiting for the integration's first prompt.
+    Booting,
+    /// At an idle prompt. The only state where submit is accepted.
+    Prompt,
+    /// A line was written; waiting for its C (or the timeout).
+    Submitted,
+    /// A command is running (C seen, D not yet, or D seen and the next prompt not yet drawn).
+    Running,
+    /// zsh is waiting for more of a multi-line command (PS2).
+    Continuation,
+    /// The alternate screen is active (vim, less, ...).
+    Alt,
+    /// No integration within INTEGRATION_TIMEOUT. The agent can read the screen only.
+    Raw,
+    /// The PTY reached EOF.
+    Exited,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrationStatus {
+    Booting,
+    Live,
+    Raw,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObserverStatus {
+    Ok,
+    /// Bytes were dropped; events are ignored until the next prompt.
+    Desynced,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScreenSnapshot {
+    pub rows: Vec<String>,
+    /// (row, col), zero-based.
+    pub cursor: (u16, u16),
+    pub alternate_screen: bool,
+    /// (rows, cols)
+    pub size: (u16, u16),
+}
+
+// ---------- vt100 callbacks ----------
+
+/// Owned by the vt100 parser. Counts rows that scroll off the normal screen, and renders the open record's output as it goes.
+#[derive(Default)]
+pub struct Collector {
+    /// Normal-screen rows scrolled off since the parser was created. Row N of the scrollback has absolute index N.
+    scrolled_total: u64,
+    open: Option<OpenRecord>,
+}
+
+impl Callbacks for Collector {
+    fn on_scroll(&mut self, contents: RowContents<'_>, alternate_screen: bool) {
+        if alternate_screen {
+            return;
+        }
+        let index = self.scrolled_total;
+        self.scrolled_total += 1;
+        if let Some(open) = self.open.as_mut() {
+            if index >= open.start_abs && !open.builder.is_full() {
+                let (text, wrapped) = row_text(&contents);
+                open.builder.push_row(&text, wrapped);
+            }
+        }
+    }
+}
+
+/// Plain text of one scrolled row, and whether it soft-wrapped into the next row.
+fn row_text(contents: &RowContents<'_>) -> (String, bool) {
+    let mut raw = String::new();
+    let mut state = BasicFormattedCaptureState::new();
+    let _ = contents.write_formatted_basic(&mut raw, &mut state);
+    let text: String = basic_formatted_to_plain(&raw).collect();
+    // vt100 0.18.1 keeps the wrap flag in a private `newline_pending` field (set to !wrapped). Its
+    // derived Debug output is the only public view of it. The unit test `wrap_flag_is_readable`
+    // fails if a vt100 upgrade changes this.
+    let wrapped = !format!("{state:?}").contains("newline_pending: true");
+    (text, wrapped)
+}
+
+struct OpenRecord {
+    record: Record,
+    builder: OutputBuilder,
+    raw: RawCapture,
+    /// Absolute index of the row where the command started (scrolled rows + cursor row at C).
+    start_abs: u64,
+    used_alt: bool,
+    approximate: bool,
+}
+
+// ---------- observer core ----------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Lifecycle {
+    Booting,
+    Prompt,
+    Submitted { since: Instant },
+    Running,
+    Continuation,
+}
+
+fn nz(n: u16) -> NonZeroU16 {
+    NonZeroU16::new(n).unwrap_or(NonZeroU16::MIN)
+}
+
+fn new_parser(size: (u16, u16)) -> Parser<Collector> {
+    Parser::new_with_callbacks(nz(size.0), nz(size.1), 0, Collector::default())
+}
+
+pub struct Core {
+    parser: Parser<Collector>,
+    size: (u16, u16),
+    scanner: Scanner,
+    lifecycle: Lifecycle,
+    spawned_at: Instant,
+    shell_pid: Option<u32>,
+    desynced: bool,
+    eof: bool,
+    /// Set by a submit (or a user CR at the prompt). Matched against the next E event to attribute the command.
+    pending: Option<(Source, String)>,
+    /// E seen, waiting for its C.
+    last_e: Option<(String, Source)>,
+    cwd: Option<Cwd>,
+    records: VecDeque<Record>,
+    next_id: u64,
+}
+
+/// Keeps at most this many completed records in memory. The oldest are dropped first.
+pub const MAX_RECORDS: usize = 1000;
+
+impl Core {
+    pub fn new(nonce: &str, size: (u16, u16)) -> Self {
+        Core {
+            parser: new_parser(size),
+            size,
+            scanner: Scanner::new(nonce),
+            lifecycle: Lifecycle::Booting,
+            spawned_at: Instant::now(),
+            shell_pid: None,
+            desynced: false,
+            eof: false,
+            pending: None,
+            last_e: None,
+            cwd: None,
+            records: VecDeque::new(),
+            next_id: 1,
+        }
+    }
+
+    pub fn apply(&mut self, msg: ObsMsg) {
+        match msg {
+            ObsMsg::Bytes(bytes) => self.feed(&bytes),
+            ObsMsg::Resize { rows, cols } => self.resize(rows, cols),
+            ObsMsg::Resync => self.resync(),
+            ObsMsg::Eof => self.eof = true,
+        }
+    }
+
+    fn feed(&mut self, bytes: &[u8]) {
+        let found: Vec<Found> = self.scanner.feed(bytes);
+        let mut pos = 0;
+        for f in found {
+            // Feed the parser up to the event, so the screen matches the event's position in the stream.
+            self.process_segment(&bytes[pos..f.end]);
+            pos = f.end;
+            self.handle(f.event);
+        }
+        self.process_segment(&bytes[pos..]);
+    }
+
+    fn process_segment(&mut self, seg: &[u8]) {
+        if seg.is_empty() {
+            return;
+        }
+        let open = self.parser.callbacks_mut().open.as_mut();
+        if let Some(open) = open {
+            open.raw.push(seg);
+        }
+        self.parser.process(seg);
+        let alt = self.parser.screen().alternate_screen();
+        if let Some(open) = self.parser.callbacks_mut().open.as_mut() {
+            open.used_alt |= alt;
+        }
+    }
+
+    fn handle(&mut self, event: Event) {
+        // While desynced, only a prompt is trusted: it is the next point where the observer knows the state.
+        if self.desynced && event != Event::PromptStart {
+            return;
+        }
+        match event {
+            Event::Hello { pid } => self.shell_pid = Some(pid),
+            Event::PromptStart => {
+                self.desynced = false;
+                self.close_open(RecordStatus::Incomplete);
+                self.last_e = None;
+                match self.lifecycle {
+                    // A redraw of the prompt right after a submit must not open the gate before C.
+                    Lifecycle::Submitted { .. } => {}
+                    Lifecycle::Booting if self.shell_pid.is_none() => {}
+                    _ => {
+                        self.lifecycle = Lifecycle::Prompt;
+                        self.pending = None;
+                    }
+                }
+            }
+            Event::Continuation => {
+                if self.lifecycle == Lifecycle::Prompt {
+                    self.lifecycle = Lifecycle::Continuation;
+                }
+            }
+            Event::CommandLine(text) => {
+                let source = match self.pending.take() {
+                    Some((source, pending_text)) if pending_text == text => source,
+                    _ => Source::Unknown,
+                };
+                self.last_e = Some((text, source));
+            }
+            Event::CommandStart => {
+                // C while a record is open: the previous command ended without a D we could trust.
+                self.close_open(RecordStatus::Incomplete);
+                let (command, source) = self.last_e.take().unwrap_or_else(|| (String::new(), Source::Unknown));
+                self.pending = None;
+                self.start_record(command, source);
+                self.lifecycle = Lifecycle::Running;
+            }
+            Event::CommandEnd { exit, pipestatus } => {
+                let open = self.parser.callbacks_mut().open.take();
+                if let Some(open) = open {
+                    self.finish_record(open, Some(exit), pipestatus, RecordStatus::Complete);
+                }
+            }
+            Event::ScrollRegion => {
+                if let Some(open) = self.parser.callbacks_mut().open.as_mut() {
+                    open.approximate = true;
+                }
+            }
+            Event::Cwd { host, path } => {
+                let cwd = Cwd { host, path };
+                if self.cwd.as_ref() != Some(&cwd) {
+                    self.cwd = Some(cwd);
+                }
+            }
+        }
+    }
+
+    fn resize(&mut self, rows: u16, cols: u16) {
+        let size = (rows.max(1), cols.max(1));
+        if let Some(open) = self.parser.callbacks_mut().open.as_mut() {
+            // vt100 may push rows through on_scroll or reflow the cursor during a resize; the output is then approximate.
+            open.approximate = true;
+        }
+        self.parser.set_size(nz(size.0), nz(size.1));
+        self.size = size;
+    }
+
+    /// Bytes were dropped. Forget the open record (incomplete), start a fresh parser, and wait for a prompt.
+    fn resync(&mut self) {
+        self.close_open(RecordStatus::Incomplete);
+        self.parser = new_parser(self.size);
+        self.scanner.reset();
+        self.desynced = true;
+        self.last_e = None;
+        self.pending = None;
+    }
+
+    fn start_record(&mut self, command: String, source: Source) {
+        let alt = self.parser.screen().alternate_screen();
+        let (crow, _) = self.parser.screen().cursor_position();
+        let id = self.next_id;
+        self.next_id += 1;
+        let cwd = self.cwd.clone();
+        let shell_pid = self.shell_pid;
+        let cb = self.parser.callbacks_mut();
+        let start_abs = cb.scrolled_total + u64::from(crow);
+        cb.open = Some(OpenRecord {
+            record: Record {
+                id,
+                command,
+                source,
+                shell_pid,
+                cwd,
+                exit_code: None,
+                pipestatus: Vec::new(),
+                status: RecordStatus::Incomplete,
+                used_alt_screen: alt,
+                output: String::new(),
+                output_truncated: false,
+                raw_head: Vec::new(),
+                raw_tail: Vec::new(),
+                raw_truncated: false,
+            },
+            builder: OutputBuilder::default(),
+            raw: RawCapture::default(),
+            start_abs,
+            used_alt: alt,
+            approximate: false,
+        });
+    }
+
+    fn close_open(&mut self, status: RecordStatus) {
+        let open = self.parser.callbacks_mut().open.take();
+        if let Some(open) = open {
+            self.finish_record(open, None, Vec::new(), status);
+        }
+    }
+
+    /// Adds the rows still on screen (from the command's first row to the cursor) and stores the record.
+    fn finish_record(&mut self, open: OpenRecord, exit: Option<i32>, pipestatus: Vec<i32>, status: RecordStatus) {
+        let OpenRecord { mut record, mut builder, raw, start_abs, used_alt, approximate } = open;
+        let (screen, cb) = self.parser.screen_and_callbacks_mut();
+        if !screen.alternate_screen() && !used_alt {
+            let (crow, _) = screen.cursor_position();
+            let cols = screen.size().1.get();
+            let first = start_abs.saturating_sub(cb.scrolled_total) as usize;
+            for (r, text) in screen.rows(0, cols).enumerate().skip(first) {
+                if r > crow as usize {
+                    break;
+                }
+                builder.push_row(&text, screen.row_wrapped(r as u16));
+            }
+        }
+        let (output, truncated) = builder.finish();
+        let (raw_head, raw_tail, raw_truncated) = raw.into_parts();
+        record.output = output;
+        record.output_truncated = truncated;
+        record.exit_code = exit;
+        record.pipestatus = pipestatus;
+        record.used_alt_screen = used_alt;
+        record.status = match status {
+            RecordStatus::Incomplete => RecordStatus::Incomplete,
+            _ if approximate => RecordStatus::Approximate,
+            _ => status,
+        };
+        record.raw_head = raw_head;
+        record.raw_tail = raw_tail;
+        record.raw_truncated = raw_truncated;
+        self.records.push_back(record);
+        while self.records.len() > MAX_RECORDS {
+            self.records.pop_front();
+        }
+    }
+
+    // ----- queries -----
+
+    pub fn lifecycle_view(&self) -> InputState {
+        if self.eof {
+            return InputState::Exited;
+        }
+        if self.integration_status() == IntegrationStatus::Raw {
+            return InputState::Raw;
+        }
+        if self.parser.screen().alternate_screen() {
+            return InputState::Alt;
+        }
+        match &self.lifecycle {
+            Lifecycle::Booting => InputState::Booting,
+            Lifecycle::Prompt => InputState::Prompt,
+            Lifecycle::Submitted { since } if since.elapsed() > SUBMIT_TIMEOUT => InputState::Prompt,
+            Lifecycle::Submitted { .. } => InputState::Submitted,
+            Lifecycle::Running => InputState::Running,
+            Lifecycle::Continuation => InputState::Continuation,
+        }
+    }
+
+    pub fn integration_status(&self) -> IntegrationStatus {
+        if self.lifecycle != Lifecycle::Booting {
+            IntegrationStatus::Live
+        } else if self.spawned_at.elapsed() > INTEGRATION_TIMEOUT {
+            IntegrationStatus::Raw
+        } else {
+            IntegrationStatus::Booting
+        }
+    }
+
+    pub fn observer_status(&self) -> ObserverStatus {
+        if self.desynced {
+            ObserverStatus::Desynced
+        } else {
+            ObserverStatus::Ok
+        }
+    }
+
+    pub fn desynced(&self) -> bool {
+        self.desynced
+    }
+
+    pub fn bracketed_paste(&self) -> bool {
+        self.parser.screen().bracketed_paste()
+    }
+
+    /// Called by the writer under the same lock as the check. Moves to Submitted and records the pending attribution.
+    pub fn begin_submit(&mut self, pending: Option<(Source, String)>) {
+        self.lifecycle = Lifecycle::Submitted { since: Instant::now() };
+        self.pending = pending;
+    }
+
+    pub fn forged_events(&self) -> u64 {
+        self.scanner.forged_events()
+    }
+
+    pub fn cwd(&self) -> Option<Cwd> {
+        self.cwd.clone()
+    }
+
+    pub fn shell_pid(&self) -> Option<u32> {
+        self.shell_pid
+    }
+
+    pub fn screen_snapshot(&self) -> ScreenSnapshot {
+        let screen = self.parser.screen();
+        let (rows, cols) = screen.size();
+        ScreenSnapshot {
+            rows: screen.rows(0, cols.get()).map(|r| r.trim_end().to_string()).collect(),
+            cursor: screen.cursor_position(),
+            alternate_screen: screen.alternate_screen(),
+            size: (rows.get(), cols.get()),
+        }
+    }
+
+    pub fn records(&self) -> Vec<RecordSummary> {
+        self.records.iter().map(RecordSummary::from).collect()
+    }
+
+    pub fn get_record(&self, id: u64) -> Option<Record> {
+        self.records.iter().find(|r| r.id == id).cloned()
+    }
+}
+
+/// The core behind a session's locks. The writer, the observer thread, and the API all lock it.
+pub struct Shared {
+    pub core: Mutex<Core>,
+}
+
+impl Shared {
+    pub fn lock(&self) -> MutexGuard<'_, Core> {
+        self.core.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Runs until the queue delivers Eof.
+pub fn run_observer(queue: Arc<ObsQueue>, shared: Arc<Shared>) {
+    loop {
+        let msg = queue.pop();
+        let eof = matches!(msg, ObsMsg::Eof);
+        shared.lock().apply(msg);
+        if eof {
+            break;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Probe(Vec<(String, bool)>);
+
+    impl Callbacks for Probe {
+        fn on_scroll(&mut self, contents: RowContents<'_>, _alternate_screen: bool) {
+            self.0.push(row_text(&contents));
+        }
+    }
+
+    /// Guards the Debug-based wrap readout in `row_text`: a soft-wrapped row must read as wrapped, a hard line end must not.
+    #[test]
+    fn wrap_flag_is_readable() {
+        let mut p = Parser::new_with_callbacks(nz(3), nz(10), 0, Probe(Vec::new()));
+        // 29 chars wrap over three 10-column rows, then a hard newline, then a short line.
+        p.process(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\nbbb\r\nccc\r\nddd\r\n");
+        let rows = &p.callbacks().0;
+        assert!(rows.contains(&("aaaaaaaaaa".to_string(), true)), "wrapped row not reported as wrapped: {rows:?}");
+        assert!(rows.iter().any(|(t, w)| t.starts_with("aaaaaaaaa") && !w), "hard line end not reported: {rows:?}");
+    }
+}
