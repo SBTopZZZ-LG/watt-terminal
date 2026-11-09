@@ -115,6 +115,25 @@ describe('transcriptReducer: local actions', () => {
     expect(isBusy(run([{ type: 'sync_busy', busy: false }]))).toBe(false);
   });
 
+  it('a new session keeps the conversation, closes what the old shell left open, and says so', () => {
+    const before = run([
+      { type: 'user_sent', clientId: 1, text: 'list files' },
+      { type: 'agent_event', event: { type: 'tool_call', call_id: 'c1', name: 'run_command', args: {} } },
+      { type: 'agent_event', event: { type: 'approval_request', call_id: 'a1', text: 'ls' } },
+      { type: 'agent_event', event: { type: 'tool_call', call_id: 'c0', name: 'get_cwd', args: {} } },
+      { type: 'agent_event', event: { type: 'tool_result', call_id: 'c0', name: 'get_cwd', ok: true, result: {} } },
+    ]);
+    const after = transcriptReducer(before, { type: 'session_reset' });
+
+    expect(after.items.map((i) => i.kind)).toEqual(['user', 'tool', 'approval', 'tool', 'notice']);
+    expect(after.items[1]).toMatchObject({ kind: 'tool', callId: 'c1', status: 'failed' });
+    expect(after.items[2]).toMatchObject({ kind: 'approval', state: 'resolved' });
+    expect(after.items[3]).toMatchObject({ kind: 'tool', callId: 'c0', status: 'ok' });
+    expect(after.items[after.items.length - 1]).toMatchObject({ kind: 'notice', text: 'New shell session started.' });
+    expect(firstPendingApproval(after)).toBeNull();
+    expect(isBusy(after)).toBe(false);
+  });
+
   it('the transcript stays bounded, and ids keep increasing', () => {
     const actions: TranscriptAction[] = Array.from({ length: MAX_ITEMS + 25 }, (_, i) => ({
       type: 'notice',

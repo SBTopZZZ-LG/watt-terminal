@@ -44,8 +44,9 @@ export type KeyRoute = 'pty' | 'drop';
  * - agent_only: agent messages only
  * - collapsed: a thin strip; a hotkey opens it for an agent message
  * - off: disabled, with the hint saying why
+ * - exited: the shell has gone; a button starts a new one in place of the input
  */
-export type BarMode = 'full' | 'agent_only' | 'collapsed' | 'off';
+export type BarMode = 'full' | 'agent_only' | 'collapsed' | 'off' | 'exited';
 
 export interface Route {
   keys: KeyRoute;
@@ -78,19 +79,26 @@ export function routeFor(state: InputState): Route {
         hint: 'No shell integration: the agent can read the screen but cannot run commands.',
       };
     case 'exited':
-      return { keys: 'drop', bar: 'off', hint: 'The shell has exited. Restart the app to start a new session.' };
+      return { keys: 'drop', bar: 'exited', hint: 'Shell exited.' };
   }
 }
 
-/** Focus target when the effective state changes from `prev` to `next`, or null to leave focus alone. */
+/**
+ * Focus target when the effective state changes from `prev` to `next`, or null to leave focus alone. Focus follows
+ * the routing: when keys start going to the PTY, xterm takes them; when the bar comes back (the prompt, or the
+ * exited notice with its button), the bar takes focus. A move between two PTY-routed states keeps focus where it is.
+ *
+ * Why: a stale focus request from the bar must never pull focus away from a running program, so the bar only
+ * takes focus through this function (or an explicit hotkey or click while keys are not going to the PTY).
+ */
 export function focusAfter(prev: InputState, next: InputState): 'xterm' | 'bar' | null {
   if (prev === next) {
     return null;
   }
-  if (next === 'running' || next === 'continuation' || next === 'alt') {
-    return prev === 'running' || prev === 'continuation' || prev === 'alt' ? null : 'xterm';
+  if (routeFor(next).keys === 'pty') {
+    return routeFor(prev).keys === 'pty' ? null : 'xterm';
   }
-  if (next === 'prompt') {
+  if (next === 'prompt' || next === 'exited') {
     return 'bar';
   }
   return null;

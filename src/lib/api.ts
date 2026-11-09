@@ -21,6 +21,10 @@ export const api = {
   startSession(rows: number, cols: number, onData: Channel<ArrayBuffer>, onEvents: Channel<WireEvent>) {
     return invoke<StartResult>('start_session', { sessionId: SESSION_ID, rows, cols, onData, onEvents });
   },
+  /** Starts a new shell if the session has exited (new nonce); otherwise attaches like startSession. */
+  restartSession(rows: number, cols: number, onData: Channel<ArrayBuffer>, onEvents: Channel<WireEvent>) {
+    return invoke<StartResult>('restart_session', { sessionId: SESSION_ID, rows, cols, onData, onEvents });
+  },
   ack(bytes: number) {
     return invoke<void>('ack', { sessionId: SESSION_ID, bytes });
   },

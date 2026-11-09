@@ -10,6 +10,9 @@ class FakeMarker {
   constructor(line: number) {
     this.line = line;
   }
+  dispose(): void {
+    this.line = -1;
+  }
   onDispose(cb: () => void): IDisposable {
     this.listeners.push(cb);
     return { dispose: () => undefined };
@@ -198,6 +201,22 @@ describe('CommandMarks', () => {
     const later = render(f.decorations[1]);
     marks.recordStarted(true);
     expect(later.dataset.agent).toBe('false');
+  });
+
+  it('reset forgets the old session and its pairing, so the new session starts clean', () => {
+    const f = fakeTerminal();
+    const marks = new CommandMarks(f.term);
+    // An old command is open and its desync stopped pairing.
+    marks.commandStart();
+    marks.observerDesynced();
+    marks.reset();
+
+    marks.commandStart();
+    marks.commandEnd(0);
+    marks.recordStarted(true);
+
+    expect(f.decorations).toHaveLength(1);
+    expect(render(f.decorations[0]).dataset).toEqual({ exit: 'ok', agent: 'true' });
   });
 
   it('an erased marker gets no decoration, but its command still counts for pairing', () => {

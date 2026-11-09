@@ -68,7 +68,7 @@ describe('routeFor: the input routing table', () => {
     ['running', 'pty', 'agent_only'],
     ['alt', 'pty', 'collapsed'],
     ['raw', 'pty', 'agent_only'],
-    ['exited', 'drop', 'off'],
+    ['exited', 'drop', 'exited'],
   ] as const)('%s: keys %s, bar %s', (state, keys, bar) => {
     const route = routeFor(state);
     expect(route.keys).toBe(keys);
@@ -94,15 +94,35 @@ describe('focusAfter', () => {
     expect(focusAfter('prompt', 'alt')).toBe('xterm');
   });
 
+  it('after submit, moves focus to xterm once the command runs (submitted -> running)', () => {
+    expect(focusAfter('submitted', 'running')).toBe('xterm');
+  });
+
+  it('moves focus to xterm when the integration times out and keys go to the PTY (raw)', () => {
+    expect(focusAfter('prompt', 'raw')).toBe('xterm');
+    expect(focusAfter('booting', 'raw')).toBe('xterm');
+  });
+
   it('keeps focus where it is when moving between keyboard-taking states', () => {
     expect(focusAfter('running', 'continuation')).toBeNull();
     expect(focusAfter('alt', 'running')).toBeNull();
+    expect(focusAfter('running', 'raw')).toBeNull();
   });
 
   it('moves focus to the bar when the prompt comes back', () => {
     expect(focusAfter('running', 'prompt')).toBe('bar');
     expect(focusAfter('alt', 'prompt')).toBe('bar');
     expect(focusAfter('booting', 'prompt')).toBe('bar');
+    expect(focusAfter('submitted', 'prompt')).toBe('bar');
+  });
+
+  it('moves focus to the bar when the shell exits, so its restart button can take Enter', () => {
+    expect(focusAfter('running', 'exited')).toBe('bar');
+    expect(focusAfter('prompt', 'exited')).toBe('bar');
+  });
+
+  it('leaves focus alone when a new session starts from exited', () => {
+    expect(focusAfter('exited', 'booting')).toBeNull();
   });
 
   it('leaves focus alone otherwise', () => {

@@ -39,6 +39,13 @@ impl<T> Registry<T> {
         self.lock().remove(id)
     }
 
+    /// Removes the item for `id` only when `pred` holds for it. The check and the removal happen under one lock.
+    pub fn remove_if(&self, id: &str, pred: impl FnOnce(&T) -> bool) -> Option<Arc<T>> {
+        let mut items = self.lock();
+        let hit = items.get(id).is_some_and(|item| pred(item));
+        if hit { items.remove(id) } else { None }
+    }
+
     /// Removes every item (app shutdown).
     pub fn take_all(&self) -> Vec<Arc<T>> {
         self.lock().drain().map(|(_, item)| item).collect()
@@ -46,5 +53,21 @@ impl<T> Registry<T> {
 
     fn lock(&self) -> MutexGuard<'_, HashMap<String, Arc<T>>> {
         self.items.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remove_if_removes_only_when_the_predicate_holds() {
+        let reg: Registry<u32> = Registry::new();
+        reg.get_or_insert_with::<()>("a", || Ok(1)).expect("insert");
+        assert!(reg.remove_if("a", |v| *v == 2).is_none());
+        assert!(reg.get("a").is_some(), "a refused removal must keep the item");
+        assert_eq!(reg.remove_if("a", |v| *v == 1).map(|v| *v), Some(1));
+        assert!(reg.get("a").is_none());
+        assert!(reg.remove_if("a", |_| true).is_none(), "a missing id removes nothing");
     }
 }

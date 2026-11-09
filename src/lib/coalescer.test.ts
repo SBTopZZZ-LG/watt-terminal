@@ -110,6 +110,21 @@ describe('Coalescer', () => {
     expect(batches[0]).toEqual(new Uint8Array([9, 9, 9]));
   });
 
+  it('discard drops pending bytes without emitting them, and the timer does not fire later', () => {
+    vi.useFakeTimers();
+    const batches: Uint8Array[] = [];
+    const c = new Coalescer({ onBatch: (b) => batches.push(b) });
+    c.push(chunk(10, 1));
+    c.discard();
+    vi.advanceTimersByTime(COALESCE_MS * 10);
+    expect(batches).toHaveLength(0);
+
+    c.push(chunk(3, 2));
+    c.flush();
+    expect(batches).toHaveLength(1);
+    expect(batches[0]).toEqual(new Uint8Array([2, 2, 2]));
+  });
+
   it('ignores empty chunks', () => {
     const batches: Uint8Array[] = [];
     const c = new Coalescer({ onBatch: (b) => batches.push(b) });

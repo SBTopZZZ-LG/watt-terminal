@@ -371,3 +371,30 @@ input {
 .bar-collapsed .bar-hint {
   flex-basis: auto;
 }
+
+.bar-exited {
+  justify-content: space-between;
+}
+
+.bar-notice {
+  color: var(--fail);
+}
+
+.bar-restart {
+  padding: 4px 10px;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--accent);
+  cursor: pointer;
+}
+
+.bar-restart:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.bar-restart:disabled {
+  opacity: 0.5;
+  cursor: default;
+}

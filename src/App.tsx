@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
 import './App.css';
 import { api, errorText } from './lib/api';
-import { connect, reportError, subscribe } from './lib/session';
+import { connect, reportError, restart, subscribe } from './lib/session';
 import type { Incoming } from './lib/session';
-import { fitToContainer, markConnected, marks, receiveBytes, term, terminalSize } from './lib/terminal';
+import { fitToContainer, markConnected, marks, receiveBytes, resetForNewSession, term, terminalSize } from './lib/terminal';
 import { effectiveState, focusAfter, inputReducer, INITIAL_INPUT, routeFor } from './lib/inputState';
 import type { BarMode } from './lib/inputState';
 import { EMPTY_TRANSCRIPT, firstPendingApproval, isBusy, transcriptReducer } from './lib/transcript';
@@ -33,6 +33,7 @@ export default function App() {
   const [cwd, setCwd] = useState<Cwd | null>(null);
   const [autoApprove, setAutoApprove] = useState(false);
   const [focusToken, setFocusToken] = useState(0);
+  const [restarting, setRestarting] = useState(false);
 
   // Read by long-lived listeners (keystrokes, hotkey), so they always see the current route.
   const routeRef = useRef(route);
@@ -42,20 +43,20 @@ export default function App() {
   const clientIds = useRef(0);
   const prevEffective = useRef<InputState>(effective);
 
+  const applyStatus = useCallback((s: Status) => {
+    dispatchInput({ type: 'rust_state', state: s.state });
+    setIntegration(s.integration);
+    setObserver(s.observer);
+    setCwd(s.cwd);
+    setAutoApprove(s.auto_approve);
+    dispatchTranscript({ type: 'sync_busy', busy: s.agent_busy });
+    if (s.observer === 'desynced') {
+      marks.observerDesynced();
+    }
+  }, []);
+
   // Connect, then load the snapshot. The snapshot covers events that arrived before this listener was up.
   useEffect(() => {
-    const applyStatus = (s: Status) => {
-      dispatchInput({ type: 'rust_state', state: s.state });
-      setIntegration(s.integration);
-      setObserver(s.observer);
-      setCwd(s.cwd);
-      setAutoApprove(s.auto_approve);
-      dispatchTranscript({ type: 'sync_busy', busy: s.agent_busy });
-      if (s.observer === 'desynced') {
-        marks.observerDesynced();
-      }
-    };
-
     const handleEvent = (ev: WireEvent) => {
       switch (ev.type) {
         case 'state':
@@ -102,7 +103,7 @@ export default function App() {
       .then(() => fitToContainer())
       .catch(reportError);
     return unsubscribe;
-  }, []);
+  }, [applyStatus]);
 
   // Focus follows the state: xterm when a program needs the keyboard, the bar when the prompt is back.
   useEffect(() => {
@@ -191,6 +192,25 @@ export default function App() {
     }
   };
 
+  // Starts a new shell after the old one exited. The terminal is cleared first, so nothing from the old shell
+  // shows up in the new one. Focus moves to the bar when the new shell's prompt arrives (see focusAfter).
+  const restartShell = () => {
+    if (restarting) {
+      return;
+    }
+    setRestarting(true);
+    resetForNewSession();
+    dispatchTranscript({ type: 'session_reset' });
+    const { rows, cols } = terminalSize();
+    restart(rows, cols)
+      .then(() => api.getStatus())
+      .then(applyStatus)
+      .then(() => fitToContainer())
+      .catch(reportError)
+      // Still true until the status is applied, so a second click cannot land while the old exit state is shown.
+      .finally(() => setRestarting(false));
+  };
+
   const approveFirst = () => {
     if (pendingApproval !== null) {
       answer(pendingApproval, true);
@@ -202,6 +222,10 @@ export default function App() {
       answer(pendingApproval, false);
     }
   };
+
+  // The bar may take focus only while keys are not going to the PTY. The alt-screen hotkey is the exception: it opens
+  // the bar on purpose, so while the bar is open it does not count as owning the keys.
+  const keysToPty = route.keys === 'pty' && !barOpen;
 
   return (
     <div className="app">
@@ -232,7 +256,10 @@ export default function App() {
         mode={barMode}
         hint={route.hint}
         hasPendingApproval={pendingApproval !== null}
+        keysToPty={keysToPty}
         focusToken={focusToken}
+        onRestart={restartShell}
+        restarting={restarting}
         onShell={onShell}
         onAgent={onAgent}
         onInterrupt={() => sendRaw(CTRL_C)}

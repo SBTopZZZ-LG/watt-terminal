@@ -35,7 +35,9 @@ export type TranscriptAction =
   | { type: 'approval_failed'; callId: string; message: string }
   | { type: 'notice'; text: string }
   /** Set from the status snapshot at startup, when a turn may already be running. */
-  | { type: 'sync_busy'; busy: boolean };
+  | { type: 'sync_busy'; busy: boolean }
+  /** A new shell replaced the old one. Pending approvals and running tools can never finish, so they are closed. */
+  | { type: 'session_reset' };
 
 export function transcriptReducer(t: Transcript, action: TranscriptAction): Transcript {
   switch (action.type) {
@@ -77,6 +79,18 @@ export function transcriptReducer(t: Transcript, action: TranscriptAction): Tran
       return add(t, (id) => ({ id, kind: 'notice', text: action.text }));
     case 'sync_busy':
       return { ...t, inFlight: action.busy ? Math.max(1, t.inFlight) : 0 };
+    case 'session_reset': {
+      const items = t.items.map((i): TranscriptItem => {
+        if (i.kind === 'approval' && i.state !== 'resolved') {
+          return { ...i, state: 'resolved' };
+        }
+        if (i.kind === 'tool' && i.status === 'running') {
+          return { ...i, status: 'failed' };
+        }
+        return i;
+      });
+      return add({ ...t, items, inFlight: 0 }, (id) => ({ id, kind: 'notice', text: 'New shell session started.' }));
+    }
   }
 }
 

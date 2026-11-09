@@ -69,6 +69,19 @@ export class Coalescer {
     this.opts.onBatch(batch);
   }
 
+  /**
+   * Drops pending bytes without emitting them. Used when the session they came from is gone. They were never
+   * handed to the caller, so they are never acked.
+   */
+  discard(): void {
+    if (this.timer !== null) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    this.parts = [];
+    this.size = 0;
+  }
+
   /** Flushes pending bytes first, so their acks still happen, then stops the timer. */
   dispose(): void {
     this.flush();

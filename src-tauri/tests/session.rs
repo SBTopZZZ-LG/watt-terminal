@@ -344,6 +344,22 @@ fn drop_removes_shim_dir_and_kills_shell() {
     assert!(!alive, "shell pid {pid} still alive after drop");
 }
 
+/// The shell dying while a command is open (here the command kills its own shell) gives that command no D. The
+/// record must still be closed, as incomplete, when the PTY reaches EOF.
+#[test]
+fn shell_exit_closes_the_open_record_as_incomplete() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let cmd = "kill -9 $$";
+    s.submit(Source::User, cmd).expect("submit");
+    assert!(wait_state(&s, InputState::Exited, Duration::from_secs(10)), "state={:?}", s.state());
+    let records = s.records();
+    let r = records.iter().find(|r| r.command == cmd).unwrap_or_else(|| panic!("no record for {cmd:?}: {records:?}"));
+    assert_eq!(r.status, RecordStatus::Incomplete);
+    assert_eq!(r.exit_code, None);
+}
+
 /// Regression for the pump's closed-gate path (pty.rs). Dropping a session while output is still in flight
 /// must not hang. With `break` on a closed gate, the reader stopped draining the master while Session::drop
 /// waited for the shell, and POC 4 saw about half of the 2 MiB-buffered cycles hang.

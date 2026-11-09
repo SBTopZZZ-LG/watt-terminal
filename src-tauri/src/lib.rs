@@ -7,7 +7,7 @@
 
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 
@@ -28,6 +28,9 @@ use crate::core::session::{Session, SessionStats, SpawnConfig};
 use crate::core::tools::SessionTools;
 
 type Reg = Registry<Attached>;
+
+/// Counts restarts, to give each restarted shell its own shim directory name.
+static RESTARTS: AtomicU64 = AtomicU64::new(0);
 
 /// The frontend's channels for one session. Swapped on re-attach, so the session keeps running.
 #[derive(Default)]
@@ -115,13 +118,44 @@ async fn start_session(
     on_events: Channel<Value>,
     reg: State<'_, Reg>,
 ) -> Result<StartResult, String> {
+    attach_or_spawn(&reg, &session_id, &session_id, rows, cols, on_data, on_events)
+}
+
+/// Starts a new shell when the session has exited: the dead session is removed and a fresh one spawned, with a new
+/// nonce. Otherwise this is start_session (idempotent).
+#[tauri::command]
+async fn restart_session(
+    session_id: String,
+    rows: u16,
+    cols: u16,
+    on_data: Channel<InvokeResponseBody>,
+    on_events: Channel<Value>,
+    reg: State<'_, Reg>,
+) -> Result<StartResult, String> {
+    // Checked and removed under the registry lock, so two restarts cannot each remove the other's new session.
+    drop(reg.remove_if(&session_id, |att| att.session.state() == InputState::Exited));
+    // A new shim directory name: the dead session's drop removes its own directory, which must not be the new one.
+    let shim_id = format!("{session_id}-{}", RESTARTS.fetch_add(1, Ordering::SeqCst));
+    attach_or_spawn(&reg, &session_id, &shim_id, rows, cols, on_data, on_events)
+}
+
+/// Attaches to `session_id`, spawning its shell first if there is none. `shim_id` names the shim directory on spawn.
+fn attach_or_spawn(
+    reg: &Reg,
+    session_id: &str,
+    shim_id: &str,
+    rows: u16,
+    cols: u16,
+    on_data: Channel<InvokeResponseBody>,
+    on_events: Channel<Value>,
+) -> Result<StartResult, String> {
     let mut pending = Some((on_data, on_events));
-    let (att, spawned) = reg.get_or_insert_with(&session_id, || -> Result<Attached, String> {
+    let (att, spawned) = reg.get_or_insert_with(session_id, || -> Result<Attached, String> {
         let (data, events) = pending.take().ok_or("channels already used")?;
         let channels = Arc::new(Channels::default());
         channels.attach(data, events);
         let cfg = SpawnConfig { rows, cols, real_zdotdir: None, histfile: dev_histfile() };
-        let session = Session::spawn(&session_id, cfg, Box::new(RawSink(channels.clone()))).map_err(io_err)?;
+        let session = Session::spawn(shim_id, cfg, Box::new(RawSink(channels.clone()))).map_err(io_err)?;
         session.set_event_sink(Arc::new(EventsSink(channels.clone())));
         Ok(Attached { session, channels, approvals: ApprovalGate::new(), agent_busy: AtomicBool::new(false) })
     })?;
@@ -238,6 +272,7 @@ pub fn run() {
         .manage(Reg::new())
         .invoke_handler(tauri::generate_handler![
             start_session,
+            restart_session,
             ack,
             resize,
             write_user,

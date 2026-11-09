@@ -351,7 +351,11 @@ impl Core {
             ObsMsg::Bytes(bytes) => self.feed(&bytes),
             ObsMsg::Resize { rows, cols } => self.resize(rows, cols),
             ObsMsg::Resync => self.resync(),
-            ObsMsg::Eof => self.eof = true,
+            ObsMsg::Eof => {
+                // The shell is gone, so a command still open will never get its D. It ends here, incomplete.
+                self.close_open(RecordStatus::Incomplete);
+                self.eof = true;
+            }
         }
     }
 
@@ -564,6 +568,8 @@ impl Core {
         }
     }
 
+    // TODO: `exec zsh` and nested shells are undetected. They have no AGENTTERM_NONCE, so they emit no events:
+    // this stays Live and the lifecycle stays Running until the session exits. Needs an "integration lost" status.
     pub fn integration_status(&self) -> IntegrationStatus {
         if self.lifecycle != Lifecycle::Booting {
             IntegrationStatus::Live

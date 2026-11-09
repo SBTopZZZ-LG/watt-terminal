@@ -14,6 +14,9 @@ export type Listener = (msg: Incoming) => void;
 const listeners = new Set<Listener>();
 let connection: Promise<StartResult> | null = null;
 let nonce: string | null = null;
+let byteSink: ((buf: ArrayBuffer) => void) | null = null;
+/** Bumped on every connect and restart. Callbacks from an older channel check it and drop their input. */
+let generation = 0;
 
 /** Adds a listener. Events that arrive while no listener is subscribed are not replayed. */
 export function subscribe(listener: Listener): () => void {
@@ -45,12 +48,42 @@ export function getNonce(): string | null {
  */
 export function connect(rows: number, cols: number, onBytes: (buf: ArrayBuffer) => void): Promise<StartResult> {
   if (connection === null) {
-    const data = new Channel<ArrayBuffer>(onBytes);
-    const events = new Channel<WireEvent>((event) => emit({ kind: 'event', event }));
-    connection = api.startSession(rows, cols, data, events).then((result) => {
-      nonce = result.nonce;
-      return result;
-    });
+    byteSink = onBytes;
+    connection = open(rows, cols, (r, c, data, events) => api.startSession(r, c, data, events));
   }
   return connection;
+}
+
+/**
+ * Replaces an exited session with a new shell (new nonce) and attaches the channels to it. Call only after
+ * connect(). The caller clears the terminal first (resetForNewSession): bytes from the old shell must not reach it.
+ */
+export function restart(rows: number, cols: number): Promise<StartResult> {
+  connection = open(rows, cols, (r, c, data, events) => api.restartSession(r, c, data, events));
+  return connection;
+}
+
+function open(
+  rows: number,
+  cols: number,
+  call: (rows: number, cols: number, data: Channel<ArrayBuffer>, events: Channel<WireEvent>) => Promise<StartResult>,
+): Promise<StartResult> {
+  generation += 1;
+  const gen = generation;
+  const data = new Channel<ArrayBuffer>((buf) => {
+    if (gen === generation) {
+      byteSink?.(buf);
+    }
+  });
+  const events = new Channel<WireEvent>((event) => {
+    if (gen === generation) {
+      emit({ kind: 'event', event });
+    }
+  });
+  return call(rows, cols, data, events).then((result) => {
+    if (gen === generation) {
+      nonce = result.nonce;
+    }
+    return result;
+  });
 }

@@ -82,6 +82,20 @@ export class CommandMarks {
     this.unpairedStarts = [];
   }
 
+  /**
+   * A new shell session: forget every open mark and all pairing, and trust pairing again. The decorations already
+   * painted go with xterm's reset(); this only disposes the markers still held here.
+   */
+  reset(): void {
+    for (const mark of [...this.open, ...this.unpairedMarks]) {
+      mark.marker?.dispose();
+    }
+    this.open = [];
+    this.unpairedMarks = [];
+    this.unpairedStarts = [];
+    this.trusted = true;
+  }
+
   private pair(mark: Mark, agent: boolean): void {
     mark.agent = agent;
     this.paint(mark);

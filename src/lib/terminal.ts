@@ -49,11 +49,17 @@ export const term = new Terminal({
 export const fit = new FitAddon();
 const unicode = new Unicode11Addon();
 
+/** Counts shell sessions. A batch from an older shell is not acked, because the ack would count against the new one. */
+let epoch = 0;
+
 /** Batches PTY bytes for xterm. Each batch is acked by its byte count once xterm has parsed it. */
 const coalescer = new Coalescer({
   onBatch(batch) {
+    const at = epoch;
     term.write(batch, () => {
-      api.ack(batch.length).catch(reportError);
+      if (at === epoch) {
+        api.ack(batch.length).catch(reportError);
+      }
     });
   },
 });
@@ -109,6 +115,20 @@ function onShellOsc(ident: 133 | 633, data: string): boolean {
 /** Feeds PTY bytes into the coalescer. Pass as the `onBytes` of connect(). */
 export function receiveBytes(buf: ArrayBuffer): void {
   coalescer.push(buf);
+}
+
+/**
+ * Clears the terminal for a new shell. Bytes the old shell already handed to xterm are parsed first, then wiped:
+ * the reset is queued behind them, and the new shell's bytes arrive only after the reset is queued (restart() is
+ * called right after this). Command marks are reset in the same step, so old marks cannot pair with new records.
+ */
+export function resetForNewSession(): void {
+  epoch += 1;
+  coalescer.discard();
+  term.write('', () => {
+    term.reset();
+    marks.reset();
+  });
 }
 
 export function terminalSize(): { rows: number; cols: number } {

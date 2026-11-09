@@ -9,8 +9,16 @@ interface Props {
   /** Why the bar is off or limited. Shown under the input. */
   hint: string | null;
   hasPendingApproval: boolean;
-  /** Bumped by the parent to move focus into the input. */
+  /**
+   * True while keys go to the PTY, so the bar must not take focus. The parent passes false while the bar is open
+   * for an agent message on the alternate screen, because that hotkey asks for the bar.
+   */
+  keysToPty: boolean;
+  /** Bumped by the parent to move focus into the input (or the restart button, when the shell exited). */
   focusToken: number;
+  /** The shell exited: starts a new session. */
+  onRestart: () => void;
+  restarting: boolean;
   /** Each resolves to an error message, or null on success. The text is kept on error. */
   onShell: (command: string) => Promise<string | null>;
   onAgent: (text: string) => Promise<string | null>;
@@ -23,19 +31,37 @@ interface Props {
 }
 
 export function InputBar(props: Props) {
-  const { mode, hint, hasPendingApproval, focusToken } = props;
+  const { mode, hint, hasPendingApproval, keysToPty, focusToken } = props;
   const [text, setText] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  const restartRef = useRef<HTMLButtonElement>(null);
   const history = useRef(new History());
 
-  // A new token moves focus. The effect reads the mode at that moment, when the input is rendered.
+  // A new token moves focus. The effect reads the mode and routing at that moment, when the input is rendered.
+  // While keys go to the PTY a token is ignored: a stale token must not take focus from a running program.
   useEffect(() => {
-    if (focusToken > 0 && mode !== 'collapsed' && mode !== 'off') {
+    if (focusToken === 0 || keysToPty) {
+      return;
+    }
+    if (mode === 'exited') {
+      restartRef.current?.focus();
+    } else if (mode !== 'collapsed' && mode !== 'off') {
       inputRef.current?.focus();
     }
   }, [focusToken]);
+
+  if (mode === 'exited') {
+    return (
+      <div className="bar bar-exited">
+        <span className="bar-notice">{hint}</span>
+        <button ref={restartRef} type="button" className="bar-restart" disabled={props.restarting} onClick={props.onRestart}>
+          Start new session
+        </button>
+      </div>
+    );
+  }
 
   if (mode === 'collapsed') {
     return (
