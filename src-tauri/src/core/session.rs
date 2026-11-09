@@ -11,13 +11,14 @@ use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
 
 use crate::core::observer::{
-    run_observer, Core, EventSink, InputState, IntegrationStatus, ObsMsg, ObsQueue, ObserverStatus, ScreenSnapshot,
-    Shared,
+    run_observer, CallStatus, Core, EventSink, InputState, IntegrationStatus, ObsMsg, ObsQueue, ObserverStatus,
+    ScreenSnapshot, Shared,
 };
 use crate::core::pty::{self, Gate, OutputSink};
 use crate::core::record::{Cwd, Record, RecordSummary, Source};
@@ -223,6 +224,12 @@ impl Session {
 
     pub fn records(&self) -> Vec<RecordSummary> {
         self.shared.lock().records()
+    }
+
+    /// Where an agent call stands, from one lock read. Use this, not `records` and `state` separately: they lock
+    /// apart, so a poll built from them can see the two halves of a change at different times.
+    pub fn call_status(&self, call_id: &str, input_wait: Duration) -> CallStatus {
+        self.shared.lock().call_status(call_id, input_wait)
     }
 
     pub fn get_record(&self, id: u64) -> Option<Record> {

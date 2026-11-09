@@ -259,7 +259,24 @@ enum Lifecycle {
     Prompt,
     Submitted { since: Instant },
     Running,
-    Continuation,
+    /// zsh is waiting for more of a command. `since` is when this stretch began (PS2 redraws keep it).
+    Continuation { since: Instant },
+}
+
+/// How many abandoned agent calls are remembered. Older ones are forgotten first.
+pub const ABANDONED_CAP: usize = 64;
+
+/// What the agent's `run_command` can learn about its own call, read under one lock.
+#[derive(Debug, Clone)]
+pub enum CallStatus {
+    /// The command finished. Carries its record.
+    Finished(Box<Record>),
+    /// The line never ran: the shell went back to the prompt (Ctrl-C) or the user finished the line themselves.
+    Abandoned,
+    /// The shell has been waiting for the rest of the line (PS2) for at least the requested time.
+    WaitingForInput,
+    /// Nothing is known yet. Carries the shell state now.
+    Pending(InputState),
 }
 
 fn nz(n: u16) -> NonZeroU16 {
@@ -290,6 +307,8 @@ pub struct Core {
     /// survives the transition from a command to the prompt. While it is set the agent's run_command is refused, so it
     /// cannot land on the user's text.
     user_typed: bool,
+    /// Agent calls whose line never ran (see `CallStatus::Abandoned`). Bounded by `ABANDONED_CAP`.
+    abandoned: VecDeque<String>,
     cwd: Option<Cwd>,
     records: VecDeque<Record>,
     next_id: u64,
@@ -315,6 +334,7 @@ impl Core {
             pending: None,
             last_e: None,
             user_typed: false,
+            abandoned: VecDeque::new(),
             cwd: None,
             records: VecDeque::new(),
             next_id: 1,
@@ -410,6 +430,11 @@ impl Core {
                     Lifecycle::Submitted { .. } => {}
                     Lifecycle::Booting if self.shell_pid.is_none() => {}
                     _ => {
+                        // An agent line still waiting for its C, and zsh is back at the prompt: the line was cancelled.
+                        if let Some((Source::Agent { call_id }, _)) = &self.pending {
+                            let call_id = call_id.clone();
+                            self.mark_abandoned(call_id);
+                        }
                         // The flag is kept here, whether this is a transition or a redraw. Bytes typed while a command
                         // ran are still in the tty, and zsh draws them on this new line (type-ahead).
                         self.lifecycle = Lifecycle::Prompt;
@@ -421,7 +446,7 @@ impl Core {
                 // Submitted too: a multi-line line the user typed closes the gate with its first CR, and zsh then
                 // asks for more (PS2). Without this the gate would reopen while zsh is still inside the command.
                 if matches!(self.lifecycle, Lifecycle::Prompt | Lifecycle::Submitted { .. }) {
-                    self.lifecycle = Lifecycle::Continuation;
+                    self.lifecycle = Lifecycle::Continuation { since: Instant::now() };
                 }
             }
             Event::CommandLine(text) => {
@@ -579,8 +604,39 @@ impl Core {
             Lifecycle::Submitted { since } if since.elapsed() > SUBMIT_TIMEOUT => InputState::Prompt,
             Lifecycle::Submitted { .. } => InputState::Submitted,
             Lifecycle::Running => InputState::Running,
-            Lifecycle::Continuation => InputState::Continuation,
+            Lifecycle::Continuation { .. } => InputState::Continuation,
         }
+    }
+
+    /// Remembers that an agent call's line never ran. Bounded: the oldest entry goes first.
+    fn mark_abandoned(&mut self, call_id: String) {
+        if self.abandoned.contains(&call_id) {
+            return;
+        }
+        self.abandoned.push_back(call_id);
+        while self.abandoned.len() > ABANDONED_CAP {
+            self.abandoned.pop_front();
+        }
+    }
+
+    /// The status of one agent call, all read in this one call (so, under one lock). `input_wait` is how long zsh
+    /// must have been waiting for more input before this reports `WaitingForInput`.
+    pub fn call_status(&self, call_id: &str, input_wait: Duration) -> CallStatus {
+        let finished = self.records.iter().find(|r| matches!(&r.source, Source::Agent { call_id: c } if c == call_id));
+        if let Some(record) = finished {
+            return CallStatus::Finished(Box::new(record.clone()));
+        }
+        if self.abandoned.iter().any(|c| c == call_id) {
+            return CallStatus::Abandoned;
+        }
+        if let (Lifecycle::Continuation { since }, Some((Source::Agent { call_id: c }, _))) =
+            (&self.lifecycle, &self.pending)
+            && c == call_id
+            && since.elapsed() >= input_wait
+        {
+            return CallStatus::WaitingForInput;
+        }
+        CallStatus::Pending(self.lifecycle_view())
     }
 
     // TODO: `exec zsh` and nested shells are undetected. They have no AGENTTERM_NONCE, so they emit no events:
@@ -655,6 +711,11 @@ impl Core {
     /// A CR the user typed while zsh waits for more of a command. Attributes the command it completes to the user,
     /// without changing the lifecycle.
     pub fn note_user_line(&mut self) {
+        // An agent line still waiting for its C is completed by the user's text: the agent's own line never runs.
+        if let Some((Source::Agent { call_id }, _)) = &self.pending {
+            let call_id = call_id.clone();
+            self.mark_abandoned(call_id);
+        }
         self.pending = Some((Source::User, None));
     }
 
@@ -783,7 +844,7 @@ mod tests {
         };
         assert!(typed(&|c| c.lifecycle = Lifecycle::Prompt));
         assert!(typed(&|c| c.lifecycle = Lifecycle::Submitted { since: Instant::now() }));
-        assert!(typed(&|c| c.lifecycle = Lifecycle::Continuation));
+        assert!(typed(&|c| c.lifecycle = Lifecycle::Continuation { since: Instant::now() }));
         assert!(typed(&|c| c.lifecycle = Lifecycle::Running));
         assert!(!typed(&|c| c.lifecycle = Lifecycle::Booting));
         assert!(!typed(&|c| {
@@ -876,5 +937,97 @@ mod tests {
         started.note_user_bytes(b"x");
         started.handle(Event::CommandStart);
         assert!(!started.user_typed_since_prompt(), "C did not clear");
+    }
+
+    const WAIT: Duration = Duration::from_secs(2);
+
+    fn agent(call_id: &str) -> Source {
+        Source::Agent { call_id: call_id.to_string() }
+    }
+
+    /// An agent line submitted at the prompt, then zsh asks for more (PS2).
+    fn agent_in_continuation(c: &mut Core, call_id: &str) {
+        c.lifecycle = Lifecycle::Submitted { since: Instant::now() };
+        c.begin_submit(Some((agent(call_id), Some("echo `x".into()))));
+        c.handle(Event::Continuation);
+    }
+
+    fn status(c: &Core, call_id: &str) -> String {
+        match c.call_status(call_id, WAIT) {
+            CallStatus::Finished(_) => "finished".into(),
+            CallStatus::Abandoned => "abandoned".into(),
+            CallStatus::WaitingForInput => "waiting".into(),
+            CallStatus::Pending(state) => format!("pending {state:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_line_cancelled_at_the_continuation_prompt_is_abandoned() {
+        let mut c = core();
+        agent_in_continuation(&mut c, "run-1");
+        c.handle(Event::PromptStart);
+        assert_eq!(status(&c, "run-1"), "abandoned");
+        assert_eq!(c.lifecycle_view(), InputState::Prompt);
+    }
+
+    #[test]
+    fn agent_line_completed_by_the_user_is_abandoned() {
+        let mut c = core();
+        agent_in_continuation(&mut c, "run-2");
+        c.note_user_line();
+        assert_eq!(status(&c, "run-2"), "abandoned");
+    }
+
+    /// A normal agent command: C closes the attribution, and it is never marked abandoned.
+    #[test]
+    fn a_normal_agent_command_is_not_abandoned_by_its_c() {
+        let mut c = core();
+        c.lifecycle = Lifecycle::Prompt;
+        c.begin_submit(Some((agent("run-3"), Some("echo ok".into()))));
+        c.handle(Event::CommandLine("echo ok".into()));
+        c.handle(Event::CommandStart);
+        assert_eq!(status(&c, "run-3"), "pending Running");
+        c.handle(Event::CommandEnd { exit: 0, pipestatus: vec![0] });
+        assert_eq!(status(&c, "run-3"), "finished");
+    }
+
+    #[test]
+    fn waiting_for_input_needs_the_full_wait_in_continuation() {
+        let mut c = core();
+        agent_in_continuation(&mut c, "run-4");
+        assert_eq!(status(&c, "run-4"), "pending Continuation", "reported before the wait");
+
+        c.lifecycle = Lifecycle::Continuation { since: Instant::now() - Duration::from_secs(3) };
+        assert_eq!(status(&c, "run-4"), "waiting");
+        assert_eq!(
+            match c.call_status("run-4", Duration::from_secs(10)) {
+                CallStatus::Pending(state) => format!("{state:?}"),
+                other => format!("{other:?}"),
+            },
+            "Continuation",
+            "a longer wait must not report yet"
+        );
+    }
+
+    /// Only a call that is still the pending agent line counts as waiting: someone else's line does not.
+    #[test]
+    fn waiting_is_only_for_the_calls_own_line() {
+        let mut c = core();
+        agent_in_continuation(&mut c, "run-5");
+        c.lifecycle = Lifecycle::Continuation { since: Instant::now() - Duration::from_secs(3) };
+        assert_eq!(status(&c, "other-call"), "pending Continuation");
+    }
+
+    #[test]
+    fn the_abandoned_set_is_bounded_and_forgets_the_oldest() {
+        let mut c = core();
+        for i in 0..(ABANDONED_CAP + 10) {
+            c.mark_abandoned(format!("run-{i}"));
+        }
+        assert_eq!(c.abandoned.len(), ABANDONED_CAP);
+        assert_eq!(status(&c, "run-0"), "pending Booting", "the oldest entry was not forgotten");
+        assert_eq!(status(&c, &format!("run-{}", ABANDONED_CAP + 9)), "abandoned");
+        c.mark_abandoned(format!("run-{}", ABANDONED_CAP + 9));
+        assert_eq!(c.abandoned.len(), ABANDONED_CAP, "a repeat mark grew the set");
     }
 }

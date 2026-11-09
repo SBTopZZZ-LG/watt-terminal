@@ -268,21 +268,40 @@ fn run_and_report(ctx: &AgentCtx<'_>, cmd: &str) {
         return;
     }
     match ctx.call_tool("run_command", json!({"command": cmd})) {
-        Ok(v) if v["outcome"] == "finished" => {
-            let r = &v["record"];
-            ctx.say(format!(
-                "Ran `{cmd}`: exit code {}. Output: {}.",
-                code_text(&r["exit_code"]),
-                output_text(r["output"].as_str().unwrap_or_default())
-            ));
-        }
-        Ok(_) => ctx.say(format!(
-            "`{cmd}` is still running after the 30 s wait. It keeps running in the terminal; ask for the last command once it finishes."
-        )),
+        Ok(v) => ctx.say(outcome_text(cmd, &v)),
         Err(e) if e.starts_with(USER_TEXT_CODE) => {
             ctx.say("I can't run that: you have text typed at the prompt. Clear it (Ctrl-C) and ask again.")
         }
         Err(e) => ctx.say(format!("I did not run `{cmd}`: {e}.")),
+    }
+}
+
+/// The chat text for a `run_command` result that came back (not an error). Only a shell in the Running state is
+/// described as still running.
+fn outcome_text(cmd: &str, v: &Value) -> String {
+    match v["outcome"].as_str() {
+        Some("finished") => {
+            let r = &v["record"];
+            format!(
+                "Ran `{cmd}`: exit code {}. Output: {}.",
+                code_text(&r["exit_code"]),
+                output_text(r["output"].as_str().unwrap_or_default())
+            )
+        }
+        Some("timed_out") if v["state"] == "running" => format!(
+            "`{cmd}` is still running after the 30 s wait. It keeps running in the terminal; ask for the last command once it finishes."
+        ),
+        Some("timed_out") => format!(
+            "`{cmd}` got no result within the 30 s wait, and the shell is not running it (shell state: {}). Ask for the last command to see whether it ran.",
+            v["state"].as_str().unwrap_or("unknown")
+        ),
+        Some("not_run") if v["reason"] == "abandoned" => format!(
+            "`{cmd}` did not run: the shell went back to the prompt without executing it (the input was cancelled or incomplete)."
+        ),
+        Some("not_run") => format!(
+            "`{cmd}` did not run yet: the shell is waiting for the rest of a multi-line command (an unclosed quote or backslash). Press Ctrl-C in the terminal to cancel it, then ask again."
+        ),
+        _ => format!("I got an unexpected result for `{cmd}`."),
     }
 }
 
@@ -476,6 +495,24 @@ mod tests {
         assert!(ctx.call_tool("run_command", json!({"command": "pwd"})).is_err());
         assert!(labels(&log).iter().all(|l| !l.starts_with("control")), "{:?}", labels(&log));
         assert_eq!(tools.reached(), vec!["get_screen".to_string(), "get_cwd".to_string()]);
+    }
+
+    /// "still running" only when the shell really is Running. Other timeouts name the state; not-run outcomes say why.
+    #[test]
+    fn run_command_outcomes_are_described_truthfully() {
+        let text = |v: Value| outcome_text("sleep 30", &v);
+        assert_eq!(
+            text(json!({"outcome": "timed_out", "state": "running"})),
+            "`sleep 30` is still running after the 30 s wait. It keeps running in the terminal; ask for the last command once it finishes."
+        );
+        let submitted = text(json!({"outcome": "timed_out", "state": "submitted"}));
+        assert!(!submitted.contains("still running"), "{submitted}");
+        assert!(submitted.contains("shell state: submitted"), "{submitted}");
+        let abandoned = text(json!({"outcome": "not_run", "reason": "abandoned"}));
+        assert!(abandoned.contains("did not run") && abandoned.contains("went back to the prompt"), "{abandoned}");
+        let waiting = text(json!({"outcome": "not_run", "reason": "waiting_for_input"}));
+        assert!(waiting.contains("waiting for the rest") && waiting.contains("Press Ctrl-C"), "{waiting}");
+        assert!(!waiting.contains("still running"), "{waiting}");
     }
 
     #[test]

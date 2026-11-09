@@ -11,12 +11,16 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::core::observer::{InputState, IntegrationStatus, ObserverStatus};
+use crate::core::observer::{CallStatus, InputState, IntegrationStatus, ObserverStatus};
 use crate::core::record::{Cwd, Record, RecordSummary, Source};
 use crate::core::session::{user_text_refusal, Session};
 
 /// How long `run_command` waits for the command to finish before it returns `TimedOut`.
 pub const DEFAULT_RUN_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long zsh must sit at a continuation prompt (PS2) after a `run_command` line before the call returns
+/// `NotRun { WaitingForInput }`. Short enough to report promptly, long enough that a multi-line command passing
+/// through PS2 for a moment is not cut off.
+pub const WAITING_FOR_INPUT_AFTER: Duration = Duration::from_secs(2);
 const RUN_POLL: Duration = Duration::from_millis(25);
 const DEFAULT_LIST: usize = 10;
 const DEFAULT_LIMIT: usize = 4096;
@@ -48,6 +52,16 @@ pub struct CommandView {
     pub truncated: bool,
 }
 
+/// Why a submitted line never ran, when the call returns without a record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotRunReason {
+    /// The line was cancelled (Ctrl-C back to the prompt) or the user finished it themselves. It will not run.
+    Abandoned,
+    /// zsh has been waiting for the rest of the line for `WAITING_FOR_INPUT_AFTER`. Nothing was sent to cancel it.
+    WaitingForInput,
+}
+
 // `Finished` carries a whole Record. Boxing it would change the public RunOutcome type, so it stays inline.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize)]
@@ -56,7 +70,10 @@ pub enum RunOutcome {
     /// The command finished within the timeout.
     Finished { record: Record },
     /// The command had not finished when the timeout expired. It keeps running; the shell is not touched.
+    /// `state` is the shell state at that moment: only `Running` means the command is still running.
     TimedOut { state: InputState },
+    /// The line did not run, or is stuck waiting for input. The shell is not touched; the caller decides what to do.
+    NotRun { reason: NotRunReason },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -111,11 +128,18 @@ pub trait AgentTools {
 /// The tools over one live session.
 pub struct SessionTools<'a> {
     session: &'a Session,
+    /// The continuation wait `run_command` uses. `WAITING_FOR_INPUT_AFTER` unless a test overrides it.
+    input_wait: Duration,
 }
 
 impl<'a> SessionTools<'a> {
     pub fn new(session: &'a Session) -> Self {
-        SessionTools { session }
+        SessionTools { session, input_wait: WAITING_FOR_INPUT_AFTER }
+    }
+
+    /// Like `new`, with a different continuation wait. For tests.
+    pub fn with_input_wait(session: &'a Session, input_wait: Duration) -> Self {
+        SessionTools { session, input_wait }
     }
 }
 
@@ -187,18 +211,16 @@ impl AgentTools for SessionTools<'_> {
 
         let deadline = Instant::now() + timeout;
         loop {
-            let finished = self
-                .session
-                .records()
-                .into_iter()
-                .find(|r| matches!(&r.source, Source::Agent { call_id: c } if *c == call_id))
-                .map(|r| r.id);
-            if let Some(id) = finished {
-                let record = self.session.get_record(id).ok_or("the finished command disappeared")?;
-                return Ok(RunOutcome::Finished { record });
-            }
-            if Instant::now() >= deadline {
-                return Ok(RunOutcome::TimedOut { state: self.session.state() });
+            // One lock read per poll: the outcome and the shell state come from the same moment.
+            match self.session.call_status(&call_id, self.input_wait) {
+                CallStatus::Finished(record) => return Ok(RunOutcome::Finished { record: *record }),
+                CallStatus::Abandoned => return Ok(RunOutcome::NotRun { reason: NotRunReason::Abandoned }),
+                CallStatus::WaitingForInput => return Ok(RunOutcome::NotRun { reason: NotRunReason::WaitingForInput }),
+                CallStatus::Pending(state) => {
+                    if Instant::now() >= deadline {
+                        return Ok(RunOutcome::TimedOut { state });
+                    }
+                }
             }
             thread::sleep(RUN_POLL);
         }

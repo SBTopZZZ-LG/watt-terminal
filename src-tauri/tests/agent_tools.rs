@@ -11,7 +11,7 @@ use agent_term_lib::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate, Mock
 use agent_term_lib::core::observer::{InputState, IntegrationStatus, ObserverStatus};
 use agent_term_lib::core::record::Source;
 use agent_term_lib::core::session::{Session, USER_TEXT_CODE};
-use agent_term_lib::core::tools::{schemas, AgentTools, RunOutcome, SessionTools, DEFAULT_RUN_TIMEOUT};
+use agent_term_lib::core::tools::{schemas, AgentTools, NotRunReason, RunOutcome, SessionTools, DEFAULT_RUN_TIMEOUT};
 use serde_json::json;
 
 use common::*;
@@ -654,4 +654,101 @@ fn keys_typed_in_the_alt_screen_do_not_refuse_run_command() {
         panic!("expected a finished record");
     };
     assert_eq!(record.output, "after-alt");
+}
+
+/// A line with an unclosed backtick makes zsh ask for more (PS2). run_command returns WaitingForInput after the
+/// continuation wait, and does not send anything. Ctrl-C at the continuation prompt then cancels the line, and the
+/// next command runs.
+#[test]
+fn unclosed_quote_waits_for_input_then_ctrl_c_recovers() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let tools = SessionTools::new(&s);
+    let began = std::time::Instant::now();
+    let outcome = tools.run_command("echo `x", DEFAULT_RUN_TIMEOUT).expect("run_command");
+    let waited = began.elapsed();
+    assert!(matches!(outcome, RunOutcome::NotRun { reason: NotRunReason::WaitingForInput }), "got {outcome:?}");
+    assert!(waited >= Duration::from_secs(2) && waited < Duration::from_secs(8), "returned after {waited:?}");
+    assert_eq!(s.state(), InputState::Continuation, "the shell is not waiting");
+
+    s.write_user(&[0x03]).expect("ctrl-c");
+    wait_prompt(&s);
+    assert!(!s.records().iter().any(|r| r.command.contains("echo `x")), "the unfinished line became a record");
+    let RunOutcome::Finished { record } = tools.run_command("echo ok", DEFAULT_RUN_TIMEOUT).expect("run after ctrl-c") else {
+        panic!("expected a finished record");
+    };
+    assert_eq!(record.output, "ok");
+}
+
+/// Through the agent's approval path (auto-approve on), the WaitingForInput outcome reaches the tool result as JSON.
+#[test]
+fn waiting_for_input_reaches_the_agent_as_a_not_run_result() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let tools = SessionTools::with_input_wait(&s, Duration::from_millis(300));
+    let approvals = ApprovalGate::new();
+    approvals.set_auto_approve(true);
+    let log: Log = Arc::default();
+    let sink = log.clone();
+    let emit = move |ev: AgentEvent| sink.lock().unwrap().push(ev);
+    let ctx = AgentCtx::new(&tools, &approvals, &emit);
+    let v = ctx.call_tool("run_command", json!({"command": "echo `x"})).expect("the call itself succeeds");
+    assert_eq!(v["outcome"], "not_run");
+    assert_eq!(v["reason"], "waiting_for_input");
+    assert_eq!(run_command_ok(&log), Some(true));
+    assert!(text_of(&log.lock().unwrap()).is_empty(), "the tool call must not add chat text");
+
+    s.write_user(&[0x03]).expect("ctrl-c");
+    wait_prompt(&s);
+}
+
+/// Ctrl-C while the agent's line is still in the shell's continuation: the call returns Abandoned at once, well before
+/// the continuation wait would have ended, and the session recovers.
+#[test]
+fn ctrl_c_in_continuation_abandons_the_call_promptly() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let (s1, t1) = (s.arc(), std::time::Instant::now());
+    let call = thread::spawn(move || {
+        let outcome = SessionTools::new(&s1).run_command("echo `x", DEFAULT_RUN_TIMEOUT);
+        (outcome, t1.elapsed())
+    });
+    assert!(wait_state(&s, InputState::Continuation, Duration::from_secs(10)), "state={:?}", s.state());
+    s.write_user(&[0x03]).expect("ctrl-c");
+    let (outcome, took) = call.join().expect("call thread");
+    let outcome = outcome.expect("run_command");
+    assert!(matches!(outcome, RunOutcome::NotRun { reason: NotRunReason::Abandoned }), "got {outcome:?}");
+    assert!(took < Duration::from_secs(2), "the abandoned call took {took:?}");
+    wait_prompt(&s);
+    let RunOutcome::Finished { record } = SessionTools::new(&s).run_command("echo after-abandon", DEFAULT_RUN_TIMEOUT).expect("run")
+    else {
+        panic!("expected a finished record");
+    };
+    assert_eq!(record.output, "after-abandon");
+}
+
+/// The user finishes the agent's unclosed line themselves. The agent's line never runs, so the call returns Abandoned
+/// at once instead of waiting out the timeout.
+#[test]
+fn user_finishing_the_agent_line_abandons_the_call() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let (s1, t1) = (s.arc(), std::time::Instant::now());
+    let call = thread::spawn(move || {
+        let outcome = SessionTools::new(&s1).run_command("echo `x", DEFAULT_RUN_TIMEOUT);
+        (outcome, t1.elapsed())
+    });
+    assert!(wait_state(&s, InputState::Continuation, Duration::from_secs(10)), "state={:?}", s.state());
+    s.write_user(b"`\r").expect("the user finishes the line");
+    let (outcome, took) = call.join().expect("call thread");
+    let outcome = outcome.expect("run_command");
+    assert!(matches!(outcome, RunOutcome::NotRun { reason: NotRunReason::Abandoned }), "got {outcome:?}");
+    assert!(took < Duration::from_secs(2), "the abandoned call took {took:?}");
+    wait_prompt(&s);
+    assert!(s.records().iter().any(|r| r.source == Source::User), "the user's completed line has no record");
+    assert!(!s.records().iter().any(|r| matches!(r.source, Source::Agent { .. })), "the abandoned line got a record");
 }
