@@ -259,7 +259,7 @@ fn last_command(ctx: &AgentCtx<'_>) {
     let observer_ok = ctx.read_tool("get_screen", json!({})).ok().is_some_and(|s| s["observer_status"] == "ok");
     let cwd = match &view["cwd"] {
         Value::Null => "unknown".to_string(),
-        c => format!("{}:{}", c["host"].as_str().unwrap_or("?"), c["path"].as_str().unwrap_or("?")),
+        c => c["path"].as_str().unwrap_or("?").to_string(),
     };
     ctx.say(format!(
         "Last command: `{}` (source: {}). Exit code {}. Directory: {}. Output: {}. Observer status: {}.",

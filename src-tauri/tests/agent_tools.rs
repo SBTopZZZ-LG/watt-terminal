@@ -271,6 +271,8 @@ fn last_command_answer_states_exit_code_and_cwd() {
         assert!(text.contains("`false`"), "{question}: {text}");
         assert!(text.contains("exit code 1"), "{question}: {text}");
         assert!(text.contains("/tmp"), "{question}: {text}");
+        let known = SessionTools::new(&s).get_cwd().expect("cwd known");
+        assert!(!text.contains(&known.host.to_lowercase()), "{question}: {text}");
         assert!(!has_approval(&events));
         assert!(matches!(events.last(), Some(AgentEvent::Done)));
     }
