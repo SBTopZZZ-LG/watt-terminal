@@ -65,28 +65,40 @@ input {
 }
 
 /*
- * Gutter marks: a thin 3px stripe in the left padding, just outside each command's output. xterm sets no inline
- * left for x: 0, so the decoration sits at column 0; margin-left moves it 5px further left, leaving a visible gap.
+ * Command stripes (StripeLayer). The layer covers the grid and is hidden in the alt screen. Each stripe spans the grid's
+ * width, shifted 5px left, and its shadow draws a 3px bar just left of that box, leaving a visible gap before the text.
+ * The badge is anchored to the stripe's right edge, so it keeps its place. A running command's stripe is muted.
  */
-.xterm-decoration[data-exit] {
+.stripe-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 6;
   pointer-events: none;
-  margin-left: -5px;
+}
+
+.stripe {
+  position: absolute;
+  left: -5px;
+  right: 5px;
+  pointer-events: none;
   box-shadow: -3px 0 0 var(--line);
 }
 
-.xterm-decoration[data-exit="ok"] {
+.stripe[data-exit="ok"] {
   box-shadow: -3px 0 0 var(--ok);
 }
 
-.xterm-decoration[data-exit="fail"] {
+.stripe[data-exit="fail"] {
   box-shadow: -3px 0 0 var(--fail);
 }
 
-.xterm-decoration[data-exit="unknown"] {
+.stripe[data-exit="unknown"],
+.stripe[data-exit="running"] {
   box-shadow: -3px 0 0 var(--muted);
 }
 
-.xterm-decoration[data-agent="true"]::after {
+/* Only when the command's first row is on screen, so the badge never sits on a row that is not the command's start. */
+.stripe[data-agent="true"][data-start-visible="true"]::after {
   content: "agent";
   position: absolute;
   right: 8px;
@@ -100,7 +112,7 @@ input {
 
 /*
  * Agent control: a pulsing green border around the terminal while the agent runs an approved command. It never takes
- * pointer events, and its z-index (5) keeps it below the gutter decorations (6) and the scrollbar. The outer element
+ * pointer events, and its z-index (5) keeps it below the command stripes (6) and the scrollbar. The outer element
  * fades; the inner glow pulses, so a fade-out does not cut the pulse off mid-cycle.
  */
 .agent-control {

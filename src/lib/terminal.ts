@@ -10,6 +10,7 @@ import '@xterm/xterm/css/xterm.css';
 import { api, errorText } from './api';
 import { Coalescer } from './coalescer';
 import { CommandMarks } from './commandMarks';
+import { StripeLayer } from './stripeLayer';
 import { getNonce, reportError } from './session';
 import { parseShellPayload } from './osc';
 import { createFitter } from './fitter';
@@ -65,8 +66,11 @@ const coalescer = new Coalescer({
   },
 });
 
-/** Shell marks for gutter decorations. Rust decides everything that matters; these are positional only. */
-export const marks = new CommandMarks(term);
+/** Created by mountTerminal, once xterm has a DOM element to draw into. */
+let stripeLayer: StripeLayer | undefined;
+
+/** Shell marks for the gutter stripes. Rust decides everything that matters; these are positional only. */
+export const marks = new CommandMarks(term, () => stripeLayer?.schedule());
 
 let mounted = false;
 let cursorHidden = false;
@@ -82,6 +86,7 @@ export function mountTerminal(host: HTMLElement): void {
   // Darkblood's prompt uses U+26A1, which is double width under Unicode 11 rules.
   term.unicode.activeVersion = '11';
   term.open(host);
+  stripeLayer = new StripeLayer(term, marks);
   fit.fit();
   term.parser.registerOscHandler(133, (data) => onShellOsc(133, data));
   term.parser.registerOscHandler(633, (data) => onShellOsc(633, data));
