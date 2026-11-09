@@ -4,9 +4,10 @@ import { api, errorText } from './lib/api';
 import { connect, reportError, restart, subscribe } from './lib/session';
 import type { Incoming } from './lib/session';
 import { fitToContainer, markConnected, marks, receiveBytes, resetForNewSession, term, terminalSize } from './lib/terminal';
-import { effectiveState, focusAfter, inputReducer, INITIAL_INPUT, routeFor } from './lib/inputState';
+import { effectiveState, focusAfter, inputReducer, INITIAL_INPUT, isFocusBarHotkey, routeFor } from './lib/inputState';
 import type { BarMode } from './lib/inputState';
-import { agentControlAfter } from './lib/agentControl';
+import { agentControlAfter, borderActive, NO_CONTROL } from './lib/agentControl';
+import type { AgentControl } from './lib/agentControl';
 import { EMPTY_TRANSCRIPT, firstPendingApproval, isBusy, transcriptReducer } from './lib/transcript';
 import type { Cwd, InputState, IntegrationStatus, ObserverStatus, Status, WireEvent } from './lib/types';
 import { TerminalView } from './components/TerminalView';
@@ -34,8 +35,9 @@ export default function App() {
   const [autoApprove, setAutoApprove] = useState(false);
   const [focusToken, setFocusToken] = useState(0);
   const [restarting, setRestarting] = useState(false);
-  // True while the agent executes an approved shell call. Drives the green border around the terminal.
-  const [agentControl, setAgentControl] = useState(false);
+  // The agent's hold on the shell: an approved call executing, or a command it started still running (see
+  // agentControl.ts). Drives the green border around the terminal.
+  const [agentControl, setAgentControl] = useState<AgentControl>(NO_CONTROL);
 
   // Read by long-lived listeners (keystrokes, hotkey), so they always see the current route.
   const routeRef = useRef(route);
@@ -51,7 +53,7 @@ export default function App() {
     setObserver(s.observer);
     setCwd(s.cwd);
     setAutoApprove(s.auto_approve);
-    setAgentControl(s.agent_control);
+    setAgentControl((c) => ({ ...c, call: s.agent_control }));
     dispatchTranscript({ type: 'sync_busy', busy: s.agent_busy });
     if (s.observer === 'desynced') {
       marks.observerDesynced();
@@ -61,7 +63,7 @@ export default function App() {
   // Connect, then load the snapshot. The snapshot covers events that arrived before this listener was up.
   useEffect(() => {
     const handleEvent = (ev: WireEvent) => {
-      setAgentControl((active) => agentControlAfter(active, ev));
+      setAgentControl((c) => agentControlAfter(c, ev));
       switch (ev.type) {
         case 'state':
           dispatchInput({ type: 'rust_state', state: ev.state });
@@ -121,10 +123,11 @@ export default function App() {
     }
   }, [effective]);
 
-  // Ctrl+Shift+A focuses the agent bar, from anywhere it is offered. Capture phase, so xterm does not also get the key.
+  // Ctrl+Shift+A (Cmd+Shift+A) focuses the agent bar, from anywhere it is offered. Capture phase, so xterm does not also
+  // get the key.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (!(e.ctrlKey && e.shiftKey && e.key.toLowerCase() === 'a')) {
+      if (!isFocusBarHotkey(e)) {
         return;
       }
       e.preventDefault();
@@ -195,7 +198,7 @@ export default function App() {
     setRestarting(true);
     resetForNewSession();
     dispatchTranscript({ type: 'session_reset' });
-    setAgentControl(false);
+    setAgentControl(NO_CONTROL);
     const { rows, cols } = terminalSize();
     restart(rows, cols)
       .then(() => api.getStatus())
@@ -235,7 +238,7 @@ export default function App() {
           onAltChange={(active) => dispatchInput({ type: 'alt', active })}
         />
         {/* Shown while the agent has the shell. Never takes clicks; sits above the terminal background, below its decorations. */}
-        <div className={agentControl ? 'agent-control is-active' : 'agent-control'} aria-hidden="true">
+        <div className={borderActive(agentControl) ? 'agent-control is-active' : 'agent-control'} aria-hidden="true">
           <div className="agent-control-glow" />
         </div>
       </div>

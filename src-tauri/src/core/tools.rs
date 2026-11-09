@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 
 use crate::core::observer::{InputState, IntegrationStatus, ObserverStatus};
 use crate::core::record::{Cwd, Record, RecordSummary, Source};
-use crate::core::session::Session;
+use crate::core::session::{user_text_refusal, Session};
 
 /// How long `run_command` waits for the command to finish before it returns `TimedOut`.
 pub const DEFAULT_RUN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -74,6 +74,11 @@ pub trait AgentTools {
     fn get_screen(&self) -> ScreenView;
     fn get_cwd(&self) -> Option<Cwd>;
     fn run_command(&self, command: &str, timeout: Duration) -> Result<RunOutcome, String>;
+    /// Whether `run_command` would already be refused for text the user typed on the prompt. Checked before the approval
+    /// card, so the user is not asked to approve a command that will be refused. Writes nothing.
+    fn run_command_precheck(&self) -> Result<(), String> {
+        Ok(())
+    }
     fn send_keys(&self, bytes: &[u8]) -> Result<(), String>;
 
     /// Calls a tool by schema name. Optional arguments take their defaults. Does not ask for approval.
@@ -174,7 +179,8 @@ impl AgentTools for SessionTools<'_> {
             return Err(format!("cannot run a command now: the session is {state:?}, not at an idle prompt"));
         }
         let call_id = format!("run-{}", NEXT_RUN.fetch_add(1, Ordering::Relaxed));
-        // submit() re-checks the prompt atomically, so a racing user submit wins or loses cleanly.
+        // submit() re-checks the prompt, and the user's text, atomically, so a racing user submit or keystroke wins or
+        // loses cleanly.
         self.session
             .submit(Source::Agent { call_id: call_id.clone() }, command)
             .map_err(|e| e.to_string())?;
@@ -195,6 +201,14 @@ impl AgentTools for SessionTools<'_> {
                 return Ok(RunOutcome::TimedOut { state: self.session.state() });
             }
             thread::sleep(RUN_POLL);
+        }
+    }
+
+    fn run_command_precheck(&self) -> Result<(), String> {
+        if self.session.user_typed_since_prompt() {
+            Err(user_text_refusal())
+        } else {
+            Ok(())
         }
     }
 

@@ -5,6 +5,7 @@ import {
   focusAfter,
   inputReducer,
   INITIAL_INPUT,
+  isFocusBarHotkey,
   routeFor,
 } from './inputState';
 import type { InputModel } from './inputState';
@@ -166,5 +167,35 @@ describe('barKeyIntent', () => {
   it('arrows walk history', () => {
     expect(barKeyIntent('ArrowUp', { ctrl: false, shift: false }, none)).toBe('history_prev');
     expect(barKeyIntent('ArrowDown', { ctrl: false, shift: false }, none)).toBe('history_next');
+  });
+});
+
+describe('isFocusBarHotkey', () => {
+  const press = (key: string, mods: { ctrl?: boolean; meta?: boolean; shift?: boolean }) => ({
+    key,
+    ctrlKey: mods.ctrl ?? false,
+    metaKey: mods.meta ?? false,
+    shiftKey: mods.shift ?? false,
+  });
+
+  it('accepts Ctrl+Shift+A and Cmd+Shift+A, in either letter case', () => {
+    expect(isFocusBarHotkey(press('a', { ctrl: true, shift: true }))).toBe(true);
+    expect(isFocusBarHotkey(press('A', { ctrl: true, shift: true }))).toBe(true);
+    expect(isFocusBarHotkey(press('a', { meta: true, shift: true }))).toBe(true);
+    expect(isFocusBarHotkey(press('A', { meta: true, shift: true }))).toBe(true);
+  });
+
+  it('needs Shift and the letter A', () => {
+    expect(isFocusBarHotkey(press('a', { ctrl: true }))).toBe(false);
+    expect(isFocusBarHotkey(press('a', { meta: true }))).toBe(false);
+    expect(isFocusBarHotkey(press('b', { ctrl: true, shift: true }))).toBe(false);
+    expect(isFocusBarHotkey(press('a', { shift: true }))).toBe(false);
+  });
+
+  it('leaves Escape to the bar: Escape is not a focus hotkey, and the bar still closes on it', () => {
+    expect(isFocusBarHotkey(press('Escape', { ctrl: true, shift: true }))).toBe(false);
+    expect(barKeyIntent('Escape', { ctrl: false, shift: false }, { inputEmpty: true, hasPendingApproval: false })).toBe(
+      'close',
+    );
   });
 });

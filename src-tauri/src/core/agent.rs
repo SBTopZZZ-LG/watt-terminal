@@ -16,7 +16,7 @@ use std::time::Duration;
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::core::session::Session;
+use crate::core::session::{Session, USER_TEXT_CODE};
 use crate::core::tools::AgentTools;
 
 pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -163,13 +163,19 @@ impl<'a> AgentCtx<'a> {
     fn run(&self, name: &str, args: Value, gated: bool) -> Result<Value, String> {
         let call_id = format!("call-{}", NEXT_CALL.fetch_add(1, Ordering::Relaxed));
         self.emit(AgentEvent::ToolCall { call_id: call_id.clone(), name: name.to_string(), args: args.clone() });
-        let needs_approval = gated
+        // A run_command the user's typed text would block is refused before the approval card: the user is not asked to
+        // approve it. The tool checks again when it injects, in case the user types while the card waits.
+        let precheck = if gated && name == "run_command" { self.tools.run_command_precheck() } else { Ok(()) };
+        let needs_approval = precheck.is_ok()
+            && gated
             && match name {
                 "send_keys" => true,
                 "run_command" => !self.approvals.auto_approve(),
                 _ => false,
             };
-        let result = if !needs_approval {
+        let result = if let Err(e) = precheck {
+            Err(e)
+        } else if !needs_approval {
             self.execute(name, &args, gated)
         } else {
             let text = args.get("command").and_then(Value::as_str).map_or_else(|| args.to_string(), str::to_string);
@@ -273,6 +279,9 @@ fn run_and_report(ctx: &AgentCtx<'_>, cmd: &str) {
         Ok(_) => ctx.say(format!(
             "`{cmd}` is still running after the 30 s wait. It keeps running in the terminal; ask for the last command once it finishes."
         )),
+        Err(e) if e.starts_with(USER_TEXT_CODE) => {
+            ctx.say("I can't run that: you have text typed at the prompt. Clear it (Ctrl-C) and ask again.")
+        }
         Err(e) => ctx.say(format!("I did not run `{cmd}`: {e}.")),
     }
 }

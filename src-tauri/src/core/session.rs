@@ -35,10 +35,21 @@ pub struct SpawnConfig {
     pub histfile: Option<PathBuf>,
 }
 
+/// Stable code at the start of the error `run_command` returns when the user has typed text on the prompt. The
+/// MockAgent matches on it, so keep it unchanged.
+pub const USER_TEXT_CODE: &str = "prompt_has_user_text";
+
+/// The refusal text for a run_command at a prompt the user has typed on. Nothing is written to the PTY.
+pub fn user_text_refusal() -> String {
+    format!("{USER_TEXT_CODE}: the prompt has text typed by the user; ask them to clear it (Ctrl-C) and try again")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubmitError {
     /// The session is not at an idle prompt. Carries the state it is in.
     NotAtPrompt(InputState),
+    /// The user has typed text on the prompt line (see `Core::note_user_bytes`). Nothing was written.
+    UserTyped,
     /// The observer lost bytes and has not seen a prompt since.
     ObserverDesynced,
     /// The session has no writer any more (the shell exited or the session was closed).
@@ -49,6 +60,7 @@ impl std::fmt::Display for SubmitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SubmitError::NotAtPrompt(s) => write!(f, "session is not at a prompt (state: {s:?})"),
+            SubmitError::UserTyped => write!(f, "{}", user_text_refusal()),
             SubmitError::ObserverDesynced => write!(f, "observer is desynced; wait for the next prompt"),
             SubmitError::Closed => write!(f, "session is closed"),
         }
@@ -157,6 +169,12 @@ impl Session {
         got.recv().map_err(|_| SubmitError::Closed)?
     }
 
+    /// True while the user has typed text on the prompt line that is still there. A pre-check only: `submit` checks the
+    /// same flag again under the writer's lock, right before it writes.
+    pub fn user_typed_since_prompt(&self) -> bool {
+        self.shared.lock().user_typed_since_prompt()
+    }
+
     /// Raw bytes from the user (keystrokes). Only the frontend decides when these are allowed.
     pub fn write_user(&self, bytes: &[u8]) -> io::Result<()> {
         self.wtx
@@ -258,23 +276,31 @@ fn run_writer(rx: Receiver<WriteCmd>, mut writer: Box<dyn Write + Send>, shared:
     for cmd in rx {
         match cmd {
             WriteCmd::User(bytes) => {
-                if bytes.contains(&b'\r') {
+                // The lock is released before the write: a blocked PTY must not hold up the observer.
+                let submitted = {
                     let mut core = shared.lock();
-                    if !core.desynced() {
-                        let state = core.lifecycle_view();
-                        match state {
+                    core.note_user_bytes(&bytes);
+                    if bytes.contains(&b'\r') && !core.desynced() {
+                        match core.lifecycle_view() {
                             // The first CR at an idle prompt closes the gate, so the agent cannot inject into the same
                             // line. C (or the submit timeout, for an empty line) reopens it.
                             InputState::Prompt => {
                                 core.begin_submit(Some((Source::User, None)));
-                                drop(core);
-                                shared.flush();
+                                true
                             }
                             // A CR completing a multi-line command the user is typing: attribute it to the user.
-                            InputState::Continuation => core.note_user_line(),
-                            _ => {}
+                            InputState::Continuation => {
+                                core.note_user_line();
+                                false
+                            }
+                            _ => false,
                         }
+                    } else {
+                        false
                     }
+                };
+                if submitted {
+                    shared.flush();
                 }
                 let _ = write_all(&mut writer, &bytes);
             }
@@ -285,6 +311,8 @@ fn run_writer(rx: Receiver<WriteCmd>, mut writer: Box<dyn Write + Send>, shared:
                         Err(SubmitError::ObserverDesynced)
                     } else {
                         match core.lifecycle_view() {
+                            // The user's text is on the line: refuse, and write nothing.
+                            InputState::Prompt if core.user_typed_since_prompt() => Err(SubmitError::UserTyped),
                             InputState::Prompt => {
                                 let bytes = encode_submit(&text, core.bracketed_paste());
                                 core.begin_submit(Some((source, Some(text))));

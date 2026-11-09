@@ -284,6 +284,10 @@ pub struct Core {
     pending: Option<(Source, Option<String>)>,
     /// E seen, waiting for its C.
     last_e: Option<(String, Source)>,
+    /// The user has typed text on the prompt line that is still there. Set by `note_user_bytes`, cleared when a new
+    /// prompt starts (a transition into Prompt), by Ctrl-C at the prompt, by a CR that submits the line, and by C.
+    /// While it is set the agent's run_command is refused, so it cannot land on the user's half-typed line.
+    user_typed: bool,
     cwd: Option<Cwd>,
     records: VecDeque<Record>,
     next_id: u64,
@@ -308,6 +312,7 @@ impl Core {
             eof: false,
             pending: None,
             last_e: None,
+            user_typed: false,
             cwd: None,
             records: VecDeque::new(),
             next_id: 1,
@@ -403,6 +408,11 @@ impl Core {
                     Lifecycle::Submitted { .. } => {}
                     Lifecycle::Booting if self.shell_pid.is_none() => {}
                     _ => {
+                        // Only a transition starts a new line. A redraw of the prompt (a resize, a theme that resets
+                        // it) keeps the user's text, so it keeps the flag too.
+                        if self.lifecycle != Lifecycle::Prompt {
+                            self.user_typed = false;
+                        }
                         self.lifecycle = Lifecycle::Prompt;
                         self.pending = None;
                     }
@@ -428,6 +438,8 @@ impl Core {
                 self.close_open(RecordStatus::Incomplete);
                 let (command, source) = self.last_e.take().unwrap_or_else(|| (String::new(), Source::Unknown));
                 self.pending = None;
+                // The line the user typed has run (or is running): the prompt is no longer holding their text.
+                self.user_typed = false;
                 self.start_record(command, source);
                 self.lifecycle = Lifecycle::Running;
             }
@@ -601,9 +613,34 @@ impl Core {
     }
 
     /// Called by the writer under the same lock as the check. Moves to Submitted and records the pending attribution.
+    /// The line leaves the prompt, so the user's text is no longer there either (an empty line never gets a C).
     pub fn begin_submit(&mut self, pending: Option<(Source, Option<String>)>) {
         self.lifecycle = Lifecycle::Submitted { since: Instant::now() };
         self.pending = pending;
+        self.user_typed = false;
+    }
+
+    /// Records the user's bytes for the typed-text check. Counted only where they edit the prompt line (Prompt, Submitted,
+    /// Continuation). While a command runs they go to the program or to a later line, and are ignored: that is the
+    /// accepted type-ahead gap. Ctrl-C discards the line, so it clears the flag. Ctrl-L clears the screen and redraws the
+    /// same line, so it changes nothing. A CR is not counted here; a CR at the prompt submits the line (`begin_submit`).
+    /// Any other byte, arrow keys included (history recall puts text on the line), sets the flag.
+    pub fn note_user_bytes(&mut self, bytes: &[u8]) {
+        if !matches!(self.lifecycle_view(), InputState::Prompt | InputState::Submitted | InputState::Continuation) {
+            return;
+        }
+        for &b in bytes {
+            match b {
+                0x03 => self.user_typed = false,
+                b'\r' | 0x0c => {}
+                _ => self.user_typed = true,
+            }
+        }
+    }
+
+    /// True while the user has text on the prompt line (see the field). run_command is refused meanwhile.
+    pub fn user_typed_since_prompt(&self) -> bool {
+        self.user_typed
     }
 
     /// A CR the user typed while zsh waits for more of a command. Attributes the command it completes to the user,

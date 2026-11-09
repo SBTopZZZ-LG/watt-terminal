@@ -10,7 +10,7 @@ use std::time::Duration;
 use agent_term_lib::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate, MockAgent, user_input};
 use agent_term_lib::core::observer::{InputState, IntegrationStatus, ObserverStatus};
 use agent_term_lib::core::record::Source;
-use agent_term_lib::core::session::Session;
+use agent_term_lib::core::session::{Session, USER_TEXT_CODE};
 use agent_term_lib::core::tools::{schemas, AgentTools, RunOutcome, SessionTools, DEFAULT_RUN_TIMEOUT};
 use serde_json::json;
 
@@ -427,4 +427,166 @@ fn user_input_without_ctrl_c_keeps_approvals_pending() {
     assert!(approvals.decide(&id, false));
     h.join().expect("turn");
     assert_eq!(run_command_ok(&log), Some(false));
+}
+
+/// Whether any screen row contains `text`.
+fn screen_has(s: &Session, text: &str) -> bool {
+    snapshot(s).rows.iter().any(|r| r.contains(text))
+}
+
+/// The row the cursor is on. zsh keeps an abandoned line (after Ctrl-C) above the new prompt, so only this row shows
+/// whether the user's text is still on the prompt line.
+fn prompt_line(s: &Session) -> String {
+    let snap = snapshot(s);
+    snap.rows.get(snap.cursor.0 as usize).cloned().unwrap_or_default()
+}
+
+/// The `error` of the last run_command ToolResult, if it failed.
+fn run_command_error(log: &Log) -> Option<String> {
+    log.lock().unwrap().iter().rev().find_map(|e| match e {
+        AgentEvent::ToolResult { name, result, .. } if name == "run_command" => result["error"].as_str().map(str::to_string),
+        _ => None,
+    })
+}
+
+/// Text the user typed on the prompt (no CR) refuses run_command, and nothing reaches the PTY: the typed line stays as
+/// it was and the agent's command never ran. Ctrl-C clears the line, and then the agent can run again.
+#[test]
+fn user_text_at_the_prompt_refuses_run_command_and_writes_nothing() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    s.write_user(b"echo typed-by-user").expect("typed");
+    assert!(wait_until(Duration::from_secs(5), || screen_has(&s, "echo typed-by-user").then_some(())).is_some());
+
+    let tools = SessionTools::new(&s);
+    assert!(tools.run_command_precheck().is_err(), "the precheck let the command through");
+    let err = tools.run_command("echo agent-marker", DEFAULT_RUN_TIMEOUT).expect_err("refused while text is typed");
+    assert!(err.starts_with(USER_TEXT_CODE), "error: {err}");
+    assert!(!s.records().iter().any(|r| r.command.contains("agent-marker")), "the refused command ran");
+    assert!(!screen_has(&s, "agent-marker"), "the refused command reached the screen");
+    assert!(screen_has(&s, "echo typed-by-user"), "the user's line changed");
+
+    s.write_user(&[0x03]).expect("ctrl-c");
+    assert!(wait_until(Duration::from_secs(5), || (!prompt_line(&s).contains("typed-by-user")).then_some(())).is_some(), "ctrl-c did not clear the prompt line");
+    wait_prompt(&s);
+    let outcome = tools.run_command("echo after-ctrl-c", DEFAULT_RUN_TIMEOUT).expect("runs after ctrl-c");
+    let RunOutcome::Finished { record } = outcome else { panic!("expected a finished record, got {outcome:?}") };
+    assert_eq!(record.output, "after-ctrl-c");
+}
+
+/// The MockAgent refuses before the approval card: nobody is asked to approve a command that would be refused.
+#[test]
+fn user_text_at_the_prompt_refuses_before_the_approval_card() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    s.write_user(b"echo typed-first").expect("typed");
+    assert!(wait_until(Duration::from_secs(5), || screen_has(&s, "typed-first").then_some(())).is_some());
+
+    // A card would wait for 300 ms and then count as a denial. Either way the refusal must come first.
+    let approvals = ApprovalGate::with_timeout(Duration::from_millis(300));
+    let events = turn(&s, &approvals, "please run `echo card-check`");
+    assert!(!has_approval(&events), "an approval card was raised for a refused command");
+    assert!(!events.iter().any(|e| matches!(e, AgentEvent::AgentControl { .. })), "the agent took control for a refused command");
+    assert_eq!(run_ok(&events), Some(false));
+    assert_eq!(
+        text_of(&events),
+        "I can't run that: you have text typed at the prompt. Clear it (Ctrl-C) and ask again."
+    );
+    assert!(!s.records().iter().any(|r| r.command == "echo card-check"), "the refused command ran");
+
+    s.write_user(&[0x03]).expect("ctrl-c");
+    wait_prompt(&s);
+}
+
+/// Text typed while the approval card waits is caught at injection: the approved command is refused, and nothing runs.
+#[test]
+fn user_text_typed_while_an_approval_waits_refuses_the_injection() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let approvals = Arc::new(ApprovalGate::new());
+    let (h, log) = turn_in_thread(s.arc(), approvals.clone(), "please run `echo late-cmd`");
+    let (id, _) = wait_approval(&log);
+    s.write_user(b"echo typed-late").expect("typed while the card waits");
+    assert!(wait_until(Duration::from_secs(5), || screen_has(&s, "typed-late").then_some(())).is_some());
+    assert!(approvals.decide(&id, true));
+    h.join().expect("turn");
+    assert_eq!(run_command_ok(&log), Some(false));
+    let err = run_command_error(&log).expect("the injection was refused with an error");
+    assert!(err.starts_with(USER_TEXT_CODE), "error: {err}");
+    assert!(!s.records().iter().any(|r| r.command == "echo late-cmd"), "the approved command ran over the user's text");
+    assert!(!screen_has(&s, "late-cmd"), "the approved command reached the screen");
+
+    s.write_user(&[0x03]).expect("ctrl-c");
+    assert!(wait_until(Duration::from_secs(5), || (!prompt_line(&s).contains("typed-late")).then_some(())).is_some(), "ctrl-c did not clear the prompt line");
+    wait_prompt(&s);
+}
+
+/// With nothing typed by the user, run_command works as before.
+#[test]
+fn run_command_works_when_the_user_has_typed_nothing() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let tools = SessionTools::new(&s);
+    assert!(tools.run_command_precheck().is_ok());
+    let RunOutcome::Finished { record } = tools.run_command("echo untouched", DEFAULT_RUN_TIMEOUT).expect("run") else {
+        panic!("expected a finished record");
+    };
+    assert_eq!(record.output, "untouched");
+}
+
+/// A line the user submits leaves the prompt clean: once it has finished, the agent's command runs.
+#[test]
+fn a_line_the_user_submits_leaves_the_prompt_clean() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    s.write_user(b"echo user-line\r").expect("typed and submitted");
+    run_finish(&s, "echo user-line");
+    wait_prompt(&s);
+    let tools = SessionTools::new(&s);
+    let RunOutcome::Finished { record } = tools.run_command("echo agent-next", DEFAULT_RUN_TIMEOUT).expect("run") else {
+        panic!("expected a finished record");
+    };
+    assert_eq!(record.output, "agent-next");
+}
+
+/// Keys typed while a command runs do not count toward the prompt check. Enter is used here, so the next prompt is
+/// left empty and the agent's command runs.
+#[test]
+fn keys_typed_while_a_command_runs_do_not_block_the_next_agent_command() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    s.submit(Source::User, "sleep 1").expect("submit");
+    assert!(wait_state(&s, InputState::Running, Duration::from_secs(3)), "state={:?}", s.state());
+    s.write_user(b"\r").expect("enter while the command runs");
+    run_finish(&s, "sleep 1");
+    wait_prompt(&s);
+    let RunOutcome::Finished { record } =
+        SessionTools::new(&s).run_command("echo next-ok", DEFAULT_RUN_TIMEOUT).expect("not refused")
+    else {
+        panic!("expected a finished record");
+    };
+    assert_eq!(record.output, "next-ok");
+}
+
+
+/// Ctrl-L redraws the line and keeps the user's text, so the refusal stays after it.
+#[test]
+fn ctrl_l_keeps_user_text_refusing_the_agent() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    s.write_user(b"echo kept").expect("typed");
+    assert!(wait_until(Duration::from_secs(5), || screen_has(&s, "echo kept").then_some(())).is_some());
+    s.write_user(b"\x0c").expect("ctrl-l");
+    thread::sleep(Duration::from_millis(500));
+    assert!(screen_has(&s, "echo kept"), "ctrl-l removed the user's text from the screen");
+    assert!(SessionTools::new(&s).run_command_precheck().is_err(), "ctrl-l cleared the refusal");
+    s.write_user(&[0x03]).expect("ctrl-c");
+    wait_prompt(&s);
 }

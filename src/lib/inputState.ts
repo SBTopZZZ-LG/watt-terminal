@@ -107,6 +107,14 @@ export function focusAfter(prev: InputState, next: InputState): 'xterm' | 'bar' 
   return null;
 }
 
+/**
+ * The hotkey that focuses the agent bar: Ctrl+Shift+A, or Cmd+Shift+A on macOS. Matched on the letter, so the Shift key
+ * does not change it. App.tsx handles it in the capture phase, so xterm does not also receive it.
+ */
+export function isFocusBarHotkey(e: { key: string; ctrlKey: boolean; metaKey: boolean; shiftKey: boolean }): boolean {
+  return (e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'a';
+}
+
 export type BarKey =
   | 'interrupt'
   | 'approve_first'
