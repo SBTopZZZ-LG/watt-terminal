@@ -111,6 +111,75 @@ input {
 }
 
 /*
+ * Find bar: a small overlay at the top right of the terminal area. It sits above the stripes (6) and the agent control (5).
+ * The status strip is outside .terminal-area, so the bar never covers it.
+ */
+.find-bar {
+  position: absolute;
+  top: 8px;
+  right: 20px;
+  z-index: 7;
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  padding: 4px 6px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+}
+
+.find-input {
+  width: 180px;
+  min-width: 0;
+  padding: 3px 6px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--bg);
+  font: 12px var(--mono);
+}
+
+.find-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.find-count {
+  min-width: 84px;
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+  text-align: right;
+}
+
+.find-button {
+  min-width: 22px;
+  height: 22px;
+  padding: 0 4px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  font: 12px var(--mono);
+  cursor: pointer;
+}
+
+.find-button:hover {
+  border-color: var(--line);
+  color: var(--text);
+}
+
+.find-button.is-on {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.find-button:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/*
  * Agent control: a pulsing green border around the terminal while the agent runs an approved command. It never takes
  * pointer events, and its z-index (5) keeps it below the command stripes (6) and the scrollbar. The outer element
  * fades; the inner glow pulses, so a fade-out does not cut the pulse off mid-cycle.

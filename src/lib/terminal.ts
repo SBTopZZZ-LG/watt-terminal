@@ -1,10 +1,13 @@
 // The single xterm instance. It lives for the page's lifetime: created once, opened once, never disposed.
 // That keeps the byte path simple. Raw PTY bytes always reach this terminal, and every render is acked.
 //
-// Rule: nothing is written to the terminal except bytes that came from the PTY.
+// Rule: nothing is written to the terminal except bytes that came from the PTY. One deliberate exception: Cmd+K
+// (clearTerminal) writes ESC[3J locally to drop the scrollback. That only changes xterm's view, the shell is not told and
+// its state is untouched. The Ctrl-L that redraws the prompt does go to the PTY, like any typed key.
 
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
+import { SearchAddon } from '@xterm/addon-search';
 import { Unicode11Addon } from '@xterm/addon-unicode11';
 import '@xterm/xterm/css/xterm.css';
 import { api, errorText } from './api';
@@ -14,6 +17,9 @@ import { StripeLayer } from './stripeLayer';
 import { getNonce, reportError } from './session';
 import { parseShellPayload } from './osc';
 import { createFitter } from './fitter';
+import { clearActions } from './clear';
+import { defaultSizeStorage, FONT_SIZE_DEFAULT, loadFontSize, saveFontSize, stepFontSize } from './zoom';
+import type { InputState } from './types';
 
 const THEME = {
   background: '#111318',
@@ -39,16 +45,27 @@ const THEME = {
   brightWhite: '#ffffff',
 };
 
+/** Find-bar highlights. Hex only, as the addon requires. Active is the selected match, drawn darker so the text stays readable. */
+export const SEARCH_DECORATIONS = {
+  matchBackground: '#2c3e52',
+  matchBorder: '#61afef',
+  matchOverviewRuler: '#61afef',
+  activeMatchBackground: '#7a5c1e',
+  activeMatchBorder: '#e5c07b',
+  activeMatchColorOverviewRuler: '#e5c07b',
+};
+
 export const term = new Terminal({
   allowProposedApi: true,
   cursorBlink: true,
   fontFamily: 'Menlo, Monaco, "SF Mono", ui-monospace, monospace',
-  fontSize: 13,
+  fontSize: loadFontSize(defaultSizeStorage()),
   scrollback: 5000,
   theme: THEME,
 });
 
 export const fit = new FitAddon();
+export const search = new SearchAddon();
 const unicode = new Unicode11Addon();
 
 /** Counts shell sessions. A batch from an older shell is not acked, because the ack would count against the new one. */
@@ -83,6 +100,7 @@ export function mountTerminal(host: HTMLElement): void {
   mounted = true;
   term.loadAddon(fit);
   term.loadAddon(unicode);
+  term.loadAddon(search);
   // Darkblood's prompt uses U+26A1, which is double width under Unicode 11 rules.
   term.unicode.activeVersion = '11';
   term.open(host);
@@ -163,6 +181,36 @@ export const fitToContainer = createFitter({
   resizeTerminal: (size) => term.resize(size.cols, size.rows),
   onError: (e) => reportError(`resize failed: ${errorText(e)}`),
 });
+
+/**
+ * Changes the font size by one step, or back to the default, and saves it. The fit runs on the next frame, after xterm
+ * has applied the new metrics, so the PTY gets the new cols and rows. Steps past the clamp do nothing.
+ */
+export function zoomFont(action: 'in' | 'out' | 'reset'): void {
+  const current = term.options.fontSize ?? FONT_SIZE_DEFAULT;
+  const next = action === 'reset' ? FONT_SIZE_DEFAULT : stepFontSize(current, action === 'in' ? 1 : -1);
+  if (next === current) {
+    return;
+  }
+  term.options.fontSize = next;
+  saveFontSize(next, defaultSizeStorage());
+  requestAnimationFrame(() => void fitToContainer());
+}
+
+/**
+ * Cmd+K. Clears the scrollback, and the command stripes on it, with a local ESC[3J. At the prompt it also sends Ctrl-L
+ * through `sendToPty`, so the shell redraws its prompt at the top. Nothing happens on the alternate screen (see clear.ts).
+ * term.clear() is not used: it disposes every marker and blanks a full-screen frame.
+ */
+export function clearTerminal(state: InputState, sendToPty: (data: string) => void): void {
+  const { local3J, ctrlL } = clearActions(term.buffer.active.type, state);
+  if (local3J) {
+    term.write('\x1b[3J');
+  }
+  if (ctrlL) {
+    sendToPty('\x0c');
+  }
+}
 
 /** Dims the cursor while keys are not going to the PTY, so the idle prompt looks like the input is elsewhere. */
 export function setCursorHidden(hidden: boolean): void {

@@ -59,7 +59,7 @@ export function InputBar(props: Props) {
 
   if (mode === 'collapsed') {
     return (
-      <div className="bar bar-collapsed" title="Ctrl+Shift+A to message the agent">
+      <div className="bar bar-collapsed" title="Ctrl/Cmd+Shift+A to message the agent">
         <span className="bar-hint">{hint}</span>
       </div>
     );
@@ -143,7 +143,7 @@ export function InputBar(props: Props) {
         ref={inputRef}
         className="bar-input"
         value={text}
-        placeholder="Ask the agent…  (Ctrl+Shift+A to focus, Esc to return)"
+        placeholder="Ask the agent…  (Ctrl/Cmd+Shift+A to focus, Esc to return)"
         spellCheck={false}
         autoComplete="off"
         onChange={(e) => {

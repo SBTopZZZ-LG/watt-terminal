@@ -3,7 +3,8 @@ import './App.css';
 import { api, errorText } from './lib/api';
 import { connect, reportError, restart, subscribe } from './lib/session';
 import type { Incoming } from './lib/session';
-import { fitToContainer, markConnected, marks, receiveBytes, resetForNewSession, term, terminalSize } from './lib/terminal';
+import { clearTerminal, fitToContainer, markConnected, marks, receiveBytes, resetForNewSession, term, terminalSize, zoomFont } from './lib/terminal';
+import { appHotkeyFor } from './lib/appHotkeys';
 import { effectiveState, focusAfter, inputReducer, INITIAL_INPUT, isFocusBarHotkey, routeFor } from './lib/inputState';
 import type { BarMode } from './lib/inputState';
 import { agentControlAfter, borderActive, NO_CONTROL } from './lib/agentControl';
@@ -14,6 +15,7 @@ import { TerminalView } from './components/TerminalView';
 import { InputBar } from './components/InputBar';
 import { Transcript } from './components/Transcript';
 import { StatusChip } from './components/StatusChip';
+import { FindBar } from './components/FindBar';
 
 const CTRL_C = '\u0003';
 
@@ -38,11 +40,19 @@ export default function App() {
   // The agent's hold on the shell: an approved call executing, or a command it started still running (see
   // agentControl.ts). Drives the green border around the terminal.
   const [agentControl, setAgentControl] = useState<AgentControl>(NO_CONTROL);
+  // The find bar is mounted while open. Its token moves focus into it when Cmd+F is pressed again.
+  const [findOpen, setFindOpen] = useState(false);
+  const [findToken, setFindToken] = useState(0);
 
   // Read by long-lived listeners (keystrokes, hotkey), so they always see the current route.
   const routeRef = useRef(route);
   useEffect(() => {
     routeRef.current = route;
+  });
+  // Read by the Cmd+K listener, which is registered once.
+  const effectiveRef = useRef(effective);
+  useEffect(() => {
+    effectiveRef.current = effective;
   });
   const clientIds = useRef(0);
   const prevEffective = useRef<InputState>(effective);
@@ -123,21 +133,47 @@ export default function App() {
     }
   }, [effective]);
 
-  // Ctrl+Shift+A (Cmd+Shift+A) focuses the agent bar, from anywhere it is offered. Capture phase, so xterm does not also
-  // get the key.
+  // Ctrl+Shift+A (Cmd+Shift+A) focuses the agent bar, from anywhere it is offered. Cmd+F, Cmd+K and Cmd+=/-/0 (see
+  // appHotkeys.ts) are handled here too. Capture phase, so xterm does not also get the key, and a handled key is
+  // stopped here so it never reaches the PTY.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (!isFocusBarHotkey(e)) {
+      if (isFocusBarHotkey(e)) {
+        e.preventDefault();
+        e.stopPropagation();
+        const { bar } = routeRef.current;
+        if (bar !== 'exited') {
+          if (bar === 'collapsed') {
+            setBarOpen(true);
+          }
+          setFocusToken((t) => t + 1);
+        }
+        return;
+      }
+      const app = appHotkeyFor(e);
+      if (app === null) {
         return;
       }
       e.preventDefault();
       e.stopPropagation();
-      const { bar } = routeRef.current;
-      if (bar !== 'exited') {
-        if (bar === 'collapsed') {
-          setBarOpen(true);
-        }
-        setFocusToken((t) => t + 1);
+      switch (app) {
+        case 'find':
+          setFindOpen(true);
+          setFindToken((t) => t + 1);
+          return;
+        case 'clear':
+          // Clears the scrollback locally; at the prompt Ctrl-L goes through the same route as typed keys (see clearTerminal).
+          clearTerminal(effectiveRef.current, handleTerminalInput);
+          return;
+        case 'zoom-in':
+          zoomFont('in');
+          return;
+        case 'zoom-out':
+          zoomFont('out');
+          return;
+        case 'zoom-reset':
+          zoomFont('reset');
+          return;
       }
     };
     window.addEventListener('keydown', onKey, true);
@@ -149,6 +185,11 @@ export default function App() {
       api.writeUser(data).catch(reportError);
     }
   }, []);
+
+  const closeFind = () => {
+    setFindOpen(false);
+    term.focus();
+  };
 
   const sendRaw = (text: string) => {
     api.writeUser(text).catch(reportError);
@@ -242,6 +283,7 @@ export default function App() {
         <div className={borderActive(agentControl) ? 'agent-control is-active' : 'agent-control'} aria-hidden="true">
           <div className="agent-control-glow" />
         </div>
+        {findOpen && <FindBar focusToken={findToken} onClose={closeFind} />}
       </div>
       <Transcript
         items={transcript.items}

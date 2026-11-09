@@ -73,7 +73,7 @@ export function routeFor(state: InputState): Route {
     case 'running':
       return { keys: 'pty', bar: 'chat', hint: 'A command is running. The agent cannot run another until it finishes.' };
     case 'alt':
-      return { keys: 'pty', bar: 'collapsed', hint: 'Full-screen app: keys go to it. Ctrl+Shift+A messages the agent.' };
+      return { keys: 'pty', bar: 'collapsed', hint: 'Full-screen app: keys go to it. Ctrl/Cmd+Shift+A messages the agent.' };
     case 'raw':
       return {
         keys: 'pty',
