@@ -17,6 +17,7 @@ import { StripeLayer } from './stripeLayer';
 import { getNonce, reportError } from './session';
 import { parseShellPayload } from './osc';
 import { createFitter } from './fitter';
+import type { GridMeasure } from './gridFit';
 import { clearActions } from './clear';
 import { defaultSizeStorage, FONT_SIZE_DEFAULT, loadFontSize, saveFontSize, stepFontSize } from './zoom';
 import type { InputState } from './types';
@@ -91,6 +92,8 @@ export const marks = new CommandMarks(term, () => stripeLayer?.schedule());
 
 let mounted = false;
 let cursorHidden = false;
+/** The .term-host element the terminal was opened in. */
+let hostElement: HTMLElement | undefined;
 
 /** Opens the terminal in `host`. Idempotent. Call before connecting, so the size is known. */
 export function mountTerminal(host: HTMLElement): void {
@@ -98,6 +101,7 @@ export function mountTerminal(host: HTMLElement): void {
     return;
   }
   mounted = true;
+  hostElement = host;
   term.loadAddon(fit);
   term.loadAddon(unicode);
   term.loadAddon(search);
@@ -181,6 +185,47 @@ export const fitToContainer = createFitter({
   resizeTerminal: (size) => term.resize(size.cols, size.rows),
   onError: (e) => reportError(`resize failed: ${errorText(e)}`),
 });
+
+/** xterm's grid element (.xterm-screen), or null before the terminal is open. Its size follows cols x rows. */
+export function gridScreen(): HTMLElement | null {
+  return term.element?.querySelector<HTMLElement>('.xterm-screen') ?? null;
+}
+
+/** The numbers the self-check in gridFit.ts compares. Null before the terminal is open. */
+export function measureGrid(): GridMeasure | null {
+  const screen = gridScreen();
+  if (!hostElement || !term.element || !screen) {
+    return null;
+  }
+  return {
+    screenRight: screen.getBoundingClientRect().right,
+    hostRight: hostElement.getBoundingClientRect().right,
+    padRight: parseFloat(getComputedStyle(term.element).paddingRight) || 0,
+  };
+}
+
+/** What the grid chip shows. Widths are CSS px, measured when this is called. */
+export interface GridInfo {
+  cols: number;
+  rows: number;
+  hostWidth: number;
+  screenWidth: number;
+  devicePixelRatio: number;
+}
+
+export function gridInfo(): GridInfo | null {
+  const screen = gridScreen();
+  if (!hostElement || !screen) {
+    return null;
+  }
+  return {
+    cols: term.cols,
+    rows: term.rows,
+    hostWidth: Math.round(hostElement.getBoundingClientRect().width),
+    screenWidth: Math.round(screen.getBoundingClientRect().width),
+    devicePixelRatio: window.devicePixelRatio,
+  };
+}
 
 /**
  * Changes the font size by one step, or back to the default, and saves it. The fit runs on the next frame, after xterm

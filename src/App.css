@@ -263,6 +263,10 @@ input {
   color: var(--fail);
 }
 
+.chip-grid {
+  font-family: var(--mono);
+}
+
 .chip-cwd {
   font-family: var(--mono);
   max-width: 320px;

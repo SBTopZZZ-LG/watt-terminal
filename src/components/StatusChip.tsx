@@ -1,4 +1,5 @@
 import { formatCwd } from '../lib/format';
+import { GridChip } from './GridChip';
 import type { InputState, IntegrationStatus, ObserverStatus, Cwd } from '../lib/types';
 
 interface Props {
@@ -35,6 +36,7 @@ export function StatusChip(props: Props) {
       <span className={`chip chip-${integration}`}>{INTEGRATION_LABEL[integration]}</span>
       <span className={`chip chip-${observer}`}>{observer === 'ok' ? 'observer ok' : 'observer desynced'}</span>
       <span className="chip">{INPUT_LABEL[input]}</span>
+      <GridChip />
       <span className="chip chip-cwd" title={cwd ? `${cwd.host}:${cwd.path}` : undefined}>
         {formatCwd(cwd)}
       </span>
