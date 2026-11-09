@@ -51,9 +51,10 @@ describe('mapTerminalKey: the rules', () => {
     expect(mapTerminalKey(key('Backspace', { meta: true }), 'prompt')).toBe('\x15');
   });
 
-  it('Shift+Enter sends ESC CR while a command runs or the shell has no integration', () => {
-    expect(mapTerminalKey(key('Enter', { shift: true }), 'running')).toBe('\x1b\r');
-    expect(mapTerminalKey(key('Enter', { shift: true }), 'raw')).toBe('\x1b\r');
+  it('Shift+Enter sends a newline (Ctrl+J) while a command runs, in the raw state or in a full-screen app', () => {
+    expect(mapTerminalKey(key('Enter', { shift: true }), 'running')).toBe('\n');
+    expect(mapTerminalKey(key('Enter', { shift: true }), 'raw')).toBe('\n');
+    expect(mapTerminalKey(key('Enter', { shift: true }), 'alt')).toBe('\n');
   });
 
   it('Shift+Enter stays a plain Enter (not mapped) at a prompt, while submitted or continuation', () => {
@@ -87,14 +88,13 @@ describe('mapTerminalKey: the rules', () => {
 });
 
 describe('mapTerminalKey: state gating', () => {
-  it('never maps in the alternate screen, so full-screen apps get xterm default encoding', () => {
+  it('maps no Option or Cmd key in the alternate screen, so full-screen apps get xterm default encoding', () => {
     for (const ev of [
       key('ArrowLeft', { alt: true }),
       key('ArrowRight', { alt: true }),
       key('ArrowLeft', { meta: true }),
       key('ArrowRight', { meta: true }),
       key('Backspace', { meta: true }),
-      key('Enter', { shift: true }),
     ]) {
       expect(mapTerminalKey(ev, 'alt'), ev.key).toBeNull();
     }
@@ -111,9 +111,9 @@ describe('mapTerminalKey: state gating', () => {
     }
   });
 
-  it('Shift+Enter is mapped only in running and raw, among all states', () => {
+  it('Shift+Enter is mapped only in running, raw and alt, among all states', () => {
     for (const s of ALL_STATES) {
-      const expected = s === 'running' || s === 'raw' ? '\x1b\r' : null;
+      const expected = s === 'running' || s === 'raw' || s === 'alt' ? '\n' : null;
       expect(mapTerminalKey(key('Enter', { shift: true }), s), s).toBe(expected);
     }
   });

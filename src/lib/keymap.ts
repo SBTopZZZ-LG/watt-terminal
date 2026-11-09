@@ -2,8 +2,10 @@
 //
 // xterm.js sends ESC[1;3D for Option+Left, which zsh does not bind (it prints "D"). Cmd+Left and Cmd+Right send
 // nothing, Cmd+Backspace sends DEL, and Shift+Enter is a plain CR. These keys are rewritten to what zsh and
-// programs such as Claude Code understand. The rules only apply while the shell owns the keyboard: a full-screen app
-// (alt) gets xterm's default encoding, and an exited shell gets nothing.
+// programs such as Claude Code understand. The Option and Cmd rules only apply while the shell owns the keyboard: a
+// full-screen app (alt) gets xterm's default encoding for them, and an exited shell gets nothing. Shift+Enter sends a
+// newline (Ctrl+J) to a running program, the raw state or a full-screen app, where Claude Code reads it as "insert
+// newline". At a prompt it is left alone, because Ctrl+J is accept-line in zsh.
 
 import type { InputState } from './types';
 
@@ -46,6 +48,10 @@ export function mapTerminalKey(ev: KeyLike, state: InputState): string | null {
   if (ev.type !== 'keydown' || ev.isComposing || ev.keyCode === 229) {
     return null;
   }
+  // Shift+Enter sends a newline to a program that owns the keyboard. At a prompt it stays a plain Enter.
+  if (onlyShift(ev) && ev.key === 'Enter') {
+    return state === 'running' || state === 'raw' || state === 'alt' ? '\n' : null;
+  }
   if (state === 'alt' || state === 'exited') {
     return null;
   }
@@ -69,10 +75,6 @@ export function mapTerminalKey(ev: KeyLike, state: InputState): string | null {
       return '\x15';
     }
     return null;
-  }
-  // Shift+Enter means "newline" to a program that owns the terminal. At a prompt it stays a plain Enter.
-  if (onlyShift(ev) && ev.key === 'Enter' && (state === 'running' || state === 'raw')) {
-    return `${ESC}\r`;
   }
   return null;
 }
