@@ -4,6 +4,7 @@
 //! The Tauri layer in `lib.rs` only wires commands and channels to these types.
 
 pub mod agent;
+pub mod llm;
 pub mod observer;
 pub mod pty;
 pub mod record;
