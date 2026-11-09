@@ -9,11 +9,12 @@ export function shortenPath(path: string): string {
   return path;
 }
 
+/** The shortened working directory only. The host is not shown. */
 export function formatCwd(cwd: Cwd | null): string {
   if (cwd === null) {
     return 'unknown';
   }
-  return `${cwd.host}:${shortenPath(cwd.path)}`;
+  return shortenPath(cwd.path);
 }
 
 /** Pretty JSON for a tool result, cut to `limit` characters so a huge output cannot flood the transcript. */

@@ -33,7 +33,8 @@ interface FakeDecoration {
 function fakeTerminal() {
   const markers: FakeMarker[] = [];
   const decorations: FakeDecoration[] = [];
-  const active = { baseY: 0, cursorY: 0 };
+  // cursorX 0 means the cursor is at column 0, as after output that ends in a newline.
+  const active = { baseY: 0, cursorY: 0, cursorX: 0 };
   const term = {
     cols: 80,
     rows: 24,
@@ -58,9 +59,14 @@ function fakeTerminal() {
     term: term as unknown as MarksTerminal,
     markers,
     decorations,
-    /** Moves the cursor down n rows, as output does. */
+    /** Moves the cursor down n rows, as output does. Ends at column 0, as output that ends in a newline does. */
     advance: (n: number) => {
       active.cursorY += n;
+      active.cursorX = 0;
+    },
+    /** Places the cursor mid-line, as output with no trailing newline does. */
+    setCursorX: (x: number) => {
+      active.cursorX = x;
     },
   };
 }
@@ -83,14 +89,46 @@ describe('CommandMarks', () => {
     expect(render(f.decorations[0]).dataset).toEqual({ exit: 'ok', agent: 'false' });
   });
 
-  it('a non-zero exit paints as a failure, and the stripe covers the output rows', () => {
+  it('a non-zero exit paints as a failure, and the stripe covers only the output rows', () => {
+    // Four lines of output, each ending in a newline. The cursor is at column 0 of row 4, which is the next
+    // prompt's row (D fires before the prompt is drawn). Rows 0 to 3 are the output, so the height is 4.
     const f = fakeTerminal();
     const marks = new CommandMarks(f.term);
     marks.commandStart();
     f.advance(4);
     marks.commandEnd(1);
-    expect(f.decorations[0].height).toBe(5);
+    expect(f.decorations[0].height).toBe(4);
     expect(render(f.decorations[0]).dataset.exit).toBe('fail');
+  });
+
+  it('output with no trailing newline includes the cursor row', () => {
+    // Two full lines, then text on row 2 with the cursor mid-line at column 5. Row 2 is output, so rows 0 to 2
+    // are covered: height 3.
+    const f = fakeTerminal();
+    const marks = new CommandMarks(f.term);
+    marks.commandStart();
+    f.advance(2);
+    f.setCursorX(5);
+    marks.commandEnd(0);
+    expect(f.decorations[0].height).toBe(3);
+  });
+
+  it('a command with no output still gets a one-row stripe', () => {
+    // The cursor is at column 0 of the command's own row, so the row-excluding rule would give 0. The minimum is 1.
+    const f = fakeTerminal();
+    const marks = new CommandMarks(f.term);
+    marks.commandStart();
+    marks.commandEnd(0);
+    expect(f.decorations[0].height).toBe(1);
+  });
+
+  it('a single line of output ending in a newline gets a one-row stripe', () => {
+    const f = fakeTerminal();
+    const marks = new CommandMarks(f.term);
+    marks.commandStart();
+    f.advance(1);
+    marks.commandEnd(0);
+    expect(f.decorations[0].height).toBe(1);
   });
 
   it('a D with no open command draws nothing', () => {

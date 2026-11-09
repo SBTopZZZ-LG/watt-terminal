@@ -27,7 +27,7 @@ const INTEGRATION_LABEL: Record<IntegrationStatus, string> = {
   raw: 'integration: none',
 };
 
-/** Thin status line in the corner of the terminal. */
+/** Slim status strip above the terminal, in normal flow. */
 export function StatusChip(props: Props) {
   const { integration, observer, input, cwd, autoApprove, onToggleAutoApprove } = props;
   return (

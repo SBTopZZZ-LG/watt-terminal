@@ -31,6 +31,26 @@ export function modeLabel(text: string): 'shell' | 'agent' {
   return text.startsWith('!') ? 'shell' : 'agent';
 }
 
+export interface KeyMods {
+  ctrl: boolean;
+  shift: boolean;
+  alt: boolean;
+  meta: boolean;
+}
+
+/** Ctrl+L with no other modifier: the clear-screen shortcut. */
+export function isClearScreenKey(key: string, mods: KeyMods): boolean {
+  return mods.ctrl && !mods.shift && !mods.alt && !mods.meta && key.toLowerCase() === 'l';
+}
+
+/**
+ * Whether Ctrl+L is sent to the shell. Only from the idle prompt (the full bar), and not while a submitted line is
+ * still being sent: by then the shell may already be running it, and a form feed would reach that command.
+ */
+export function clearScreenDecision(bar: BarMode, sending: boolean): 'send' | 'ignore' {
+  return bar === 'full' && !sending ? 'send' : 'ignore';
+}
+
 export type SubmitDecision =
   | { kind: 'none' }
   | { kind: 'reject'; reason: string }

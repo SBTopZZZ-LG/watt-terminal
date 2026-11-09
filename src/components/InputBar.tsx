@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { barKeyIntent } from '../lib/inputState';
 import type { BarMode } from '../lib/inputState';
-import { decideSubmit, History, modeLabel } from '../lib/barInput';
+import { clearScreenDecision, decideSubmit, History, isClearScreenKey, modeLabel } from '../lib/barInput';
 
 interface Props {
   mode: BarMode;
@@ -15,6 +15,8 @@ interface Props {
   onShell: (command: string) => Promise<string | null>;
   onAgent: (text: string) => Promise<string | null>;
   onInterrupt: () => void;
+  /** Ctrl+L at the prompt: the shell clears the screen. The text in the bar is left alone. */
+  onClearScreen: () => void;
   onApproveFirst: () => void;
   onDenyFirst: () => void;
   onClose: () => void;
@@ -74,6 +76,13 @@ export function InputBar(props: Props) {
 
   function onKeyDown(e: ReactKeyboardEvent<HTMLInputElement>) {
     if (e.nativeEvent.isComposing) {
+      return;
+    }
+    if (isClearScreenKey(e.key, { ctrl: e.ctrlKey, shift: e.shiftKey, alt: e.altKey, meta: e.metaKey })) {
+      if (clearScreenDecision(mode, sending) === 'send') {
+        e.preventDefault();
+        props.onClearScreen();
+      }
       return;
     }
     const intent = barKeyIntent(

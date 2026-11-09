@@ -20,8 +20,11 @@ describe('formatCwd', () => {
     expect(formatCwd(null)).toBe('unknown');
   });
 
-  it('shows host and shortened path', () => {
-    expect(formatCwd({ host: 'mac', path: '/Users/sbtopzzz' })).toBe('mac:~');
+  it('shows only the shortened path, never the host', () => {
+    expect(formatCwd({ host: 'mac', path: '/Users/sbtopzzz' })).toBe('~');
+    expect(formatCwd({ host: 'mac', path: '/Users/sbtopzzz/Developer' })).toBe('~/Developer');
+    expect(formatCwd({ host: 'mac', path: '/tmp' })).toBe('/tmp');
+    expect(formatCwd({ host: 'mac', path: '/tmp' })).not.toContain('mac');
   });
 });
 

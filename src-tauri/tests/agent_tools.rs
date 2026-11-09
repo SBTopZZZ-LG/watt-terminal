@@ -289,6 +289,11 @@ fn screen_and_directory_answers_use_the_session() {
     assert!(screen.contains("screen-marker-42"), "{screen}");
     let cwd = text_of(&turn(&s, &approvals, "where am I"));
     assert!(cwd.contains("/tmp"), "{cwd}");
+    // The answer gives the path only. The host is in get_cwd's JSON but must not be in the answer.
+    let known = SessionTools::new(&s).get_cwd().expect("cwd known");
+    assert!(!known.host.is_empty());
+    assert_eq!(cwd, format!("You are in {}.", known.path));
+    assert!(!cwd.contains(&known.host), "{cwd}");
 }
 
 #[test]

@@ -98,8 +98,12 @@ export class CommandMarks {
     const marker = mark.marker;
     if (marker && marker.line >= 0) {
       const buf = this.term.buffer.active;
-      const endLine = buf.baseY + buf.cursorY;
-      const height = Math.max(1, endLine - marker.line + 1);
+      // D is emitted before the next prompt is drawn. Output that ends in a newline leaves the cursor at column 0
+      // of the next prompt's row, which is not part of the command, so that row is left out. Output with no
+      // trailing newline leaves the cursor mid-line on its own row, which is part of the command.
+      const cursorRow = buf.baseY + buf.cursorY;
+      const lastRow = buf.cursorX > 0 ? cursorRow : cursorRow - 1;
+      const height = Math.max(1, lastRow - marker.line + 1);
       const decoration: IDecoration | undefined = this.term.registerDecoration({
         marker,
         x: 0,

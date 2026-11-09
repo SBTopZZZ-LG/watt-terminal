@@ -14,6 +14,8 @@ import { Transcript } from './components/Transcript';
 import { StatusChip } from './components/StatusChip';
 
 const CTRL_C = '\u0003';
+// Form feed. At the prompt the shell's clear-screen widget runs and redraws the prompt; the bar keeps its text.
+const CLEAR_SCREEN = '\u000c';
 
 export default function App() {
   const [input, dispatchInput] = useReducer(inputReducer, INITIAL_INPUT);
@@ -203,20 +205,20 @@ export default function App() {
 
   return (
     <div className="app">
+      <StatusChip
+        integration={integration}
+        observer={observer}
+        input={effective}
+        cwd={cwd}
+        autoApprove={autoApprove}
+        onToggleAutoApprove={toggleAutoApprove}
+      />
       <div className="terminal-area">
         <TerminalView
           keysToPty={route.keys === 'pty'}
           onInput={handleTerminalInput}
           onAltChange={(active) => dispatchInput({ type: 'alt', active })}
           onIdleClick={() => setFocusToken((t) => t + 1)}
-        />
-        <StatusChip
-          integration={integration}
-          observer={observer}
-          input={effective}
-          cwd={cwd}
-          autoApprove={autoApprove}
-          onToggleAutoApprove={toggleAutoApprove}
         />
       </div>
       <Transcript
@@ -234,6 +236,7 @@ export default function App() {
         onShell={onShell}
         onAgent={onAgent}
         onInterrupt={() => sendRaw(CTRL_C)}
+        onClearScreen={() => sendRaw(CLEAR_SCREEN)}
         onApproveFirst={approveFirst}
         onDenyFirst={denyFirst}
         onClose={closeBar}

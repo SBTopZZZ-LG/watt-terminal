@@ -174,6 +174,38 @@ fn ctrl_c_interrupts_a_running_command() {
 }
 
 #[test]
+fn ctrl_l_at_prompt_clears_and_keeps_the_prompt_state() {
+    let _g = serial();
+    let seen = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let sink = seen.clone();
+    let s = start_with_hook(Some(Box::new(move |c: &[u8]| sink.lock().unwrap().extend_from_slice(c))));
+    wait_prompt(&s);
+    run(&s, "echo before-clear");
+    let records_before = s.records().len();
+    let forged_before = s.stats().forged_events;
+    let mark = seen.lock().unwrap().len();
+    // A lone form feed (^L) at the prompt: zsh runs its clear-screen widget and redraws the prompt.
+    s.write_user(b"\x0c").expect("ctrl-l");
+    let cleared = wait_until(Duration::from_secs(5), || {
+        seen.lock().unwrap()[mark..].windows(4).any(|w| w == b"\x1b[2J").then_some(())
+    });
+    assert!(cleared.is_some(), "no ESC[2J after ^L; output={:?}", String::from_utf8_lossy(&seen.lock().unwrap()[mark..]));
+    // The redrawn prompt emits A and B again. That must not open a record, change the state, or count as forged.
+    let redrawn = wait_until(Duration::from_secs(5), || {
+        seen.lock().unwrap()[mark..].windows(7).any(|w| w == b"\x1b]133;A").then_some(())
+    });
+    assert!(redrawn.is_some(), "prompt was not redrawn after ^L");
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(s.state(), InputState::Prompt);
+    assert_eq!(s.integration_status(), IntegrationStatus::Live);
+    assert_eq!(s.observer_status(), ObserverStatus::Ok);
+    assert_eq!(s.records().len(), records_before, "records: {:?}", s.records());
+    assert_eq!(s.stats().forged_events, forged_before);
+    let r = run(&s, "echo after-clear");
+    assert_eq!(r.output, "after-clear");
+}
+
+#[test]
 fn alt_screen_flag_and_used_alt_screen() {
     let _g = serial();
     let s = start();

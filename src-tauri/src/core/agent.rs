@@ -289,11 +289,7 @@ fn screen(ctx: &AgentCtx<'_>) {
 fn where_am_i(ctx: &AgentCtx<'_>) {
     match ctx.read_tool("get_cwd", json!({})) {
         Ok(Value::Null) => ctx.say("I don't know the working directory yet."),
-        Ok(c) => ctx.say(format!(
-            "You are in {}:{}.",
-            c["host"].as_str().unwrap_or("?"),
-            c["path"].as_str().unwrap_or("?")
-        )),
+        Ok(c) => ctx.say(format!("You are in {}.", c["path"].as_str().unwrap_or("?"))),
         Err(e) => ctx.say(format!("I could not read the directory: {e}.")),
     }
 }

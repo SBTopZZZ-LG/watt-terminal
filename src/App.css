@@ -52,26 +52,38 @@ input {
 .term-host {
   position: absolute;
   inset: 0;
-  padding: 8px 12px;
   background: var(--bg);
 }
 
-/* Gutter marks: a thin stripe at the left of each command's output. */
+/*
+ * The padding lives on .xterm, not on .term-host. FitAddon measures .term-host (border-box, so its padding is
+ * included) and subtracts only the padding of .xterm, so padding on .term-host made the grid too big.
+ * The left padding also holds the command stripe, which sits outside column 0.
+ */
+.term-host .xterm {
+  padding: 8px 12px 8px 16px;
+}
+
+/*
+ * Gutter marks: a thin 3px stripe in the left padding, just outside each command's output. xterm sets no inline
+ * left for x: 0, so the decoration sits at column 0; margin-left moves it 5px further left, leaving a visible gap.
+ */
 .xterm-decoration[data-exit] {
   pointer-events: none;
-  box-shadow: inset 3px 0 0 var(--line);
+  margin-left: -5px;
+  box-shadow: -3px 0 0 var(--line);
 }
 
 .xterm-decoration[data-exit="ok"] {
-  box-shadow: inset 3px 0 0 var(--ok);
+  box-shadow: -3px 0 0 var(--ok);
 }
 
 .xterm-decoration[data-exit="fail"] {
-  box-shadow: inset 3px 0 0 var(--fail);
+  box-shadow: -3px 0 0 var(--fail);
 }
 
 .xterm-decoration[data-exit="unknown"] {
-  box-shadow: inset 3px 0 0 var(--muted);
+  box-shadow: -3px 0 0 var(--muted);
 }
 
 .xterm-decoration[data-agent="true"]::after {
@@ -86,19 +98,19 @@ input {
   font: 10px/16px var(--mono);
 }
 
-/* ---------- status chip ---------- */
+/* ---------- status strip ---------- */
 
 .status-chip {
-  position: absolute;
-  top: 8px;
-  right: 10px;
+  flex: 0 0 26px;
+  height: 26px;
   display: flex;
   gap: 6px;
   align-items: center;
-  flex-wrap: wrap;
   justify-content: flex-end;
-  max-width: 70%;
-  z-index: 2;
+  padding: 0 10px;
+  overflow: hidden;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg);
 }
 
 .chip {
@@ -129,6 +141,7 @@ input {
 .chip-cwd {
   font-family: var(--mono);
   max-width: 320px;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
 }
