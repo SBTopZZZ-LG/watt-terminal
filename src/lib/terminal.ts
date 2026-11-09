@@ -12,6 +12,7 @@ import { Coalescer } from './coalescer';
 import { CommandMarks } from './commandMarks';
 import { getNonce, reportError } from './session';
 import { parseShellPayload } from './osc';
+import { createFitter } from './fitter';
 
 const THEME = {
   background: '#111318',
@@ -144,23 +145,19 @@ export function markConnected(): void {
 
 /**
  * Fits the terminal to its container and tells Rust first, then resizes xterm. Rust resizes the PTY and the
- * observer together, so the order keeps the PTY and the renderer in step.
+ * observer together, so the order keeps the PTY and the renderer in step. Calls are serialized (see fitter.ts).
  */
-export async function fitToContainer(): Promise<void> {
-  if (!connected) {
-    return;
-  }
-  const dims = fit.proposeDimensions();
-  if (!dims || (dims.cols === term.cols && dims.rows === term.rows)) {
-    return;
-  }
-  try {
-    await api.resize(dims.rows, dims.cols);
-    term.resize(dims.cols, dims.rows);
-  } catch (e) {
-    reportError(`resize failed: ${errorText(e)}`);
-  }
-}
+export const fitToContainer = createFitter({
+  connected: () => connected,
+  proposeSize: () => {
+    const dims = fit.proposeDimensions();
+    return dims ? { rows: dims.rows, cols: dims.cols } : null;
+  },
+  currentSize: () => ({ rows: term.rows, cols: term.cols }),
+  resizePty: (size) => api.resize(size.rows, size.cols),
+  resizeTerminal: (size) => term.resize(size.cols, size.rows),
+  onError: (e) => reportError(`resize failed: ${errorText(e)}`),
+});
 
 /** Dims the cursor while keys are not going to the PTY, so the idle prompt looks like the input is elsewhere. */
 export function setCursorHidden(hidden: boolean): void {

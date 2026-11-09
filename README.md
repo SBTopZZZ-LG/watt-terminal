@@ -32,6 +32,7 @@ AGENT_TERM_HISTFILE=/tmp/agent-term-hist npm run tauri dev
 ## Input
 
 - The terminal is the main input. Type at the prompt as you would in any terminal. Keys go to the shell, or to the program that is running (vim, ssh, and so on).
+- Mapped keys (not in full-screen apps): Option+Left/Right move by word, Cmd+Left/Right go to the line start/end, Cmd+Backspace clears the line, and Shift+Enter sends a newline to a running command (at the prompt it is a plain Enter). Cmd+Backspace sends Ctrl-U, which also marks the typed prompt as edited, so if the agent then refuses to run a command, press Ctrl+C in the terminal.
 - The bar at the bottom is for the agent. Its text is always a message to the agent, including text that starts with `!`. For example, "what was the last command" or "run `pwd`". A `run` request shows an approval card before anything is typed into the shell.
 - Ctrl+Shift+A focuses the agent bar. Esc in the bar returns focus to the terminal.
 - While the agent runs an approved command, a green border pulses around the terminal. It fades out when the agent is idle.

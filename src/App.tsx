@@ -234,6 +234,7 @@ export default function App() {
       <div className="terminal-area">
         <TerminalView
           keysToPty={route.keys === 'pty'}
+          inputState={effective}
           onInput={handleTerminalInput}
           onAltChange={(active) => dispatchInput({ type: 'alt', active })}
         />
