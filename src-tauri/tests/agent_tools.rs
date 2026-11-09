@@ -590,3 +590,68 @@ fn ctrl_l_keeps_user_text_refusing_the_agent() {
     s.write_user(&[0x03]).expect("ctrl-c");
     wait_prompt(&s);
 }
+
+/// Text typed while a command runs is type-ahead: zsh draws it on the next prompt line. The agent's run_command is refused
+/// there and writes nothing. Ctrl-C at the prompt clears the line, and then the agent's command runs.
+#[test]
+fn type_ahead_during_a_command_refuses_the_next_agent_command() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    s.submit(Source::User, "sleep 1").expect("submit");
+    assert!(wait_state(&s, InputState::Running, Duration::from_secs(3)), "state={:?}", s.state());
+    s.write_user(b"zqx").expect("type-ahead while the command runs");
+    run_finish(&s, "sleep 1");
+    assert!(wait_until(Duration::from_secs(5), || prompt_line(&s).contains("zqx").then_some(())).is_some(), "the type-ahead never reached the prompt line");
+
+    let tools = SessionTools::new(&s);
+    assert!(tools.run_command_precheck().is_err(), "the precheck let the command through");
+    let err = tools.run_command("echo type-ahead-marker", DEFAULT_RUN_TIMEOUT).expect_err("refused over type-ahead");
+    assert!(err.starts_with(USER_TEXT_CODE), "error: {err}");
+    assert!(!s.records().iter().any(|r| r.command.contains("type-ahead-marker")), "the refused command ran");
+    assert!(!screen_has(&s, "type-ahead-marker"), "the refused command reached the screen");
+
+    s.write_user(&[0x03]).expect("ctrl-c at the prompt");
+    assert!(wait_until(Duration::from_secs(5), || (!prompt_line(&s).contains("zqx")).then_some(())).is_some(), "ctrl-c did not clear the prompt line");
+    wait_prompt(&s);
+    let RunOutcome::Finished { record } = tools.run_command("echo after-type-ahead", DEFAULT_RUN_TIMEOUT).expect("runs after ctrl-c") else {
+        panic!("expected a finished record");
+    };
+    assert_eq!(record.output, "after-type-ahead");
+}
+
+/// Ctrl-C while a command runs does not clear type-ahead, so the refusal holds until a Ctrl-C at the prompt.
+#[test]
+fn ctrl_c_during_a_command_keeps_the_type_ahead_refusal() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    s.submit(Source::User, "sleep 3").expect("submit");
+    assert!(wait_state(&s, InputState::Running, Duration::from_secs(3)), "state={:?}", s.state());
+    s.write_user(b"zqx").expect("type-ahead");
+    s.write_user(&[0x03]).expect("ctrl-c while the command runs");
+    wait_prompt(&s);
+    let tools = SessionTools::new(&s);
+    assert!(tools.run_command_precheck().is_err(), "ctrl-c during the command cleared the type-ahead");
+    s.write_user(&[0x03]).expect("ctrl-c at the prompt");
+    assert!(wait_until(Duration::from_secs(5), || tools.run_command_precheck().is_ok().then_some(())).is_some(), "ctrl-c at the prompt did not clear the refusal");
+}
+
+/// Keys typed in the alt screen go to the full-screen program, not to the prompt, so they do not refuse run_command.
+#[test]
+fn keys_typed_in_the_alt_screen_do_not_refuse_run_command() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let cmd = r"printf '\033[?1049h'; read line; printf '\033[?1049l'";
+    s.submit(Source::User, cmd).expect("submit");
+    assert!(wait_state(&s, InputState::Alt, Duration::from_secs(5)), "state={:?}", s.state());
+    s.write_user(b"zqx\r").expect("typed in the alt screen");
+    run_finish(&s, cmd);
+    let tools = SessionTools::new(&s);
+    assert!(tools.run_command_precheck().is_ok(), "alt-screen keys refused the agent");
+    let RunOutcome::Finished { record } = tools.run_command("echo after-alt", DEFAULT_RUN_TIMEOUT).expect("runs after the alt screen") else {
+        panic!("expected a finished record");
+    };
+    assert_eq!(record.output, "after-alt");
+}

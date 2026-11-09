@@ -284,9 +284,11 @@ pub struct Core {
     pending: Option<(Source, Option<String>)>,
     /// E seen, waiting for its C.
     last_e: Option<(String, Source)>,
-    /// The user has typed text on the prompt line that is still there. Set by `note_user_bytes`, cleared when a new
-    /// prompt starts (a transition into Prompt), by Ctrl-C at the prompt, by a CR that submits the line, and by C.
-    /// While it is set the agent's run_command is refused, so it cannot land on the user's half-typed line.
+    /// The user has typed text that may be on the prompt line. Set by `note_user_bytes`, which counts typing at the
+    /// prompt and type-ahead typed while a command runs (zsh reads that from the tty at the next prompt). Cleared by
+    /// Ctrl-C at the prompt (not while a command runs), by a CR that submits the line (`begin_submit`), and by C. It
+    /// survives the transition from a command to the prompt. While it is set the agent's run_command is refused, so it
+    /// cannot land on the user's text.
     user_typed: bool,
     cwd: Option<Cwd>,
     records: VecDeque<Record>,
@@ -408,11 +410,8 @@ impl Core {
                     Lifecycle::Submitted { .. } => {}
                     Lifecycle::Booting if self.shell_pid.is_none() => {}
                     _ => {
-                        // Only a transition starts a new line. A redraw of the prompt (a resize, a theme that resets
-                        // it) keeps the user's text, so it keeps the flag too.
-                        if self.lifecycle != Lifecycle::Prompt {
-                            self.user_typed = false;
-                        }
+                        // The flag is kept here, whether this is a transition or a redraw. Bytes typed while a command
+                        // ran are still in the tty, and zsh draws them on this new line (type-ahead).
                         self.lifecycle = Lifecycle::Prompt;
                         self.pending = None;
                     }
@@ -620,19 +619,29 @@ impl Core {
         self.user_typed = false;
     }
 
-    /// Records the user's bytes for the typed-text check. Counted only where they edit the prompt line (Prompt, Submitted,
-    /// Continuation). While a command runs they go to the program or to a later line, and are ignored: that is the
-    /// accepted type-ahead gap. Ctrl-C discards the line, so it clears the flag. Ctrl-L clears the screen and redraws the
-    /// same line, so it changes nothing. A CR is not counted here; a CR at the prompt submits the line (`begin_submit`).
-    /// Any other byte, arrow keys included (history recall puts text on the line), sets the flag.
+    /// Records the user's bytes for the typed-text check. Counted in Prompt, Submitted, Continuation and Running. While a
+    /// command runs, the bytes stay in the tty and zsh draws them on the next prompt line (type-ahead), so they count.
+    /// Not counted in Alt, Raw, Booting or Exited: a full-screen program or a shell without integration reads those keys.
+    /// Accepted false positives: a program that reads stdin, an ssh session.
+    ///
+    /// Ctrl-C at the prompt discards the line, so it clears the flag. Ctrl-C while a command runs does not clear it.
+    /// Probed with zsh on macOS: `zqx` typed during `sleep 3`, then Ctrl-C, left the new prompt empty, so the tty did
+    /// discard the type-ahead. That depends on the foreground program keeping ISIG on and not setting NOFLSH, and a
+    /// program that never reads input may leave the bytes behind. Not clearing costs one extra Ctrl-C at the prompt.
+    ///
+    /// Ctrl-L clears the screen and redraws the same line, so it changes nothing. A CR does not set the flag: a CR at the
+    /// prompt submits the line (`begin_submit`). Any other byte, arrow keys included (history recall puts text on the
+    /// line), sets it.
     pub fn note_user_bytes(&mut self, bytes: &[u8]) {
-        if !matches!(self.lifecycle_view(), InputState::Prompt | InputState::Submitted | InputState::Continuation) {
+        let state = self.lifecycle_view();
+        if !matches!(state, InputState::Prompt | InputState::Submitted | InputState::Continuation | InputState::Running) {
             return;
         }
+        let running = state == InputState::Running;
         for &b in bytes {
             match b {
-                0x03 => self.user_typed = false,
-                b'\r' | 0x0c => {}
+                0x03 if !running => self.user_typed = false,
+                0x03 | b'\r' | 0x0c => {}
                 _ => self.user_typed = true,
             }
         }
@@ -756,5 +765,116 @@ mod tests {
         let rows = &p.callbacks().0;
         assert!(rows.contains(&("aaaaaaaaaa".to_string(), true)), "wrapped row not reported as wrapped: {rows:?}");
         assert!(rows.iter().any(|(t, w)| t.starts_with("aaaaaaaaa") && !w), "hard line end not reported: {rows:?}");
+    }
+
+    fn core() -> Core {
+        Core::new("test-nonce", (24, 80))
+    }
+
+    /// Which lifecycles count typed bytes: the prompt-editing ones and Running (type-ahead). Alt, Raw, Booting and
+    /// Exited do not.
+    #[test]
+    fn typed_bytes_count_only_where_zsh_holds_the_prompt_line() {
+        let typed = |setup: &dyn Fn(&mut Core)| {
+            let mut c = core();
+            setup(&mut c);
+            c.note_user_bytes(b"x");
+            c.user_typed_since_prompt()
+        };
+        assert!(typed(&|c| c.lifecycle = Lifecycle::Prompt));
+        assert!(typed(&|c| c.lifecycle = Lifecycle::Submitted { since: Instant::now() }));
+        assert!(typed(&|c| c.lifecycle = Lifecycle::Continuation));
+        assert!(typed(&|c| c.lifecycle = Lifecycle::Running));
+        assert!(!typed(&|c| c.lifecycle = Lifecycle::Booting));
+        assert!(!typed(&|c| {
+            c.lifecycle = Lifecycle::Prompt;
+            c.parser.process(b"\x1b[?1049h");
+        }));
+        assert!(!typed(&|c| c.spawned_at = Instant::now() - Duration::from_secs(10)), "Raw");
+        assert!(!typed(&|c| c.apply(ObsMsg::Eof)), "Exited");
+    }
+
+    #[test]
+    fn the_raw_and_alt_setups_are_the_states_they_claim() {
+        let mut raw = core();
+        raw.spawned_at = Instant::now() - Duration::from_secs(10);
+        assert_eq!(raw.lifecycle_view(), InputState::Raw);
+
+        let mut alt = core();
+        alt.lifecycle = Lifecycle::Prompt;
+        alt.parser.process(b"\x1b[?1049h");
+        assert_eq!(alt.lifecycle_view(), InputState::Alt);
+
+        let mut exited = core();
+        exited.apply(ObsMsg::Eof);
+        assert_eq!(exited.lifecycle_view(), InputState::Exited);
+    }
+
+    /// Type-ahead typed while a command runs survives the transition into Prompt: zsh draws it there.
+    #[test]
+    fn type_ahead_survives_the_transition_to_the_prompt() {
+        let mut c = core();
+        c.lifecycle = Lifecycle::Running;
+        c.note_user_bytes(b"zqx");
+        c.handle(Event::PromptStart);
+        assert_eq!(c.lifecycle_view(), InputState::Prompt);
+        assert!(c.user_typed_since_prompt(), "the flag was cleared by the transition into Prompt");
+    }
+
+    /// Ctrl-C at the prompt discards the line. Ctrl-C while a command runs does not clear type-ahead (see note_user_bytes).
+    #[test]
+    fn ctrl_c_clears_at_the_prompt_but_not_while_a_command_runs() {
+        let mut prompt = core();
+        prompt.lifecycle = Lifecycle::Prompt;
+        prompt.note_user_bytes(b"x");
+        prompt.note_user_bytes(&[0x03]);
+        assert!(!prompt.user_typed_since_prompt());
+
+        let mut running = core();
+        running.lifecycle = Lifecycle::Running;
+        running.note_user_bytes(b"x");
+        running.note_user_bytes(&[0x03]);
+        assert!(running.user_typed_since_prompt());
+        running.handle(Event::PromptStart);
+        running.note_user_bytes(&[0x03]);
+        assert!(!running.user_typed_since_prompt(), "Ctrl-C at the new prompt did not clear");
+    }
+
+    /// Bytes in one write are processed in order: text typed before a Ctrl-C at the prompt is cleared by it.
+    #[test]
+    fn a_write_is_processed_in_order() {
+        let mut c = core();
+        c.lifecycle = Lifecycle::Prompt;
+        c.note_user_bytes(b"x\x03");
+        assert!(!c.user_typed_since_prompt());
+        c.note_user_bytes(b"\x03x");
+        assert!(c.user_typed_since_prompt());
+    }
+
+    /// A CR does not set the flag (a CR at the prompt submits the line), nor does Ctrl-L (it redraws the same line).
+    #[test]
+    fn cr_and_ctrl_l_do_not_set_the_flag() {
+        for state in [Lifecycle::Prompt, Lifecycle::Running] {
+            let mut c = core();
+            c.lifecycle = state;
+            c.note_user_bytes(b"\r");
+            c.note_user_bytes(&[0x0c]);
+            assert!(!c.user_typed_since_prompt());
+        }
+    }
+
+    #[test]
+    fn a_submit_and_command_start_clear_the_flag() {
+        let mut submitted = core();
+        submitted.lifecycle = Lifecycle::Prompt;
+        submitted.note_user_bytes(b"x");
+        submitted.begin_submit(None);
+        assert!(!submitted.user_typed_since_prompt(), "begin_submit did not clear");
+
+        let mut started = core();
+        started.lifecycle = Lifecycle::Prompt;
+        started.note_user_bytes(b"x");
+        started.handle(Event::CommandStart);
+        assert!(!started.user_typed_since_prompt(), "C did not clear");
     }
 }
