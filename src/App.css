@@ -65,6 +65,16 @@ input {
 }
 
 /*
+ * xterm 6.0.0 gives each DOM row an inline width of cols x a cell width measured as an integer, so a full row is a few px
+ * narrower than its text and the last glyph gets cut. Let the overflow show sideways and keep vertical clipping. This
+ * overrides xterm's inline overflow: hidden; it can go once xterm measures row width correctly.
+ */
+.term-host .xterm-rows > div {
+  overflow-x: visible !important;
+  overflow-y: clip !important;
+}
+
+/*
  * Command stripes (StripeLayer). The layer covers the grid and is hidden in the alt screen. Each stripe spans the grid's
  * width, shifted 5px left, and its shadow draws a 3px bar just left of that box, leaving a visible gap before the text.
  * The badge is anchored to the stripe's right edge, so it keeps its place. A running command's stripe is muted.
