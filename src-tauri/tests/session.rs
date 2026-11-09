@@ -373,10 +373,10 @@ fn drop_while_in_flight(cycle: usize, stalled: bool) {
         thread::spawn(move || {
             for chunk in rx {
                 received.fetch_add(chunk.len(), Ordering::SeqCst);
-                if !stall.load(Ordering::SeqCst) {
-                    if let Some(s) = weak.upgrade() {
-                        s.ack(chunk.len());
-                    }
+                if !stall.load(Ordering::SeqCst)
+                    && let Some(s) = weak.upgrade()
+                {
+                    s.ack(chunk.len());
                 }
             }
         });

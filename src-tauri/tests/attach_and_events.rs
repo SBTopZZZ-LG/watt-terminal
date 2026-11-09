@@ -35,8 +35,8 @@ fn attaching_the_same_id_twice_spawns_one_pty() {
         spawn_session(&home)
     };
 
-    let (first, created) = registry.get_or_insert_with(ID, || spawn()).expect("first attach");
-    let (second, created_again) = registry.get_or_insert_with(ID, || spawn()).expect("second attach");
+    let (first, created) = registry.get_or_insert_with(ID, spawn).expect("first attach");
+    let (second, created_again) = registry.get_or_insert_with(ID, spawn).expect("second attach");
     assert!(created);
     assert!(!created_again, "a second attach must not report a new session");
     assert!(Arc::ptr_eq(&first, &second));

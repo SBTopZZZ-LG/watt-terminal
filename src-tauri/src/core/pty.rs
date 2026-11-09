@@ -82,6 +82,12 @@ impl Gate {
     }
 }
 
+impl Default for Gate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 enum ReadMsg {
     Data(Vec<u8>),
     Eof,

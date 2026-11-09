@@ -43,10 +43,10 @@ impl Channels {
     }
 
     fn send_json<T: Serialize>(&self, ev: &T) {
-        if let Ok(v) = serde_json::to_value(ev) {
-            if let Some(ch) = lock(&self.events).as_ref() {
-                let _ = ch.send(v);
-            }
+        if let Ok(v) = serde_json::to_value(ev)
+            && let Some(ch) = lock(&self.events).as_ref()
+        {
+            let _ = ch.send(v);
         }
     }
 }

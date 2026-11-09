@@ -121,6 +121,12 @@ impl ObsQueue {
     }
 }
 
+impl Default for ObsQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ---------- status types ----------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -212,11 +218,12 @@ impl Callbacks for Collector {
         }
         let index = self.scrolled_total;
         self.scrolled_total += 1;
-        if let Some(open) = self.open.as_mut() {
-            if index >= open.start_abs && !open.builder.is_full() {
-                let (text, wrapped) = row_text(&contents);
-                open.builder.push_row(&text, wrapped);
-            }
+        if let Some(open) = self.open.as_mut()
+            && index >= open.start_abs
+            && !open.builder.is_full()
+        {
+            let (text, wrapped) = row_text(&contents);
+            open.builder.push_row(&text, wrapped);
         }
     }
 }

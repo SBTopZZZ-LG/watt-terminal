@@ -253,12 +253,13 @@ fn percent_decode(s: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(s.len());
     let mut i = 0;
     while i < s.len() {
-        if s[i] == b'%' && i + 2 < s.len() {
-            if let (Some(h), Some(l)) = (hex(s[i + 1]), hex(s[i + 2])) {
-                out.push(h << 4 | l);
-                i += 3;
-                continue;
-            }
+        if s[i] == b'%'
+            && i + 2 < s.len()
+            && let (Some(h), Some(l)) = (hex(s[i + 1]), hex(s[i + 2]))
+        {
+            out.push(h << 4 | l);
+            i += 3;
+            continue;
         }
         out.push(s[i]);
         i += 1;
@@ -277,12 +278,12 @@ fn unescape_e(s: &[u8]) -> String {
                 i += 2;
                 continue;
             }
-            if s.get(i + 1) == Some(&b'x') {
-                if let (Some(h), Some(l)) = (s.get(i + 2).and_then(|&c| hex(c)), s.get(i + 3).and_then(|&c| hex(c))) {
-                    out.push(h << 4 | l);
-                    i += 4;
-                    continue;
-                }
+            if s.get(i + 1) == Some(&b'x')
+                && let (Some(h), Some(l)) = (s.get(i + 2).and_then(|&c| hex(c)), s.get(i + 3).and_then(|&c| hex(c)))
+            {
+                out.push(h << 4 | l);
+                i += 4;
+                continue;
             }
         }
         out.push(s[i]);

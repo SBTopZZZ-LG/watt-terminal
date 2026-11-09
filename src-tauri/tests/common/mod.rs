@@ -24,6 +24,8 @@ use agent_term_lib::core::session::{Session, SpawnConfig};
 static SERIAL: Mutex<()> = Mutex::new(());
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+type Hook = Box<dyn FnMut(&[u8]) + Send>;
+
 pub fn serial() -> MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -83,7 +85,7 @@ impl Drop for Harness {
 
 /// Starts a session. A renderer thread receives every output chunk, runs `hook` on it, and acks it.
 /// The renderer holds only a Weak reference, so dropping the Harness tears the session down.
-pub fn start_with_hook(hook: Option<Box<dyn FnMut(&[u8]) + Send>>) -> Harness {
+pub fn start_with_hook(hook: Option<Hook>) -> Harness {
     start_inner(hook, None)
 }
 
@@ -92,7 +94,7 @@ pub fn start_with_histfile(histfile: &Path) -> Harness {
     start_inner(None, Some(histfile.to_path_buf()))
 }
 
-fn start_inner(hook: Option<Box<dyn FnMut(&[u8]) + Send>>, histfile: Option<PathBuf>) -> Harness {
+fn start_inner(hook: Option<Hook>, histfile: Option<PathBuf>) -> Harness {
     let home = make_real_home();
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     let id = format!("t{}", NEXT_ID.fetch_add(1, Ordering::SeqCst));

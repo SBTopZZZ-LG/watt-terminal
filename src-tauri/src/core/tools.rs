@@ -48,6 +48,8 @@ pub struct CommandView {
     pub truncated: bool,
 }
 
+// `Finished` carries a whole Record. Boxing it would change the public RunOutcome type, so it stays inline.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum RunOutcome {

@@ -26,8 +26,7 @@ fn turn(s: &Session, approvals: &ApprovalGate, text: &str) -> Vec<AgentEvent> {
     let tools = SessionTools::new(s);
     let ctx = AgentCtx::new(&tools, approvals, &emit);
     agent::run_turn(&mut MockAgent, text, &ctx);
-    let events = log.lock().unwrap().clone();
-    events
+    log.lock().unwrap().clone()
 }
 
 /// Runs one turn on another thread, for turns that wait for an approval. Returns the thread and the event log.
