@@ -3,7 +3,7 @@
 //! Channels, per session: `on_data` carries raw PTY bytes (`InvokeResponseBody::Raw`, which the frontend
 //! receives as an ArrayBuffer) and must be acknowledged with `ack`. `on_events` carries JSON objects:
 //! session events (`state`, `integration`, `observer`, `cwd`, `record_started`, `record_finished`) and
-//! agent events (`text`, `tool_call`, `tool_result`, `approval_request`, `done`), told apart by `type`.
+//! agent events (`text`, `tool_call`, `tool_result`, `approval_request`, `agent_control`, `done`), told apart by `type`.
 
 use std::io;
 use std::path::PathBuf;
@@ -19,10 +19,10 @@ use tauri::{Manager, RunEvent, State};
 // Core logic (PTY, shell integration, observer, agent) has no Tauri dependency, so `cargo test` runs it headless.
 pub mod core;
 
-use crate::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate, MockAgent};
+use crate::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate, MockAgent, OnDrop};
 use crate::core::observer::{EventSink, InputState, IntegrationStatus, ObserverStatus, SessionEvent};
 use crate::core::pty::OutputSink;
-use crate::core::record::{Cwd, Source};
+use crate::core::record::Cwd;
 use crate::core::registry::Registry;
 use crate::core::session::{Session, SessionStats, SpawnConfig};
 use crate::core::tools::SessionTools;
@@ -80,6 +80,18 @@ pub struct Attached {
     channels: Arc<Channels>,
     approvals: ApprovalGate,
     agent_busy: AtomicBool,
+    /// True while the agent is executing a shell-acting call (see `AgentEvent::AgentControl`).
+    agent_control: AtomicBool,
+}
+
+impl Attached {
+    /// Ends a turn: clears the control flag (telling the UI) and the busy flag. Runs even when the turn panicked.
+    fn end_turn(&self) {
+        if self.agent_control.swap(false, Ordering::SeqCst) {
+            self.channels.send_json(&AgentEvent::AgentControl { active: false });
+        }
+        self.agent_busy.store(false, Ordering::SeqCst);
+    }
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -157,7 +169,13 @@ fn attach_or_spawn(
         let cfg = SpawnConfig { rows, cols, real_zdotdir: None, histfile: dev_histfile() };
         let session = Session::spawn(shim_id, cfg, Box::new(RawSink(channels.clone()))).map_err(io_err)?;
         session.set_event_sink(Arc::new(EventsSink(channels.clone())));
-        Ok(Attached { session, channels, approvals: ApprovalGate::new(), agent_busy: AtomicBool::new(false) })
+        Ok(Attached {
+            session,
+            channels,
+            approvals: ApprovalGate::new(),
+            agent_busy: AtomicBool::new(false),
+            agent_control: AtomicBool::new(false),
+        })
     })?;
     if let Some((data, events)) = pending.take() {
         att.channels.attach(data, events);
@@ -183,15 +201,6 @@ fn write_user(session_id: String, text: String, reg: State<'_, Reg>) -> Result<(
     agent::user_input(&att.session, &att.approvals, &text).map_err(io_err)
 }
 
-/// A line typed in the input bar (the frontend strips a leading `!`). Waits for the writer, so it runs off the UI thread.
-#[tauri::command]
-async fn submit_input(session_id: String, text: String, reg: State<'_, Reg>) -> Result<(), String> {
-    let att = session(&reg, &session_id)?;
-    tauri::async_runtime::spawn_blocking(move || att.session.submit(Source::User, &text).map_err(|e| e.to_string()))
-        .await
-        .map_err(|e| e.to_string())?
-}
-
 /// Starts one agent turn on its own thread. Events arrive on the events channel.
 #[tauri::command]
 fn agent_message(session_id: String, text: String, reg: State<'_, Reg>) -> Result<(), String> {
@@ -201,12 +210,19 @@ fn agent_message(session_id: String, text: String, reg: State<'_, Reg>) -> Resul
     }
     let worker = att.clone();
     let spawned = thread::Builder::new().name("agent".into()).spawn(move || {
+        // Runs on panic too, so a crashed turn cannot leave the agent busy or in control of the shell.
+        let _end = OnDrop::new(|| worker.end_turn());
         let tools = SessionTools::new(&worker.session);
         let channels = worker.channels.clone();
-        let emit = move |ev: AgentEvent| channels.send_json(&ev);
+        let owner = worker.clone();
+        let emit = move |ev: AgentEvent| {
+            if let AgentEvent::AgentControl { active } = &ev {
+                owner.agent_control.store(*active, Ordering::SeqCst);
+            }
+            channels.send_json(&ev);
+        };
         let ctx = AgentCtx::new(&tools, &worker.approvals, &emit);
         agent::run_turn(&mut MockAgent, &text, &ctx);
-        worker.agent_busy.store(false, Ordering::SeqCst);
     });
     if let Err(e) = spawned {
         att.agent_busy.store(false, Ordering::SeqCst);
@@ -239,6 +255,7 @@ struct Status {
     stats: SessionStats,
     auto_approve: bool,
     agent_busy: bool,
+    agent_control: bool,
 }
 
 #[tauri::command]
@@ -252,6 +269,7 @@ fn get_status(session_id: String, reg: State<'_, Reg>) -> Result<Status, String>
         stats: att.session.stats(),
         auto_approve: att.approvals.auto_approve(),
         agent_busy: att.agent_busy.load(Ordering::SeqCst),
+        agent_control: att.agent_control.load(Ordering::SeqCst),
     })
 }
 
@@ -276,7 +294,6 @@ pub fn run() {
             ack,
             resize,
             write_user,
-            submit_input,
             agent_message,
             approve_tool,
             set_auto_approve,

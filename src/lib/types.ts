@@ -50,6 +50,8 @@ export type AgentEvent =
   | { type: 'tool_call'; call_id: string; name: string; args: unknown }
   | { type: 'tool_result'; call_id: string; name: string; ok: boolean; result: unknown }
   | { type: 'approval_request'; call_id: string; text: string }
+  /** The agent is executing an approved shell call (true) and has finished it (false). */
+  | { type: 'agent_control'; active: boolean }
   | { type: 'done' };
 
 export type WireEvent = SessionEvent | AgentEvent;
@@ -73,4 +75,5 @@ export interface Status {
   stats: SessionStats;
   auto_approve: boolean;
   agent_busy: boolean;
+  agent_control: boolean;
 }

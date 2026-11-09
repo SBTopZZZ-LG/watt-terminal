@@ -144,6 +144,9 @@ function applyAgentEvent(t: Transcript, ev: AgentEvent): Transcript {
       }));
     case 'done':
       return { ...t, inFlight: Math.max(0, t.inFlight - 1) };
+    // Drives the terminal border (see agentControl.ts), not the transcript.
+    case 'agent_control':
+      return t;
   }
 }
 

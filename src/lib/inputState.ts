@@ -1,5 +1,5 @@
-// Input routing for the UI. Rust is authoritative for gating (it refuses submits outside Prompt). This module
-// only decides what the UI does: where keystrokes go, whether the input bar is usable, and where focus sits.
+// Input routing for the UI. Rust is authoritative for gating (it refuses agent commands outside Prompt). This module
+// only decides what the UI does: where keystrokes go, what the input bar offers, and where focus sits.
 //
 // Inputs: the InputState that Rust reports, and the alternate-screen flag from xterm's buffer. The alt flag is
 // an immediate local override, so vim and friends take over the keyboard without waiting for a round trip.
@@ -35,18 +35,16 @@ export function effectiveState(m: InputModel): InputState {
   return m.rust;
 }
 
-/** Where xterm's keystrokes go: to the PTY, or dropped (the input bar owns input at the prompt). */
+/** Where xterm's keystrokes go: to the PTY, or dropped. Only an exited shell drops them. */
 export type KeyRoute = 'pty' | 'drop';
 
 /**
  * What the input bar offers:
- * - full: shell and agent input
- * - agent_only: agent messages only
- * - collapsed: a thin strip; a hotkey opens it for an agent message
- * - off: disabled, with the hint saying why
+ * - chat: the agent message box, in every state except the alternate screen and an exited shell
+ * - collapsed: a thin strip while a full-screen app runs; a hotkey opens the chat for one message
  * - exited: the shell has gone; a button starts a new one in place of the input
  */
-export type BarMode = 'full' | 'agent_only' | 'collapsed' | 'off' | 'exited';
+export type BarMode = 'chat' | 'collapsed' | 'exited';
 
 export interface Route {
   keys: KeyRoute;
@@ -57,25 +55,29 @@ export interface Route {
 export function routeFor(state: InputState): Route {
   switch (state) {
     case 'booting':
-      return { keys: 'drop', bar: 'off', hint: 'Starting the shell and its integration...' };
+      return { keys: 'pty', bar: 'chat', hint: 'The shell is starting. The agent cannot run commands yet.' };
     case 'prompt':
-      return { keys: 'drop', bar: 'full', hint: null };
+      return { keys: 'pty', bar: 'chat', hint: null };
     case 'submitted':
-      return { keys: 'drop', bar: 'off', hint: 'Waiting for the command to start...' };
+      return {
+        keys: 'pty',
+        bar: 'chat',
+        hint: 'The command is starting. The agent cannot run commands until it finishes.',
+      };
     case 'continuation':
       return {
         keys: 'pty',
-        bar: 'agent_only',
-        hint: 'The shell is waiting for the rest of a multi-line command. Shell commands are off.',
+        bar: 'chat',
+        hint: 'The shell is waiting for the rest of a multi-line command. The agent cannot run commands now.',
       };
     case 'running':
-      return { keys: 'pty', bar: 'agent_only', hint: 'A command is running. Shell commands are off until it finishes.' };
+      return { keys: 'pty', bar: 'chat', hint: 'A command is running. The agent cannot run another until it finishes.' };
     case 'alt':
       return { keys: 'pty', bar: 'collapsed', hint: 'Full-screen app: keys go to it. Ctrl+Shift+A messages the agent.' };
     case 'raw':
       return {
         keys: 'pty',
-        bar: 'agent_only',
+        bar: 'chat',
         hint: 'No shell integration: the agent can read the screen but cannot run commands.',
       };
     case 'exited':
@@ -84,22 +86,23 @@ export function routeFor(state: InputState): Route {
 }
 
 /**
- * Focus target when the effective state changes from `prev` to `next`, or null to leave focus alone. Focus follows
- * the routing: when keys start going to the PTY, xterm takes them; when the bar comes back (the prompt, or the
- * exited notice with its button), the bar takes focus. A move between two PTY-routed states keeps focus where it is.
+ * Focus target when the effective state changes from `prev` to `next`, or null to leave focus alone.
  *
- * Why: a stale focus request from the bar must never pull focus away from a running program, so the bar only
- * takes focus through this function (or an explicit hotkey or click while keys are not going to the PTY).
+ * Focus does not follow the shell's state. A command starting or finishing, or a prompt coming back, never moves
+ * focus, so text being typed in the bar is never taken away. There are two exceptions, both at the ends of a shell:
+ * - the shell exits: the bar takes focus, so its restart button can take Enter (the terminal no longer takes keys);
+ * - a new shell starts after an exit: the terminal takes focus again.
+ * The terminal also takes focus on mount, and the hotkey and Esc move focus explicitly (see App.tsx).
  */
 export function focusAfter(prev: InputState, next: InputState): 'xterm' | 'bar' | null {
   if (prev === next) {
     return null;
   }
-  if (routeFor(next).keys === 'pty') {
-    return routeFor(prev).keys === 'pty' ? null : 'xterm';
-  }
-  if (next === 'prompt' || next === 'exited') {
+  if (next === 'exited') {
     return 'bar';
+  }
+  if (prev === 'exited') {
+    return 'xterm';
   }
   return null;
 }
@@ -122,6 +125,7 @@ export interface BarKeyContext {
 /**
  * What a key pressed in the input bar means. Ctrl-C is always `interrupt` (the caller sends ^C to the PTY),
  * whatever the state. Enter approves the first pending approval when the input is empty; Escape denies it.
+ * Otherwise Escape closes the bar's focus (back to the terminal).
  */
 export function barKeyIntent(
   key: string,

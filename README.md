@@ -31,8 +31,10 @@ AGENT_TERM_HISTFILE=/tmp/agent-term-hist npm run tauri dev
 
 ## Input
 
-- Text starting with `!` is a shell command. It runs in the same session as a normal user command. The `!` and one optional space are removed, so `!ls` runs `ls`.
-- Any other text goes to the agent. For example, "what was the last command" or "run `pwd`". A `run` request shows an approval card before anything is typed into the shell.
+- The terminal is the main input. Type at the prompt as you would in any terminal. Keys go to the shell, or to the program that is running (vim, ssh, and so on).
+- The bar at the bottom is for the agent. Its text is always a message to the agent, including text that starts with `!`. For example, "what was the last command" or "run `pwd`". A `run` request shows an approval card before anything is typed into the shell.
+- Ctrl+Shift+A focuses the agent bar. Esc in the bar returns focus to the terminal.
+- While the agent runs an approved command, a green border pulses around the terminal. It fades out when the agent is idle.
 
 ## Tests
 

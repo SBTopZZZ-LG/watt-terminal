@@ -34,9 +34,6 @@ export const api = {
   writeUser(text: string) {
     return invoke<void>('write_user', { sessionId: SESSION_ID, text });
   },
-  submitInput(text: string) {
-    return invoke<void>('submit_input', { sessionId: SESSION_ID, text });
-  },
   agentMessage(text: string) {
     return invoke<void>('agent_message', { sessionId: SESSION_ID, text });
   },

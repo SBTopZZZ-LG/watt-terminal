@@ -64,7 +64,8 @@ pub struct SessionStats {
 
 /// Input to the writer thread.
 enum WriteCmd {
-    /// Raw keystrokes or bytes from the user. A CR at the prompt starts a submitted line, so the gate closes until C.
+    /// Raw keystrokes or bytes from the user. A CR at the prompt starts a submitted line, so the gate closes until C
+    /// (or the submit timeout, for an empty line).
     User(Vec<u8>),
     Submit { source: Source, text: String, reply: Sender<Result<(), SubmitError>> },
 }
@@ -259,10 +260,20 @@ fn run_writer(rx: Receiver<WriteCmd>, mut writer: Box<dyn Write + Send>, shared:
             WriteCmd::User(bytes) => {
                 if bytes.contains(&b'\r') {
                     let mut core = shared.lock();
-                    if core.lifecycle_view() == InputState::Prompt && !core.desynced() {
-                        core.begin_submit(None);
-                        drop(core);
-                        shared.flush();
+                    if !core.desynced() {
+                        let state = core.lifecycle_view();
+                        match state {
+                            // The first CR at an idle prompt closes the gate, so the agent cannot inject into the same
+                            // line. C (or the submit timeout, for an empty line) reopens it.
+                            InputState::Prompt => {
+                                core.begin_submit(Some((Source::User, None)));
+                                drop(core);
+                                shared.flush();
+                            }
+                            // A CR completing a multi-line command the user is typing: attribute it to the user.
+                            InputState::Continuation => core.note_user_line(),
+                            _ => {}
+                        }
                     }
                 }
                 let _ = write_all(&mut writer, &bytes);
@@ -276,7 +287,7 @@ fn run_writer(rx: Receiver<WriteCmd>, mut writer: Box<dyn Write + Send>, shared:
                         match core.lifecycle_view() {
                             InputState::Prompt => {
                                 let bytes = encode_submit(&text, core.bracketed_paste());
-                                core.begin_submit(Some((source, text)));
+                                core.begin_submit(Some((source, Some(text))));
                                 Ok(bytes)
                             }
                             other => Err(SubmitError::NotAtPrompt(other)),

@@ -136,3 +136,20 @@ fn listeners_get_state_integration_and_record_events() {
     });
     assert_eq!(exit, Some(Some(0)));
 }
+
+#[test]
+fn user_typed_command_is_reported_with_user_source() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let sink = Arc::new(Collect(Mutex::new(Vec::new())));
+    s.set_event_sink(sink.clone());
+    s.write_user(b"echo typed-ev\r").expect("typed");
+    let started = wait_until(Duration::from_secs(10), || {
+        sink.0.lock().unwrap().iter().find_map(|e| match e {
+            SessionEvent::RecordStarted { command, source, .. } if command == "echo typed-ev" => Some(source.clone()),
+            _ => None,
+        })
+    });
+    assert_eq!(started, Some(agent_term_lib::core::record::Source::User));
+}

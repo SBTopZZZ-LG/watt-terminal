@@ -88,6 +88,23 @@ pub fn user_input(session: &Session, approvals: &ApprovalGate, text: &str) -> io
     session.write_user(text.as_bytes())
 }
 
+/// Runs a closure when dropped, including while a panic unwinds. Used so a turn cannot leave flags set.
+pub struct OnDrop<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> OnDrop<F> {
+    pub fn new(f: F) -> Self {
+        OnDrop(Some(f))
+    }
+}
+
+impl<F: FnOnce()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f();
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
@@ -95,6 +112,10 @@ pub enum AgentEvent {
     ToolCall { call_id: String, name: String, args: Value },
     ToolResult { call_id: String, name: String, ok: bool, result: Value },
     ApprovalRequest { call_id: String, text: String },
+    /// The agent is in control of the shell: an approved `run_command` or `send_keys` is executing. Sent true before
+    /// the call and false after it. A denied call sends nothing. A call the tool refuses (for example, the shell is
+    /// busy) is bracketed too, but the bracket is immediate.
+    AgentControl { active: bool },
     Done,
 }
 
@@ -149,14 +170,14 @@ impl<'a> AgentCtx<'a> {
                 _ => false,
             };
         let result = if !needs_approval {
-            self.tools.call(name, &args)
+            self.execute(name, &args, gated)
         } else {
             let text = args.get("command").and_then(Value::as_str).map_or_else(|| args.to_string(), str::to_string);
             let approved = self.approvals.ask(&call_id, || {
                 self.emit(AgentEvent::ApprovalRequest { call_id: call_id.clone(), text: text.clone() })
             });
             if approved {
-                self.tools.call(name, &args)
+                self.execute(name, &args, gated)
             } else {
                 Err("not approved (denied, cancelled, or timed out)".to_string())
             }
@@ -166,6 +187,19 @@ impl<'a> AgentCtx<'a> {
             Err(e) => (false, json!({"error": e})),
         };
         self.emit(AgentEvent::ToolResult { call_id, name: name.to_string(), ok, result: value });
+        result
+    }
+
+    /// Calls the tool. For the calls that act on the shell, the agent is in control from before the call until after it.
+    fn execute(&self, name: &str, args: &Value, gated: bool) -> Result<Value, String> {
+        let controls_shell = gated && matches!(name, "run_command" | "send_keys");
+        if controls_shell {
+            self.emit(AgentEvent::AgentControl { active: true });
+        }
+        let result = self.tools.call(name, args);
+        if controls_shell {
+            self.emit(AgentEvent::AgentControl { active: false });
+        }
         result
     }
 }
@@ -391,5 +425,58 @@ mod tests {
         let ctx = AgentCtx::new(&tools, &gate, &emit);
         assert!(ctx.call_tool("get_cwd", json!({})).is_ok());
         assert_eq!(tools.reached(), vec!["get_cwd".to_string()]);
+    }
+
+    /// One label per event, so the order of the calls and the control bracket can be checked in one go.
+    fn labels(log: &Mutex<Vec<AgentEvent>>) -> Vec<String> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .map(|e| match e {
+                AgentEvent::ToolCall { name, .. } => format!("call {name}"),
+                AgentEvent::ToolResult { name, .. } => format!("result {name}"),
+                AgentEvent::ApprovalRequest { .. } => "approval".to_string(),
+                AgentEvent::AgentControl { active } => format!("control {active}"),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn agent_control_sits_between_an_approved_shell_call_and_its_result() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        gate.set_auto_approve(true);
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        assert!(ctx.call_tool("run_command", json!({"command": "pwd"})).is_ok());
+        assert_eq!(labels(&log), ["call run_command", "control true", "control false", "result run_command"]);
+    }
+
+    #[test]
+    fn agent_control_is_never_sent_for_read_tools_or_unapproved_calls() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        assert!(ctx.read_tool("get_screen", json!({})).is_ok());
+        assert!(ctx.call_tool("get_cwd", json!({})).is_ok());
+        // Nobody answers: the approval times out and the call never reaches the tools.
+        assert!(ctx.call_tool("run_command", json!({"command": "pwd"})).is_err());
+        assert!(labels(&log).iter().all(|l| !l.starts_with("control")), "{:?}", labels(&log));
+        assert_eq!(tools.reached(), vec!["get_screen".to_string(), "get_cwd".to_string()]);
+    }
+
+    #[test]
+    fn on_drop_runs_when_the_body_panics() {
+        let ran = std::cell::Cell::new(false);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = OnDrop::new(|| ran.set(true));
+            panic!("turn crashed");
+        }));
+        assert!(result.is_err());
+        assert!(ran.get(), "the guard did not run while the panic unwound");
     }
 }

@@ -1,89 +1,15 @@
-// Parsing for the input bar. Text starting with `!` is a shell command (the `!` and one optional space are
-// removed); anything else is a message for the agent.
+// Input bar text rules. The bar sends agent messages only, so every line is text for the agent (a leading `!` has no
+// meaning here). Shell input is typed in the terminal.
 
-import type { BarMode } from './inputState';
-
-export type ParsedInput =
-  | { kind: 'empty' }
-  | { kind: 'shell'; command: string }
-  | { kind: 'shell_invalid'; reason: string }
-  | { kind: 'agent'; text: string };
-
-export function parseBarInput(text: string): ParsedInput {
-  if (text.trim() === '') {
-    return { kind: 'empty' };
-  }
-  if (text.startsWith('!')) {
-    let command = text.slice(1);
-    if (command.startsWith(' ')) {
-      command = command.slice(1);
-    }
-    if (command.trim() === '') {
-      return { kind: 'shell_invalid', reason: 'Nothing to run after !' };
-    }
-    return { kind: 'shell', command };
-  }
-  return { kind: 'agent', text: text.trim() };
-}
-
-/** The mode indicator shown next to the input. */
-export function modeLabel(text: string): 'shell' | 'agent' {
-  return text.startsWith('!') ? 'shell' : 'agent';
-}
-
-export interface KeyMods {
-  ctrl: boolean;
-  shift: boolean;
-  alt: boolean;
-  meta: boolean;
-}
-
-/** Ctrl+L with no other modifier: the clear-screen shortcut. */
-export function isClearScreenKey(key: string, mods: KeyMods): boolean {
-  return mods.ctrl && !mods.shift && !mods.alt && !mods.meta && key.toLowerCase() === 'l';
+/** The message to send for the bar's text: trimmed, or null when there is nothing to send. */
+export function messageFor(text: string): string | null {
+  const trimmed = text.trim();
+  return trimmed === '' ? null : trimmed;
 }
 
 /**
- * Whether Ctrl+L is sent to the shell. Only from the idle prompt (the full bar), and not while a submitted line is
- * still being sent: by then the shell may already be running it, and a form feed would reach that command.
- */
-export function clearScreenDecision(bar: BarMode, sending: boolean): 'send' | 'ignore' {
-  return bar === 'full' && !sending ? 'send' : 'ignore';
-}
-
-export type SubmitDecision =
-  | { kind: 'none' }
-  | { kind: 'reject'; reason: string }
-  | { kind: 'shell'; command: string }
-  | { kind: 'agent'; text: string };
-
-/**
- * Decides what Enter does. `offHint` is the route's hint, shown when the bar is off. Rust still checks the
- * prompt on submit; this check only gives the user the reason before anything is sent.
- */
-export function decideSubmit(bar: BarMode, offHint: string | null, text: string): SubmitDecision {
-  const parsed = parseBarInput(text);
-  switch (parsed.kind) {
-    case 'empty':
-      return { kind: 'none' };
-    case 'shell_invalid':
-      return { kind: 'reject', reason: parsed.reason };
-    case 'shell':
-      if (bar === 'full') {
-        return { kind: 'shell', command: parsed.command };
-      }
-      return { kind: 'reject', reason: bar === 'off' ? (offHint ?? 'Input is off.') : 'Shell commands need an idle prompt.' };
-    case 'agent':
-      if (bar === 'full' || bar === 'agent_only') {
-        return { kind: 'agent', text: parsed.text };
-      }
-      return { kind: 'reject', reason: offHint ?? 'Input is off.' };
-  }
-}
-
-/**
- * Up/Down history in memory. `index` equals `entries.length` when showing the live line, whose text is kept
- * as the draft when the user starts walking back.
+ * Up/Down history of agent messages in memory. `index` equals `entries.length` when showing the live line, whose text
+ * is kept as the draft when the user starts walking back.
  */
 export class History {
   private entries: string[] = [];

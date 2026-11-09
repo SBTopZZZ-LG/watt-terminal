@@ -279,8 +279,9 @@ pub struct Core {
     shell_pid: Option<u32>,
     desynced: bool,
     eof: bool,
-    /// Set by a submit (or a user CR at the prompt). Matched against the next E event to attribute the command.
-    pending: Option<(Source, String)>,
+    /// Set by a submit or a user CR. Matched against the next E event to attribute the command. A None text matches
+    /// any command: that is a line the user typed in the terminal, whose text Rust never sees.
+    pending: Option<(Source, Option<String>)>,
     /// E seen, waiting for its C.
     last_e: Option<(String, Source)>,
     cwd: Option<Cwd>,
@@ -408,13 +409,16 @@ impl Core {
                 }
             }
             Event::Continuation => {
-                if self.lifecycle == Lifecycle::Prompt {
+                // Submitted too: a multi-line line the user typed closes the gate with its first CR, and zsh then
+                // asks for more (PS2). Without this the gate would reopen while zsh is still inside the command.
+                if matches!(self.lifecycle, Lifecycle::Prompt | Lifecycle::Submitted { .. }) {
                     self.lifecycle = Lifecycle::Continuation;
                 }
             }
             Event::CommandLine(text) => {
                 let source = match self.pending.take() {
-                    Some((source, pending_text)) if pending_text == text => source,
+                    Some((source, None)) => source,
+                    Some((source, Some(pending_text))) if pending_text == text => source,
                     _ => Source::Unknown,
                 };
                 self.last_e = Some((text, source));
@@ -597,9 +601,15 @@ impl Core {
     }
 
     /// Called by the writer under the same lock as the check. Moves to Submitted and records the pending attribution.
-    pub fn begin_submit(&mut self, pending: Option<(Source, String)>) {
+    pub fn begin_submit(&mut self, pending: Option<(Source, Option<String>)>) {
         self.lifecycle = Lifecycle::Submitted { since: Instant::now() };
         self.pending = pending;
+    }
+
+    /// A CR the user typed while zsh waits for more of a command. Attributes the command it completes to the user,
+    /// without changing the lifecycle.
+    pub fn note_user_line(&mut self) {
+        self.pending = Some((Source::User, None));
     }
 
     pub fn forged_events(&self) -> u64 {

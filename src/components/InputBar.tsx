@@ -2,36 +2,31 @@ import { useEffect, useRef, useState } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { barKeyIntent } from '../lib/inputState';
 import type { BarMode } from '../lib/inputState';
-import { clearScreenDecision, decideSubmit, History, isClearScreenKey, modeLabel } from '../lib/barInput';
+import { History, messageFor } from '../lib/barInput';
 
 interface Props {
   mode: BarMode;
-  /** Why the bar is off or limited. Shown under the input. */
+  /** Why the bar is limited. Shown under the input. */
   hint: string | null;
   hasPendingApproval: boolean;
-  /**
-   * True while keys go to the PTY, so the bar must not take focus. The parent passes false while the bar is open
-   * for an agent message on the alternate screen, because that hotkey asks for the bar.
-   */
-  keysToPty: boolean;
   /** Bumped by the parent to move focus into the input (or the restart button, when the shell exited). */
   focusToken: number;
+  /** Reports when the input gains or loses focus. */
+  onFocusChange: (focused: boolean) => void;
   /** The shell exited: starts a new session. */
   onRestart: () => void;
   restarting: boolean;
-  /** Each resolves to an error message, or null on success. The text is kept on error. */
-  onShell: (command: string) => Promise<string | null>;
+  /** Resolves to an error message, or null on success. The text is kept on error. */
   onAgent: (text: string) => Promise<string | null>;
   onInterrupt: () => void;
-  /** Ctrl+L at the prompt: the shell clears the screen. The text in the bar is left alone. */
-  onClearScreen: () => void;
   onApproveFirst: () => void;
   onDenyFirst: () => void;
+  /** Escape with nothing to deny: focus goes back to the terminal. */
   onClose: () => void;
 }
 
 export function InputBar(props: Props) {
-  const { mode, hint, hasPendingApproval, keysToPty, focusToken } = props;
+  const { mode, hint, hasPendingApproval, focusToken } = props;
   const [text, setText] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
@@ -39,15 +34,14 @@ export function InputBar(props: Props) {
   const restartRef = useRef<HTMLButtonElement>(null);
   const history = useRef(new History());
 
-  // A new token moves focus. The effect reads the mode and routing at that moment, when the input is rendered.
-  // While keys go to the PTY a token is ignored: a stale token must not take focus from a running program.
+  // A new token moves focus. The effect reads the mode at that moment, when the input is rendered.
   useEffect(() => {
-    if (focusToken === 0 || keysToPty) {
+    if (focusToken === 0) {
       return;
     }
     if (mode === 'exited') {
       restartRef.current?.focus();
-    } else if (mode !== 'collapsed' && mode !== 'off') {
+    } else if (mode === 'chat') {
       inputRef.current?.focus();
     }
   }, [focusToken]);
@@ -71,25 +65,13 @@ export function InputBar(props: Props) {
     );
   }
 
-  const off = mode === 'off';
-  const label = modeLabel(text);
-  const placeholder = off
-    ? (hint ?? 'Input is off.')
-    : mode === 'agent_only'
-      ? 'Message the agent'
-      : 'Type a command after ! or ask the agent';
-
   async function submit() {
-    const decision = decideSubmit(mode, hint, text);
-    if (decision.kind === 'none') {
-      return;
-    }
-    if (decision.kind === 'reject') {
-      setError(decision.reason);
+    const message = messageFor(text);
+    if (message === null) {
       return;
     }
     setSending(true);
-    const err = decision.kind === 'shell' ? await props.onShell(decision.command) : await props.onAgent(decision.text);
+    const err = await props.onAgent(message);
     setSending(false);
     if (err) {
       setError(err);
@@ -102,13 +84,6 @@ export function InputBar(props: Props) {
 
   function onKeyDown(e: ReactKeyboardEvent<HTMLInputElement>) {
     if (e.nativeEvent.isComposing) {
-      return;
-    }
-    if (isClearScreenKey(e.key, { ctrl: e.ctrlKey, shift: e.shiftKey, alt: e.altKey, meta: e.metaKey })) {
-      if (clearScreenDecision(mode, sending) === 'send') {
-        e.preventDefault();
-        props.onClearScreen();
-      }
       return;
     }
     const intent = barKeyIntent(
@@ -136,7 +111,7 @@ export function InputBar(props: Props) {
         return;
       case 'submit':
         e.preventDefault();
-        if (!sending && !off) {
+        if (!sending) {
           void submit();
         }
         return;
@@ -163,13 +138,12 @@ export function InputBar(props: Props) {
 
   return (
     <div className={`bar bar-${mode}`}>
-      <span className={`bar-mode mode-${off ? 'off' : label}`}>{off ? '-' : label}</span>
+      <span className="bar-mode mode-agent">agent</span>
       <input
         ref={inputRef}
         className="bar-input"
         value={text}
-        disabled={off}
-        placeholder={placeholder}
+        placeholder="Ask the agent…  (Ctrl+Shift+A to focus, Esc to return)"
         spellCheck={false}
         autoComplete="off"
         onChange={(e) => {
@@ -177,9 +151,11 @@ export function InputBar(props: Props) {
           setError(null);
         }}
         onKeyDown={onKeyDown}
+        onFocus={() => props.onFocusChange(true)}
+        onBlur={() => props.onFocusChange(false)}
       />
       {error !== null && <div className="bar-error">{error}</div>}
-      {!off && error === null && hint !== null && <div className="bar-hint">{hint}</div>}
+      {error === null && hint !== null && <div className="bar-hint">{hint}</div>}
     </div>
   );
 }

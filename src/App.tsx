@@ -6,6 +6,7 @@ import type { Incoming } from './lib/session';
 import { fitToContainer, markConnected, marks, receiveBytes, resetForNewSession, term, terminalSize } from './lib/terminal';
 import { effectiveState, focusAfter, inputReducer, INITIAL_INPUT, routeFor } from './lib/inputState';
 import type { BarMode } from './lib/inputState';
+import { agentControlAfter } from './lib/agentControl';
 import { EMPTY_TRANSCRIPT, firstPendingApproval, isBusy, transcriptReducer } from './lib/transcript';
 import type { Cwd, InputState, IntegrationStatus, ObserverStatus, Status, WireEvent } from './lib/types';
 import { TerminalView } from './components/TerminalView';
@@ -14,17 +15,16 @@ import { Transcript } from './components/Transcript';
 import { StatusChip } from './components/StatusChip';
 
 const CTRL_C = '\u0003';
-// Form feed. At the prompt the shell's clear-screen widget runs and redraws the prompt; the bar keeps its text.
-const CLEAR_SCREEN = '\u000c';
 
 export default function App() {
   const [input, dispatchInput] = useReducer(inputReducer, INITIAL_INPUT);
   const effective = effectiveState(input);
   const route = routeFor(effective);
 
+  // The bar counts as open while its input has focus, or the hotkey asked for it. Only the alternate screen cares: an
+  // open bar stays as the chat there, so a program starting or ending never takes the input's focus away.
   const [barOpen, setBarOpen] = useState(false);
-  // The alternate-screen strip opens for an agent message only when the hotkey asks for it.
-  const barMode: BarMode = route.bar === 'collapsed' && barOpen ? 'agent_only' : route.bar;
+  const barMode: BarMode = route.bar === 'collapsed' && barOpen ? 'chat' : route.bar;
 
   const [transcript, dispatchTranscript] = useReducer(transcriptReducer, EMPTY_TRANSCRIPT);
   const [transcriptOpen, setTranscriptOpen] = useState(true);
@@ -34,6 +34,8 @@ export default function App() {
   const [autoApprove, setAutoApprove] = useState(false);
   const [focusToken, setFocusToken] = useState(0);
   const [restarting, setRestarting] = useState(false);
+  // True while the agent executes an approved shell call. Drives the green border around the terminal.
+  const [agentControl, setAgentControl] = useState(false);
 
   // Read by long-lived listeners (keystrokes, hotkey), so they always see the current route.
   const routeRef = useRef(route);
@@ -49,6 +51,7 @@ export default function App() {
     setObserver(s.observer);
     setCwd(s.cwd);
     setAutoApprove(s.auto_approve);
+    setAgentControl(s.agent_control);
     dispatchTranscript({ type: 'sync_busy', busy: s.agent_busy });
     if (s.observer === 'desynced') {
       marks.observerDesynced();
@@ -58,6 +61,7 @@ export default function App() {
   // Connect, then load the snapshot. The snapshot covers events that arrived before this listener was up.
   useEffect(() => {
     const handleEvent = (ev: WireEvent) => {
+      setAgentControl((active) => agentControlAfter(active, ev));
       switch (ev.type) {
         case 'state':
           dispatchInput({ type: 'rust_state', state: ev.state });
@@ -105,7 +109,8 @@ export default function App() {
     return unsubscribe;
   }, [applyStatus]);
 
-  // Focus follows the state: xterm when a program needs the keyboard, the bar when the prompt is back.
+  // Focus follows the shell's end, not its commands (see focusAfter): the bar takes it when the shell exits, the
+  // terminal when a new one starts.
   useEffect(() => {
     const target = focusAfter(prevEffective.current, effective);
     prevEffective.current = effective;
@@ -114,12 +119,9 @@ export default function App() {
     } else if (target === 'bar') {
       setFocusToken((t) => t + 1);
     }
-    if (effective !== 'alt') {
-      setBarOpen(false);
-    }
   }, [effective]);
 
-  // Ctrl+Shift+A opens the bar for an agent message. Capture phase, so xterm does not also get the key.
+  // Ctrl+Shift+A focuses the agent bar, from anywhere it is offered. Capture phase, so xterm does not also get the key.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!(e.ctrlKey && e.shiftKey && e.key.toLowerCase() === 'a')) {
@@ -127,8 +129,11 @@ export default function App() {
       }
       e.preventDefault();
       e.stopPropagation();
-      if (routeRef.current.bar !== 'off') {
-        setBarOpen(true);
+      const { bar } = routeRef.current;
+      if (bar !== 'exited') {
+        if (bar === 'collapsed') {
+          setBarOpen(true);
+        }
         setFocusToken((t) => t + 1);
       }
     };
@@ -144,15 +149,6 @@ export default function App() {
 
   const sendRaw = (text: string) => {
     api.writeUser(text).catch(reportError);
-  };
-
-  const onShell = async (command: string): Promise<string | null> => {
-    try {
-      await api.submitInput(command);
-      return null;
-    } catch (e) {
-      return errorText(e);
-    }
   };
 
   const onAgent = async (text: string): Promise<string | null> => {
@@ -184,16 +180,14 @@ export default function App() {
     api.setAutoApprove(next).then(() => setAutoApprove(next), reportError);
   };
 
+  // Escape in the bar gives the keyboard back to the terminal. On the alternate screen it also closes the strip.
   const closeBar = () => {
-    // Escape collapses the alternate-screen strip and gives the keyboard back to the program.
-    if (route.bar === 'collapsed') {
-      setBarOpen(false);
-      term.focus();
-    }
+    setBarOpen(false);
+    term.focus();
   };
 
   // Starts a new shell after the old one exited. The terminal is cleared first, so nothing from the old shell
-  // shows up in the new one. Focus moves to the bar when the new shell's prompt arrives (see focusAfter).
+  // shows up in the new one. Focus moves to the terminal when the new shell starts (see focusAfter).
   const restartShell = () => {
     if (restarting) {
       return;
@@ -201,6 +195,7 @@ export default function App() {
     setRestarting(true);
     resetForNewSession();
     dispatchTranscript({ type: 'session_reset' });
+    setAgentControl(false);
     const { rows, cols } = terminalSize();
     restart(rows, cols)
       .then(() => api.getStatus())
@@ -223,10 +218,6 @@ export default function App() {
     }
   };
 
-  // The bar may take focus only while keys are not going to the PTY. The alt-screen hotkey is the exception: it opens
-  // the bar on purpose, so while the bar is open it does not count as owning the keys.
-  const keysToPty = route.keys === 'pty' && !barOpen;
-
   return (
     <div className="app">
       <StatusChip
@@ -242,8 +233,11 @@ export default function App() {
           keysToPty={route.keys === 'pty'}
           onInput={handleTerminalInput}
           onAltChange={(active) => dispatchInput({ type: 'alt', active })}
-          onIdleClick={() => setFocusToken((t) => t + 1)}
         />
+        {/* Shown while the agent has the shell. Never takes clicks; sits above the terminal background, below its decorations. */}
+        <div className={agentControl ? 'agent-control is-active' : 'agent-control'} aria-hidden="true">
+          <div className="agent-control-glow" />
+        </div>
       </div>
       <Transcript
         items={transcript.items}
@@ -256,14 +250,12 @@ export default function App() {
         mode={barMode}
         hint={route.hint}
         hasPendingApproval={pendingApproval !== null}
-        keysToPty={keysToPty}
         focusToken={focusToken}
+        onFocusChange={setBarOpen}
         onRestart={restartShell}
         restarting={restarting}
-        onShell={onShell}
         onAgent={onAgent}
         onInterrupt={() => sendRaw(CTRL_C)}
-        onClearScreen={() => sendRaw(CLEAR_SCREEN)}
         onApproveFirst={approveFirst}
         onDenyFirst={denyFirst}
         onClose={closeBar}

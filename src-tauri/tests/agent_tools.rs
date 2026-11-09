@@ -86,6 +86,18 @@ fn run_command_ok(log: &Log) -> Option<bool> {
     run_ok(&log.lock().unwrap())
 }
 
+/// The `active` value of each agent_control event, in order.
+fn control_events(log: &Log) -> Vec<bool> {
+    log.lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::AgentControl { active } => Some(*active),
+            _ => None,
+        })
+        .collect()
+}
+
 #[test]
 fn list_and_get_command_page_and_json_calls() {
     let _g = serial();
@@ -336,7 +348,27 @@ fn denied_command_never_runs() {
     h.join().expect("turn");
     assert!(!s.records().iter().any(|r| r.command == "echo denied-cmd"), "denied command ran");
     assert_eq!(run_command_ok(&log), Some(false));
+    assert!(control_events(&log).is_empty(), "a denied command put the agent in control");
     run(&s, "echo still-here");
+}
+
+/// The agent is in control only from the approved start of run_command until its result, never while it waits for
+/// the approval.
+#[test]
+fn agent_control_is_on_only_while_an_approved_command_runs() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let approvals = Arc::new(ApprovalGate::new());
+    let (h, log) = turn_in_thread(s.arc(), approvals.clone(), "please run `sleep 1; echo ctl-ok`");
+    let (id, _) = wait_approval(&log);
+    assert!(control_events(&log).is_empty(), "in control while waiting for approval");
+    assert!(approvals.decide(&id, true));
+    h.join().expect("turn");
+    assert_eq!(control_events(&log), vec![true, false]);
+    assert_eq!(run_command_ok(&log), Some(true));
+    let r = s.records().into_iter().find(|r| r.command == "sleep 1; echo ctl-ok").expect("approved command ran");
+    assert_eq!(r.exit_code, Some(0));
 }
 
 #[test]

@@ -12,7 +12,7 @@ use std::sync::{mpsc, Arc, Barrier, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use agent_term_lib::core::observer::{InputState, IntegrationStatus, ObserverStatus};
+use agent_term_lib::core::observer::{EventSink, InputState, IntegrationStatus, ObserverStatus, SessionEvent};
 use agent_term_lib::core::record::{Cwd, RecordStatus, Source};
 use agent_term_lib::core::session::{Session, SpawnConfig, SubmitError};
 use agent_term_lib::core::shim;
@@ -203,6 +203,101 @@ fn ctrl_l_at_prompt_clears_and_keeps_the_prompt_state() {
     assert_eq!(s.stats().forged_events, forged_before);
     let r = run(&s, "echo after-clear");
     assert_eq!(r.output, "after-clear");
+}
+
+struct Events(Mutex<Vec<SessionEvent>>);
+
+impl EventSink for Events {
+    fn event(&self, ev: SessionEvent) {
+        self.0.lock().unwrap().push(ev);
+    }
+}
+
+/// A command the user types at the terminal, with its CR in the bytes they send. Rust never sees the text: the shell
+/// reports it, and the record is attributed to the user.
+#[test]
+fn user_typed_command_at_prompt_is_recorded_as_user() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    s.write_user(b"false\r").expect("typed");
+    let r = run_finish(&s, "false");
+    assert_eq!(r.source, Source::User);
+    assert_eq!(r.exit_code, Some(1));
+    assert_eq!(r.output, "");
+    s.write_user(b"echo typed-ok\r").expect("typed");
+    let r = run_finish(&s, "echo typed-ok");
+    assert_eq!(r.source, Source::User);
+    assert_eq!(r.exit_code, Some(0));
+    assert_eq!(r.output, "typed-ok");
+}
+
+/// An empty Enter closes the gate for the submit timeout, then returns to Prompt. No record is made.
+#[test]
+fn empty_enter_goes_submitted_then_back_to_prompt_without_a_record() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let events = Arc::new(Events(Mutex::new(Vec::new())));
+    s.set_event_sink(events.clone());
+    s.write_user(b"\r").expect("enter");
+    let seen = wait_until(Duration::from_secs(5), || {
+        let evs = events.0.lock().unwrap();
+        let sub = evs.iter().position(|e| matches!(e, SessionEvent::State { state: InputState::Submitted }))?;
+        evs[sub..].iter().any(|e| matches!(e, SessionEvent::State { state: InputState::Prompt })).then_some(())
+    });
+    assert!(seen.is_some(), "no Submitted followed by Prompt: {:?}", events.0.lock().unwrap());
+    assert_eq!(s.state(), InputState::Prompt);
+    assert!(s.records().is_empty(), "an empty line made a record: {:?}", s.records());
+    run(&s, "echo after-empty");
+}
+
+/// A user's Enter while the agent's command runs does not break the gate: the agent's record still finishes as the
+/// agent's, and the agent can submit again once the shell is back at a prompt.
+#[test]
+fn user_enter_during_an_agent_command_leaves_the_gate_alone() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let cmd = "sleep 2; echo AGENT-OK";
+    s.submit(Source::Agent { call_id: "gate-1".into() }, cmd).expect("agent submit");
+    assert!(wait_state(&s, InputState::Running, Duration::from_secs(3)), "state={:?}", s.state());
+    s.write_user(b"\r").expect("user enter while the agent's command runs");
+    let r = run_finish(&s, cmd);
+    assert_eq!(r.source, Source::Agent { call_id: "gate-1".into() });
+    assert_eq!(r.exit_code, Some(0));
+    assert!(r.output.contains("AGENT-OK"), "output={:?}", r.output);
+    wait_prompt(&s);
+    let second = s.submit(Source::Agent { call_id: "gate-2".into() }, "echo next-agent");
+    assert!(second.is_ok(), "the gate did not reopen after the agent's command: {second:?}");
+    let r = run_finish(&s, "echo next-agent");
+    assert_eq!(r.exit_code, Some(0));
+}
+
+/// A multi-line command the user types. Its first CR closes the gate, and zsh's continuation prompt keeps the state at
+/// Continuation past the submit timeout, so an agent submit is refused. The completed command is the user's.
+#[test]
+fn user_typed_multiline_command_stays_in_continuation_and_is_the_users() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    s.write_user(b"if true; then\r").expect("first line");
+    assert!(wait_state(&s, InputState::Continuation, Duration::from_secs(3)), "state={:?}", s.state());
+    thread::sleep(Duration::from_millis(2000));
+    assert_eq!(s.state(), InputState::Continuation, "the submit timeout released a continuation");
+    let refused = s.submit(Source::Agent { call_id: "in-if".into() }, "echo injected");
+    assert_eq!(refused, Err(SubmitError::NotAtPrompt(InputState::Continuation)));
+    s.write_user(b"echo in-if\r").expect("second line");
+    s.write_user(b"fi\r").expect("third line");
+    let id = wait_until(Duration::from_secs(10), || {
+        s.records().iter().find(|r| r.source == Source::User && r.exit_code.is_some()).map(|r| r.id)
+    })
+    .unwrap_or_else(|| panic!("the typed command did not finish: {:?}", s.records()));
+    let r = s.get_record(id).expect("record");
+    assert_eq!(r.exit_code, Some(0));
+    assert_eq!(r.output, "in-if");
+    wait_prompt(&s);
+    assert!(!s.records().iter().any(|r| r.command.contains("injected")), "the refused agent command ran");
 }
 
 #[test]

@@ -61,13 +61,13 @@ describe('inputReducer and effectiveState', () => {
 
 describe('routeFor: the input routing table', () => {
   it.each([
-    ['booting', 'drop', 'off'],
-    ['prompt', 'drop', 'full'],
-    ['submitted', 'drop', 'off'],
-    ['continuation', 'pty', 'agent_only'],
-    ['running', 'pty', 'agent_only'],
+    ['booting', 'pty', 'chat'],
+    ['prompt', 'pty', 'chat'],
+    ['submitted', 'pty', 'chat'],
+    ['continuation', 'pty', 'chat'],
+    ['running', 'pty', 'chat'],
     ['alt', 'pty', 'collapsed'],
-    ['raw', 'pty', 'agent_only'],
+    ['raw', 'pty', 'chat'],
     ['exited', 'drop', 'exited'],
   ] as const)('%s: keys %s, bar %s', (state, keys, bar) => {
     const route = routeFor(state);
@@ -75,59 +75,57 @@ describe('routeFor: the input routing table', () => {
     expect(route.bar).toBe(bar);
   });
 
+  it('sends keys to the PTY in every state except exited', () => {
+    for (const s of ALL_STATES) {
+      expect(routeFor(s).keys, s).toBe(s === 'exited' ? 'drop' : 'pty');
+    }
+  });
+
+  it('the bar is the agent chat in every state except the alt screen and an exited shell', () => {
+    for (const s of ALL_STATES) {
+      const expected = s === 'alt' ? 'collapsed' : s === 'exited' ? 'exited' : 'chat';
+      expect(routeFor(s).bar, s).toBe(expected);
+    }
+  });
+
   it('gives a hint for every state except the prompt, where nothing needs explaining', () => {
     for (const s of ALL_STATES) {
       expect(routeFor(s).hint === null, s).toBe(s === 'prompt');
     }
   });
-
-  it('only the prompt lets the bar run shell commands', () => {
-    const full = ALL_STATES.filter((s) => routeFor(s).bar === 'full');
-    expect(full).toEqual(['prompt']);
-  });
 });
 
 describe('focusAfter', () => {
-  it('moves focus to xterm when a program takes the keyboard', () => {
-    expect(focusAfter('prompt', 'running')).toBe('xterm');
-    expect(focusAfter('prompt', 'continuation')).toBe('xterm');
-    expect(focusAfter('prompt', 'alt')).toBe('xterm');
+  it('never moves focus for a state change between live states', () => {
+    // The bar keeps focus while commands start, run, finish and while programs take the keyboard.
+    const live = ALL_STATES.filter((s) => s !== 'exited');
+    for (const prev of live) {
+      for (const next of live) {
+        expect(focusAfter(prev, next), `${prev} -> ${next}`).toBeNull();
+      }
+    }
   });
 
-  it('after submit, moves focus to xterm once the command runs (submitted -> running)', () => {
-    expect(focusAfter('submitted', 'running')).toBe('xterm');
-  });
-
-  it('moves focus to xterm when the integration times out and keys go to the PTY (raw)', () => {
-    expect(focusAfter('prompt', 'raw')).toBe('xterm');
-    expect(focusAfter('booting', 'raw')).toBe('xterm');
-  });
-
-  it('keeps focus where it is when moving between keyboard-taking states', () => {
-    expect(focusAfter('running', 'continuation')).toBeNull();
-    expect(focusAfter('alt', 'running')).toBeNull();
-    expect(focusAfter('running', 'raw')).toBeNull();
-  });
-
-  it('moves focus to the bar when the prompt comes back', () => {
-    expect(focusAfter('running', 'prompt')).toBe('bar');
-    expect(focusAfter('alt', 'prompt')).toBe('bar');
-    expect(focusAfter('booting', 'prompt')).toBe('bar');
-    expect(focusAfter('submitted', 'prompt')).toBe('bar');
+  it('a command the agent started does not move focus, so the bar keeps it while the command runs', () => {
+    expect(focusAfter('submitted', 'running')).toBeNull();
+    expect(focusAfter('running', 'prompt')).toBeNull();
+    expect(focusAfter('alt', 'prompt')).toBeNull();
   });
 
   it('moves focus to the bar when the shell exits, so its restart button can take Enter', () => {
     expect(focusAfter('running', 'exited')).toBe('bar');
     expect(focusAfter('prompt', 'exited')).toBe('bar');
+    expect(focusAfter('alt', 'exited')).toBe('bar');
   });
 
-  it('leaves focus alone when a new session starts from exited', () => {
-    expect(focusAfter('exited', 'booting')).toBeNull();
+  it('moves focus to the terminal when a new shell starts after an exit', () => {
+    expect(focusAfter('exited', 'booting')).toBe('xterm');
+    expect(focusAfter('exited', 'prompt')).toBe('xterm');
   });
 
-  it('leaves focus alone otherwise', () => {
+  it('does nothing when the state stays the same', () => {
     expect(focusAfter('prompt', 'prompt')).toBeNull();
-    expect(focusAfter('prompt', 'submitted')).toBeNull();
+    expect(focusAfter('exited', 'exited')).toBeNull();
   });
 });
 
@@ -158,7 +156,7 @@ describe('barKeyIntent', () => {
     expect(barKeyIntent('Enter', { ctrl: false, shift: false }, none)).toBe('submit');
   });
 
-  it('Escape denies a pending approval, otherwise it closes the bar', () => {
+  it('Escape denies a pending approval, otherwise it closes the bar (focus back to the terminal)', () => {
     expect(barKeyIntent('Escape', { ctrl: false, shift: false }, { inputEmpty: true, hasPendingApproval: true })).toBe(
       'deny_first',
     );

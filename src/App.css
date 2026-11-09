@@ -98,6 +98,50 @@ input {
   font: 10px/16px var(--mono);
 }
 
+/*
+ * Agent control: a pulsing green border around the terminal while the agent runs an approved command. It never takes
+ * pointer events, and its z-index (5) keeps it below the gutter decorations (6) and the scrollbar. The outer element
+ * fades; the inner glow pulses, so a fade-out does not cut the pulse off mid-cycle.
+ */
+.agent-control {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 600ms ease-out;
+}
+
+.agent-control.is-active {
+  opacity: 1;
+  transition: opacity 250ms ease-in;
+}
+
+.agent-control-glow {
+  position: absolute;
+  inset: 0;
+  border: 2px solid var(--ok);
+  box-shadow: inset 0 0 18px rgba(152, 195, 121, 0.35);
+  animation: agent-control-pulse 2s ease-in-out infinite;
+}
+
+@keyframes agent-control-pulse {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .agent-control-glow {
+    animation: none;
+    opacity: 0.8;
+  }
+}
+
 /* ---------- status strip ---------- */
 
 .status-chip {
@@ -323,10 +367,6 @@ input {
   color: var(--muted);
 }
 
-.mode-shell {
-  color: var(--ok);
-}
-
 .mode-agent {
   color: var(--accent);
 }
@@ -344,10 +384,6 @@ input {
 .bar-input:focus {
   outline: none;
   border-color: var(--accent);
-}
-
-.bar-input:disabled {
-  opacity: 0.5;
 }
 
 .bar-hint,
