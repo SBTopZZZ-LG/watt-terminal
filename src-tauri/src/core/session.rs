@@ -16,7 +16,8 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize}
 use serde::Serialize;
 
 use crate::core::observer::{
-    run_observer, Core, InputState, IntegrationStatus, ObsMsg, ObsQueue, ObserverStatus, ScreenSnapshot, Shared,
+    run_observer, Core, EventSink, InputState, IntegrationStatus, ObsMsg, ObsQueue, ObserverStatus, ScreenSnapshot,
+    Shared,
 };
 use crate::core::pty::{self, Gate, OutputSink};
 use crate::core::record::{Cwd, Record, RecordSummary, Source};
@@ -29,6 +30,9 @@ pub struct SpawnConfig {
     /// Directory holding the user's startup files. None: the app's own ZDOTDIR if set, else $HOME.
     /// Tests use this to keep the user's history file out of reach (zsh appends every command to HISTFILE).
     pub real_zdotdir: Option<PathBuf>,
+    /// Dev only: a file to use as HISTFILE instead of the real one (the Tauri layer sets this from
+    /// AGENT_TERM_HISTFILE). None keeps the user's own history file.
+    pub histfile: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +78,8 @@ pub struct Session {
     child: Mutex<Box<dyn Child + Send + Sync>>,
     shell_pid: Option<u32>,
     shim_dir: PathBuf,
+    /// The integration nonce the shell was given. Never logged; the frontend uses it only to filter OSC payloads.
+    nonce: String,
 }
 
 impl Session {
@@ -96,6 +102,9 @@ impl Session {
             None => std::env::var_os("ZDOTDIR").unwrap_or_default(),
         };
         cmd.env("AGENTTERM_REAL_ZDOTDIR", real);
+        if let Some(histfile) = &cfg.histfile {
+            cmd.env("AGENTTERM_HISTFILE", histfile);
+        }
         let child = pair.slave.spawn_command(cmd).map_err(to_io)?;
         // The parent must drop the slave, or EOF is never seen on the master.
         drop(pair.slave);
@@ -103,7 +112,7 @@ impl Session {
         let reader = pair.master.try_clone_reader().map_err(to_io)?;
         let writer = pair.master.take_writer().map_err(to_io)?;
 
-        let shared = Arc::new(Shared { core: Mutex::new(Core::new(&nonce, (cfg.rows, cfg.cols))) });
+        let shared = Arc::new(Shared::new(Core::new(&nonce, (cfg.rows, cfg.cols))));
         let queue = Arc::new(ObsQueue::new());
         let gate = Arc::new(Gate::new());
 
@@ -128,7 +137,13 @@ impl Session {
             child: Mutex::new(child),
             shell_pid,
             shim_dir,
+            nonce,
         })
+    }
+
+    /// The integration nonce. Stable for the life of the session.
+    pub fn nonce(&self) -> &str {
+        &self.nonce
     }
 
     /// Writes `text` plus CR at an idle prompt, atomically: the prompt check and the Submitted transition
@@ -162,6 +177,11 @@ impl Session {
     /// Called by the renderer after it has rendered `bytes` of output.
     pub fn ack(&self, bytes: usize) {
         self.gate.ack(bytes);
+    }
+
+    /// Installs the listener for state, status, cwd and record events. Replaces any earlier one.
+    pub fn set_event_sink(&self, sink: Arc<dyn EventSink>) {
+        self.shared.set_sink(sink);
     }
 
     pub fn state(&self) -> InputState {
@@ -241,6 +261,8 @@ fn run_writer(rx: Receiver<WriteCmd>, mut writer: Box<dyn Write + Send>, shared:
                     let mut core = shared.lock();
                     if core.lifecycle_view() == InputState::Prompt && !core.desynced() {
                         core.begin_submit(None);
+                        drop(core);
+                        shared.flush();
                     }
                 }
                 let _ = write_all(&mut writer, &bytes);
@@ -261,6 +283,9 @@ fn run_writer(rx: Receiver<WriteCmd>, mut writer: Box<dyn Write + Send>, shared:
                         }
                     }
                 };
+                if prepared.is_ok() {
+                    shared.flush();
+                }
                 let result = match prepared {
                     Ok(bytes) => write_all(&mut writer, &bytes).map_err(|_| SubmitError::Closed),
                     Err(e) => Err(e),

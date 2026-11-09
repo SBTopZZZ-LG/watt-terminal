@@ -1,51 +1,243 @@
-import { useState } from "react";
-import reactLogo from "./assets/react.svg";
-import { invoke } from "@tauri-apps/api/core";
-import "./App.css";
+import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
+import './App.css';
+import { api, errorText } from './lib/api';
+import { connect, reportError, subscribe } from './lib/session';
+import type { Incoming } from './lib/session';
+import { fitToContainer, markConnected, marks, receiveBytes, term, terminalSize } from './lib/terminal';
+import { effectiveState, focusAfter, inputReducer, INITIAL_INPUT, routeFor } from './lib/inputState';
+import type { BarMode } from './lib/inputState';
+import { EMPTY_TRANSCRIPT, firstPendingApproval, isBusy, transcriptReducer } from './lib/transcript';
+import type { Cwd, InputState, IntegrationStatus, ObserverStatus, Status, WireEvent } from './lib/types';
+import { TerminalView } from './components/TerminalView';
+import { InputBar } from './components/InputBar';
+import { Transcript } from './components/Transcript';
+import { StatusChip } from './components/StatusChip';
 
-function App() {
-  const [greetMsg, setGreetMsg] = useState("");
-  const [name, setName] = useState("");
+const CTRL_C = '\u0003';
 
-  async function greet() {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    setGreetMsg(await invoke("greet", { name }));
-  }
+export default function App() {
+  const [input, dispatchInput] = useReducer(inputReducer, INITIAL_INPUT);
+  const effective = effectiveState(input);
+  const route = routeFor(effective);
+
+  const [barOpen, setBarOpen] = useState(false);
+  // The alternate-screen strip opens for an agent message only when the hotkey asks for it.
+  const barMode: BarMode = route.bar === 'collapsed' && barOpen ? 'agent_only' : route.bar;
+
+  const [transcript, dispatchTranscript] = useReducer(transcriptReducer, EMPTY_TRANSCRIPT);
+  const [transcriptOpen, setTranscriptOpen] = useState(true);
+  const [integration, setIntegration] = useState<IntegrationStatus>('booting');
+  const [observer, setObserver] = useState<ObserverStatus>('ok');
+  const [cwd, setCwd] = useState<Cwd | null>(null);
+  const [autoApprove, setAutoApprove] = useState(false);
+  const [focusToken, setFocusToken] = useState(0);
+
+  // Read by long-lived listeners (keystrokes, hotkey), so they always see the current route.
+  const routeRef = useRef(route);
+  useEffect(() => {
+    routeRef.current = route;
+  });
+  const clientIds = useRef(0);
+  const prevEffective = useRef<InputState>(effective);
+
+  // Connect, then load the snapshot. The snapshot covers events that arrived before this listener was up.
+  useEffect(() => {
+    const applyStatus = (s: Status) => {
+      dispatchInput({ type: 'rust_state', state: s.state });
+      setIntegration(s.integration);
+      setObserver(s.observer);
+      setCwd(s.cwd);
+      setAutoApprove(s.auto_approve);
+      dispatchTranscript({ type: 'sync_busy', busy: s.agent_busy });
+      if (s.observer === 'desynced') {
+        marks.observerDesynced();
+      }
+    };
+
+    const handleEvent = (ev: WireEvent) => {
+      switch (ev.type) {
+        case 'state':
+          dispatchInput({ type: 'rust_state', state: ev.state });
+          return;
+        case 'integration':
+          setIntegration(ev.status);
+          return;
+        case 'observer':
+          setObserver(ev.status);
+          if (ev.status === 'desynced') {
+            marks.observerDesynced();
+          }
+          return;
+        case 'cwd':
+          setCwd(ev.cwd);
+          return;
+        case 'record_started':
+          marks.recordStarted(ev.source.kind === 'agent');
+          return;
+        case 'record_finished':
+          return;
+        default:
+          dispatchTranscript({ type: 'agent_event', event: ev });
+      }
+    };
+
+    const onMessage = (msg: Incoming) => {
+      if (msg.kind === 'error') {
+        dispatchTranscript({ type: 'notice', text: msg.message });
+      } else {
+        handleEvent(msg.event);
+      }
+    };
+
+    const unsubscribe = subscribe(onMessage);
+    const { rows, cols } = terminalSize();
+    connect(rows, cols, receiveBytes)
+      .then(() => {
+        markConnected();
+        return api.getStatus();
+      })
+      .then(applyStatus)
+      .then(() => fitToContainer())
+      .catch(reportError);
+    return unsubscribe;
+  }, []);
+
+  // Focus follows the state: xterm when a program needs the keyboard, the bar when the prompt is back.
+  useEffect(() => {
+    const target = focusAfter(prevEffective.current, effective);
+    prevEffective.current = effective;
+    if (target === 'xterm') {
+      term.focus();
+    } else if (target === 'bar') {
+      setFocusToken((t) => t + 1);
+    }
+    if (effective !== 'alt') {
+      setBarOpen(false);
+    }
+  }, [effective]);
+
+  // Ctrl+Shift+A opens the bar for an agent message. Capture phase, so xterm does not also get the key.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey && e.shiftKey && e.key.toLowerCase() === 'a')) {
+        return;
+      }
+      e.preventDefault();
+      e.stopPropagation();
+      if (routeRef.current.bar !== 'off') {
+        setBarOpen(true);
+        setFocusToken((t) => t + 1);
+      }
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, []);
+
+  const handleTerminalInput = useCallback((data: string) => {
+    if (routeRef.current.keys === 'pty') {
+      api.writeUser(data).catch(reportError);
+    }
+  }, []);
+
+  const sendRaw = (text: string) => {
+    api.writeUser(text).catch(reportError);
+  };
+
+  const onShell = async (command: string): Promise<string | null> => {
+    try {
+      await api.submitInput(command);
+      return null;
+    } catch (e) {
+      return errorText(e);
+    }
+  };
+
+  const onAgent = async (text: string): Promise<string | null> => {
+    clientIds.current += 1;
+    const clientId = clientIds.current;
+    // Added before the call, so the user's line lands above the agent's replies.
+    dispatchTranscript({ type: 'user_sent', clientId, text });
+    try {
+      await api.agentMessage(text);
+      return null;
+    } catch (e) {
+      const message = errorText(e);
+      dispatchTranscript({ type: 'user_failed', clientId, message });
+      return message;
+    }
+  };
+
+  const answer = (callId: string, approve: boolean) => {
+    dispatchTranscript({ type: 'approval_answering', callId, approve });
+    api.approveTool(callId, approve).catch((e) => {
+      dispatchTranscript({ type: 'approval_failed', callId, message: errorText(e) });
+    });
+  };
+
+  const pendingApproval = firstPendingApproval(transcript);
+
+  const toggleAutoApprove = () => {
+    const next = !autoApprove;
+    api.setAutoApprove(next).then(() => setAutoApprove(next), reportError);
+  };
+
+  const closeBar = () => {
+    // Escape collapses the alternate-screen strip and gives the keyboard back to the program.
+    if (route.bar === 'collapsed') {
+      setBarOpen(false);
+      term.focus();
+    }
+  };
+
+  const approveFirst = () => {
+    if (pendingApproval !== null) {
+      answer(pendingApproval, true);
+    }
+  };
+
+  const denyFirst = () => {
+    if (pendingApproval !== null) {
+      answer(pendingApproval, false);
+    }
+  };
 
   return (
-    <main className="container">
-      <h1>Welcome to Tauri + React</h1>
-
-      <div className="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/vite.svg" className="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img src="/tauri.svg" className="logo tauri" alt="Tauri logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <p>Click on the Tauri, Vite, and React logos to learn more.</p>
-
-      <form
-        className="row"
-        onSubmit={(e) => {
-          e.preventDefault();
-          greet();
-        }}
-      >
-        <input
-          id="greet-input"
-          onChange={(e) => setName(e.currentTarget.value)}
-          placeholder="Enter a name..."
+    <div className="app">
+      <div className="terminal-area">
+        <TerminalView
+          keysToPty={route.keys === 'pty'}
+          onInput={handleTerminalInput}
+          onAltChange={(active) => dispatchInput({ type: 'alt', active })}
+          onIdleClick={() => setFocusToken((t) => t + 1)}
         />
-        <button type="submit">Greet</button>
-      </form>
-      <p>{greetMsg}</p>
-    </main>
+        <StatusChip
+          integration={integration}
+          observer={observer}
+          input={effective}
+          cwd={cwd}
+          autoApprove={autoApprove}
+          onToggleAutoApprove={toggleAutoApprove}
+        />
+      </div>
+      <Transcript
+        items={transcript.items}
+        busy={isBusy(transcript)}
+        open={transcriptOpen}
+        onToggle={() => setTranscriptOpen((o) => !o)}
+        onApprove={answer}
+      />
+      <InputBar
+        mode={barMode}
+        hint={route.hint}
+        hasPendingApproval={pendingApproval !== null}
+        focusToken={focusToken}
+        onShell={onShell}
+        onAgent={onAgent}
+        onInterrupt={() => sendRaw(CTRL_C)}
+        onApproveFirst={approveFirst}
+        onDenyFirst={denyFirst}
+        onClose={closeBar}
+      />
+    </div>
   );
 }
-
-export default App;

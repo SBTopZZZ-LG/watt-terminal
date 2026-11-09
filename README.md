@@ -1,7 +1,60 @@
-# Tauri + React + Typescript
+# agent-term
 
-This template should help get you started developing with Tauri, React and Typescript in Vite.
+A terminal where you and an AI agent share one persistent shell session. You run commands in the terminal as usual; the agent can see the same session (commands, output, screen, cwd) and can run commands in it. Built with Tauri v2, Rust, React and TypeScript, with xterm.js for rendering.
 
-## Recommended IDE Setup
+## Slice 1 scope
 
-- [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+- Local `zsh -l` only, started through an integration shim. The user's own dotfiles are read and never edited.
+- The agent is a mock (`MockAgent`): deterministic keyword rules, no network, no API key.
+- Read tools are always allowed. `run_command` needs approval each time unless the session's auto-approve toggle is on (off by default). It only runs at an idle prompt with shell integration live.
+- `send_keys` is a stub that returns an error.
+
+## Prerequisites
+
+- macOS
+- Rust (with `cargo`)
+- Node.js and npm
+- zsh (the default macOS shell)
+
+## Setup and running
+
+```sh
+npm install
+npm run tauri dev
+```
+
+To keep manual runs away from your real `~/.zsh_history`, use the isolated-history variant. `AGENT_TERM_HISTFILE` is a dev-only setting. When it is set, the shell's `HISTFILE` is that path. When it is unset, which is the default, the shell uses your own history file.
+
+```sh
+AGENT_TERM_HISTFILE=/tmp/agent-term-hist npm run tauri dev
+```
+
+## Input
+
+- Text starting with `!` is a shell command. It runs in the same session as a normal user command. The `!` and one optional space are removed, so `!ls` runs `ls`.
+- Any other text goes to the agent. For example, "what was the last command" or "run `pwd`". A `run` request shows an approval card before anything is typed into the shell.
+
+## Tests
+
+Frontend:
+
+```sh
+npm test
+npm run build
+```
+
+Backend:
+
+```sh
+cd src-tauri && cargo test
+```
+
+The Rust integration tests spawn real `zsh -l` sessions through the user's own startup files (`~/.zshenv`, `~/.zprofile`, `~/.zshrc`, `~/.zlogin`). They run with a temporary `HISTFILE` so the real `~/.zsh_history` is not written. Expect them to take about a minute, since they run one at a time.
+
+## Known limitations
+
+- Mock agent only. There is no LLM yet.
+- Local zsh only. No SSH.
+- No "integration lost" detection. An `exec zsh` or nested shell silently loses shell integration.
+- TUIs (alternate-screen apps such as `vim` or `less`) are rendered, but the agent can only read the screen. It cannot type into them, because `send_keys` is a stub.
+- Conversation is not persisted across app restarts.

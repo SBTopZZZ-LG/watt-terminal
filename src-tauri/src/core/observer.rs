@@ -91,6 +91,25 @@ impl ObsQueue {
         }
     }
 
+    /// Like `pop`, but gives up after `timeout` so the observer can check time-based transitions.
+    pub fn pop_timeout(&self, timeout: Duration) -> Option<ObsMsg> {
+        let deadline = Instant::now() + timeout;
+        let mut s = self.lock();
+        loop {
+            if let Some(msg) = s.q.pop_front() {
+                if let ObsMsg::Bytes(b) = &msg {
+                    s.queued_bytes -= b.len();
+                }
+                return Some(msg);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            s = self.cv.wait_timeout(s, deadline - now).unwrap_or_else(|e| e.into_inner()).0;
+        }
+    }
+
     /// (overflow_events, dropped_bytes)
     pub fn overflow_stats(&self) -> (u64, u64) {
         let s = self.lock();
@@ -149,6 +168,31 @@ pub struct ScreenSnapshot {
     pub alternate_screen: bool,
     /// (rows, cols)
     pub size: (u16, u16),
+}
+
+/// Session changes for listeners (the UI). Delivered in order, outside the core lock.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SessionEvent {
+    State { state: InputState },
+    Integration { status: IntegrationStatus },
+    Observer { status: ObserverStatus },
+    Cwd { cwd: Option<Cwd> },
+    RecordStarted { id: u64, command: String, source: Source },
+    RecordFinished { record: RecordSummary },
+}
+
+pub trait EventSink: Send + Sync {
+    fn event(&self, ev: SessionEvent);
+}
+
+/// The last values reported, so state and status events fire only on change.
+#[derive(Default)]
+struct Reported {
+    state: Option<InputState>,
+    integration: Option<IntegrationStatus>,
+    observer: Option<ObserverStatus>,
+    cwd: Option<Cwd>,
 }
 
 // ---------- vt100 callbacks ----------
@@ -235,6 +279,9 @@ pub struct Core {
     cwd: Option<Cwd>,
     records: VecDeque<Record>,
     next_id: u64,
+    /// Events raised since the last `take_events`.
+    events: Vec<SessionEvent>,
+    reported: Reported,
 }
 
 /// Keeps at most this many completed records in memory. The oldest are dropped first.
@@ -256,7 +303,40 @@ impl Core {
             cwd: None,
             records: VecDeque::new(),
             next_id: 1,
+            events: Vec::new(),
+            reported: Reported::default(),
         }
+    }
+
+    /// Returns the events raised since the last call, including state and status changes. With
+    /// `deliver` false (no listener yet) the queued record events are dropped and nothing is reported,
+    /// so a listener attached later still gets the current state.
+    pub fn take_events(&mut self, deliver: bool) -> Vec<SessionEvent> {
+        if !deliver {
+            self.events.clear();
+            return Vec::new();
+        }
+        let mut out = std::mem::take(&mut self.events);
+        let state = self.lifecycle_view();
+        if self.reported.state != Some(state) {
+            self.reported.state = Some(state);
+            out.push(SessionEvent::State { state });
+        }
+        let integration = self.integration_status();
+        if self.reported.integration != Some(integration) {
+            self.reported.integration = Some(integration);
+            out.push(SessionEvent::Integration { status: integration });
+        }
+        let observer = self.observer_status();
+        if self.reported.observer != Some(observer) {
+            self.reported.observer = Some(observer);
+            out.push(SessionEvent::Observer { status: observer });
+        }
+        if self.reported.cwd != self.cwd {
+            self.reported.cwd = self.cwd.clone();
+            out.push(SessionEvent::Cwd { cwd: self.cwd.clone() });
+        }
+        out
     }
 
     pub fn apply(&mut self, msg: ObsMsg) {
@@ -383,6 +463,7 @@ impl Core {
         self.next_id += 1;
         let cwd = self.cwd.clone();
         let shell_pid = self.shell_pid;
+        self.events.push(SessionEvent::RecordStarted { id, command: command.clone(), source: source.clone() });
         let cb = self.parser.callbacks_mut();
         let start_abs = cb.scrolled_total + u64::from(crow);
         cb.open = Some(OpenRecord {
@@ -447,6 +528,7 @@ impl Core {
         record.raw_head = raw_head;
         record.raw_tail = raw_tail;
         record.raw_truncated = raw_truncated;
+        self.events.push(SessionEvent::RecordFinished { record: RecordSummary::from(&record) });
         self.records.push_back(record);
         while self.records.len() > MAX_RECORDS {
             self.records.pop_front();
@@ -542,20 +624,51 @@ impl Core {
 /// The core behind a session's locks. The writer, the observer thread, and the API all lock it.
 pub struct Shared {
     pub core: Mutex<Core>,
+    /// Held while events are taken and delivered, so listeners see them in the order they were raised.
+    dispatch: Mutex<()>,
+    sink: Mutex<Option<Arc<dyn EventSink>>>,
 }
 
 impl Shared {
+    pub fn new(core: Core) -> Self {
+        Shared { core: Mutex::new(core), dispatch: Mutex::new(()), sink: Mutex::new(None) }
+    }
+
     pub fn lock(&self) -> MutexGuard<'_, Core> {
         self.core.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    /// Installs the listener and delivers the current state to it.
+    pub fn set_sink(&self, sink: Arc<dyn EventSink>) {
+        *self.sink.lock().unwrap_or_else(|e| e.into_inner()) = Some(sink);
+        self.flush();
+    }
+
+    /// Delivers pending events. Never called with the core lock held.
+    pub fn flush(&self) {
+        let _order = self.dispatch.lock().unwrap_or_else(|e| e.into_inner());
+        let sink = self.sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let events = self.lock().take_events(sink.is_some());
+        if let Some(sink) = sink {
+            for ev in events {
+                sink.event(ev);
+            }
+        }
+    }
 }
+
+/// How often the observer wakes without bytes, so time-based transitions (Booting to Raw, a submit timing out) are reported.
+pub const OBSERVER_TICK: Duration = Duration::from_millis(100);
 
 /// Runs until the queue delivers Eof.
 pub fn run_observer(queue: Arc<ObsQueue>, shared: Arc<Shared>) {
     loop {
-        let msg = queue.pop();
-        let eof = matches!(msg, ObsMsg::Eof);
-        shared.lock().apply(msg);
+        let msg = queue.pop_timeout(OBSERVER_TICK);
+        let eof = matches!(msg, Some(ObsMsg::Eof));
+        if let Some(msg) = msg {
+            shared.lock().apply(msg);
+        }
+        shared.flush();
         if eof {
             break;
         }

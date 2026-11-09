@@ -1,150 +1,23 @@
-//! Real-PTY tests. Each session runs `zsh -l` through the shim with the user's real startup files.
-//! zsh with oh-my-zsh's `share_history` appends every command to HISTFILE, so each test session gets
-//! a temporary real ZDOTDIR whose wrapper files source the user's own $HOME files and then point
-//! HISTFILE into a temp directory. The user's real history file is never written by these tests.
-//! Sessions are killed with SIGKILL on drop. Tests run one at a time (a global lock) so timing
-//! assertions are not disturbed by each other.
+//! Real-PTY tests for the session core. Each test runs `zsh -l` through the shim with a temporary real
+//! ZDOTDIR (see common/mod.rs), so the user's history file is never touched.
+
+mod common;
 
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::ops::Deref;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
-use std::sync::{Arc, Barrier, Mutex, MutexGuard, Weak};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Barrier, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use agent_term_lib::core::observer::{InputState, IntegrationStatus, ObserverStatus, ScreenSnapshot};
-use agent_term_lib::core::pty::OutputSink;
-use agent_term_lib::core::record::{Cwd, Record, RecordStatus, Source};
+use agent_term_lib::core::observer::{InputState, IntegrationStatus, ObserverStatus};
+use agent_term_lib::core::record::{Cwd, RecordStatus, Source};
 use agent_term_lib::core::session::{Session, SpawnConfig, SubmitError};
 use agent_term_lib::core::shim;
 
-static SERIAL: Mutex<()> = Mutex::new(());
-static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-
-fn serial() -> MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-struct ChanSink(mpsc::Sender<Vec<u8>>);
-
-impl OutputSink for ChanSink {
-    fn output(&mut self, bytes: &[u8]) {
-        let _ = self.0.send(bytes.to_vec());
-    }
-}
-
-fn unique_name(tag: &str) -> PathBuf {
-    let n = NEXT_ID.fetch_add(1, Ordering::SeqCst);
-    std::env::temp_dir().join(format!("agent-term-test-{}-{n}-{tag}", std::process::id()))
-}
-
-/// Temporary real ZDOTDIR: wrapper files that source the user's own $HOME files, then point HISTFILE at a temp file.
-fn make_real_home() -> PathBuf {
-    let dir = unique_name("zdot");
-    fs::create_dir_all(&dir).expect("create real zdotdir");
-    let source = |name: &str| format!("[[ -r \"$HOME/{name}\" ]] && source \"$HOME/{name}\"\n");
-    fs::write(dir.join(".zshenv"), source(".zshenv")).expect("write");
-    fs::write(dir.join(".zprofile"), source(".zprofile")).expect("write");
-    fs::write(dir.join(".zlogin"), source(".zlogin")).expect("write");
-    let mut rc = source(".zshrc");
-    rc.push_str(&format!("HISTFILE='{}'\n", dir.join(".zsh_history").display()));
-    fs::write(dir.join(".zshrc"), rc).expect("write");
-    dir
-}
-
-/// A running session plus its temporary real ZDOTDIR. Dropping it kills the shell, then removes the directory.
-pub struct Harness {
-    session: Option<Arc<Session>>,
-    home: PathBuf,
-}
-
-impl Harness {
-    fn arc(&self) -> Arc<Session> {
-        self.session.clone().expect("session")
-    }
-}
-
-impl Deref for Harness {
-    type Target = Session;
-    fn deref(&self) -> &Session {
-        self.session.as_ref().expect("session")
-    }
-}
-
-impl Drop for Harness {
-    fn drop(&mut self) {
-        drop(self.session.take());
-        let _ = fs::remove_dir_all(&self.home);
-    }
-}
-
-/// Starts a session. A renderer thread receives every output chunk, runs `hook` on it, and acks it.
-/// The renderer holds only a Weak reference, so dropping the Harness tears the session down.
-fn start_with_hook(hook: Option<Box<dyn FnMut(&[u8]) + Send>>) -> Harness {
-    let home = make_real_home();
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
-    let id = format!("t{}", NEXT_ID.fetch_add(1, Ordering::SeqCst));
-    let cfg = SpawnConfig { rows: 30, cols: 120, real_zdotdir: Some(home.clone()) };
-    let session = Arc::new(Session::spawn(&id, cfg, Box::new(ChanSink(tx))).expect("spawn session"));
-    let weak: Weak<Session> = Arc::downgrade(&session);
-    thread::spawn(move || {
-        let mut hook = hook;
-        for chunk in rx {
-            if let Some(h) = hook.as_mut() {
-                h(&chunk);
-            }
-            if let Some(s) = weak.upgrade() {
-                s.ack(chunk.len());
-            }
-        }
-    });
-    Harness { session: Some(session), home }
-}
-
-fn start() -> Harness {
-    start_with_hook(None)
-}
-
-fn wait_until<T>(timeout: Duration, mut f: impl FnMut() -> Option<T>) -> Option<T> {
-    let end = Instant::now() + timeout;
-    loop {
-        if let Some(v) = f() {
-            return Some(v);
-        }
-        if Instant::now() >= end {
-            return None;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-}
-
-fn wait_state(s: &Session, want: InputState, timeout: Duration) -> bool {
-    wait_until(timeout, || (s.state() == want).then_some(())).is_some()
-}
-
-fn wait_prompt(s: &Session) {
-    assert!(wait_state(s, InputState::Prompt, Duration::from_secs(20)), "never reached prompt; state={:?}", s.state());
-}
-
-/// Submits `cmd` at a prompt, waits for its D, then for the next prompt. Returns the completed record.
-fn run(s: &Session, cmd: &str) -> Record {
-    wait_prompt(s);
-    s.submit(Source::User, cmd).expect("submit at prompt");
-    let id = wait_until(Duration::from_secs(20), || {
-        s.records().iter().find(|r| r.command == cmd && r.exit_code.is_some()).map(|r| r.id)
-    })
-    .unwrap_or_else(|| panic!("no finished record for {cmd:?}; records={:?}", s.records()));
-    wait_prompt(s);
-    s.get_record(id).expect("record by id")
-}
-
-fn snapshot(s: &Session) -> ScreenSnapshot {
-    s.screen_snapshot()
-}
+use common::*;
 
 #[test]
 fn hello_and_first_prompt_within_5s() {
@@ -244,17 +117,6 @@ fn forged_untagged_d_is_rejected_and_does_not_finish_the_record() {
     assert_eq!(r.exit_code, Some(0));
     assert_eq!(r.output, "forged-done");
 }
-
-/// Waits for an already-submitted command to finish, then for the prompt.
-fn run_finish(s: &Session, cmd: &str) -> Record {
-    let id = wait_until(Duration::from_secs(20), || {
-        s.records().iter().find(|r| r.command == cmd && r.exit_code.is_some()).map(|r| r.id)
-    })
-    .unwrap_or_else(|| panic!("command did not finish: {cmd:?}"));
-    wait_prompt(s);
-    s.get_record(id).expect("record")
-}
-
 #[test]
 fn submit_is_refused_while_a_command_runs() {
     let _g = serial();
@@ -448,6 +310,99 @@ fn drop_removes_shim_dir_and_kills_shell() {
         .map(|st| st.success())
         .unwrap_or(false);
     assert!(!alive, "shell pid {pid} still alive after drop");
+}
+
+/// Regression for the pump's closed-gate path (pty.rs). Dropping a session while output is still in flight
+/// must not hang. With `break` on a closed gate, the reader stopped draining the master while Session::drop
+/// waited for the shell, and POC 4 saw about half of the 2 MiB-buffered cycles hang.
+#[test]
+fn drop_while_output_is_in_flight_never_hangs() {
+    let _g = serial();
+    // Cycles 0-4: submit and drop at once, renderer acking. Cycles 5-9: the renderer stops acking, so 2 MiB
+    // piles up and the gate is closed (paused) when the drop happens.
+    for cycle in 0..10 {
+        drop_while_in_flight(cycle, cycle >= 5);
+    }
+}
+
+fn drop_while_in_flight(cycle: usize, stalled: bool) {
+    let tag = format!("drop-inflight-{cycle}");
+    let home = make_real_home();
+    let shim_dir = shim::dir_for(&tag);
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let cfg = SpawnConfig { rows: 30, cols: 120, real_zdotdir: Some(home.clone()), histfile: None };
+    let s = Arc::new(Session::spawn(&tag, cfg, Box::new(ChanSink(tx))).expect("spawn session"));
+
+    // Renderer: counts bytes and acks them unless stalled. It holds a Weak, so the test owns the Session.
+    let received = Arc::new(AtomicUsize::new(0));
+    let stall = Arc::new(AtomicBool::new(false));
+    {
+        let (weak, received, stall) = (Arc::downgrade(&s), received.clone(), stall.clone());
+        thread::spawn(move || {
+            for chunk in rx {
+                received.fetch_add(chunk.len(), Ordering::SeqCst);
+                if !stall.load(Ordering::SeqCst) {
+                    if let Some(s) = weak.upgrade() {
+                        s.ack(chunk.len());
+                    }
+                }
+            }
+        });
+    }
+
+    wait_prompt(&s);
+    let pid = s.shell_pid();
+    stall.store(stalled, Ordering::SeqCst);
+    s.submit(Source::User, "yes | head -c 5000000").expect("submit");
+    if stalled {
+        let got = wait_until(Duration::from_secs(20), || (received.load(Ordering::SeqCst) >= 2 << 20).then_some(()));
+        assert!(got.is_some(), "cycle {cycle}: 2 MiB of output never arrived");
+        thread::sleep(Duration::from_millis(300));
+    }
+
+    // The drop runs on a helper thread so a hang shows up as a timeout instead of blocking the test runner.
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    thread::spawn(move || {
+        drop(s);
+        let _ = done_tx.send(());
+    });
+    if done_rx.recv_timeout(Duration::from_secs(10)).is_err() {
+        // Leave nothing running: kill the stuck shell's children, then the shell, by pid (never by name).
+        if let Some(pid) = pid {
+            let pid = pid.to_string();
+            let _ = Command::new("pkill").args(["-KILL", "-P", &pid]).status();
+            let _ = Command::new("kill").args(["-KILL", &pid]).status();
+        }
+        let _ = done_rx.recv_timeout(Duration::from_secs(5));
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&shim_dir);
+        panic!("cycle {cycle} (stalled={stalled}): Session::drop did not return within 10 s; shell pid {pid:?} was killed");
+    }
+    let _ = fs::remove_dir_all(&home);
+    assert!(!shim_dir.exists(), "cycle {cycle}: shim dir left behind");
+}
+
+/// AGENT_TERM_HISTFILE (dev only): the shell's HISTFILE is the requested path, and nothing reaches the real history.
+#[test]
+fn histfile_override_is_applied_and_real_history_untouched() {
+    let _g = serial();
+    let real_hist = PathBuf::from(std::env::var("HOME").expect("HOME")).join(".zsh_history");
+    let before = meta_of(&real_hist);
+    let want = unique_name("histfile-override");
+    let marker = format!("override-marker-{}", std::process::id());
+    let s = start_with_histfile(&want);
+    let r = run(&s, "print -r -- $HISTFILE");
+    assert_eq!(r.output, want.display().to_string());
+    run(&s, &format!("echo {marker}"));
+    // fc -W writes the in-memory history to HISTFILE, so the override file must hold the marker.
+    run(&s, "fc -W");
+    drop(s);
+    let written = fs::read_to_string(&want).unwrap_or_default();
+    let _ = fs::remove_file(&want);
+    assert!(written.contains(&marker), "override file does not contain the marker; file={written:?}");
+    assert_eq!(meta_of(&real_hist), before, "real ~/.zsh_history changed during the test");
+    let real_text = fs::read_to_string(&real_hist).unwrap_or_default();
+    assert!(!real_text.contains(&marker), "marker reached the real ~/.zsh_history");
 }
 
 /// Verifies the renderer's byte stream: BEGIN marker, then exactly `total` pattern bytes, then END.

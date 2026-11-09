@@ -144,7 +144,9 @@ fn pump(rx: Receiver<ReadMsg>, gate: Arc<Gate>, sink: &mut dyn OutputSink, queue
             }
         }
         if !gate.wait_for_room() {
-            break;
+            // Closed (session teardown): keep draining until EOF, so a dying shell can flush its tty and exit,
+            // but send nothing more.
+            continue;
         }
         sink.output(&batch);
         gate.sent(batch.len());
