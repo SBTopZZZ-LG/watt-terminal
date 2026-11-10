@@ -16,7 +16,10 @@ export type TestState = { kind: 'running' } | { kind: 'done'; result: TestResult
 
 export interface ProviderEditorProps {
   draft: ProviderDraft;
-  /** What is saved, or null for a provider not saved yet. The dirty marker and the save guard compare to it. */
+  /**
+   * The baseline the draft is compared with: what is saved, or for a provider not saved yet, the draft it started from. Null
+   * means no baseline, which counts as unsaved. The dirty marker and the save guard compare to it.
+   */
   saved: ProviderDraft | null;
   problems: DraftProblems;
   /** The ids of the other providers, for the id rules of a new provider. */
@@ -76,24 +79,26 @@ export function ProviderEditor(p: ProviderEditorProps) {
   const [newModel, setNewModel] = useState('');
   const { draft } = p;
   const dirty = isDirty(draft, p.saved);
+  // A provider not saved yet is pending even when untouched: fetch, test and save all wait for its first save.
+  const pending = draft.isNew || dirty;
   const busy = p.saving || p.fetching;
   const off = p.locked || busy;
   const set = (patch: Partial<ProviderDraft>) => p.onChange({ ...draft, ...patch });
 
   // Fetching and testing work on the saved provider, so they need it saved and unchanged.
   const unsavedReason = draft.isNew ? NEEDS_SAVE_FIRST : NEEDS_SAVE_CHANGES;
-  const fetchBlock = dirty
+  const fetchBlock = pending
     ? unsavedReason
     : modelsUrlFor(draft) === null
       ? 'This provider has no model list URL. Set one above and save.'
       : null;
-  const testBlock = dirty ? unsavedReason : null;
+  const testBlock = pending ? unsavedReason : null;
 
   const keyLocal = isLocalHttp(draft.chat_url);
   const keyInputShown = !draft.clearKey && (!draft.storedKey || draft.keyEditing);
   const newModelId = newModel.trim();
   const newModelTaken = draft.models.some((m) => m.id === newModelId);
-  const saveBlocked = off || !dirty || hasProblems(p.problems);
+  const saveBlocked = off || !pending || hasProblems(p.problems);
 
   const setHeader = (key: string, patch: Partial<HeaderDraft>) =>
     set({ headers: draft.headers.map((h) => (h.key === key ? { ...h, ...patch } : h)) });
@@ -390,7 +395,7 @@ export function ProviderEditor(p: ProviderEditorProps) {
                   </label>
                   <button
                     type="button"
-                    disabled={off || dirty}
+                    disabled={off || pending}
                     aria-label={`Test ${m.id}`}
                     title={testBlock ?? 'Send one short test message to this model'}
                     onClick={() => p.onTest(m.id)}

@@ -121,6 +121,18 @@ export function parsePositiveInt(text: string): number | null {
   return n >= 1 && n <= U32_MAX ? n : null;
 }
 
+/** What a commit of the global context limit does: refuse the text, leave the saved limit alone, or send `value`. */
+export type LimitCommit = { kind: 'invalid' } | { kind: 'unchanged' } | { kind: 'send'; value: number | null };
+
+/** Reads the typed global context limit against the saved one. Blank means no limit (null). */
+export function limitCommit(text: string, saved: number | null): LimitCommit {
+  if (text.trim() !== '' && parsePositiveInt(text) === null) {
+    return { kind: 'invalid' };
+  }
+  const value = parsePositiveInt(text);
+  return value === saved ? { kind: 'unchanged' } : { kind: 'send', value };
+}
+
 /** A slug for a provider id from its name: lower case, a-z 0-9 and '-', at most 40 characters, unique among takenIds. */
 export function slugify(name: string, takenIds: readonly string[]): string {
   const base = name
@@ -286,7 +298,10 @@ export function buildSaveInput(draft: ProviderDraft): SaveProviderInput {
   };
 }
 
-/** Whether the draft differs from what is saved. A new provider is always unsaved. */
+/**
+ * Whether the draft differs from its baseline: what is saved, or for a provider not saved yet, the draft it started from (a
+ * blank one or a preset). With no baseline (null) the draft counts as unsaved.
+ */
 export function isDirty(draft: ProviderDraft, saved: ProviderDraft | null): boolean {
   if (saved === null) {
     return true;

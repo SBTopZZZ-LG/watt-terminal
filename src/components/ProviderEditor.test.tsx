@@ -250,6 +250,19 @@ describe('ProviderEditor: validation and save', () => {
     expect(out).toContain('Unsaved changes');
   });
 
+  it('an untouched new provider has no unsaved marker and can be saved, and fetch still says save first', () => {
+    const fresh = draftFromPreset(
+      { key: 'custom', label: 'Custom', provider: { ...PROVIDER, id: 'custom', name: 'Custom' }, needs_key: false, note: '' },
+      [],
+    );
+    const out = html({ draft: fresh, saved: fresh });
+    expect(out).not.toContain('Unsaved changes');
+    expect(buttonText(out, 'Save provider')).not.toContain('disabled');
+    const fetch = buttonText(out, 'Fetch models');
+    expect(fetch).toContain('disabled=""');
+    expect(fetch).toContain('Save the provider first.');
+  });
+
   it('a save error from the backend is shown verbatim, as an alert', () => {
     const out = html({
       draft: { ...SAVED, stream: false },

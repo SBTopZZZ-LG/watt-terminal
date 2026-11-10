@@ -73,12 +73,33 @@ describe('HistoryContent: groups and rows', () => {
     expect(out).toContain('>alpha</span>');
   });
 
-  it('workspace mode shows the root in the heading, and the time on each row, with no chip', () => {
+  it('workspace mode shows the root in the heading, and no chip', () => {
     const out = html({ groupBy: 'workspace', groups: groupsFor(METAS, 'workspace', NOW) });
     expect(out).toContain('class="history-root"');
     expect(out).toContain('/Users/me/alpha');
     expect(out).not.toContain('class="history-chip"');
-    expect(out).toContain('09:00');
+  });
+
+  it('both modes give each row the message count and the relative time, and the absolute date in its title', () => {
+    for (const groupBy of ['date', 'workspace'] as const) {
+      const out = html({ groupBy, groups: groupsFor(METAS, groupBy, NOW) });
+      expect(out).toContain('<span>4 messages</span><span>3h ago</span>');
+      expect(out).toContain('<span>1 message</span><span>16h ago</span>');
+      expect(out).toContain('\nNov 10, 2026 09:00"');
+      expect(out).toContain('\nNov 9, 2026 20:00"');
+    }
+  });
+
+  it('the date is not repeated in the row meta, in either mode', () => {
+    for (const groupBy of ['date', 'workspace'] as const) {
+      const out = html({ groupBy, groups: groupsFor(METAS, groupBy, NOW) });
+      const meta = out.match(/<span class="history-meta">.*?<\/span><\/button>/g) ?? [];
+      expect(meta).toHaveLength(2);
+      for (const m of meta) {
+        expect(m).not.toMatch(/Nov \d/);
+        expect(m).not.toContain('09:00');
+      }
+    }
   });
 
   it('message counts are singular for one and plural otherwise', () => {
@@ -107,7 +128,7 @@ describe('HistoryContent: groups and rows', () => {
 
   it('the filter box is a labelled search input with its placeholder', () => {
     const out = html({ query: 'build' });
-    expect(out).toContain('placeholder="Filter conversations"');
+    expect(out).toContain('placeholder="Filter"');
     expect(out).toContain('aria-label="Filter conversations"');
     expect(out).toContain('value="build"');
   });
@@ -172,7 +193,7 @@ describe('HistoryContent: current conversation and busy rows', () => {
   it('when idle the open buttons are enabled, with the title and root', () => {
     const out = html();
     expect(out).not.toMatch(/class="history-open"[^>]*disabled/);
-    expect(out).toContain('title="Fix the build\n/Users/me/alpha"');
+    expect(out).toContain('title="Fix the build\n/Users/me/alpha\nNov 10, 2026 09:00"');
   });
 
   it('while one conversation is opening the others are disabled and it says so', () => {

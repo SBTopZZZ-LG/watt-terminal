@@ -9,9 +9,9 @@ import {
   draftNew,
   fetchSummaryText,
   isDirty,
+  limitCommit,
   modelOptions,
   modelRefKey,
-  parsePositiveInt,
   validateDraft,
 } from '../lib/settingsForm';
 import type { ProviderDraft } from '../lib/settingsForm';
@@ -27,6 +27,7 @@ export interface EditorState {
   /** The saved provider's id, or null for a provider not saved yet (shown at the end of the list). */
   forId: string | null;
   draft: ProviderDraft;
+  /** The baseline the draft is compared with: the saved provider, or the draft a new provider started from. */
   saved: ProviderDraft | null;
   saving: boolean;
   saveError: string | null;
@@ -358,6 +359,21 @@ export function SettingsDialog({ onClose, onChanged }: SettingsDialogProps) {
   // Focus goes back to the opener when the dialog is unmounted.
   useEffect(() => () => restoreFocus(opener), [opener]);
 
+  // Focus is lost when the focused control unmounts itself (Keep editing, Remove, Retry) or is disabled while busy. The
+  // browser then puts it on <body> without a focusin, so the listener above never sees it, and Esc would do nothing. After
+  // each render, a dialog with no usable focus takes it itself, so Esc and Tab work at once. The check waits for a timer:
+  // a commit from a blur (Tab out of the limit field) renders while the browser is still moving focus, when activeElement
+  // is <body>, and an immediate check would take the focus from the control Tab is moving to.
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      const active = document.activeElement;
+      if (!active || active === document.body || !active.isConnected || active.matches(':disabled')) {
+        dialogRef.current?.focus({ preventScroll: true });
+      }
+    }, 0);
+    return () => window.clearTimeout(timer);
+  });
+
   const applyView = (v: SettingsView) => setLoad({ kind: 'ready', view: v });
 
   const requestClose = () => {
@@ -429,27 +445,36 @@ export function SettingsDialog({ onClose, onChanged }: SettingsDialogProps) {
     );
   };
 
+  // A commit in flight blocks the next one. The field is disabled while busy, and the blur that follows the focus moving off
+  // it would otherwise send the same value again before the first call has come back. A ref, since state lags a render.
+  const limitInFlight = useRef(false);
+
   const commitLimit = (text: string) => {
-    if (view === null) {
+    if (view === null || limitInFlight.current) {
       return;
     }
-    if (text.trim() !== '' && parsePositiveInt(text) === null) {
+    const plan = limitCommit(text, view.settings.global_context_limit);
+    if (plan.kind === 'invalid') {
       setLimit((l) => ({ ...l, error: LIMIT_ERROR }));
       return;
     }
-    const value = parsePositiveInt(text);
-    if (value === view.settings.global_context_limit) {
+    if (plan.kind === 'unchanged') {
       setLimit((l) => ({ ...l, error: null }));
       return;
     }
+    limitInFlight.current = true;
     setLimit((l) => ({ ...l, busy: true, error: null }));
-    api.setGlobalContextLimit(value).then(
+    api.setGlobalContextLimit(plan.value).then(
       (v) => {
+        limitInFlight.current = false;
         applyView(v);
         setLimit({ text: limitText(v), error: null, busy: false });
         onChanged();
       },
-      (e: unknown) => setLimit((l) => ({ ...l, busy: false, error: errorText(e) })),
+      (e: unknown) => {
+        limitInFlight.current = false;
+        setLimit((l) => ({ ...l, busy: false, error: errorText(e) }));
+      },
     );
   };
 
@@ -494,7 +519,8 @@ export function SettingsDialog({ onClose, onChanged }: SettingsDialogProps) {
       }
       draft = draftFromPreset(preset, taken);
     }
-    setEditor(newEditor(null, draft, null));
+    // A new provider's baseline is the draft it starts from, so it is clean until something is typed or added.
+    setEditor(newEditor(null, draft, draft));
     setNotice(null);
   };
 

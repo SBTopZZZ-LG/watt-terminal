@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import type { KeyboardEvent } from 'react';
 import { api, errorText } from '../lib/api';
-import { filterMetas, formatWhen, groupByDate, groupByWorkspace, relativeTime } from '../lib/historyView';
+import { filterMetas, groupByDate, groupByWorkspace, relativeTime } from '../lib/historyView';
 import type { ConversationMeta, HistoryGroupBy, LoadedConversation } from '../lib/types';
 
 /** A delete waiting for its second click: one row, or the whole history. */
@@ -30,6 +30,15 @@ export function groupsFor(metas: ConversationMeta[], groupBy: HistoryGroupBy, no
 
 function messageCount(n: number): string {
   return n === 1 ? '1 message' : `${n} messages`;
+}
+
+const MONTHS_SHORT = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+/** The absolute local date and time, for a row's title: "Nov 10, 2026 09:00". */
+function absoluteWhen(ts: number): string {
+  const d = new Date(ts * 1000);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${MONTHS_SHORT[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
 export interface HistoryContentProps {
@@ -78,7 +87,7 @@ export function HistoryContent(p: HistoryContentProps) {
         <input
           type="search"
           className="history-filter"
-          placeholder="Filter conversations"
+          placeholder="Filter"
           aria-label="Filter conversations"
           value={p.query}
           onChange={(e) => p.onQuery(e.target.value)}
@@ -211,17 +220,15 @@ function HistoryRow({ meta, groupBy, now, isCurrent, busy, opening, anyOpening, 
         className="history-open"
         disabled={busy || anyOpening}
         aria-current={isCurrent ? 'true' : undefined}
-        title={busy ? BUSY_TITLE : [title, root].filter((s) => s !== '').join('\n')}
+        title={busy ? BUSY_TITLE : [title, root, absoluteWhen(meta.updated_at)].filter((s) => s !== '').join('\n')}
         onClick={() => onOpen(meta.id)}
       >
         <span className="history-title">{title}</span>
         <span className="history-meta">
-          {groupBy === 'date' ? (
+          {groupBy === 'date' && (
             <span className="history-chip" title={root === '' ? undefined : root}>
               {meta.workspace.label}
             </span>
-          ) : (
-            <span>{formatWhen(meta.updated_at, now)}</span>
           )}
           <span>{messageCount(meta.message_count)}</span>
           <span>{relativeTime(meta.updated_at, now)}</span>

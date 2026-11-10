@@ -11,7 +11,9 @@ import {
   isLocalHttp,
   modelOptions,
   modelRefKey,
+  limitCommit,
   modelsUrlFor,
+  newHeaderDraft,
   parsePositiveInt,
   slugify,
   urlProblem,
@@ -58,6 +60,26 @@ describe('parsePositiveInt', () => {
     for (const text of ['', '   ', '0', '-1', '1.5', '1e3', 'abc', '12px', '4294967296']) {
       expect(parsePositiveInt(text), text).toBeNull();
     }
+  });
+});
+
+describe('limitCommit', () => {
+  it('refuses text that is neither blank nor a whole number of at least 1', () => {
+    for (const text of ['0', '-3', 'abc', '1.5']) {
+      expect(limitCommit(text, null), text).toEqual({ kind: 'invalid' });
+    }
+  });
+
+  it('leaves the saved limit alone when the text matches it, blank included', () => {
+    expect(limitCommit('12000', 12000)).toEqual({ kind: 'unchanged' });
+    expect(limitCommit(' 12000 ', 12000)).toEqual({ kind: 'unchanged' });
+    expect(limitCommit('', null)).toEqual({ kind: 'unchanged' });
+  });
+
+  it('sends the new value, or null when the text is cleared', () => {
+    expect(limitCommit('15000', 12000)).toEqual({ kind: 'send', value: 15000 });
+    expect(limitCommit('7', null)).toEqual({ kind: 'send', value: 7 });
+    expect(limitCommit('', 12000)).toEqual({ kind: 'send', value: null });
   });
 });
 
@@ -142,6 +164,31 @@ describe('preset and new drafts', () => {
     const d = withName(saved(), 'Renamed', []);
     expect(d.id).toBe('acme');
     expect(d.name).toBe('Renamed');
+  });
+
+  it('an untouched new draft, blank or from a preset, is clean against the draft it started from', () => {
+    const fromPreset = draftFromPreset(preset, ['openrouter']);
+    expect(isDirty(fromPreset, fromPreset)).toBe(false);
+    const blank = draftNew();
+    expect(isDirty(blank, blank)).toBe(false);
+  });
+
+  it('any edit to an untouched new draft makes it dirty: name, URL, typed key, header, model', () => {
+    const start = draftFromPreset(preset, ['openrouter']);
+    expect(isDirty(withName(start, 'OpenRouter Two', ['openrouter']), start)).toBe(true);
+    expect(isDirty({ ...start, chat_url: 'https://openrouter.ai/api/v2/chat/completions' }, start)).toBe(true);
+    expect(isDirty({ ...start, apiKey: 'sk-live' }, start)).toBe(true);
+    expect(isDirty({ ...start, headers: [...start.headers, newHeaderDraft()] }, start)).toBe(true);
+    expect(isDirty({ ...start, models: [{ id: 'gpt', source: 'custom', context_limit: '', provider_context: null }] }, start)).toBe(
+      true,
+    );
+  });
+
+  it('typing a name and typing it back is clean again', () => {
+    const start = draftFromPreset(preset, ['openrouter']);
+    const typed = withName(start, 'Other', ['openrouter']);
+    expect(isDirty(typed, start)).toBe(true);
+    expect(isDirty(withName(typed, 'OpenRouter', ['openrouter']), start)).toBe(false);
   });
 });
 
@@ -266,7 +313,7 @@ describe('buildSaveInput: numbers, URLs and blanks', () => {
 });
 
 describe('isDirty', () => {
-  it('a new provider is always unsaved', () => {
+  it('with no baseline (null), a draft counts as unsaved', () => {
     expect(isDirty(draftNew(), null)).toBe(true);
   });
 
