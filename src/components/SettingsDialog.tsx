@@ -376,7 +376,14 @@ export function SettingsDialog({ onClose, onChanged }: SettingsDialogProps) {
 
   const applyView = (v: SettingsView) => setLoad({ kind: 'ready', view: v });
 
+  // A save in flight: closing now would offer to discard a change that is being saved, and would drop its result. Esc, the
+  // backdrop and Close are ignored until it settles.
+  const saving = editor?.saving === true;
+
   const requestClose = () => {
+    if (saving) {
+      return;
+    }
     if (dirty) {
       setAskClose(true);
       return;
@@ -535,6 +542,7 @@ export function SettingsDialog({ onClose, onChanged }: SettingsDialogProps) {
     }
     const input = buildSaveInput(editor.draft);
     const id = input.provider.id;
+    setAskClose(false);
     setEditor({ ...editor, saving: true, saveError: null });
     api.saveProvider(input).then(
       (v) => {
@@ -716,7 +724,7 @@ export function SettingsDialog({ onClose, onChanged }: SettingsDialogProps) {
               </button>
             </>
           ) : (
-            <button type="button" onClick={requestClose}>
+            <button type="button" disabled={saving} onClick={requestClose}>
               Close
             </button>
           )}

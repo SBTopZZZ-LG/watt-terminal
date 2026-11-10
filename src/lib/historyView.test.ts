@@ -8,6 +8,8 @@ import {
   itemsFromMessages,
   NO_RESULT_TEXT,
   relativeTime,
+  safeText,
+  UNKNOWN_DATE,
 } from './historyView';
 import type { ChatMessage, ConversationMeta, Workspace } from './types';
 
@@ -201,6 +203,16 @@ describe('groupByDate', () => {
     expect(groupByDate([meta('a', now + 3600)], now)[0].label).toBe('Today');
   });
 
+  it('a time that cannot be read is in one last group, "Unknown date", and never a NaN label', () => {
+    const groups = groupByDate(
+      [meta('bad', Number.NaN), meta('inf', Number.POSITIVE_INFINITY), meta('huge', 1e20), meta('today', local(2026, 10, 10, 9))],
+      now,
+    );
+    expect(groups.map((g) => g.label)).toEqual(['Today', UNKNOWN_DATE]);
+    expect(groups[1].items.map((m) => m.id)).toEqual(['bad', 'inf', 'huge']);
+    expect(groups.every((g) => !g.label.includes('NaN') && !g.key.includes('NaN'))).toBe(true);
+  });
+
   it('omits empty groups and orders the months newest first', () => {
     const groups = groupByDate([meta('a', local(2025, 11, 20)), meta('b', local(2026, 0, 4)), meta('c', local(2026, 4, 1))], now);
     expect(groups.map((g) => g.label)).toEqual(['May 2026', 'January 2026', 'December 2025']);
@@ -290,6 +302,11 @@ describe('formatWhen', () => {
   it('adds the year for another year', () => {
     expect(formatWhen(local(2025, 10, 8, 14, 0), now)).toBe('Nov 8, 2025');
   });
+
+  it('a time that cannot be read is "Unknown date"', () => {
+    expect(formatWhen(Number.NaN, now)).toBe(UNKNOWN_DATE);
+    expect(formatWhen(1e20, now)).toBe(UNKNOWN_DATE);
+  });
 });
 
 describe('relativeTime', () => {
@@ -299,6 +316,20 @@ describe('relativeTime', () => {
     expect(relativeTime(now, now)).toBe('just now');
     expect(relativeTime(now - 59, now)).toBe('just now');
     expect(relativeTime(now + 30, now)).toBe('just now');
+    expect(relativeTime(now + 60, now)).toBe('just now');
+  });
+
+  it('a time more than a minute ahead is the absolute time, not "just now"', () => {
+    const ahead = now + 3600;
+    expect(relativeTime(ahead, now)).toBe(formatWhen(ahead, now));
+    expect(relativeTime(ahead, now)).not.toBe('just now');
+    expect(relativeTime(now + 61, now)).toBe(formatWhen(now + 61, now));
+  });
+
+  it('a time that cannot be read is "Unknown date", never NaN', () => {
+    expect(relativeTime(Number.NaN, now)).toBe(UNKNOWN_DATE);
+    expect(relativeTime(now, Number.NaN)).toBe(UNKNOWN_DATE);
+    expect(relativeTime(1e20, now)).toBe(UNKNOWN_DATE);
   });
 
   it('is minutes, then hours, then days, under a week', () => {
@@ -311,6 +342,31 @@ describe('relativeTime', () => {
   it('is the clock time from a week on', () => {
     const old = now - 7 * 86400;
     expect(relativeTime(old, now)).toBe(formatWhen(old, now));
+  });
+});
+
+describe('safeText', () => {
+  it('leaves ordinary text, and emoji with joiners, unchanged', () => {
+    expect(safeText('Fix the build')).toBe('Fix the build');
+    expect(safeText('ünïcode 日本語')).toBe('ünïcode 日本語');
+    // ZWJ (U+200D) and ZWNJ (U+200C) are needed by emoji sequences and some scripts, so they stay.
+    expect(safeText('👩‍💻')).toBe('👩‍💻');
+    expect(safeText('ب‌ا')).toBe('ب‌ا');
+  });
+
+  it('removes each bidi control and invisible format character', () => {
+    for (const cp of [0x200b, 0x200e, 0x200f, 0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2060, 0x2066, 0x2067, 0x2068, 0x2069, 0xfeff]) {
+      const ch = String.fromCodePoint(cp);
+      expect(safeText(`a${ch}b`)).toBe('ab');
+    }
+  });
+
+  it('a right-to-left override in a title does not reverse the text that follows it', () => {
+    expect(safeText('evil‮gnirts')).toBe('evilgnirts');
+  });
+
+  it('control characters become spaces, so words do not run together', () => {
+    expect(safeText('line one\ntwo\u0007three')).toBe('line one two three');
   });
 });
 

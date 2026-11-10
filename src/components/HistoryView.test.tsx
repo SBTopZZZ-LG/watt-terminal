@@ -166,6 +166,23 @@ describe('HistoryContent: states', () => {
     expect(out).toContain('role="alert"');
     expect(out).toContain('the agent is working');
   });
+
+  it('loading, empty and no-match states are status regions, so a screen reader announces them', () => {
+    expect(html({ load: { kind: 'loading' }, groups: [] })).toMatch(/role="status"[^>]*>Loading conversations/);
+    expect(html({ load: { kind: 'ready', metas: [], now: NOW }, groups: [] })).toMatch(/role="status"[^>]*>No saved conversations yet/);
+    expect(html({ query: 'nope', groups: [] })).toMatch(/role="status"[^>]*>No conversations match/);
+  });
+
+  it('a stored title with bidi or invisible characters is shown without them, and not as an empty title', () => {
+    const odd = meta('t3', 'evil‮gnirts​', local(2026, 10, 10, 8), ALPHA);
+    const out = html({ load: { kind: 'ready', metas: [odd], now: NOW }, groups: groupsFor([odd], 'date', NOW) });
+    expect(out).toContain('evilgnirts<');
+    expect(out).not.toContain('‮');
+    expect(out).not.toContain('​');
+    const blank = meta('t4', '​‮', local(2026, 10, 10, 8), ALPHA);
+    const blankOut = html({ load: { kind: 'ready', metas: [blank], now: NOW }, groups: groupsFor([blank], 'date', NOW) });
+    expect(blankOut).toContain('>Untitled conversation<');
+  });
 });
 
 describe('HistoryContent: current conversation and busy rows', () => {
@@ -180,12 +197,13 @@ describe('HistoryContent: current conversation and busy rows', () => {
     expect(html({ currentId: 'ses_missing' })).not.toContain('history-current');
   });
 
-  it('while the agent is busy every open button is disabled, with the reason as its title', () => {
+  it('while the agent is busy every open button is aria-disabled (still focusable), with the reason as its title', () => {
     const out = html({ busy: true });
     const buttons = out.match(/<button[^>]*class="history-open"[^>]*>/g) ?? [];
     expect(buttons).toHaveLength(2);
     for (const b of buttons) {
-      expect(b).toContain('disabled=""');
+      expect(b).toContain('aria-disabled="true"');
+      expect(b).not.toMatch(/\sdisabled(=|\s|>)/);
       expect(b).toContain('Wait for the agent to finish');
     }
   });
@@ -200,7 +218,7 @@ describe('HistoryContent: current conversation and busy rows', () => {
     const out = html({ opening: 't1' });
     expect(out).toContain('Opening...');
     const buttons = out.match(/<button[^>]*class="history-open"[^>]*>/g) ?? [];
-    expect(buttons.every((b) => b.includes('disabled=""'))).toBe(true);
+    expect(buttons.every((b) => b.includes('aria-disabled="true"'))).toBe(true);
   });
 
   it('busy does not disable the delete buttons', () => {

@@ -452,9 +452,14 @@ input {
   min-height: 0;
 }
 
+/*
+ * The body keeps at least 120px, or half the transcript when that is less. It gives way first when the panel is short
+ * (shrink factor 100, against 1 for the todo panel and the header): an expanded todo list then keeps its room until the body
+ * is at its floor, and only then does the list shrink. A shrink factor below 1 would be scaled down by flexbox, so it is not used.
+ */
 .agent-panel.is-sized .transcript-body {
-  flex: 1 1 auto;
-  min-height: 0;
+  flex: 1 100 auto;
+  min-height: min(120px, 50%);
   max-height: none;
 }
 
@@ -481,17 +486,6 @@ input {
   flex-wrap: wrap;
 }
 
-/* The header wraps: the title and the dock buttons on the first line, New conversation on the second, to the right. */
-.agent-panel.dock-left .transcript-header,
-.agent-panel.dock-right .transcript-header {
-  flex-wrap: wrap;
-  row-gap: 2px;
-}
-
-.agent-panel.dock-left .transcript-new,
-.agent-panel.dock-right .transcript-new {
-  margin-left: auto;
-}
 
 /* Collapsed side panel: a 32px rail with one button. The children stay mounted, hidden. */
 .agent-rail {
@@ -615,8 +609,11 @@ input {
   cursor: pointer;
 }
 
+/* The header wraps in every dock: at a narrow width the buttons go to a further line, so New conversation is never clipped. */
 .transcript-header {
   display: flex;
+  flex-wrap: wrap;
+  row-gap: 2px;
   align-items: center;
   padding-right: 12px;
 }
@@ -633,6 +630,7 @@ input {
 
 .transcript-new {
   flex: 0 0 auto;
+  margin-left: auto;
   padding: 2px 8px;
   border: 1px dashed var(--rule);
   border-radius: 2px;
@@ -793,8 +791,11 @@ input {
  * The todo panel, pinned above the body (see TodoPanel.tsx). One line collapsed, the list below when expanded. Tokens only,
  * and no animation, so prefers-reduced-motion has nothing to stop. Text wraps inside the list and ellipsises in the summary.
  */
+/* Collapsed, the panel keeps its line (it never shrinks under its toggle). Expanded, it can shrink, and its list gives way. */
 .todo-panel {
+  display: flex;
   flex: 0 0 auto;
+  flex-direction: column;
   min-width: 0;
   padding: 0 12px;
   border-bottom: 1px dashed var(--rule);
@@ -803,6 +804,7 @@ input {
 
 .todo-toggle {
   display: flex;
+  flex: 0 0 auto;
   align-items: center;
   gap: 8px;
   width: 100%;
@@ -835,6 +837,12 @@ input {
   color: var(--ink);
 }
 
+/* Expanded, the panel can shrink: the body takes the squeeze first (see .agent-panel.is-sized .transcript-body), then the list. */
+.todo-panel.expanded {
+  flex: 0 1 auto;
+  min-height: 0;
+}
+
 /* Everything completed: the summary drops to the dim colour, so it reads as a note rather than a task. */
 .todo-panel.all-done .todo-summary {
   color: var(--muted);
@@ -850,8 +858,13 @@ input {
   transform: none;
 }
 
-/* Capped, with its own scroll, so a long list does not take the transcript. */
+/*
+ * Capped, with its own scroll, so a long list does not take the transcript. It is a shrinkable flex child: in a sized panel
+ * it gives up room to the body (whose min-height keeps the messages visible), and scrolls inside what it keeps.
+ */
 .todo-list {
+  flex: 0 1 auto;
+  min-height: 0;
   margin: 0;
   padding: 0 0 6px;
   list-style: none;
@@ -1735,7 +1748,7 @@ input {
   cursor: pointer;
 }
 
-.history-open:hover:not(:disabled) {
+.history-open:hover:not([aria-disabled="true"]) {
   border-color: var(--rule);
   background: var(--tint);
 }
@@ -1745,7 +1758,7 @@ input {
   outline-offset: 1px;
 }
 
-.history-open:disabled {
+.history-open[aria-disabled="true"] {
   color: var(--muted);
   cursor: default;
   opacity: 0.6;

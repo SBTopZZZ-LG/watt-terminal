@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import type { KeyboardEvent } from 'react';
 import { api, errorText } from '../lib/api';
-import { filterMetas, groupByDate, groupByWorkspace, relativeTime } from '../lib/historyView';
-import type { ConversationMeta, HistoryGroupBy, LoadedConversation } from '../lib/types';
+import { filterMetas, groupByDate, groupByWorkspace, relativeTime, safeText, UNKNOWN_DATE } from '../lib/historyView';
+import type { ConversationMeta, HistoryGroupBy } from '../lib/types';
 
 /** A delete waiting for its second click: one row, or the whole history. */
 export type Confirm = { kind: 'row'; id: string } | { kind: 'all' };
@@ -37,6 +37,9 @@ const MONTHS_SHORT = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'S
 /** The absolute local date and time, for a row's title: "Nov 10, 2026 09:00". */
 function absoluteWhen(ts: number): string {
   const d = new Date(ts * 1000);
+  if (!Number.isFinite(d.getTime())) {
+    return UNKNOWN_DATE;
+  }
   const pad = (n: number) => String(n).padStart(2, '0');
   return `${MONTHS_SHORT[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
@@ -51,7 +54,7 @@ export interface HistoryContentProps {
   now: number;
   /** The live conversation's id: its row is marked. */
   currentId: string | null;
-  /** The agent is working: rows are disabled, since a conversation cannot be opened then. */
+  /** The agent is working: rows are disabled (aria-disabled, so the reason stays reachable), since a conversation cannot be opened then. */
   busy: boolean;
   /** The conversation being loaded, if any. */
   opening: string | null;
@@ -85,6 +88,7 @@ export function HistoryContent(p: HistoryContentProps) {
     <div className="history-view" onKeyDown={onKeyDown}>
       <div className="history-toolbar">
         <input
+          id="history-filter"
           type="search"
           className="history-filter"
           placeholder="Filter"
@@ -135,7 +139,11 @@ export function HistoryContent(p: HistoryContentProps) {
 
 function ListBody(p: HistoryContentProps) {
   if (p.load.kind === 'loading') {
-    return <div className="history-state">Loading conversations...</div>;
+    return (
+      <div className="history-state" role="status">
+        Loading conversations...
+      </div>
+    );
   }
   if (p.load.kind === 'error') {
     return (
@@ -148,15 +156,24 @@ function ListBody(p: HistoryContentProps) {
     );
   }
   if (p.load.metas.length === 0) {
-    return <div className="history-state">No saved conversations yet.</div>;
+    return (
+      <div className="history-state" role="status">
+        No saved conversations yet.
+      </div>
+    );
   }
   if (p.groups.length === 0) {
-    return <div className="history-state">No conversations match &quot;{p.query.trim()}&quot;.</div>;
+    return (
+      <div className="history-state" role="status">
+        No conversations match &quot;{p.query.trim()}&quot;.
+      </div>
+    );
   }
   return (
     <>
       {p.groups.map((group) => {
         const expanded = !p.collapsed.has(group.key);
+        const sub = safeText(group.sub);
         return (
           <section key={group.key} className="history-group">
             <button
@@ -165,8 +182,8 @@ function ListBody(p: HistoryContentProps) {
               aria-expanded={expanded}
               onClick={() => p.onToggleGroup(group.key)}
             >
-              <span className="history-group-label">{group.label}</span>
-              {group.sub !== '' && <span className="history-root">{group.sub}</span>}
+              <span className="history-group-label">{safeText(group.label)}</span>
+              {sub !== '' && <span className="history-root">{sub}</span>}
               <span className="history-count">{group.items.length}</span>
             </button>
             {expanded && (
@@ -211,23 +228,31 @@ interface RowProps {
 }
 
 function HistoryRow({ meta, groupBy, now, isCurrent, busy, opening, anyOpening, confirmingDelete, onOpen, onConfirm, onDelete }: RowProps) {
-  const title = meta.title === '' ? 'Untitled conversation' : meta.title;
-  const root = meta.workspace.root;
+  const shownTitle = safeText(meta.title).trim();
+  const title = shownTitle === '' ? 'Untitled conversation' : shownTitle;
+  const root = safeText(meta.workspace.root);
+  const label = safeText(meta.workspace.label);
+  // A blocked row stays focusable (aria-disabled, not disabled), so keyboard users reach its title that says why.
+  const blocked = busy || anyOpening;
   return (
     <li className={`history-row${isCurrent ? ' is-current' : ''}`}>
       <button
         type="button"
         className="history-open"
-        disabled={busy || anyOpening}
+        aria-disabled={blocked ? true : undefined}
         aria-current={isCurrent ? 'true' : undefined}
         title={busy ? BUSY_TITLE : [title, root, absoluteWhen(meta.updated_at)].filter((s) => s !== '').join('\n')}
-        onClick={() => onOpen(meta.id)}
+        onClick={() => {
+          if (!blocked) {
+            onOpen(meta.id);
+          }
+        }}
       >
         <span className="history-title">{title}</span>
         <span className="history-meta">
           {groupBy === 'date' && (
             <span className="history-chip" title={root === '' ? undefined : root}>
-              {meta.workspace.label}
+              {label}
             </span>
           )}
           <span>{messageCount(meta.message_count)}</span>
@@ -270,16 +295,29 @@ interface HistoryViewProps {
   busy: boolean;
   groupBy: HistoryGroupBy;
   onGroupBy(groupBy: HistoryGroupBy): void;
-  /** A conversation was opened: the caller makes it the live transcript and leaves the view. */
-  onOpened(loaded: LoadedConversation): void;
+  /**
+   * Opens a conversation as the live one. Resolves with the reason it was not opened, or null when it was (the caller then
+   * shows the chat, and the view unmounts).
+   */
+  onOpen(id: string): Promise<string | null>;
+  /** The live conversation was deleted: the caller resets the chat, since the backend started a new one. */
+  onLiveDeleted(): void;
   onClose(): void;
+}
+
+/** Moves focus to the filter when nothing else has it (the focused control of a delete is gone by then). */
+function focusFilterIfLost() {
+  const active = document.activeElement;
+  if (active === null || active === document.body) {
+    document.getElementById('history-filter')?.focus();
+  }
 }
 
 /**
  * The History view with its state: the list (loaded on mount, so each visit refreshes it), the filter, the collapsed groups,
  * the pending delete, and the open and delete calls. Failures are shown in the view and never block the chat.
  */
-export function HistoryView({ currentId, busy, groupBy, onGroupBy, onOpened, onClose }: HistoryViewProps) {
+export function HistoryView({ currentId, busy, groupBy, onGroupBy, onOpen, onLiveDeleted, onClose }: HistoryViewProps) {
   const [load, setLoad] = useState<LoadState>({ kind: 'loading' });
   const [attempt, setAttempt] = useState(0);
   const [query, setQuery] = useState('');
@@ -328,24 +366,35 @@ export function HistoryView({ currentId, busy, groupBy, onGroupBy, onOpened, onC
   const open = (id: string) => {
     setOpening(id);
     setActionError(null);
-    api
-      .loadConversation(id)
-      .then(
-        (loaded) => onOpened(loaded),
-        (e: unknown) => setActionError(errorText(e)),
-      )
+    onOpen(id)
+      .then((refusal) => {
+        if (refusal !== null) {
+          setActionError(refusal);
+        }
+      })
       .finally(() => setOpening(null));
   };
 
   const removeMetas = (keep: (m: ConversationMeta) => boolean) =>
     setLoad((s) => (s.kind === 'ready' ? { ...s, metas: s.metas.filter(keep) } : s));
 
+  // A refused delete (the agent is busy) shows its reason and changes nothing. A delete that reset the live conversation
+  // tells the caller, which resets the chat to match the backend.
   const deleteOne = (id: string) => {
     setConfirm(null);
     setActionError(null);
     api.deleteConversation(id).then(
-      () => removeMetas((m) => m.id !== id),
-      (e: unknown) => setActionError(errorText(e)),
+      (result) => {
+        removeMetas((m) => m.id !== id);
+        if (result.deleted_live) {
+          onLiveDeleted();
+        }
+        focusFilterIfLost();
+      },
+      (e: unknown) => {
+        setActionError(errorText(e));
+        focusFilterIfLost();
+      },
     );
   };
 
@@ -353,8 +402,17 @@ export function HistoryView({ currentId, busy, groupBy, onGroupBy, onOpened, onC
     setConfirm(null);
     setActionError(null);
     api.deleteAllConversations().then(
-      () => removeMetas(() => false),
-      (e: unknown) => setActionError(errorText(e)),
+      (result) => {
+        removeMetas(() => false);
+        if (result.deleted_live) {
+          onLiveDeleted();
+        }
+        focusFilterIfLost();
+      },
+      (e: unknown) => {
+        setActionError(errorText(e));
+        focusFilterIfLost();
+      },
     );
   };
 

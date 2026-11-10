@@ -77,6 +77,9 @@ export default function App() {
   const uiLoaded = useRef<Promise<UiState | null> | null>(null);
   const uiReady = useRef(false);
   const restoring = useRef(false);
+  // Counts the UI's own changes to the live conversation or the transcript: a send, a new conversation, an open. A load
+  // that was started before a change compares it when it returns, so a late result never lands on a newer state.
+  const epoch = useRef(0);
 
   /** Saves a UI state change to the file, once the file has been reconciled. Before that, the change is only in localStorage. */
   const persist = (patch: UiStatePatch) => {
@@ -133,6 +136,11 @@ export default function App() {
     api.getStatus().then(applyStatus).catch(reportError);
   };
 
+  /** Reads only the live conversation's id again. The busy state stays the transcript's own, so a send still in transit is not lost. */
+  const syncConversationId = () => {
+    api.getStatus().then((s) => setConversationId(s.conversation_id)).catch(reportError);
+  };
+
   // The UI state file: read once, reconciled with the localStorage values, and kept in step after that. The file wins when it
   // has a valid value; a missing value is filled in from localStorage (see uiState.ts). With no file (no store), nothing changes.
   useEffect(() => {
@@ -175,7 +183,9 @@ export default function App() {
   useEffect(() => {
     /**
      * Reopens the last conversation when the transcript is empty and no turn is running (so a send cannot race it). A failure
-     * (not found, unreadable) forgets the last conversation, quietly. Nothing is shown.
+     * (not found, unreadable) forgets the last conversation, quietly. Nothing is shown. If the user acted while the load was
+     * running (a send, a new conversation, an open), their state stands: the restored messages are not shown, and the status
+     * is read again so the live conversation id matches the backend.
      */
     const restoreLast = async (status: Status) => {
       if (restoring.current) {
@@ -188,12 +198,14 @@ export default function App() {
       if (lastId === null || !shouldRestoreLast({ lastId, itemCount: current.items.length, transcriptBusy: isBusy(current), statusBusy: status.agent_busy })) {
         return;
       }
+      const started = epoch.current;
       try {
         const loaded = await api.loadConversation(lastId);
-        if (transcriptRef.current.items.length > 0) {
-          // The user sent a message while the load was running. The transcript is theirs now.
+        if (epoch.current !== started || transcriptRef.current.items.length > 0) {
+          syncConversationId();
           return;
         }
+        epoch.current += 1;
         dispatchTranscript({ type: 'conversation_loaded', items: itemsFromMessages(loaded.messages), todos: loaded.todos });
         setConversationId(loaded.id);
       } catch {
@@ -363,6 +375,7 @@ export default function App() {
   };
 
   const onAgent = async (text: string): Promise<string | null> => {
+    epoch.current += 1;
     clientIds.current += 1;
     const clientId = clientIds.current;
     // Added before the call, so the user's line lands above the agent's replies.
@@ -380,6 +393,7 @@ export default function App() {
   // Clears the agent's conversation. The backend refuses while the agent is busy; the button is also disabled then. On
   // error the reason is shown in the transcript, and the conversation stays as it was.
   const newConversation = () => {
+    epoch.current += 1;
     api.newConversation().then(
       () => {
         dispatchTranscript({ type: 'conversation_reset' });
@@ -390,11 +404,38 @@ export default function App() {
     );
   };
 
-  /** A saved conversation was opened from the History view: it becomes the live transcript, and the chat is shown. */
-  const openConversation = (loaded: LoadedConversation) => {
+  /**
+   * A saved conversation was opened from the History view: it becomes the live transcript, and the chat is shown with the
+   * input focused. The backend refuses the load while the agent is busy. A send, a new conversation or another open that
+   * happened while this one loaded is not overwritten: the result is refused, and the status is read again.
+   * Resolves with the reason it was refused, or null when it was opened.
+   */
+  const openConversation = async (id: string): Promise<string | null> => {
+    const started = epoch.current;
+    let loaded: LoadedConversation;
+    try {
+      loaded = await api.loadConversation(id);
+    } catch (e) {
+      return errorText(e);
+    }
+    if (epoch.current !== started || isBusy(transcriptRef.current)) {
+      syncConversationId();
+      return 'The chat changed while this conversation was loading, so it was not opened. Open it again.';
+    }
+    epoch.current += 1;
     dispatchTranscript({ type: 'conversation_loaded', items: itemsFromMessages(loaded.messages), todos: loaded.todos });
     setConversationId(loaded.id);
     setPanelBody('chat');
+    setFocusToken((t) => t + 1);
+    refreshStatus();
+    return null;
+  };
+
+  /** The live conversation was deleted from the History view: the backend started a new one, so the chat is reset to match. */
+  const liveDeleted = () => {
+    epoch.current += 1;
+    dispatchTranscript({ type: 'conversation_reset' });
+    setConversationId(null);
     refreshStatus();
   };
 
@@ -560,7 +601,8 @@ export default function App() {
                     busy={busy}
                     groupBy={historyGroupBy}
                     onGroupBy={setGroupBy}
-                    onOpened={openConversation}
+                    onOpen={openConversation}
+                    onLiveDeleted={liveDeleted}
                     onClose={closeHistory}
                   />
                 ) : null

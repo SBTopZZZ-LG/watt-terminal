@@ -28,6 +28,24 @@ const MONTHS_SHORT = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'S
 
 const DAY_S = 86_400;
 
+/** The label for a time that cannot be shown (not a finite number, or out of Date's range). Never "NaN" on screen. */
+export const UNKNOWN_DATE = 'Unknown date';
+
+/** The local Date for a Unix-seconds time, or null when it is not a usable time. */
+function dateOf(ts: number): Date | null {
+  const d = new Date(ts * 1000);
+  return Number.isFinite(d.getTime()) ? d : null;
+}
+
+/** Control characters become spaces. Bidi overrides and marks and the other invisible format characters are removed. ZWJ and ZWNJ (U+200D, U+200C) stay: emoji and some scripts need them. */
+const CONTROL_CHARS = /\p{Cc}/gu;
+const INVISIBLE_FORMAT = /[\u200B\u200E\u200F\u202A-\u202E\u2060\u2066-\u2069\uFEFF]/g;
+
+/** Text as a History row or a title attribute shows it: stored titles, workspace labels and paths can hold these characters. */
+export function safeText(text: string): string {
+  return text.replace(CONTROL_CHARS, ' ').replace(INVISIBLE_FORMAT, '');
+}
+
 /** The text of a message's content. Strings pass through; null and missing give ''; anything else is shown as JSON. */
 function textOf(content: unknown): string {
   if (typeof content === 'string') {
@@ -162,7 +180,7 @@ export interface DateGroup {
  * The history grouped by when each conversation was last updated, in local time: Today, Yesterday, Previous 7 days, then one
  * group per calendar month ("November 2026"). Previous 7 days is the seven days before yesterday: from local midnight eight days
  * back, up to yesterday's midnight. Anything older is by month. Groups with no conversations are left out. Newest first.
- * An update time after `now` (clock skew) counts as today.
+ * An update time after `now` (clock skew) counts as today. A time that cannot be read is in a last group, "Unknown date".
  */
 export function groupByDate(metas: ConversationMeta[], now: number): DateGroup[] {
   const nowMs = now * 1000;
@@ -170,10 +188,16 @@ export function groupByDate(metas: ConversationMeta[], now: number): DateGroup[]
   const yesterday = dayStart(nowMs, -1);
   const weekStart = dayStart(nowMs, -8);
   const groups = new Map<string, DateGroup>();
+  const unknown: ConversationMeta[] = [];
   for (const meta of newestFirst(metas)) {
     const ms = meta.updated_at * 1000;
     let key: string;
     let label: string;
+    if (dateOf(meta.updated_at) === null) {
+      // No usable time: kept apart, in a group of its own at the end.
+      unknown.push(meta);
+      continue;
+    }
     if (ms >= today) {
       key = 'today';
       label = 'Today';
@@ -195,7 +219,11 @@ export function groupByDate(metas: ConversationMeta[], now: number): DateGroup[]
       groups.set(key, { key, label, items: [meta] });
     }
   }
-  return [...groups.values()];
+  const out = [...groups.values()];
+  if (unknown.length > 0) {
+    out.push({ key: 'unknown', label: UNKNOWN_DATE, items: unknown });
+  }
+  return out;
 }
 
 export interface WorkspaceGroup {
@@ -244,8 +272,11 @@ export function filterMetas(metas: ConversationMeta[], query: string): Conversat
 
 /** A clock time in local time: "HH:MM" for the same day, "Nov 8" for the same year, else "Nov 8, 2025". */
 export function formatWhen(ts: number, now: number): string {
-  const d = new Date(ts * 1000);
-  const n = new Date(now * 1000);
+  const d = dateOf(ts);
+  const n = dateOf(now);
+  if (d === null || n === null) {
+    return UNKNOWN_DATE;
+  }
   if (d.getFullYear() === n.getFullYear() && d.getMonth() === n.getMonth() && d.getDate() === n.getDate()) {
     return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
   }
@@ -254,11 +285,17 @@ export function formatWhen(ts: number, now: number): string {
 }
 
 /**
- * How long ago, in short words: "just now" under a minute, "5m ago", "3h ago", and "2d ago" under a week. Older, or in the
- * future, it is formatWhen (future times show as "just now" when they are less than a minute ahead).
+ * How long ago, in short words: "just now" under a minute, "5m ago", "3h ago", and "2d ago" under a week. Older, or more than
+ * a minute in the future, it is formatWhen. A time a little ahead (clock skew, under a minute) is "just now".
  */
 export function relativeTime(ts: number, now: number): string {
+  if (!Number.isFinite(ts) || !Number.isFinite(now)) {
+    return UNKNOWN_DATE;
+  }
   const diff = now - ts;
+  if (diff < -60) {
+    return formatWhen(ts, now);
+  }
   if (diff < 60) {
     return 'just now';
   }
