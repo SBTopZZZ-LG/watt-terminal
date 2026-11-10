@@ -17,8 +17,8 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize}
 use serde::Serialize;
 
 use crate::core::observer::{
-    run_observer, CallStatus, Core, EventSink, InputState, IntegrationStatus, ObsMsg, ObsQueue, ObserverStatus,
-    ScreenSnapshot, Shared,
+    run_observer, Activity, CallStatus, Core, EventSink, InputState, IntegrationStatus, ObsMsg, ObsQueue,
+    ObserverStatus, ScreenSnapshot, Shared,
 };
 use crate::core::pty::{self, Gate, OutputSink};
 use crate::core::record::{Cwd, Record, RecordSummary, Source};
@@ -230,6 +230,11 @@ impl Session {
     /// apart, so a poll built from them can see the two halves of a change at different times.
     pub fn call_status(&self, call_id: &str, input_wait: Duration) -> CallStatus {
         self.shared.lock().call_status(call_id, input_wait)
+    }
+
+    /// The shell state, the screen generation and the newest finished record, from one lock read. A wait polls this.
+    pub fn activity(&self) -> Activity {
+        self.shared.lock().activity()
     }
 
     pub fn get_record(&self, id: u64) -> Option<Record> {

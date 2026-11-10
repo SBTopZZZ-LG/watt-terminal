@@ -4,6 +4,7 @@
 //! refused unless the session is at an idle prompt with shell integration live. `send_keys` is a stub.
 //! Approval is not checked here; `agent::AgentCtx::call_tool` asks for it before calling these methods.
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -23,6 +24,15 @@ pub const DEFAULT_RUN_TIMEOUT: Duration = Duration::from_secs(30);
 /// `NotRun { WaitingForInput }`. Short enough to report promptly, long enough that a multi-line command passing
 /// through PS2 for a moment is not cut off.
 pub const WAITING_FOR_INPUT_AFTER: Duration = Duration::from_secs(2);
+/// The longest one `wait` call may last, and the length when the model gives no `seconds`.
+pub const MAX_WAIT_SECONDS: u64 = 120;
+pub const DEFAULT_WAIT_SECONDS: u64 = 10;
+/// The waiting one turn may do in total. Past it, `wait` returns an error without waiting.
+pub const MAX_WAIT_PER_TURN: Duration = Duration::from_secs(30 * 60);
+/// After a screen change, `wait` returns once the screen has been quiet for `WAIT_QUIET`, or `WAIT_BURST` after the
+/// first change, whichever comes first. So the snapshot is not a frame that is still being drawn.
+const WAIT_QUIET: Duration = Duration::from_millis(300);
+const WAIT_BURST: Duration = Duration::from_millis(1500);
 const RUN_POLL: Duration = Duration::from_millis(25);
 const DEFAULT_LIST: usize = 10;
 const DEFAULT_LIMIT: usize = 4096;
@@ -81,6 +91,35 @@ pub enum RunOutcome {
     NotRun { reason: NotRunReason },
 }
 
+/// Why a `wait` returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitReason {
+    /// The shell was at an idle prompt when the wait began, so there was nothing to wait for.
+    Idle,
+    /// The session exited, when the wait began or while it ran.
+    SessionExited,
+    /// A command finished while the wait ran. `record` carries it.
+    CommandFinished,
+    /// The visible screen changed (not reported with `ignore_updates`).
+    ScreenChanged,
+    /// The time ran out and nothing above happened.
+    Timeout,
+    /// The turn was cancelled.
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WaitView {
+    pub reason: WaitReason,
+    pub waited_ms: u64,
+    pub state: InputState,
+    pub screen: ScreenView,
+    /// The command that finished, for `CommandFinished`. Serialized like `RunOutcome::Finished`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record: Option<Record>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolSchema {
     pub name: &'static str,
@@ -96,6 +135,9 @@ pub trait AgentTools {
     fn get_screen(&self) -> ScreenView;
     fn get_cwd(&self) -> Option<Cwd>;
     fn run_command(&self, command: &str, timeout: Duration) -> Result<RunOutcome, String>;
+    /// Waits up to `seconds` (already clamped to 1..=MAX_WAIT_SECONDS) for the shell to do something worth reporting. See
+    /// `WaitReason`. Counts against the turn's wait budget, not the command limit.
+    fn wait(&self, seconds: u64, ignore_updates: bool) -> Result<WaitView, String>;
     /// Whether `run_command` would already be refused for text the user typed on the prompt. Checked before the approval
     /// card, so the user is not asked to approve a command that will be refused. Writes nothing.
     fn run_command_precheck(&self) -> Result<(), String> {
@@ -115,6 +157,15 @@ pub trait AgentTools {
             }
             "get_screen" => to_json(self.get_screen()),
             "get_cwd" => to_json(self.get_cwd()),
+            "wait" => {
+                let (seconds, note) = wait_seconds_arg(args);
+                let ignore_updates = bool_arg(args, "ignore_updates", false)?;
+                let mut value = to_json(self.wait(seconds, ignore_updates)?)?;
+                if let Some(note) = note {
+                    value["note"] = json!(note);
+                }
+                Ok(value)
+            }
             "run_command" => {
                 let command = str_arg(args, "command")?;
                 to_json(self.run_command(command, DEFAULT_RUN_TIMEOUT)?)
@@ -130,23 +181,38 @@ pub trait AgentTools {
     }
 }
 
-/// The tools over one live session.
+/// The tools over one live session. The agent makes one per turn, so the wait budget below is per turn.
 pub struct SessionTools<'a> {
     session: &'a Session,
     /// The continuation wait `run_command` uses. `WAITING_FOR_INPUT_AFTER` unless a test overrides it.
     input_wait: Duration,
     /// When set, `run_command` checks it while it waits and before it sends anything.
     cancel: Option<Arc<TurnCancel>>,
+    /// The most `wait` may spend through this value. `MAX_WAIT_PER_TURN` unless a test overrides it.
+    wait_budget: Duration,
+    /// Time spent in `wait` through this value so far.
+    wait_used: Cell<Duration>,
 }
 
 impl<'a> SessionTools<'a> {
     pub fn new(session: &'a Session) -> Self {
-        SessionTools { session, input_wait: WAITING_FOR_INPUT_AFTER, cancel: None }
+        SessionTools::with_input_wait(session, WAITING_FOR_INPUT_AFTER)
     }
 
     /// Like `new`, with a different continuation wait. For tests.
     pub fn with_input_wait(session: &'a Session, input_wait: Duration) -> Self {
-        SessionTools { session, input_wait, cancel: None }
+        SessionTools {
+            session,
+            input_wait,
+            cancel: None,
+            wait_budget: MAX_WAIT_PER_TURN,
+            wait_used: Cell::new(Duration::ZERO),
+        }
+    }
+
+    /// Like `new`, with a different per-turn wait budget. For tests.
+    pub fn with_wait_budget(self, budget: Duration) -> Self {
+        SessionTools { wait_budget: budget, ..self }
     }
 
     /// Lets the turn's cancel stop `run_command`'s wait. A cancelled call returns `NotRun { Cancelled }` within one poll.
@@ -250,6 +316,20 @@ impl AgentTools for SessionTools<'_> {
         }
     }
 
+    fn wait(&self, seconds: u64, ignore_updates: bool) -> Result<WaitView, String> {
+        let used = self.wait_used.get();
+        if used >= self.wait_budget {
+            return Err(format!(
+                "wait budget for this turn is used up ({} s of waiting); stop waiting and report what you have",
+                used.as_secs()
+            ));
+        }
+        let started = Instant::now();
+        let view = self.wait_for(seconds, ignore_updates, started);
+        self.wait_used.set(used + started.elapsed());
+        Ok(view)
+    }
+
     fn run_command_precheck(&self) -> Result<(), String> {
         if self.session.user_typed_since_prompt() {
             Err(user_text_refusal())
@@ -260,6 +340,69 @@ impl AgentTools for SessionTools<'_> {
 
     fn send_keys(&self, _bytes: &[u8]) -> Result<(), String> {
         Err("send_keys is disabled in slice 1".into())
+    }
+}
+
+impl SessionTools<'_> {
+    /// The wait itself. An idle prompt or an exited session returns at once. Otherwise the first of these ends it:
+    /// the turn is cancelled, the session exits, a command finishes (the shell back at its prompt with a newer record),
+    /// the screen changes (unless `ignore_updates`, and then after its quiet period), or the time runs out.
+    fn wait_for(&self, seconds: u64, ignore_updates: bool, started: Instant) -> WaitView {
+        let deadline = started + Duration::from_secs(seconds);
+        let start = self.session.activity();
+        let (reason, finished) = match start.state {
+            InputState::Prompt => (WaitReason::Idle, None),
+            InputState::Exited => (WaitReason::SessionExited, None),
+            _ => {
+                // The first and the latest time the screen was seen to change, since the wait began.
+                let mut changed: Option<(Instant, Instant)> = None;
+                let mut seen_gen = start.screen_gen;
+                loop {
+                    let now = Instant::now();
+                    let act = self.session.activity();
+                    if self.cancelled() {
+                        break (WaitReason::Cancelled, None);
+                    }
+                    if act.state == InputState::Exited {
+                        break (WaitReason::SessionExited, None);
+                    }
+                    if act.last_record_id > start.last_record_id && act.state == InputState::Prompt {
+                        break (WaitReason::CommandFinished, Some(act.last_record_id));
+                    }
+                    if act.screen_gen != seen_gen {
+                        seen_gen = act.screen_gen;
+                        changed = Some(match changed {
+                            Some((first, _)) => (first, now),
+                            None => (now, now),
+                        });
+                    }
+                    let settled = changed.is_some_and(|(first, last)| {
+                        now.duration_since(last) >= WAIT_QUIET || now.duration_since(first) >= WAIT_BURST
+                    });
+                    if !ignore_updates && settled {
+                        break (WaitReason::ScreenChanged, None);
+                    }
+                    if now >= deadline {
+                        // A change seen before the deadline is reported, not lost to the timeout.
+                        let reason = if !ignore_updates && changed.is_some() {
+                            WaitReason::ScreenChanged
+                        } else {
+                            WaitReason::Timeout
+                        };
+                        break (reason, None);
+                    }
+                    thread::sleep(RUN_POLL);
+                }
+            }
+        };
+        let screen = self.get_screen();
+        WaitView {
+            reason,
+            waited_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            state: screen.state,
+            screen,
+            record: finished.and_then(|id| self.session.get_record(id)),
+        }
     }
 }
 
@@ -296,6 +439,17 @@ pub fn schemas() -> Vec<ToolSchema> {
             name: "get_cwd",
             description: "Get the shell's current host and directory, or null if not known yet.",
             parameters: json!({"type": "object", "properties": {}}),
+        },
+        ToolSchema {
+            name: "wait",
+            description: "Wait for the shell instead of polling get_screen. Use it after run_command comes back with the command still running. Returns at once when a command finishes (with its record), and early when the screen changes unless ignore_updates is true; set ignore_updates when only the end of the command matters. Also returns on timeout, and at once when the shell is idle.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "seconds": {"type": "integer", "minimum": 1, "maximum": MAX_WAIT_SECONDS, "default": DEFAULT_WAIT_SECONDS},
+                    "ignore_updates": {"type": "boolean", "default": false},
+                },
+            }),
         },
         ToolSchema {
             name: "run_command",
@@ -337,10 +491,63 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
     args.get(key).and_then(Value::as_str).ok_or_else(|| format!("argument `{key}` must be a string"))
 }
 
+fn bool_arg(args: &Value, key: &str, default: bool) -> Result<bool, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(v) => v.as_bool().ok_or_else(|| format!("argument `{key}` must be true or false")),
+    }
+}
+
+/// The `seconds` argument of `wait`, clamped to 1..=MAX_WAIT_SECONDS. A missing or non-integer value is the default.
+/// The note says what was clamped, so the model learns how long it actually waited.
+fn wait_seconds_arg(args: &Value) -> (u64, Option<String>) {
+    let requested = args.get("seconds").and_then(|v| v.as_i64().map(i128::from).or_else(|| v.as_u64().map(i128::from)));
+    let Some(requested) = requested else {
+        return (DEFAULT_WAIT_SECONDS, None);
+    };
+    let clamped = requested.clamp(1, i128::from(MAX_WAIT_SECONDS));
+    let note = (clamped != requested)
+        .then(|| format!("seconds {requested} is outside 1 to {MAX_WAIT_SECONDS}; waited {clamped} s instead"));
+    (clamped as u64, note)
+}
+
 /// Largest index <= `i` that is a character boundary of `s`.
 fn char_floor(s: &str, mut i: usize) -> usize {
     while !s.is_char_boundary(i) {
         i -= 1;
     }
     i
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wait_seconds_are_clamped_and_the_clamp_is_noted() {
+        assert_eq!(wait_seconds_arg(&json!({"seconds": 5})), (5, None));
+        assert_eq!(wait_seconds_arg(&json!({"seconds": 120})), (120, None));
+        assert_eq!(wait_seconds_arg(&json!({})), (DEFAULT_WAIT_SECONDS, None));
+        assert_eq!(wait_seconds_arg(&json!({"seconds": "5"})), (DEFAULT_WAIT_SECONDS, None), "a string is not an integer");
+        assert_eq!(wait_seconds_arg(&json!({"seconds": 2.5})), (DEFAULT_WAIT_SECONDS, None), "a fraction is not an integer");
+
+        let (high, note) = wait_seconds_arg(&json!({"seconds": 500}));
+        assert_eq!(high, MAX_WAIT_SECONDS);
+        assert!(note.is_some_and(|n| n.contains("500")));
+        let (huge, note) = wait_seconds_arg(&json!({"seconds": u64::MAX}));
+        assert_eq!(huge, MAX_WAIT_SECONDS);
+        assert!(note.is_some());
+        let (zero, note) = wait_seconds_arg(&json!({"seconds": 0}));
+        assert_eq!(zero, 1);
+        assert!(note.is_some());
+        let (negative, _) = wait_seconds_arg(&json!({"seconds": -4}));
+        assert_eq!(negative, 1);
+    }
+
+    #[test]
+    fn ignore_updates_must_be_a_boolean_and_defaults_to_false() {
+        assert_eq!(bool_arg(&json!({}), "ignore_updates", false), Ok(false));
+        assert_eq!(bool_arg(&json!({"ignore_updates": true}), "ignore_updates", false), Ok(true));
+        assert!(bool_arg(&json!({"ignore_updates": "yes"}), "ignore_updates", false).is_err());
+    }
 }

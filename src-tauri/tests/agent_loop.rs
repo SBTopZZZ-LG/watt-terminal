@@ -14,7 +14,7 @@ use agent_term_lib::core::chat::history::History;
 use agent_term_lib::core::chat::prompt;
 use agent_term_lib::core::llm::{TurnCancel, http_client};
 use agent_term_lib::core::record::{Cwd, RecordSummary};
-use agent_term_lib::core::tools::{AgentTools, CommandView, RunOutcome, ScreenView};
+use agent_term_lib::core::tools::{AgentTools, CommandView, RunOutcome, ScreenView, WaitView};
 use serde_json::{Value, json};
 
 const KEY: &str = "sk-or-test-SECRETVALUE-0123456789";
@@ -208,6 +208,9 @@ impl AgentTools for FakeTools {
     fn run_command(&self, _command: &str, _timeout: Duration) -> Result<RunOutcome, String> {
         panic!("the loop calls tools by name through `call`")
     }
+    fn wait(&self, _seconds: u64, _ignore_updates: bool) -> Result<WaitView, String> {
+        panic!("the loop calls tools by name through `call`")
+    }
     fn send_keys(&self, _bytes: &[u8]) -> Result<(), String> {
         panic!("the loop calls tools by name through `call`")
     }
@@ -221,6 +224,11 @@ impl AgentTools for FakeTools {
                 }
                 Ok(json!({"host": "box", "path": "/home/u"}))
             }
+            "wait" => Ok(json!({
+                "reason": "timeout", "waited_ms": 5000, "state": "running",
+                "screen": {"rows": ["sleep 30"], "cursor": [1, 0], "alternate_screen": false, "size": [24, 80],
+                           "state": "running", "observer_status": "ok", "integration_status": "live"},
+            })),
             "run_command" => {
                 let output = self.command_output.clone().unwrap_or_else(|| "hello\n".to_string());
                 Ok(json!({
@@ -386,6 +394,54 @@ fn read_tool_result_goes_back_to_the_model_under_the_same_call_id() {
     assert_eq!(tool_msg["tool_call_id"], "call_1");
     assert_eq!(tool_msg["content"], "box:/home/u", "the projected result, not the raw JSON");
     assert_paired(&stored(&conv.history()));
+}
+
+/// `wait` goes through the loop as a read tool: no approval card, its result under its own call id, projected as text.
+#[test]
+fn wait_is_a_read_tool_under_its_call_id() {
+    let provider = serve(vec![
+        Script::json(tool_reply(&[("call_w", "wait", "{\"seconds\":5}")])),
+        Script::json(text_reply("it is still running")),
+    ]);
+    let conv = Conversation::new().unwrap();
+    let tools = FakeTools::default();
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
+    let events = turn(&mut agent, &tools, &no_gate(), "wait a bit");
+
+    assert_eq!(decisions(&events), [("wait".to_string(), "read", true)]);
+    assert!(!events.iter().any(|e| matches!(e, AgentEvent::ApprovalRequest { .. })), "wait asked for approval");
+    assert_eq!(tools.reached(), ["wait"]);
+    let msgs = stored(&conv.history());
+    assert!(tool_content(&msgs, "call_w").starts_with("waited 5.0s: the wait time ran out"), "{msgs:?}");
+    assert_eq!(texts(&events), ["it is still running"]);
+    assert_paired(&msgs);
+}
+
+/// The per-turn command limit counts only `run_command`: waits in the same turn do not use it up, and they all run.
+#[test]
+fn waits_do_not_count_against_the_command_limit() {
+    let mut calls: Vec<(String, &str, String)> = Vec::new();
+    for i in 0..MAX_COMMANDS_PER_TURN {
+        calls.push((format!("cmd_{i}"), "run_command", "{\"command\":\"pwd\"}".to_string()));
+    }
+    for i in 0..5 {
+        calls.push((format!("wait_{i}"), "wait", "{\"seconds\":1}".to_string()));
+    }
+    let refs: Vec<(&str, &str, &str)> = calls.iter().map(|(id, name, args)| (id.as_str(), *name, args.as_str())).collect();
+    let provider = serve(vec![Script::json(tool_reply(&refs)), Script::json(text_reply("done"))]);
+    let conv = Conversation::new().unwrap();
+    let tools = FakeTools::default();
+    let gate = no_gate();
+    gate.set_auto_approve(true);
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
+    turn(&mut agent, &tools, &gate, "run and wait");
+
+    let reached = tools.reached();
+    assert_eq!(reached.iter().filter(|n| *n == "run_command").count(), MAX_COMMANDS_PER_TURN);
+    assert_eq!(reached.iter().filter(|n| *n == "wait").count(), 5, "a wait was refused");
+    let msgs = stored(&conv.history());
+    assert!(!format!("{msgs:?}").contains("per-turn command limit"), "a wait counted as a command");
+    assert_paired(&msgs);
 }
 
 #[test]

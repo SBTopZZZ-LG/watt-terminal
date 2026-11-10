@@ -12,7 +12,7 @@ use agent_term_lib::core::llm::TurnCancel;
 use agent_term_lib::core::observer::{InputState, IntegrationStatus, ObserverStatus};
 use agent_term_lib::core::record::Source;
 use agent_term_lib::core::session::{Session, USER_TEXT_CODE};
-use agent_term_lib::core::tools::{schemas, AgentTools, NotRunReason, RunOutcome, SessionTools, DEFAULT_RUN_TIMEOUT};
+use agent_term_lib::core::tools::{schemas, AgentTools, NotRunReason, RunOutcome, SessionTools, WaitReason, DEFAULT_RUN_TIMEOUT};
 use serde_json::json;
 
 use common::*;
@@ -229,7 +229,168 @@ fn send_keys_is_disabled_and_schemas_list_every_tool() {
     let err = tools.call("send_keys", &json!({"bytes": [108, 115, 13]})).expect_err("send_keys via JSON");
     assert!(err.contains("disabled in slice 1"), "error: {err}");
     let names: Vec<&str> = schemas().iter().map(|t| t.name).collect();
-    assert_eq!(names, ["list_commands", "get_command", "get_screen", "get_cwd", "run_command", "send_keys"]);
+    assert_eq!(names, ["list_commands", "get_command", "get_screen", "get_cwd", "wait", "run_command", "send_keys"]);
+}
+
+/// Submits `cmd` as the user and waits until the shell reports it running.
+fn start_running(s: &Session, cmd: &str) {
+    s.submit(Source::User, cmd).expect("submit");
+    assert!(wait_state(s, InputState::Running, Duration::from_secs(10)), "state={:?}", s.state());
+}
+
+#[test]
+fn wait_returns_at_once_when_a_command_finishes_and_carries_its_record() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    start_running(&s, "sleep 1");
+    let started = Instant::now();
+    let view = SessionTools::new(&s).wait(20, false).expect("wait");
+    let took = started.elapsed();
+    assert_eq!(view.reason, WaitReason::CommandFinished, "{view:?}");
+    assert!(took < Duration::from_secs(10), "the wait took {took:?}");
+    assert_eq!(view.state, InputState::Prompt);
+    let record = view.record.expect("the finished command's record");
+    assert_eq!(record.command, "sleep 1");
+    assert_eq!(record.exit_code, Some(0));
+}
+
+#[test]
+fn wait_returns_early_when_output_appears_while_the_command_still_runs() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let cmd = r"sleep 1; printf 'marker-out\n'; sleep 4";
+    start_running(&s, cmd);
+    let started = Instant::now();
+    let view = SessionTools::new(&s).wait(20, false).expect("wait");
+    assert_eq!(view.reason, WaitReason::ScreenChanged, "{view:?}");
+    assert!(started.elapsed() < Duration::from_secs(10), "the wait took {:?}", started.elapsed());
+    assert_eq!(view.state, InputState::Running, "the command was still running");
+    assert!(view.screen.rows.iter().any(|r| r == "marker-out"), "rows: {:?}", view.screen.rows);
+    assert!(view.record.is_none());
+    run_finish(&s, cmd);
+}
+
+/// With `ignore_updates` the output does not wake the wait: it ends when the command finishes, with the record.
+#[test]
+fn wait_with_ignore_updates_ignores_output_and_ends_at_the_command_finish() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let cmd = r"printf 'noise\n'; sleep 2; printf 'more\n'; sleep 2";
+    start_running(&s, cmd);
+    let view = SessionTools::new(&s).wait(20, true).expect("wait");
+    assert_eq!(view.reason, WaitReason::CommandFinished, "{view:?}");
+    assert!(view.waited_ms >= 2500, "the wait returned on output, after {} ms", view.waited_ms);
+    let record = view.record.expect("the record");
+    assert!(record.output.contains("more"), "output: {:?}", record.output);
+    assert_eq!(record.exit_code, Some(0));
+}
+
+#[test]
+fn wait_times_out_on_a_quiet_command_and_the_session_stays_usable() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    start_running(&s, "sleep 5");
+    let view = SessionTools::new(&s).wait(1, false).expect("wait");
+    assert_eq!(view.reason, WaitReason::Timeout, "{view:?}");
+    assert!((900..3000).contains(&view.waited_ms), "waited {} ms", view.waited_ms);
+    assert_eq!(view.state, InputState::Running, "the timeout must not touch the command");
+    assert!(view.record.is_none());
+
+    s.write_user(&[0x03]).expect("ctrl-c");
+    wait_prompt(&s);
+    let idle = SessionTools::new(&s).wait(10, false).expect("wait after the timeout");
+    assert_eq!(idle.reason, WaitReason::Idle);
+    let r = run(&s, "echo alive-after-wait");
+    assert_eq!(r.output, "alive-after-wait");
+}
+
+#[test]
+fn wait_at_an_idle_prompt_returns_at_once_with_or_without_ignore_updates() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    for ignore in [false, true] {
+        let started = Instant::now();
+        let view = SessionTools::new(&s).wait(10, ignore).expect("wait");
+        assert_eq!(view.reason, WaitReason::Idle, "ignore_updates={ignore}");
+        assert!(started.elapsed() < Duration::from_secs(1), "ignore_updates={ignore} took {:?}", started.elapsed());
+        assert!(view.record.is_none());
+    }
+}
+
+#[test]
+fn cancel_ends_a_wait_within_a_second_and_leaves_the_command_alone() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    start_running(&s, "sleep 5");
+    let cancel = Arc::new(TurnCancel::new());
+    let (s1, c1) = (s.arc(), cancel.clone());
+    let call = thread::spawn(move || SessionTools::new(&s1).with_cancel(c1).wait(60, false));
+    thread::sleep(Duration::from_millis(300));
+    let cancelled_at = Instant::now();
+    cancel.cancel();
+    let view = call.join().expect("wait thread").expect("wait");
+    let took = cancelled_at.elapsed();
+    assert_eq!(view.reason, WaitReason::Cancelled, "{view:?}");
+    assert!(took < Duration::from_secs(1), "the cancelled wait took {took:?}");
+    assert_eq!(s.state(), InputState::Running, "the cancel must not touch the running command");
+
+    s.write_user(&[0x03]).expect("ctrl-c");
+    wait_prompt(&s);
+}
+
+/// The JSON path: a missing `seconds` is the default, an out-of-range one is clamped with a note, and a bad type is an
+/// error. The clamp is seen in a real wait: `seconds: 0` becomes 1 and says so.
+#[test]
+fn wait_arguments_are_clamped_and_the_clamp_is_noted() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let tools = SessionTools::new(&s);
+    let v = tools.call("wait", &json!({"seconds": 500, "ignore_updates": true})).expect("wait at the prompt");
+    assert_eq!(v["reason"], "idle");
+    assert!(v["note"].as_str().is_some_and(|n| n.contains("500")), "{v}");
+    let v = tools.call("wait", &json!({})).expect("defaults");
+    assert_eq!(v["reason"], "idle");
+    assert!(v.get("note").is_none(), "no clamp, no note: {v}");
+    assert!(tools.call("wait", &json!({"ignore_updates": "yes"})).is_err(), "a non-boolean is refused");
+
+    start_running(&s, "sleep 3");
+    let started = Instant::now();
+    let v = tools.call("wait", &json!({"seconds": 0})).expect("clamped wait");
+    assert_eq!(v["reason"], "timeout", "{v}");
+    assert!(started.elapsed() < Duration::from_secs(3), "seconds 0 was not clamped up to 1");
+    assert!(v["note"].as_str().is_some_and(|n| n.contains("waited 1 s")), "{v}");
+    run_finish(&s, "sleep 3");
+}
+
+/// The wait budget is per turn: a wait starts only while the turn has budget left, and the one that starts is allowed to
+/// finish. Here the budget is 500 ms, so the first 1 s wait is allowed and the second is refused without waiting.
+#[test]
+fn wait_budget_is_per_turn_and_refuses_a_wait_started_after_it_is_used_up() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    start_running(&s, "sleep 5");
+    let tools = SessionTools::new(&s).with_wait_budget(Duration::from_millis(500));
+    let first = tools.call("wait", &json!({"seconds": 1, "ignore_updates": true})).expect("the first wait runs");
+    assert_eq!(first["reason"], "timeout", "{first}");
+    let started = Instant::now();
+    let err = tools.call("wait", &json!({"seconds": 5})).expect_err("the budget is used up");
+    assert!(err.contains("wait budget for this turn is used up"), "{err}");
+    assert!(started.elapsed() < Duration::from_millis(500), "a refused wait still waited");
+    assert_eq!(s.state(), InputState::Running);
+
+    // A new turn (a new SessionTools) has its own budget.
+    let next = SessionTools::new(&s).wait(1, true).expect("a new turn waits again");
+    assert_eq!(next.reason, WaitReason::Timeout);
+    s.write_user(&[0x03]).expect("ctrl-c");
+    wait_prompt(&s);
 }
 
 #[test]

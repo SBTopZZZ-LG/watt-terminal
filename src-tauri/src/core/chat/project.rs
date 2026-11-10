@@ -19,6 +19,8 @@ const TAIL_BYTES: usize = 3000;
 /// Screen and command-list text keep their most recent bytes up to these limits.
 const SCREEN_LIMIT: usize = 6000;
 const LIST_LIMIT: usize = 6000;
+/// The output tail of a command that a `wait` finished. The screen gets the rest of `SCREEN_LIMIT`.
+const WAIT_OUTPUT_LIMIT: usize = SCREEN_LIMIT / 2;
 /// Unknown tools' JSON, error messages and command lines in the list are capped at these many bytes.
 const SMALL_LIMIT: usize = 2000;
 const COMMAND_TEXT_LIMIT: usize = 200;
@@ -36,6 +38,7 @@ pub fn project(name: &str, ok: bool, result: &Value, redactor: &Redactor) -> Str
             "run_command" => run_command_text(result, redactor),
             "get_command" => get_command_text(result, redactor),
             "get_screen" => get_screen_text(result, redactor),
+            "wait" => wait_text(result, redactor),
             "list_commands" => list_commands_text(result, redactor),
             "get_cwd" => cwd_text(Some(result)),
             _ => compact_json(result),
@@ -115,6 +118,11 @@ fn get_command_text(v: &Value, r: &Redactor) -> String {
 }
 
 fn get_screen_text(v: &Value, r: &Redactor) -> String {
+    format!("{}\n{}", screen_header(v), screen_body(v, r, SCREEN_LIMIT))
+}
+
+/// The rows of a screen, trailing blank rows dropped, redacted, keeping the most recent `limit` bytes.
+fn screen_body(v: &Value, r: &Redactor, limit: usize) -> String {
     let rows: Vec<&str> = v
         .get("rows")
         .and_then(Value::as_array)
@@ -124,8 +132,70 @@ fn get_screen_text(v: &Value, r: &Redactor) -> String {
     while body.last().is_some_and(|row| row.is_empty()) {
         body.pop();
     }
-    let rows_text = keep_tail(&r.redact(&body.join("\n")), SCREEN_LIMIT);
-    format!("{}\n{rows_text}", screen_header(v))
+    keep_tail(&r.redact(&body.join("\n")), limit)
+}
+
+/// A `wait` result: a first line with the reason and the time waited, the note if the seconds were clamped, the screen
+/// as get_screen shows it, and for a finished command its record line and output tail. The output is not repeated
+/// when every one of its lines is already a row on the screen. Together the screen and the output stay near SCREEN_LIMIT.
+fn wait_text(v: &Value, r: &Redactor) -> String {
+    let mut lines = vec![format!("waited {}: {}", waited_text(v), wait_reason_text(v))];
+    if let Some(note) = v.get("note").and_then(Value::as_str) {
+        lines.push(note.to_string());
+    }
+    let screen = v.get("screen").unwrap_or(&Value::Null);
+    let record = v.get("record").filter(|rec| !rec.is_null());
+    let output = record.map(|rec| {
+        let text = rec.get("output").and_then(Value::as_str).unwrap_or("");
+        keep_tail(&r.redact(text.trim_end()), WAIT_OUTPUT_LIMIT)
+    });
+    let output_len = output.as_ref().map_or(0, String::len);
+    let body = screen_body(screen, r, SCREEN_LIMIT.saturating_sub(output_len));
+    lines.push(format!("{}\n{body}", screen_header(screen)));
+    if let (Some(rec), Some(output)) = (record, output) {
+        lines.push(command_header(rec, r));
+        let screen_rows: Vec<&str> = body.lines().map(str::trim_end).collect();
+        let shown = output.lines().all(|line| screen_rows.contains(&line.trim_end()));
+        lines.push(if output.trim().is_empty() {
+            "(no output)".to_string()
+        } else if shown {
+            "(the output is on the screen above)".to_string()
+        } else {
+            output
+        });
+    }
+    lines.join("\n")
+}
+
+fn waited_text(v: &Value) -> String {
+    v.get("waited_ms").and_then(Value::as_u64).map_or_else(|| "?".to_string(), |ms| format!("{:.1}s", ms as f64 / 1000.0))
+}
+
+fn wait_reason_text(v: &Value) -> String {
+    match v.get("reason").and_then(Value::as_str).unwrap_or("") {
+        "idle" => "the shell is idle at the prompt, so there was nothing to wait for".to_string(),
+        "session_exited" => "the shell session has exited".to_string(),
+        "command_finished" => match v.get("record").and_then(|rec| rec.get("exit_code")).and_then(Value::as_i64) {
+            Some(code) => format!("the command finished with exit status {code}"),
+            None => "the command finished, exit status unknown".to_string(),
+        },
+        "screen_changed" => "the screen changed".to_string(),
+        "timeout" => "the wait time ran out and nothing finished".to_string(),
+        "cancelled" => "the turn was cancelled".to_string(),
+        _ => "the wait ended".to_string(),
+    }
+}
+
+fn command_header(rec: &Value, r: &Redactor) -> String {
+    let command = escape_controls(&r.redact(rec.get("command").and_then(Value::as_str).unwrap_or("")));
+    format!(
+        "command id={} exit={} status={} cwd={} command={}",
+        scalar(rec.get("id")),
+        scalar(rec.get("exit_code")),
+        scalar(rec.get("status")),
+        cwd_text(rec.get("cwd")),
+        cap(&command, COMMAND_TEXT_LIMIT),
+    )
 }
 
 fn screen_header(v: &Value) -> String {
@@ -536,6 +606,89 @@ mod tests {
         assert!(out.len() <= SCREEN_LIMIT + 200);
     }
 
+    fn screen(rows: &[&str]) -> Value {
+        json!({
+            "rows": rows, "cursor": [0, 0], "alternate_screen": false, "size": [24, 80],
+            "state": "prompt", "observer_status": "ok", "integration_status": "live",
+        })
+    }
+
+    #[test]
+    fn wait_first_line_gives_the_reason_and_the_time_waited() {
+        let v = json!({"reason": "screen_changed", "waited_ms": 1300, "state": "running", "screen": screen(&["x"])});
+        let out = project("wait", true, &v, &none());
+        assert!(out.starts_with("waited 1.3s: the screen changed\n"), "{out}");
+
+        let idle = json!({"reason": "idle", "waited_ms": 0, "state": "prompt", "screen": screen(&["$ "])});
+        let out = project("wait", true, &idle, &none());
+        assert!(out.starts_with("waited 0.0s: the shell is idle at the prompt"), "{out}");
+    }
+
+    #[test]
+    fn wait_for_a_finished_command_gives_its_exit_status_and_output() {
+        let v = json!({
+            "reason": "command_finished", "waited_ms": 4200, "state": "prompt",
+            "screen": screen(&["$ make"]), "record": finished("hello\nworld")["record"],
+        });
+        let out = project("wait", true, &v, &none());
+        assert!(out.starts_with("waited 4.2s: the command finished with exit status 0\n"), "{out}");
+        assert!(out.contains("command id=7 exit=0 status=complete cwd=mac:/tmp command=ls"), "{out}");
+        assert!(out.ends_with("hello\nworld"), "the output tail comes last: {out}");
+    }
+
+    #[test]
+    fn wait_does_not_repeat_output_the_screen_already_shows() {
+        let v = json!({
+            "reason": "command_finished", "waited_ms": 900, "state": "prompt",
+            "screen": screen(&["$ ls", "hello", "world", "$ "]), "record": finished("hello\nworld")["record"],
+        });
+        let out = project("wait", true, &v, &none());
+        assert!(out.contains("(the output is on the screen above)"), "{out}");
+        assert_eq!(out.matches("hello").count(), 1, "the output was repeated: {out}");
+    }
+
+    #[test]
+    fn wait_shows_output_the_screen_does_not_have_and_reports_empty_output() {
+        let v = json!({
+            "reason": "command_finished", "waited_ms": 900, "state": "prompt",
+            "screen": screen(&["$ ls"]), "record": finished("hello\nworld")["record"],
+        });
+        let out = project("wait", true, &v, &none());
+        assert!(out.ends_with("hello\nworld"), "{out}");
+
+        let mut quiet = finished("");
+        quiet["record"]["exit_code"] = json!(1);
+        let v = json!({"reason": "command_finished", "waited_ms": 5, "screen": screen(&["$ true"]), "record": quiet["record"]});
+        let out = project("wait", true, &v, &none());
+        assert!(out.starts_with("waited 0.0s: the command finished with exit status 1\n"), "{out}");
+        assert!(out.ends_with("(no output)"), "{out}");
+    }
+
+    #[test]
+    fn wait_says_when_the_requested_seconds_were_clamped() {
+        let v = json!({
+            "reason": "timeout", "waited_ms": 120000, "state": "running",
+            "note": "seconds 500 is outside 1 to 120; waited 120 s instead", "screen": screen(&["x"]),
+        });
+        let out = project("wait", true, &v, &none());
+        assert_eq!(out.lines().nth(1), Some("seconds 500 is outside 1 to 120; waited 120 s instead"), "{out}");
+    }
+
+    #[test]
+    fn wait_result_stays_near_the_screen_limit_even_for_huge_screen_and_output() {
+        let rows: Vec<String> = (0..2000).map(|i| format!("row {i:05}")).collect();
+        let v = json!({
+            "reason": "command_finished", "waited_ms": 1, "state": "prompt",
+            "screen": {"rows": rows, "cursor": [0, 0], "alternate_screen": false, "size": [2000, 9],
+                       "state": "prompt", "observer_status": "ok", "integration_status": "live"},
+            "record": finished(&numbered_lines(3000))["record"],
+        });
+        let out = project("wait", true, &v, &none());
+        assert!(out.len() <= SCREEN_LIMIT + 600, "{} bytes", out.len());
+        assert!(out.contains("bytes above omitted"));
+        assert!(out.ends_with("line 02999"), "the output keeps its most recent lines: {out}");
+    }
+
     #[test]
     fn list_commands_gives_one_line_per_command() {
         let v = json!([
@@ -606,7 +759,7 @@ mod tests {
             json!([{"source": 3, "command": 4}, null]),
         ];
         let names = [
-            "run_command", "get_command", "get_screen", "list_commands", "get_cwd", "send_keys", "unknown",
+            "run_command", "get_command", "get_screen", "list_commands", "get_cwd", "wait", "send_keys", "unknown",
         ];
         let r = none();
         for name in names {

@@ -145,8 +145,8 @@ pub enum AgentEvent {
 
 static NEXT_CALL: AtomicU64 = AtomicU64::new(1);
 
-/// Tools that never change the shell. `read_tool` accepts only these.
-const READ_TOOLS: [&str; 4] = ["list_commands", "get_command", "get_screen", "get_cwd"];
+/// Tools that never change the shell. `read_tool` accepts only these. Must match `READ_NAMES` in core/chat/agent_loop.rs.
+const READ_TOOLS: [&str; 5] = ["list_commands", "get_command", "get_screen", "get_cwd", "wait"];
 
 /// What an agent may use during one turn: the approval gate and a way to report events. The tools are
 /// private: the only route to them is `call_tool` (approval-gated) or `read_tool` (read-only names).
@@ -169,7 +169,7 @@ impl<'a> AgentCtx<'a> {
         self.emit(AgentEvent::Text { text: text.into() });
     }
 
-    /// Calls a read-only tool (`list_commands`, `get_command`, `get_screen`, `get_cwd`) and reports the call
+    /// Calls a read-only tool (`list_commands`, `get_command`, `get_screen`, `get_cwd`, `wait`) and reports the call
     /// and its result. Never asks for approval. Any other name is refused without running.
     pub fn read_tool(&self, name: &str, args: Value) -> Result<Value, String> {
         if !READ_TOOLS.contains(&name) {
@@ -425,7 +425,7 @@ mod tests {
     use super::*;
     use crate::core::observer::{InputState, IntegrationStatus, ObserverStatus};
     use crate::core::record::{Cwd, RecordSummary};
-    use crate::core::tools::{CommandView, RunOutcome, ScreenView};
+    use crate::core::tools::{CommandView, RunOutcome, ScreenView, WaitView};
 
     /// Records every tool call the agent manages to reach. Nothing here touches a shell.
     #[derive(Default)]
@@ -465,6 +465,9 @@ mod tests {
             None
         }
         fn run_command(&self, _command: &str, _timeout: Duration) -> Result<RunOutcome, String> {
+            Err("not used".into())
+        }
+        fn wait(&self, _seconds: u64, _ignore_updates: bool) -> Result<WaitView, String> {
             Err("not used".into())
         }
         fn send_keys(&self, _bytes: &[u8]) -> Result<(), String> {
@@ -530,6 +533,20 @@ mod tests {
         assert!(ctx.read_tool("get_screen", json!({})).is_ok());
         assert!(ctx.call_tool("get_cwd", json!({})).is_ok());
         assert_eq!(decisions(&log), [named("get_screen", "read", true), named("get_cwd", "read", true)]);
+    }
+
+    /// `wait` is a read tool: it goes through `read_tool` with the "read" decision, and never shows an approval card.
+    #[test]
+    fn wait_is_a_read_tool_and_never_asks_for_approval() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        assert!(ctx.read_tool("wait", json!({"seconds": 1})).is_ok());
+        assert_eq!(decisions(&log), [named("wait", "read", true)]);
+        assert_eq!(tools.reached(), ["wait"]);
+        assert!(!log.lock().unwrap().iter().any(|e| matches!(e, AgentEvent::ApprovalRequest { .. })));
     }
 
     #[test]

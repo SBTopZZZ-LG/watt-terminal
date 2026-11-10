@@ -43,8 +43,9 @@ const ENV_HEADERS: &str = "AGENT_TERM_LLM_HEADERS";
 const ENV_STREAM: &str = "AGENT_TERM_LLM_STREAM";
 const ENV_MAX_TOKENS: &str = "AGENT_TERM_LLM_MAX_TOKENS";
 
-/// Tool names the model may call that the loop routes by name. Anything else is an unknown tool.
-const READ_NAMES: [&str; 4] = ["list_commands", "get_command", "get_screen", "get_cwd"];
+/// Tool names the model may call that the loop routes by name. Anything else is an unknown tool. Must match `READ_TOOLS`
+/// in core/agent.rs.
+const READ_NAMES: [&str; 5] = ["list_commands", "get_command", "get_screen", "get_cwd", "wait"];
 /// Longest tool name echoed back in an error, so a model cannot make the history carry a huge name.
 const NAME_LIMIT: usize = 80;
 

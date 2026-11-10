@@ -6,6 +6,8 @@
 //! prompt. Terminal output is unaffected: the renderer receives every byte separately.
 
 use std::collections::VecDeque;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::num::NonZeroU16;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -176,6 +178,16 @@ pub struct ScreenSnapshot {
     pub size: (u16, u16),
 }
 
+/// What a `wait` needs to know, read under one lock.
+#[derive(Debug, Clone, Copy)]
+pub struct Activity {
+    pub state: InputState,
+    /// Bumped whenever the visible screen changes (see `Core::note_screen`).
+    pub screen_gen: u64,
+    /// Id of the newest finished record, 0 when no command has finished yet.
+    pub last_record_id: u64,
+}
+
 /// Session changes for listeners (the UI). Delivered in order, outside the core lock.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -287,8 +299,25 @@ fn new_parser(size: (u16, u16)) -> Parser<Collector> {
     Parser::new_with_callbacks(nz(size.0), nz(size.1), 0, Collector::default())
 }
 
+/// A hash of what is visible: the size, the rows, the cursor and whether the alternate screen is up.
+fn screen_fingerprint(screen: &vt100::Screen) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    let (rows, cols) = screen.size();
+    (rows.get(), cols.get()).hash(&mut hasher);
+    for row in screen.rows(0, cols.get()) {
+        row.hash(&mut hasher);
+    }
+    screen.cursor_position().hash(&mut hasher);
+    screen.alternate_screen().hash(&mut hasher);
+    hasher.finish()
+}
+
 pub struct Core {
     parser: Parser<Collector>,
+    /// Hash of the visible screen at the last `note_screen`. Compared on each call.
+    screen_hash: u64,
+    /// Counts visible-screen changes. Waits compare it between polls.
+    screen_gen: u64,
     size: (u16, u16),
     scanner: Scanner,
     lifecycle: Lifecycle,
@@ -322,8 +351,11 @@ pub const MAX_RECORDS: usize = 1000;
 
 impl Core {
     pub fn new(nonce: &str, size: (u16, u16)) -> Self {
+        let parser = new_parser(size);
         Core {
-            parser: new_parser(size),
+            screen_hash: screen_fingerprint(parser.screen()),
+            screen_gen: 0,
+            parser,
             size,
             scanner: Scanner::new(nonce),
             lifecycle: Lifecycle::Booting,
@@ -749,6 +781,24 @@ impl Core {
     pub fn get_record(&self, id: u64) -> Option<Record> {
         self.records.iter().find(|r| r.id == id).cloned()
     }
+
+    /// Bumps the screen generation when the visible screen differs from the last call. The observer calls it after
+    /// every message and every tick, under the same lock as the apply, so a change is never seen half-applied.
+    pub fn note_screen(&mut self) {
+        let hash = screen_fingerprint(self.parser.screen());
+        if hash != self.screen_hash {
+            self.screen_hash = hash;
+            self.screen_gen += 1;
+        }
+    }
+
+    pub fn activity(&self) -> Activity {
+        Activity {
+            state: self.lifecycle_view(),
+            screen_gen: self.screen_gen,
+            last_record_id: self.records.back().map_or(0, |r| r.id),
+        }
+    }
 }
 
 /// The core behind a session's locks. The writer, the observer thread, and the API all lock it.
@@ -795,8 +845,13 @@ pub fn run_observer(queue: Arc<ObsQueue>, shared: Arc<Shared>) {
     loop {
         let msg = queue.pop_timeout(OBSERVER_TICK);
         let eof = matches!(msg, Some(ObsMsg::Eof));
-        if let Some(msg) = msg {
-            shared.lock().apply(msg);
+        {
+            let mut core = shared.lock();
+            if let Some(msg) = msg {
+                core.apply(msg);
+            }
+            // On every message, not only on a tick: a long burst of output never ticks, and it changes the screen.
+            core.note_screen();
         }
         shared.flush();
         if eof {
@@ -1029,5 +1084,33 @@ mod tests {
         assert_eq!(status(&c, &format!("run-{}", ABANDONED_CAP + 9)), "abandoned");
         c.mark_abandoned(format!("run-{}", ABANDONED_CAP + 9));
         assert_eq!(c.abandoned.len(), ABANDONED_CAP, "a repeat mark grew the set");
+    }
+
+    /// The screen generation moves on a visible change (text, cursor, alternate screen, size) and not otherwise.
+    #[test]
+    fn screen_gen_moves_only_when_the_visible_screen_changes() {
+        let mut c = core();
+        let start = c.activity().screen_gen;
+        c.note_screen();
+        assert_eq!(c.activity().screen_gen, start, "an unchanged screen bumped the generation");
+
+        c.parser.process(b"hello");
+        c.note_screen();
+        let text = c.activity().screen_gen;
+        assert_eq!(text, start + 1, "new text did not bump the generation");
+        c.note_screen();
+        assert_eq!(c.activity().screen_gen, text, "a repeated call with no change bumped the generation");
+
+        c.parser.process(b"\x1b[3;1H");
+        c.note_screen();
+        assert_eq!(c.activity().screen_gen, text + 1, "a cursor move is a visible change");
+
+        c.parser.process(b"\x1b[?1049h");
+        c.note_screen();
+        assert_eq!(c.activity().screen_gen, text + 2, "entering the alternate screen did not bump the generation");
+
+        c.resize(10, 40);
+        c.note_screen();
+        assert_eq!(c.activity().screen_gen, text + 3, "a resize did not bump the generation");
     }
 }
