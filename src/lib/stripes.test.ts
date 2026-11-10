@@ -1,21 +1,28 @@
 import { describe, expect, it } from 'vitest';
-import { separatorSegments, separatorTop, stripeSegments } from './stripes';
+import { badgeOnSeparator, separatorSegments, separatorTop, stripeSegments } from './stripes';
 import type { StripeMark } from './stripes';
 
 function mark(start: number, end: number, extra: Partial<StripeMark> = {}): StripeMark {
-  return { start, end, exit: 'ok', agent: false, ...extra };
+  return { start, end, exit: 'ok', agent: false, separatorRow: null, ...extra };
 }
 
 describe('stripeSegments', () => {
   it('a mark inside the viewport covers its rows, relative to the viewport top', () => {
     const [seg] = stripeSegments([mark(12, 14)], 10, 24);
-    expect(seg).toEqual({ firstRow: 2, rowCount: 3, exit: 'ok', agent: false, startVisible: true });
+    expect(seg).toEqual({ firstRow: 2, rowCount: 3, exit: 'ok', agent: false, startVisible: true, separatorRow: null });
   });
 
   it('a mark whose first row scrolled above the viewport stays visible on its remaining rows', () => {
     // seq 1 500 style: the command runs rows 0 to 499, the viewport shows rows 300 to 323.
     const [seg] = stripeSegments([mark(0, 499)], 300, 24);
-    expect(seg).toEqual({ firstRow: 0, rowCount: 24, exit: 'ok', agent: false, startVisible: false });
+    expect(seg).toEqual({
+      firstRow: 0,
+      rowCount: 24,
+      exit: 'ok',
+      agent: false,
+      startVisible: false,
+      separatorRow: null,
+    });
   });
 
   it('a mark that starts above and ends below the viewport covers the whole viewport', () => {
@@ -53,7 +60,14 @@ describe('stripeSegments', () => {
 
   it('a mark that starts at -1 (trimmed) and ends inside the viewport is not marked as starting visibly', () => {
     const [seg] = stripeSegments([mark(-1, 12)], 10, 24);
-    expect(seg).toEqual({ firstRow: 0, rowCount: 3, exit: 'ok', agent: false, startVisible: false });
+    expect(seg).toEqual({
+      firstRow: 0,
+      rowCount: 3,
+      exit: 'ok',
+      agent: false,
+      startVisible: false,
+      separatorRow: null,
+    });
   });
 
   it('a mark whose end is before its start gives no segment', () => {
@@ -67,8 +81,8 @@ describe('stripeSegments', () => {
       24,
     );
     expect(segs).toEqual([
-      { firstRow: 0, rowCount: 1, exit: 'running', agent: true, startVisible: true },
-      { firstRow: 1, rowCount: 2, exit: 'fail', agent: false, startVisible: true },
+      { firstRow: 0, rowCount: 1, exit: 'running', agent: true, startVisible: true, separatorRow: null },
+      { firstRow: 1, rowCount: 2, exit: 'fail', agent: false, startVisible: true, separatorRow: null },
     ]);
   });
 
@@ -76,32 +90,75 @@ describe('stripeSegments', () => {
     expect(stripeSegments([], 0, 24)).toEqual([]);
     expect(stripeSegments([mark(0, 5)], 0, 0)).toEqual([]);
   });
+
+  it('passes the separator row through, even when it is outside the viewport', () => {
+    const [seg] = stripeSegments([mark(12, 14, { separatorRow: 40 })], 10, 24);
+    expect(seg.separatorRow).toBe(40);
+  });
+});
+
+describe('badgeOnSeparator', () => {
+  const blank = () => true;
+  const notBlank = () => false;
+
+  it('a command with no separator keeps its badge on the stripe', () => {
+    expect(badgeOnSeparator(null, blank)).toBe(false);
+  });
+
+  it('a separator on a blank row takes the badge', () => {
+    expect(badgeOnSeparator(12, blank)).toBe(true);
+  });
+
+  it('a separator on a row that is not blank leaves the badge on the stripe', () => {
+    expect(badgeOnSeparator(12, notBlank)).toBe(false);
+  });
+
+  it('checks the absolute row, so a separator out of view still takes the badge', () => {
+    const checked: number[] = [];
+    const isBlank = (row: number) => {
+      checked.push(row);
+      return true;
+    };
+    // The viewport is rows 10 to 33, the separator is at row 40: the answer is the same as if it were on screen.
+    expect(badgeOnSeparator(40, isBlank)).toBe(true);
+    expect(checked).toEqual([40]);
+  });
 });
 
 describe('separatorSegments', () => {
+  const at = (row: number, agent = false) => ({ row, agent });
+
   it('a row inside the viewport gives its row relative to the viewport top', () => {
-    expect(separatorSegments([12], 10, 24)).toEqual([2]);
+    expect(separatorSegments([at(12)], 10, 24)).toEqual([at(2)]);
   });
 
   it('rows above the viewport give nothing', () => {
-    expect(separatorSegments([0, 9], 10, 24)).toEqual([]);
+    expect(separatorSegments([at(0), at(9)], 10, 24)).toEqual([]);
   });
 
   it('rows below the viewport give nothing', () => {
-    expect(separatorSegments([34, 50], 10, 24)).toEqual([]);
+    expect(separatorSegments([at(34), at(50)], 10, 24)).toEqual([]);
   });
 
   it('the first and last viewport rows are included', () => {
-    expect(separatorSegments([10, 33], 10, 24)).toEqual([0, 23]);
+    expect(separatorSegments([at(10), at(33)], 10, 24)).toEqual([at(0), at(23)]);
   });
 
   it('an empty list or a zero-row viewport gives nothing', () => {
     expect(separatorSegments([], 0, 24)).toEqual([]);
-    expect(separatorSegments([5], 0, 0)).toEqual([]);
+    expect(separatorSegments([at(5)], 0, 0)).toEqual([]);
   });
 
   it('keeps the order given, and drops only the rows outside', () => {
-    expect(separatorSegments([30, 5, 12, 40, 10], 10, 24)).toEqual([20, 2, 0]);
+    expect(separatorSegments([at(30), at(5), at(12), at(40), at(10)], 10, 24)).toEqual([
+      at(20),
+      at(2),
+      at(0),
+    ]);
+  });
+
+  it('keeps the agent flag of each line', () => {
+    expect(separatorSegments([at(12, true), at(14, false)], 10, 24)).toEqual([at(2, true), at(4, false)]);
   });
 });
 

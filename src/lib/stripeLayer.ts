@@ -8,12 +8,16 @@
 // Separator lines are 1px lines between a command's output and the next prompt. They are centred in the blank row
 // the shell leaves before that prompt (see integration.zsh), or on the prompt row's top edge when that row is not blank.
 //
+// The agent badge sits on the separator line when the command has one in a blank row, right-aligned and centred on
+// the line. Otherwise it sits on the stripe's first row, as before. The stripe never draws it while its separator row
+// is blank, even when that row is out of view, so the badge does not jump while scrolling.
+//
 // Known limitation: after a window resize that reflows the buffer, a mark (stripe or separator) that sat on a wrapped
 // row (not the first row of its logical line) can land on a neighbouring row. Accepted; the layer is positional only.
 
 import type { Terminal } from '@xterm/xterm';
 import type { CommandMarks } from './commandMarks';
-import { separatorSegments, separatorTop, stripeSegments } from './stripes';
+import { badgeOnSeparator, separatorSegments, separatorTop, stripeSegments } from './stripes';
 
 export class StripeLayer {
   private readonly layer: HTMLDivElement;
@@ -62,6 +66,8 @@ export class StripeLayer {
     }
     const rows = this.term.rows;
     const cellHeight = this.screen.getBoundingClientRect().height / rows;
+    // Absolute rows, so a separator outside the viewport still answers for its command's badge.
+    const isBlank = (absoluteRow: number): boolean => buf.getLine(absoluteRow)?.translateToString(true) === '';
     const segments = stripeSegments(this.marks.stripes(), buf.viewportY, rows);
     segments.forEach((seg, i) => {
       const el = this.elementAt(this.pool, 'stripe', i);
@@ -69,7 +75,8 @@ export class StripeLayer {
       el.style.top = `${seg.firstRow * cellHeight}px`;
       el.style.height = `${seg.rowCount * cellHeight}px`;
       el.dataset.exit = seg.exit;
-      el.dataset.agent = String(seg.agent);
+      // The stripe draws the badge only when the badge is not on the separator line.
+      el.dataset.agent = String(seg.agent && !badgeOnSeparator(seg.separatorRow, isBlank));
       el.dataset.startVisible = String(seg.startVisible);
     });
     for (let i = segments.length; i < this.pool.length; i++) {
@@ -77,13 +84,15 @@ export class StripeLayer {
     }
 
     // A separator sits in the blank row the shell leaves before the prompt, centred there. When that row is not
-    // blank (the shell integration is degraded or the gap is off), the line sits on the prompt row's top edge.
-    const separators = separatorSegments(this.marks.separatorRows(), buf.viewportY, rows);
-    separators.forEach((row, i) => {
+    // blank (the shell integration is degraded or the gap is off), the line sits on the prompt row's top edge, and
+    // its command's badge stays on the stripe.
+    const separators = separatorSegments(this.marks.separators(), buf.viewportY, rows);
+    separators.forEach((sep, i) => {
       const el = this.elementAt(this.separatorPool, 'separator', i);
-      const blank = buf.getLine(buf.viewportY + row)?.translateToString(true) === '';
+      const blank = isBlank(buf.viewportY + sep.row);
       el.hidden = false;
-      el.style.top = `${separatorTop(row, cellHeight, blank)}px`;
+      el.style.top = `${separatorTop(sep.row, cellHeight, blank)}px`;
+      el.dataset.agent = String(sep.agent && blank);
     });
     for (let i = separators.length; i < this.separatorPool.length; i++) {
       this.separatorPool[i].hidden = true;

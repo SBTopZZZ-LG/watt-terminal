@@ -89,7 +89,7 @@ describe('CommandMarks', () => {
     marks.commandStart();
     f.advance(3);
     marks.commandEnd(0);
-    expect(marks.stripes()).toEqual([{ start: 0, end: 2, exit: 'ok', agent: false }]);
+    expect(marks.stripes()).toEqual([{ start: 0, end: 2, exit: 'ok', agent: false, separatorRow: null }]);
   });
 
   it('a non-zero exit paints as a failure, and the stripe covers only the output rows', () => {
@@ -100,7 +100,7 @@ describe('CommandMarks', () => {
     marks.commandStart();
     f.advance(4);
     marks.commandEnd(1);
-    expect(marks.stripes()).toEqual([{ start: 0, end: 3, exit: 'fail', agent: false }]);
+    expect(marks.stripes()).toEqual([{ start: 0, end: 3, exit: 'fail', agent: false, separatorRow: null }]);
   });
 
   it('output with no trailing newline includes the cursor row', () => {
@@ -112,7 +112,7 @@ describe('CommandMarks', () => {
     f.advance(2);
     f.setCursorX(5);
     marks.commandEnd(0);
-    expect(marks.stripes()).toEqual([{ start: 0, end: 2, exit: 'ok', agent: false }]);
+    expect(marks.stripes()).toEqual([{ start: 0, end: 2, exit: 'ok', agent: false, separatorRow: null }]);
   });
 
   it('a command with no output still gets a one-row stripe', () => {
@@ -121,7 +121,7 @@ describe('CommandMarks', () => {
     const marks = new CommandMarks(f.term);
     marks.commandStart();
     marks.commandEnd(0);
-    expect(marks.stripes()).toEqual([{ start: 0, end: 0, exit: 'ok', agent: false }]);
+    expect(marks.stripes()).toEqual([{ start: 0, end: 0, exit: 'ok', agent: false, separatorRow: null }]);
   });
 
   it('a single line of output ending in a newline gets a one-row stripe', () => {
@@ -130,20 +130,20 @@ describe('CommandMarks', () => {
     marks.commandStart();
     f.advance(1);
     marks.commandEnd(0);
-    expect(marks.stripes()).toEqual([{ start: 0, end: 0, exit: 'ok', agent: false }]);
+    expect(marks.stripes()).toEqual([{ start: 0, end: 0, exit: 'ok', agent: false, separatorRow: null }]);
   });
 
   it('a running command has a muted stripe that grows with its output', () => {
     const f = fakeTerminal();
     const marks = new CommandMarks(f.term);
     marks.commandStart();
-    expect(marks.stripes()).toEqual([{ start: 0, end: 0, exit: 'running', agent: false }]);
+    expect(marks.stripes()).toEqual([{ start: 0, end: 0, exit: 'running', agent: false, separatorRow: null }]);
     f.advance(1);
-    expect(marks.stripes()).toEqual([{ start: 0, end: 0, exit: 'running', agent: false }]);
+    expect(marks.stripes()).toEqual([{ start: 0, end: 0, exit: 'running', agent: false, separatorRow: null }]);
     f.advance(4);
-    expect(marks.stripes()).toEqual([{ start: 0, end: 4, exit: 'running', agent: false }]);
+    expect(marks.stripes()).toEqual([{ start: 0, end: 4, exit: 'running', agent: false, separatorRow: null }]);
     marks.commandEnd(0);
-    expect(marks.stripes()).toEqual([{ start: 0, end: 4, exit: 'ok', agent: false }]);
+    expect(marks.stripes()).toEqual([{ start: 0, end: 4, exit: 'ok', agent: false, separatorRow: null }]);
   });
 
   it('a D with no open command draws nothing', () => {
@@ -185,7 +185,7 @@ describe('CommandMarks', () => {
     marks.commandStart();
     marks.recordStarted(true);
     marks.commandEnd(0);
-    expect(marks.stripes()).toEqual([{ start: 0, end: 0, exit: 'ok', agent: true }]);
+    expect(marks.stripes()).toEqual([{ start: 0, end: 0, exit: 'ok', agent: true, separatorRow: null }]);
   });
 
   it('pairs when the record is reported before its C is parsed, and keeps later commands aligned', () => {
@@ -227,7 +227,7 @@ describe('CommandMarks', () => {
     marks.commandEnd(0);
     marks.recordStarted(true);
 
-    expect(marks.stripes()).toEqual([{ start: 0, end: 0, exit: 'ok', agent: true }]);
+    expect(marks.stripes()).toEqual([{ start: 0, end: 0, exit: 'ok', agent: true, separatorRow: null }]);
   });
 
   it('reset disposes the markers it holds', () => {
@@ -250,11 +250,11 @@ describe('CommandMarks', () => {
     f.buffer.baseY = 10;
     f.buffer.cursorY = 11;
     marks.commandEnd(0);
-    expect(marks.stripes()).toEqual([{ start: 4, end: 20, exit: 'ok', agent: false }]);
+    expect(marks.stripes()).toEqual([{ start: 4, end: 20, exit: 'ok', agent: false, separatorRow: null }]);
 
     // A clear erases rows 10 onwards. The stripe stops at row 9, the last row above the viewport.
     f.clear();
-    expect(marks.stripes()).toEqual([{ start: 4, end: 9, exit: 'ok', agent: false }]);
+    expect(marks.stripes()).toEqual([{ start: 4, end: 9, exit: 'ok', agent: false, separatorRow: null }]);
   });
 
   it('a clear leaves a command that ended in the scrollback alone', () => {
@@ -295,7 +295,7 @@ describe('CommandMarks', () => {
     // Records still arrive one per command, so the first record belongs to the erased command.
     marks.recordStarted(true);
     marks.recordStarted(false);
-    expect(marks.stripes()[0]).toEqual({ start: 0, end: 0, exit: 'fail', agent: false });
+    expect(marks.stripes()[0]).toEqual({ start: 0, end: 0, exit: 'fail', agent: false, separatorRow: null });
   });
 });
 

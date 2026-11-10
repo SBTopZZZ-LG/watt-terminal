@@ -12,6 +12,8 @@ export interface StripeMark {
   end: number;
   exit: StripeExit;
   agent: boolean;
+  /** Absolute row of the separator line above the command's prompt, or null when it has none (or it is gone). */
+  separatorRow: number | null;
 }
 
 export interface StripeSegment {
@@ -22,6 +24,15 @@ export interface StripeSegment {
   agent: boolean;
   /** True when the command's first row is in the viewport. The agent badge is shown only then. */
   startVisible: boolean;
+  /** Absolute row of the command's separator, as on StripeMark. */
+  separatorRow: number | null;
+}
+
+/** A separator line. `row` is absolute, or viewport-relative once separatorSegments has run. */
+export interface SeparatorLine {
+  row: number;
+  /** The command whose prompt sits below the line is an agent command. */
+  agent: boolean;
 }
 
 /**
@@ -44,21 +55,36 @@ export function stripeSegments(marks: readonly StripeMark[], viewportY: number, 
       exit: mark.exit,
       agent: mark.agent,
       startVisible: mark.start >= viewportY && mark.start <= bottom,
+      separatorRow: mark.separatorRow,
     });
   }
   return segments;
 }
 
 /**
- * The viewport-relative row of each absolute row that lies in the viewport, in the order given. Rows outside
- * the viewport give nothing. Used for the separator lines, which are one row each.
+ * Whether a command's agent badge sits on its separator line rather than on its stripe. It does when the command
+ * has a separator and that row is blank, the usable blank row the shell leaves before the prompt. `isBlank` takes an
+ * absolute row, and the check does not depend on the viewport: a separator scrolled out of view still keeps the badge
+ * off the stripe, so the badge does not jump between places while scrolling.
  */
-export function separatorSegments(absoluteRows: readonly number[], viewportY: number, viewportRows: number): number[] {
+export function badgeOnSeparator(separatorRow: number | null, isBlank: (absoluteRow: number) => boolean): boolean {
+  return separatorRow !== null && isBlank(separatorRow);
+}
+
+/**
+ * The separator lines inside the viewport, with `row` made viewport-relative, in the order given. Lines outside
+ * the viewport give nothing. Each separator is one row.
+ */
+export function separatorSegments(
+  lines: readonly SeparatorLine[],
+  viewportY: number,
+  viewportRows: number,
+): SeparatorLine[] {
   const bottom = viewportY + viewportRows - 1;
-  const out: number[] = [];
-  for (const row of absoluteRows) {
-    if (row >= viewportY && row <= bottom) {
-      out.push(row - viewportY);
+  const out: SeparatorLine[] = [];
+  for (const line of lines) {
+    if (line.row >= viewportY && line.row <= bottom) {
+      out.push({ row: line.row - viewportY, agent: line.agent });
     }
   }
   return out;

@@ -13,9 +13,10 @@
 // A separator line marks a prompt that follows a command which ran, so output and the next prompt are visibly apart.
 // It is one marker on the row where that prompt's A is emitted. The shell leaves a blank row before such a prompt
 // (integration.zsh), so the marker is on that blank row and StripeLayer centres the line in it. Drawn by StripeLayer too.
+// The command that starts below a separator keeps it (Mark.separator), so the agent badge can sit on the line.
 
 import type { IMarker, Terminal } from '@xterm/xterm';
-import type { StripeExit, StripeMark } from './stripes';
+import type { SeparatorLine, StripeExit, StripeMark } from './stripes';
 
 /** The part of xterm this module uses. Kept small so the logic can be tested without a DOM. */
 export type MarksTerminal = Pick<Terminal, 'buffer' | 'parser' | 'registerMarker'>;
@@ -35,6 +36,11 @@ interface Mark {
   agent: boolean;
   /** A clear erased the first row. The command has no stripe any more. */
   dropped: boolean;
+  /**
+   * The separator of the prompt this command ran after, when there was one. Its agent badge is drawn on that line.
+   * Undefined for the first command, after an empty Enter, or after a clear.
+   */
+  separator: IMarker | undefined;
 }
 
 export class CommandMarks {
@@ -53,11 +59,18 @@ export class CommandMarks {
    * Separator lines: one marker on the row of each prompt that follows a command which ran. Dropped by xterm with
    * their rows, and pruned when read.
    */
-  private separators: IMarker[] = [];
+  private separatorMarkers: IMarker[] = [];
   /** A command started since the last prompt. An empty Enter, or a Ctrl-L redraw, leaves it false. */
   private commandSincePrompt = false;
   /** The most recently finished mark, which the next prompt's separator belongs to. */
   private lastClosed: Mark | undefined;
+  /**
+   * The separator of the latest prompt, handed to the next command that starts. Cleared when a prompt follows no
+   * separator (an empty Enter, a clear), and kept when a prompt is redrawn in place.
+   */
+  private promptSeparator: IMarker | undefined;
+  /** Absolute row of the latest prompt's A. Tells an in-place redraw (same row) from a new prompt. */
+  private lastPromptRow = -1;
 
   /** `changed` is called when a stripe may have changed, so the layer can repaint. */
   constructor(
@@ -79,7 +92,14 @@ export class CommandMarks {
     this.closeOpen('unknown');
     this.commandSincePrompt = true;
     const start: IMarker | undefined = this.term.registerMarker(0);
-    const mark: Mark = { start, end: undefined, exit: null, agent: false, dropped: false };
+    const mark: Mark = {
+      start,
+      end: undefined,
+      exit: null,
+      agent: false,
+      dropped: false,
+      separator: this.promptSeparator,
+    };
     this.marks.push(mark);
     this.open.push(mark);
     const agent = this.unpairedStarts.shift();
@@ -103,26 +123,44 @@ export class CommandMarks {
   /** Shell event A: a new prompt. Any command still open ended without a D. */
   promptStart(): void {
     this.closeOpen('unknown');
+    const buf = this.term.buffer.active;
+    const row = buf.baseY + buf.cursorY;
     // The row A is emitted on (the blank row, when the shell adds one) gets a separator when a command ran before
     // it and that command still has a stripe. A clear that erased the command's first row leaves no stripe, so no
     // line either.
+    let sep: IMarker | undefined;
     if (this.commandSincePrompt && this.lastClosed && this.range(this.lastClosed) !== null) {
-      const sep = this.term.registerMarker(0);
+      sep = this.term.registerMarker(0);
       if (sep) {
-        this.separators.push(sep);
+        this.separatorMarkers.push(sep);
       }
     }
+    // The next command takes this prompt's separator. With no separator: after a command, the prompt has none (a
+    // clear). With no command, a prompt on a new row is an empty Enter, which has none; on the same row it is a
+    // redraw, which keeps the separator it had.
+    if (sep) {
+      this.promptSeparator = sep;
+    } else if (this.commandSincePrompt) {
+      this.promptSeparator = undefined;
+    } else if (row !== this.lastPromptRow) {
+      this.promptSeparator = undefined;
+    }
+    this.lastPromptRow = row;
     this.commandSincePrompt = false;
     this.changed();
   }
 
   /**
-   * The absolute rows that get a separator line, pruned of disposed markers. Rows are read by StripeLayer on each
-   * repaint, and the separators are not drawn in the alternate screen.
+   * The separator lines, pruned of disposed markers, in the order they were made. `agent` is true when the command
+   * whose prompt sits below the line is an agent command. Rows are read by StripeLayer on each repaint, and the
+   * separators are not drawn in the alternate screen.
    */
-  separatorRows(): number[] {
-    this.separators = this.separators.filter((sep) => !sep.isDisposed && sep.line >= 0);
-    return this.separators.map((sep) => sep.line);
+  separators(): SeparatorLine[] {
+    this.separatorMarkers = this.separatorMarkers.filter((sep) => !sep.isDisposed && sep.line >= 0);
+    return this.separatorMarkers.map((sep) => ({
+      row: sep.line,
+      agent: this.marks.some((mark) => mark.separator === sep && mark.agent),
+    }));
   }
 
   /** Rust reported a record started. `agent` is true when the agent ran it. */
@@ -155,13 +193,15 @@ export class CommandMarks {
       mark.start?.dispose();
       mark.end?.dispose();
     }
-    for (const sep of this.separators) {
+    for (const sep of this.separatorMarkers) {
       sep.dispose();
     }
     this.marks = [];
-    this.separators = [];
+    this.separatorMarkers = [];
     this.commandSincePrompt = false;
     this.lastClosed = undefined;
+    this.promptSeparator = undefined;
+    this.lastPromptRow = -1;
     this.open = [];
     this.unpairedMarks = [];
     this.unpairedStarts = [];
@@ -171,7 +211,8 @@ export class CommandMarks {
 
   /**
    * The stripes to draw, as absolute buffer rows. Read by StripeLayer on each repaint. Finished marks that have no
-   * rows left are dropped from the list here.
+   * rows left are dropped from the list here. `separatorRow` is the row of the mark's separator while that marker
+   * is alive, else null.
    */
   stripes(): StripeMark[] {
     this.marks = this.marks.filter((mark) => mark.exit === null || this.range(mark) !== null);
@@ -179,7 +220,15 @@ export class CommandMarks {
     for (const mark of this.marks) {
       const range = this.range(mark);
       if (range) {
-        stripes.push({ start: range.start, end: range.end, exit: exitClass(mark.exit), agent: mark.agent });
+        const sep = mark.separator;
+        const separatorRow = sep && !sep.isDisposed && sep.line >= 0 ? sep.line : null;
+        stripes.push({
+          start: range.start,
+          end: range.end,
+          exit: exitClass(mark.exit),
+          agent: mark.agent,
+          separatorRow,
+        });
       }
     }
     return stripes;

@@ -77,7 +77,8 @@ input {
 /*
  * Command stripes (StripeLayer). The layer covers the grid and is hidden in the alt screen. Each stripe spans the grid's
  * width, shifted 5px left, and its shadow draws a 3px bar just left of that box, leaving a visible gap before the text.
- * The badge is anchored to the stripe's right edge, so it keeps its place. A running command's stripe is muted.
+ * The agent badge goes on the stripe's right edge, or on the separator line above the command (see below). A running
+ * command's stripe is muted.
  */
 .stripe-layer {
   position: absolute;
@@ -107,7 +108,10 @@ input {
   box-shadow: -3px 0 0 var(--muted);
 }
 
-/* Only when the command's first row is on screen, so the badge never sits on a row that is not the command's start. */
+/*
+ * Only when the command's first row is on screen, so the badge never sits on a row that is not the command's start.
+ * StripeLayer sets data-agent false when the badge is on the separator line instead (its separator row is blank).
+ */
 .stripe[data-agent="true"][data-start-visible="true"]::after {
   content: "agent";
   position: absolute;
@@ -129,6 +133,24 @@ input {
   height: 1px;
   background: var(--line);
   pointer-events: none;
+}
+
+/*
+ * The agent badge on the separator line of an agent command, when that line is in a blank row. It is right-aligned
+ * and centred on the 1px line, like a tab on a rule, and looks like the stripe badge. The badge is taller than the
+ * line, so nothing on the separator may set overflow: hidden.
+ */
+.separator[data-agent="true"]::after {
+  content: "agent";
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  padding: 0 6px;
+  border-radius: 3px;
+  background: var(--accent);
+  color: var(--bg);
+  font: 10px/16px var(--mono);
 }
 
 /*
