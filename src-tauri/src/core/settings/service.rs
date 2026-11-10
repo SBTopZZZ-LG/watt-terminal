@@ -37,6 +37,8 @@ const TEST_PROMPT: &str = "Reply with the single word: ok";
 const TEST_MAX_TOKENS: u32 = 16;
 /// Longest reply text shown in a test result, in characters.
 const EXCERPT_CHARS: usize = 200;
+/// The refusal for a fetch that returned no models. The saved list is kept as it was.
+const NO_MODELS_FETCHED: &str = "the provider returned no models; the saved list was not changed";
 
 /// What the settings UI shows. It holds which secrets are stored, never their values.
 #[derive(Debug, Clone, Serialize)]
@@ -355,6 +357,10 @@ impl SettingsService {
     /// Folds a fetched model list into provider `id`. A default model that is no longer listed keeps its entry, so the
     /// default never disappears on a refresh.
     pub fn apply_fetched(&self, id: &str, fetched: Vec<FetchedModel>) -> Result<(SettingsView, FetchSummary), String> {
+        // An empty list would remove every fetched model, so it is refused before anything is read or changed.
+        if fetched.is_empty() {
+            return Err(NO_MODELS_FETCHED.to_string());
+        }
         let _write = lock(&self.write);
         let mut candidate = self.writable()?;
         let index = candidate.providers.iter().position(|p| p.id == id).ok_or_else(|| no_provider(id))?;
@@ -827,6 +833,23 @@ mod tests {
         let (view, summary) = f.service.apply_fetched("acme", fetched).unwrap();
         assert_eq!(summary, FetchSummary { added: 0, updated: 2, removed: 1, total: 3 });
         assert!(view.settings.providers[0].model("gone").is_none());
+    }
+
+    #[test]
+    fn an_empty_fetched_list_is_refused_and_the_saved_settings_stay_as_they_were() {
+        let f = fixture();
+        let mut p = provider("acme");
+        p.models = vec![model("mine", ModelSource::Custom), model("kept", ModelSource::Fetched)];
+        f.service.save_provider(with_key(p, KEY)).unwrap();
+        let before = f.service.view().unwrap();
+        let file_before = read_file(&f.dir);
+
+        let err = f.service.apply_fetched("acme", Vec::new()).unwrap_err();
+        assert_eq!(err, "the provider returned no models; the saved list was not changed");
+        assert_eq!(f.service.view().unwrap().settings, before.settings, "the models are not wiped");
+        assert_eq!(read_file(&f.dir), file_before, "nothing is written");
+        let ids: Vec<&str> = before.settings.providers[0].models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["mine", "kept"]);
     }
 
     #[test]

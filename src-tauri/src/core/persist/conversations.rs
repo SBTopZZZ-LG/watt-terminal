@@ -16,6 +16,8 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io::ErrorKind;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
@@ -23,7 +25,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use super::PersistError;
-use super::workspace::Workspace;
+use super::workspace::{Workspace, is_hidden_or_control};
 use crate::core::chat::redact::Redactor;
 use crate::core::chat::todo::{self, Todo};
 use crate::core::settings::write_private_atomic;
@@ -112,12 +114,20 @@ struct IndexFile {
 pub struct ConversationStore {
     dir: PathBuf,
     lock: Mutex<()>,
+    /// Conversation files read, for the tests that check when the index is rebuilt from them.
+    #[cfg(test)]
+    reads: AtomicUsize,
 }
 
 impl ConversationStore {
     /// A store over `dir`. The directory is created on the first write.
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into(), lock: Mutex::new(()) }
+        Self {
+            dir: dir.into(),
+            lock: Mutex::new(()),
+            #[cfg(test)]
+            reads: AtomicUsize::new(0),
+        }
     }
 
     /// Writes the conversation and its index entry. A new id gets `created_at = now` and a title derived from the
@@ -265,6 +275,8 @@ impl ConversationStore {
 
     /// The stored conversation, `None` when there is no file. A file that cannot be read or used is `Corrupt`.
     fn read_stored(&self, id: &str) -> Result<Option<StoredConversation>, PersistError> {
+        #[cfg(test)]
+        self.reads.fetch_add(1, Ordering::SeqCst);
         let path = self.path_for(id);
         let text = match fs::read_to_string(&path) {
             Ok(text) => text,
@@ -316,15 +328,26 @@ impl ConversationStore {
     /// and its `skipped` ids together are exactly the `<id>.json` files on disk, and every skipped id is on disk.
     /// Otherwise it is rebuilt from the files, and the rebuilt index is written.
     fn index_locked(&self) -> Result<IndexFile, PersistError> {
+        self.index_checked(&[])
+    }
+
+    /// `index_locked`, except that the `touched` ids are left out of the check. The caller has just written or removed
+    /// their files and is about to set their entries itself, so their state on disk and in the index may differ now.
+    /// Any other disagreement still rebuilds the index.
+    fn index_checked(&self, touched: &[&str]) -> Result<IndexFile, PersistError> {
         let on_disk = self.ids_on_disk()?;
         if let Some(index) = self.read_index() {
-            let listed: HashSet<&str> = index.conversations.iter().map(|m| m.id.as_str()).collect();
-            let skipped: HashSet<&str> = index.skipped.iter().map(String::as_str).collect();
-            let agrees = listed.len() == index.conversations.len()
-                && skipped.len() == index.skipped.len()
+            let untouched = |id: &&str| !touched.contains(id);
+            let all_listed: HashSet<&str> = index.conversations.iter().map(|m| m.id.as_str()).collect();
+            let all_skipped: HashSet<&str> = index.skipped.iter().map(String::as_str).collect();
+            let listed: HashSet<&str> = all_listed.iter().copied().filter(untouched).collect();
+            let skipped: HashSet<&str> = all_skipped.iter().copied().filter(untouched).collect();
+            let disk_untouched = on_disk.iter().filter(|id| untouched(&id.as_str())).count();
+            let agrees = all_listed.len() == index.conversations.len()
+                && all_skipped.len() == index.skipped.len()
                 && skipped.iter().all(|id| on_disk.contains(*id))
                 && listed.iter().all(|id| on_disk.contains(*id) && !skipped.contains(*id))
-                && listed.len() + skipped.len() == on_disk.len();
+                && listed.len() + skipped.len() == disk_untouched;
             if agrees {
                 return Ok(index);
             }
@@ -344,14 +367,15 @@ impl ConversationStore {
         Ok(index)
     }
 
-    /// Applies `change` to the conversations, forgets the `touched` ids as skipped, and writes the index back. Caller
-    /// holds the lock.
+    /// Applies `change` to the conversations, forgets the `touched` ids as skipped, and writes the index back. The
+    /// touched files are the caller's change, so the index is not rebuilt for them (see `index_checked`). Caller holds
+    /// the lock.
     fn update_index_locked(
         &self,
         touched: &[&str],
         change: impl FnOnce(&mut Vec<ConversationMeta>),
     ) -> Result<(), PersistError> {
-        let mut index = self.index_locked()?;
+        let mut index = self.index_checked(touched)?;
         change(&mut index.conversations);
         sort_metas(&mut index.conversations);
         index.skipped.retain(|id| !touched.contains(&id.as_str()));
@@ -418,8 +442,10 @@ pub fn normalize_title(raw: &str) -> Result<String, PersistError> {
     if chars > MAX_RENAME_CHARS {
         return Err(PersistError::Invalid(format!("the title must be at most {MAX_RENAME_CHARS} characters")));
     }
-    if title.chars().any(char::is_control) {
-        return Err(PersistError::Invalid("the title must not contain control characters".into()));
+    if title.chars().any(is_hidden_or_control) {
+        return Err(PersistError::Invalid(
+            "the title must not contain control or invisible formatting characters".into(),
+        ));
     }
     Ok(title.to_string())
 }
@@ -440,9 +466,10 @@ fn first_line(text: &str) -> Option<String> {
     text.lines().map(collapse_whitespace).find(|line| !line.is_empty())
 }
 
-/// Control characters count as whitespace, then runs of whitespace become one space and the ends are trimmed.
+/// Control and invisible formatting characters count as whitespace, then runs of whitespace become one space and the
+/// ends are trimmed.
 fn collapse_whitespace(line: &str) -> String {
-    let spaced: String = line.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    let spaced: String = line.chars().map(|c| if is_hidden_or_control(c) { ' ' } else { c }).collect();
     spaced.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -688,6 +715,49 @@ mod tests {
     fn control_characters_in_a_title_become_spaces() {
         let title = derive_title(&[json!({"role": "user", "content": "a\u{7}b\u{0}c"})]);
         assert_eq!(title, "a b c");
+    }
+
+    /// The characters `is_hidden_or_control` hides from titles and labels, one of each in every range.
+    fn hidden_chars() -> Vec<char> {
+        [0x200B, 0x200E, 0x200F, 0x202A, 0x202B, 0x202C, 0x202D, 0x202E, 0x2060, 0x2066, 0x2067, 0x2068, 0x2069, 0xFEFF]
+            .into_iter()
+            .map(|cp| char::from_u32(cp).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn bidi_and_invisible_characters_become_spaces_in_derived_titles() {
+        for c in hidden_chars() {
+            let text = format!("a{c}b");
+            assert_eq!(derive_title(&[json!({"role": "user", "content": text})]), "a b", "U+{:04X}", c as u32);
+        }
+        let override_text = "\u{202E}gnp.exe";
+        assert_eq!(derive_title(&[json!({"role": "user", "content": override_text})]), "gnp.exe");
+    }
+
+    #[test]
+    fn bidi_and_invisible_characters_refuse_a_rename() {
+        for c in hidden_chars() {
+            let title = format!("plan{c}b");
+            assert!(matches!(normalize_title(&title), Err(PersistError::Invalid(_))), "U+{:04X}", c as u32);
+        }
+    }
+
+    #[test]
+    fn zero_width_joiner_and_non_joiner_stay_in_titles() {
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467} trip plan";
+        assert_eq!(derive_title(&[json!({"role": "user", "content": family})]), family);
+        assert_eq!(normalize_title(family).unwrap(), family);
+        let persian = "\u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645}";
+        assert_eq!(derive_title(&[json!({"role": "user", "content": persian})]), persian);
+        assert_eq!(normalize_title(persian).unwrap(), persian);
+    }
+
+    #[test]
+    fn an_ordinary_title_is_unchanged_by_the_hidden_character_rules() {
+        let ordinary = "Plan: naïve café — 日本語 (v2) #1";
+        assert_eq!(derive_title(&[json!({"role": "user", "content": ordinary})]), ordinary);
+        assert_eq!(normalize_title(ordinary).unwrap(), ordinary);
     }
 
     #[test]
@@ -1073,6 +1143,54 @@ mod tests {
         s.save(&request(&id(28), "a"), &redactor(), 5).unwrap();
         fs::write(s.dir.join(INDEX_FILE), br#"{"version": 9, "conversations": []}"#).unwrap();
         assert_eq!(s.list().unwrap().len(), 1);
+    }
+
+    /// Conversation files read since the last call. A rebuild reads every file, so a count of one (the saved id's own
+    /// existence check) means the index was trusted.
+    fn reads_since_last(s: &ConversationStore) -> usize {
+        s.reads.swap(0, Ordering::SeqCst)
+    }
+
+    #[test]
+    fn save_of_a_new_id_delete_and_prune_do_not_rebuild_the_index() {
+        let tmp = TempDir::new();
+        let s = store(&tmp);
+        for n in 60..64 {
+            s.save(&request(&id(n), "x"), &redactor(), u64::from(n)).unwrap();
+        }
+        s.list().unwrap();
+        reads_since_last(&s);
+
+        s.save(&request(&id(70), "new"), &redactor(), 70).unwrap();
+        assert_eq!(reads_since_last(&s), 1, "a save reads only the saved id's own file");
+        assert_eq!(s.list().unwrap().len(), 5);
+
+        s.delete(&id(60)).unwrap();
+        assert_eq!(reads_since_last(&s), 0, "a delete reads no conversation file");
+        assert_eq!(s.list().unwrap().len(), 4);
+
+        let removed = s.prune(2, None).unwrap();
+        assert_eq!(removed, vec![id(61), id(62)]);
+        assert_eq!(reads_since_last(&s), 0, "a prune reads no conversation file");
+        assert_eq!(read_index(&s).conversations.len(), 2);
+        assert!(read_index(&s).skipped.is_empty());
+    }
+
+    #[test]
+    fn a_stray_file_still_makes_the_next_save_rebuild_the_index() {
+        let tmp = TempDir::new();
+        let s = store(&tmp);
+        for n in 80..83 {
+            s.save(&request(&id(n), "x"), &redactor(), u64::from(n)).unwrap();
+        }
+        s.list().unwrap();
+        // A copy under a name the index does not know. It is not one of the saved or touched ids, so it is a mismatch.
+        fs::copy(s.path_for(&id(80)), s.path_for(&id(90))).unwrap();
+        reads_since_last(&s);
+
+        s.save(&request(&id(70), "new"), &redactor(), 70).unwrap();
+        assert!(reads_since_last(&s) > 1, "the mismatch forces a rebuild that reads the files");
+        assert_eq!(read_index(&s).skipped, vec![id(90)], "the copy is recorded as skipped");
     }
 
     // Delete, rename, prune, delete_all

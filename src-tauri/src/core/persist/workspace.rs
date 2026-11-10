@@ -54,6 +54,19 @@ fn project_root(path: &str) -> String {
     path.to_string()
 }
 
+/// Control characters and the invisible formatting characters that can reorder or hide text when shown: the
+/// bidirectional marks and overrides (U+200E, U+200F, U+202A-U+202E, U+2066-U+2069), the zero-width space, word joiner
+/// and byte order mark (U+200B, U+2060, U+FEFF). Zero-width non-joiner and joiner (U+200C, U+200D) are not included:
+/// emoji sequences and some scripts need them.
+pub fn is_hidden_or_control(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{200B}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}' | '\u{2066}'..='\u{2069}'
+                | '\u{FEFF}'
+        )
+}
+
 fn label_for(root: &str, local: bool, home: Option<&Path>) -> String {
     if root.is_empty() {
         return "Unknown".to_string();
@@ -65,10 +78,17 @@ fn label_for(root: &str, local: bool, home: Option<&Path>) -> String {
     if root_path.parent().is_none() {
         return "/".to_string();
     }
-    match root_path.file_name() {
+    let name = match root_path.file_name() {
         Some(name) => name.to_string_lossy().into_owned(),
         None => root.to_string(),
+    };
+    if !name.chars().any(is_hidden_or_control) {
+        return name;
     }
+    // Hidden and control characters become spaces, as in titles. A name that is only those reads as unknown.
+    let shown: String = name.chars().map(|c| if is_hidden_or_control(c) { ' ' } else { c }).collect();
+    let shown = shown.trim();
+    if shown.is_empty() { "Unknown".to_string() } else { shown.to_string() }
 }
 
 #[cfg(test)]
@@ -220,6 +240,36 @@ mod tests {
         let w = workspace_for(Some(("build-box", "/")), LOCAL, None);
         assert_eq!(w.root, "/");
         assert_eq!(w.label, "/");
+    }
+
+    #[test]
+    fn hidden_and_control_characters_in_a_label_become_spaces() {
+        // The remote path needs no disk access, so these names are plain strings.
+        let w = workspace_for(Some(("build-box", "/work/re\u{202E}vop")), LOCAL, None);
+        assert_eq!(w.label, "re vop");
+        let w = workspace_for(Some(("build-box", "/work/a\u{200B}b\u{FEFF}")), LOCAL, None);
+        assert_eq!(w.label, "a b");
+        let w = workspace_for(Some(("build-box", "/work/\u{2066}\u{2069}")), LOCAL, None);
+        assert_eq!(w.label, "Unknown", "a name that is only hidden characters reads as unknown");
+    }
+
+    #[test]
+    fn zero_width_joiner_stays_in_a_label_and_ordinary_names_are_unchanged() {
+        let family = "/work/family\u{200D}\u{1F467}";
+        let w = workspace_for(Some(("build-box", family)), LOCAL, None);
+        assert_eq!(w.label, "family\u{200D}\u{1F467}");
+        let w = workspace_for(Some(("build-box", "/work/my  proj ")), LOCAL, None);
+        assert_eq!(w.label, "my  proj ", "no hidden character, so the name is kept as it is");
+    }
+
+    #[test]
+    fn hidden_character_predicate_covers_its_ranges_only() {
+        for cp in [0x200B, 0x200E, 0x200F, 0x202A, 0x202E, 0x2060, 0x2066, 0x2069, 0xFEFF, 0x0007, 0x007F] {
+            assert!(is_hidden_or_control(char::from_u32(cp).unwrap()), "U+{cp:04X} is hidden");
+        }
+        for cp in [0x200C, 0x200D, 0x2029, 0x202F, 0x2065, 0x206A, 0x00A0, 'a' as u32] {
+            assert!(!is_hidden_or_control(char::from_u32(cp).unwrap()), "U+{cp:04X} is shown");
+        }
     }
 
     #[test]

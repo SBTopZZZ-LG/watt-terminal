@@ -445,3 +445,93 @@ async fn cancel_during_a_stalled_non_stream_request_returns_cancelled_promptly()
     assert_eq!(result.unwrap_err(), LlmError::Cancelled);
     assert!(started.elapsed() < Duration::from_secs(2));
 }
+
+/// Binds a fake server on 127.0.0.1 with an ephemeral port. Connection `n` gets the reply that `reply(base, n, raw)`
+/// returns, a full HTTP response. Returns the base URL and the raw requests, in order. The server ends after `count`
+/// connections.
+fn serve_each(
+    count: usize,
+    reply: impl Fn(&str, usize, &str) -> String + Send + 'static,
+) -> (String, mpsc::Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake server");
+    let base = format!("http://{}", listener.local_addr().expect("local addr"));
+    let (tx, rx) = mpsc::channel();
+    let server_base = base.clone();
+    thread::spawn(move || {
+        for n in 0..count {
+            let Ok((mut sock, _)) = listener.accept() else { return };
+            let _ = sock.set_nodelay(true);
+            let raw = read_request(&mut sock);
+            let _ = tx.send(raw.clone());
+            let _ = sock.write_all(reply(&server_base, n, &raw).as_bytes());
+            let _ = sock.flush();
+        }
+    });
+    (base, rx)
+}
+
+/// A complete HTTP response with `Connection: close` and the given extra header lines (each ending in CRLF).
+fn http_reply(status: &str, extra_headers: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+fn text_reply_json(text: &str) -> String {
+    json!({"choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": text}}]})
+        .to_string()
+}
+
+#[tokio::test]
+async fn a_redirect_to_the_same_origin_is_followed_and_the_body_and_headers_are_sent_again() {
+    let (base, rx) = serve_each(2, |base, n, _raw| match n {
+        0 => http_reply("307 Temporary Redirect", &format!("Location: {base}/moved\r\n"), ""),
+        _ => http_reply("200 OK", "Content-Type: application/json\r\n", &text_reply_json("moved ok")),
+    });
+    let mut cfg = cfg(format!("{base}/chat"));
+    cfg.headers = vec![("x-custom-key".to_string(), "custom-value-123".to_string())];
+    let reply = complete(&http_client().unwrap(), &cfg, &request(), &TurnCancel::new()).await.unwrap();
+    assert_eq!(reply.text, "moved ok");
+
+    let first = rx.recv().unwrap();
+    let second = rx.recv().unwrap();
+    assert!(first.starts_with("POST /chat "), "{first}");
+    assert!(second.starts_with("POST /moved "), "{second}");
+    assert!(second.contains("What directory am I in?"), "a 307 re-sends the body to the same origin: {second}");
+    assert!(second.to_ascii_lowercase().contains("x-custom-key: custom-value-123"), "{second}");
+}
+
+#[tokio::test]
+async fn a_redirect_to_another_port_is_not_followed_and_the_other_server_gets_no_connection() {
+    let other = TcpListener::bind("127.0.0.1:0").expect("bind other server");
+    other.set_nonblocking(true).expect("non-blocking");
+    let other_url = format!("http://{}/steal", other.local_addr().expect("local addr"));
+    let (base, rx) = serve_each(1, move |_, _, _| {
+        http_reply("307 Temporary Redirect", &format!("Location: {other_url}\r\n"), "")
+    });
+    let mut cfg = cfg(format!("{base}/chat"));
+    cfg.headers = vec![("x-custom-key".to_string(), "custom-value-123".to_string())];
+
+    let err = complete(&http_client().unwrap(), &cfg, &request(), &TurnCancel::new()).await.unwrap_err();
+    assert_eq!(err, LlmError::Transport("the server redirected to another origin; not followed".to_string()));
+    assert!(rx.recv().unwrap().starts_with("POST /chat "));
+    // Nothing reached the other server: the client decided before connecting, so no connection is waiting.
+    let accepted = other.accept();
+    assert!(
+        matches!(&accepted, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+        "the other origin must get no connection: {accepted:?}"
+    );
+}
+
+#[tokio::test]
+async fn redirects_past_the_limit_fail_with_a_clear_message() {
+    // The original request and ten followed redirects are eleven connections. The eleventh redirect is refused.
+    let (base, _rx) = serve_each(agent_term_lib::core::llm::MAX_REDIRECTS + 1, |base, _, _| {
+        http_reply("302 Found", &format!("Location: {base}/again\r\n"), "")
+    });
+    let err = complete(&http_client().unwrap(), &cfg(format!("{base}/chat")), &request(), &TurnCancel::new())
+        .await
+        .unwrap_err();
+    assert_eq!(err, LlmError::Transport("too many redirects".to_string()));
+}

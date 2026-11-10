@@ -164,9 +164,31 @@ impl TurnCancel {
     }
 }
 
-/// The shared HTTP client: rustls, connect timeout, and no default User-Agent (each request sets its own).
+/// Most redirects one request follows.
+pub const MAX_REDIRECTS: usize = 10;
+
+/// The shared HTTP client: rustls, connect timeout, redirects only within the origin of the request, and no default
+/// User-Agent (each request sets its own).
 pub fn http_client() -> Result<reqwest::Client, reqwest::Error> {
-    reqwest::Client::builder().connect_timeout(CONNECT_TIMEOUT).build()
+    reqwest::Client::builder().connect_timeout(CONNECT_TIMEOUT).redirect(same_origin_redirects()).build()
+}
+
+/// Follows a redirect only when the new URL has the same scheme, host and port as the original request. The default
+/// policy would send the key and the custom headers to another server, and would re-send a POST body on a 307 or 308.
+/// Any other redirect fails the request with a message that says so, and nothing is sent to the other origin.
+fn same_origin_redirects() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() > MAX_REDIRECTS {
+            return attempt.error("too many redirects");
+        }
+        // `previous` starts with the URL of the original request.
+        let same_origin = attempt.previous().first().is_some_and(|first| first.origin() == attempt.url().origin());
+        if same_origin {
+            attempt.follow()
+        } else {
+            attempt.error("the server redirected to another origin; not followed")
+        }
+    })
 }
 
 /// One non-streaming request (`stream: false`). Returns once the whole reply has arrived.
@@ -338,7 +360,11 @@ fn request_body(req: &ChatRequest, stream: bool) -> Value {
 pub(crate) fn transport(err: reqwest::Error) -> LlmError {
     // The URL is dropped: a configured endpoint may carry a token in its userinfo or query.
     let err = err.without_url();
-    if err.is_timeout() {
+    if err.is_redirect() {
+        // The redirect policy's own message (see `same_origin_redirects`) is the cause. reqwest's text is generic.
+        let cause = std::error::Error::source(&err).map_or_else(|| err.to_string(), ToString::to_string);
+        LlmError::Transport(cause)
+    } else if err.is_timeout() {
         LlmError::Transport("the request timed out".to_string())
     } else if err.is_connect() {
         LlmError::Transport(format!("could not connect: {err}"))

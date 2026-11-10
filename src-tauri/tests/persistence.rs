@@ -536,3 +536,78 @@ fn new_conversation_clears_the_todo_list_and_the_saved_copy_keeps_its_own() {
     // The todo module is used by name here so the import is exercised by the test as well.
     assert!(todo::prompt_block(&saved.todos).is_some());
 }
+
+/// The steps `delete_conversation` takes for the live conversation: the live one is reset (new id, empty history and
+/// todos), the saved file is deleted, and the remembered last conversation is forgotten.
+fn delete_live_as_the_command_does(persist: &Persist, conv: &Conversation, saved_id: &str) {
+    conv.reset().unwrap();
+    persist.conversations.delete(saved_id).unwrap();
+    persist.forget_last().unwrap();
+}
+
+#[test]
+fn deleting_the_live_conversation_and_then_a_turn_does_not_bring_the_file_back() {
+    let provider = serve(vec![text_reply("first answer"), text_reply("second answer")]);
+    let tmp = TempDir::new();
+    let persist = persist_in(&tmp);
+    let s = settings(&provider.url);
+
+    let conv = Conversation::new().unwrap();
+    let old_id = conv.id();
+    let mut agent = agent_for(&s, &conv);
+    run(&mut agent, "first question");
+    finish(&persist, &conv, &agent, None, 100).expect("the turn is saved");
+    assert!(conversation_file(&tmp, &old_id).exists());
+
+    delete_live_as_the_command_does(&persist, &conv, &old_id);
+    assert!(!conversation_file(&tmp, &old_id).exists());
+    assert_eq!(persist.ui.load().unwrap().last_conversation_id, None, "the last conversation is forgotten");
+    assert!(conv.history().lock().unwrap().snapshot().is_empty(), "the live history is empty");
+
+    // The next turn runs on the new id and saves under it. The deleted id is not written back.
+    let new_id = conv.id();
+    assert_ne!(new_id, old_id);
+    let mut agent = agent_for(&s, &conv);
+    run(&mut agent, "second question");
+    let saved = finish(&persist, &conv, &agent, None, 200).expect("the turn is saved");
+    assert_eq!(saved.id, new_id);
+    assert!(!conversation_file(&tmp, &old_id).exists(), "the deleted conversation is not resurrected");
+    let listed: Vec<String> = persist.conversations.list().unwrap().into_iter().map(|m| m.id).collect();
+    assert_eq!(listed, vec![new_id.clone()]);
+    assert_eq!(persist.ui.load().unwrap().last_conversation_id, Some(new_id));
+    assert_eq!(provider.requests().len(), 2);
+}
+
+#[test]
+fn deleting_another_conversation_leaves_the_live_one_alone() {
+    let provider = serve(vec![text_reply("a"), text_reply("b"), text_reply("c")]);
+    let tmp = TempDir::new();
+    let persist = persist_in(&tmp);
+    let s = settings(&provider.url);
+
+    let live = Conversation::new().unwrap();
+    let mut agent = agent_for(&s, &live);
+    run(&mut agent, "live question");
+    finish(&persist, &live, &agent, None, 100).expect("saved");
+
+    let other = Conversation::new().unwrap();
+    let other_id = other.id();
+    let mut agent_other = agent_for(&s, &other);
+    run(&mut agent_other, "other question");
+    finish(&persist, &other, &agent_other, None, 110).expect("saved");
+
+    // The other conversation was saved last, so it is the remembered one. Deleting the live one does not forget it.
+    persist.conversations.delete(&live.id()).unwrap();
+    assert!(!persist.forget_if_last(&live.id()).unwrap(), "a conversation that is not the remembered one is kept");
+    assert_eq!(persist.ui.load().unwrap().last_conversation_id, Some(other_id.clone()));
+
+    // Deleting the other one (not live) also leaves the live conversation as it is.
+    let live_id = live.id();
+    persist.conversations.delete(&other_id).unwrap();
+    assert_eq!(live.id(), live_id, "the live conversation keeps its id");
+    let mut agent = agent_for(&s, &live);
+    run(&mut agent, "live follow-up");
+    let saved = finish(&persist, &live, &agent, None, 120).expect("saved");
+    assert_eq!(saved.id, live_id);
+    assert!(conversation_file(&tmp, &live_id).exists());
+}

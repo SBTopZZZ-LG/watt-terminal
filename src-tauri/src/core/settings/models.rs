@@ -13,6 +13,7 @@ use futures_util::StreamExt;
 use serde_json::Value;
 
 use super::{MAX_MODEL_ID_CHARS, Model, ModelSource, Provider};
+use crate::core::chat::redact::Redactor;
 use crate::core::llm::{self, LlmError, ProviderConfig};
 
 /// Total time for one model-list request, including the body.
@@ -163,14 +164,19 @@ async fn fetch_within(
     let response = client.get(url).headers(header_map).timeout(timeout).send().await.map_err(transport)?;
     let status = response.status();
     let (bytes, too_big) = read_capped(response).await?;
-    let text = llm::redact(&String::from_utf8_lossy(&bytes), api_key);
+    let body = String::from_utf8_lossy(&bytes);
     if !status.is_success() {
+        // The same secrets the connection test removes: the key and every header value. The key is also replaced
+        // exactly, so a short key that the redactor would skip is still removed.
+        let mut known = vec![api_key.to_string()];
+        known.extend(headers.iter().map(|(_, value)| value.clone()));
+        let text = Redactor::new(known).redact(&llm::redact(&body, api_key));
         return Err(ModelsError::Http { status: status.as_u16(), message: error_message(&text) });
     }
     if too_big {
         return Err(ModelsError::TooLarge);
     }
-    parse_model_list(&text)
+    parse_model_list(&llm::redact(&body, api_key))
 }
 
 /// Reads the body up to `MAX_BODY_BYTES`. Returns what was read and whether the body was longer. Stops reading at
@@ -502,5 +508,39 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err, ModelsError::Transport("the request timed out".to_string()));
+    }
+
+    /// Answers one request with `status` and `body`, then closes the connection.
+    fn one_shot(status: &'static str, body: String) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf);
+            let head = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = sock.write_all(head.as_bytes());
+            let _ = sock.write_all(body.as_bytes());
+        });
+        format!("http://{addr}/v1/models")
+    }
+
+    #[tokio::test]
+    async fn an_error_body_hides_the_key_and_every_header_value() {
+        const KEY: &str = "DUMMY-key-0123456789abcdef";
+        const HEADER: &str = "DUMMY-header-fedcba9876543210";
+        let body = format!(r#"{{"error":{{"message":"bad key {KEY} and header {HEADER}"}}}}"#);
+        let url = one_shot("403 Forbidden", body);
+        let client = llm::http_client().unwrap();
+        let headers = [("X-Key".to_string(), HEADER.to_string())];
+        let err = fetch_within(&client, &url, KEY, &headers, "agent-term-test/0", FETCH_TIMEOUT).await.unwrap_err();
+        let text = err.to_string();
+        assert!(matches!(err, ModelsError::Http { status: 403, .. }), "{err:?}");
+        assert!(!text.contains(KEY) && !text.contains(HEADER), "{text}");
+        assert!(text.contains("bad key [redacted] and header [REDACTED]"), "{text}");
     }
 }

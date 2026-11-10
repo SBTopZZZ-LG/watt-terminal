@@ -142,6 +142,11 @@ export interface LoadedConversation {
   todos?: TodoItem[];
 }
 
+/** What a saved-conversation delete reports. `deleted_live` is true when the live conversation was reset to a new one. */
+export interface DeleteResult {
+  deleted_live: boolean;
+}
+
 export type Dock = 'left' | 'top' | 'right' | 'bottom';
 export type HistoryGroupBy = 'date' | 'workspace';
 

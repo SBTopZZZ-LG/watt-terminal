@@ -51,6 +51,11 @@ impl<T> Registry<T> {
         self.lock().drain().map(|(_, item)| item).collect()
     }
 
+    /// Every item, still registered. The order is unspecified.
+    pub fn snapshot(&self) -> Vec<Arc<T>> {
+        self.lock().values().cloned().collect()
+    }
+
     fn lock(&self) -> MutexGuard<'_, HashMap<String, Arc<T>>> {
         self.items.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -69,5 +74,16 @@ mod tests {
         assert_eq!(reg.remove_if("a", |v| *v == 1).map(|v| *v), Some(1));
         assert!(reg.get("a").is_none());
         assert!(reg.remove_if("a", |_| true).is_none(), "a missing id removes nothing");
+    }
+
+    #[test]
+    fn snapshot_lists_every_item_and_keeps_them_registered() {
+        let reg: Registry<u32> = Registry::new();
+        reg.get_or_insert_with::<()>("a", || Ok(1)).expect("insert");
+        reg.get_or_insert_with::<()>("b", || Ok(2)).expect("insert");
+        let mut values: Vec<u32> = reg.snapshot().iter().map(|v| **v).collect();
+        values.sort();
+        assert_eq!(values, vec![1, 2]);
+        assert!(reg.get("a").is_some() && reg.get("b").is_some(), "a snapshot removes nothing");
     }
 }

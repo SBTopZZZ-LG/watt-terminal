@@ -4,6 +4,7 @@
 import { Channel, invoke } from '@tauri-apps/api/core';
 import type {
   ConversationMeta,
+  DeleteResult,
   FetchOutcome,
   LoadedConversation,
   ModelRef,
@@ -76,14 +77,16 @@ export const api = {
   loadConversation(id: string) {
     return invoke<LoadedConversation>('load_conversation', { sessionId: SESSION_ID, id });
   },
+  /** Deletes a saved conversation. Refused while the agent is busy. `deleted_live` says the live conversation was reset. */
   deleteConversation(id: string) {
-    return invoke<void>('delete_conversation', { id });
+    return invoke<DeleteResult>('delete_conversation', { id });
   },
   renameConversation(id: string, title: string) {
     return invoke<ConversationMeta>('rename_conversation', { id, title });
   },
+  /** Deletes every saved conversation. Refused while the agent is busy. The live conversation is reset. */
   deleteAllConversations() {
-    return invoke<void>('delete_all_conversations');
+    return invoke<DeleteResult>('delete_all_conversations');
   },
   getUiState() {
     return invoke<UiState>('get_ui_state');

@@ -585,17 +585,61 @@ async fn load_conversation(
     Ok(LoadedConversation { id, title, messages, todos })
 }
 
-/// Deletes a saved conversation. Deleting one that does not exist is not an error. When it was the remembered last
-/// conversation, that is forgotten too; a failure to forget it is logged, not returned.
+/// What a delete reports: whether a live conversation was among those deleted and was reset to a new one.
+#[derive(Serialize)]
+struct DeleteResult {
+    deleted_live: bool,
+}
+
+/// Deletes saved conversations (`target`: one id, or `None`: all of them) and resets the live conversations that
+/// the deletion covers, as one step. Refused while any agent is busy. Every session's turn-cancel lock is held from
+/// the busy check to the end of the reset, as `begin_turn` and `new_conversation` do, so no turn starts in between.
+/// A reset live conversation gets a new id, so a later save cannot write a deleted conversation back. The reset
+/// happens even when the file deletion fails part way, for the same reason. Returns whether a live conversation was
+/// reset.
+fn delete_saved(sessions: &[Arc<Attached>], store: &Persist, target: Option<&str>) -> Result<bool, String> {
+    let _turns: Vec<_> = sessions.iter().map(|att| lock(&att.turn_cancel)).collect();
+    if sessions.iter().any(|att| att.agent_busy.load(Ordering::SeqCst)) {
+        return Err(BUSY_REFUSAL.into());
+    }
+    let deleted = match target {
+        Some(id) => store.conversations.delete(id),
+        None => store.conversations.delete_all(),
+    };
+    let mut reset = false;
+    for att in sessions {
+        if target.is_none_or(|id| att.conversation.id() == id) {
+            att.conversation.reset().map_err(io_err)?;
+            reset = true;
+        }
+    }
+    deleted.map_err(|e| e.to_string())?;
+    Ok(reset)
+}
+
+/// Deletes a saved conversation. Deleting one that does not exist is not an error. When the deleted conversation is the
+/// live one, the live conversation is reset (see `delete_saved`) and the remembered last conversation is forgotten.
+/// Otherwise, when it was the remembered last conversation, that is forgotten too. A failure to forget is logged, not
+/// returned. Refused while the agent is working.
 #[tauri::command]
-async fn delete_conversation(id: String, persist: State<'_, PersistState>) -> Result<(), String> {
+async fn delete_conversation(
+    id: String,
+    reg: State<'_, Reg>,
+    persist: State<'_, PersistState>,
+) -> Result<DeleteResult, String> {
     let store = persist.get()?;
+    let sessions = reg.snapshot();
     blocking(move || {
-        store.conversations.delete(&id).map_err(|e| e.to_string())?;
-        if let Err(e) = store.forget_if_last(&id) {
+        let deleted_live = delete_saved(&sessions, &store, Some(&id))?;
+        let remembered = if deleted_live {
+            store.forget_last().map(|_| ())
+        } else {
+            store.forget_if_last(&id).map(|_| ())
+        };
+        if let Err(e) = remembered {
             eprintln!("agent-term: the last conversation was not forgotten ({e})");
         }
-        Ok(())
+        Ok(DeleteResult { deleted_live })
     })
     .await
 }
@@ -611,16 +655,21 @@ async fn rename_conversation(
     blocking(move || store.conversations.rename(&id, &title).map_err(|e| e.to_string())).await
 }
 
-/// Deletes every saved conversation, and forgets the remembered last one. The live conversation is not touched.
+/// Deletes every saved conversation, and forgets the remembered last one. Every live conversation is reset, since each
+/// one may have been deleted (see `delete_saved`). Refused while any agent is working.
 #[tauri::command]
-async fn delete_all_conversations(persist: State<'_, PersistState>) -> Result<(), String> {
+async fn delete_all_conversations(
+    reg: State<'_, Reg>,
+    persist: State<'_, PersistState>,
+) -> Result<DeleteResult, String> {
     let store = persist.get()?;
+    let sessions = reg.snapshot();
     blocking(move || {
-        store.conversations.delete_all().map_err(|e| e.to_string())?;
+        let deleted_live = delete_saved(&sessions, &store, None)?;
         if let Err(e) = store.forget_last() {
             eprintln!("agent-term: the last conversation was not forgotten ({e})");
         }
-        Ok(())
+        Ok(DeleteResult { deleted_live })
     })
     .await
 }

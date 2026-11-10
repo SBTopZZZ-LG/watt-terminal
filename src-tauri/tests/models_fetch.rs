@@ -132,3 +132,34 @@ async fn a_success_body_that_is_not_a_model_list_is_a_parse_error() {
     let err = fetch_models(&http_client().unwrap(), &url, KEY, &[], USER_AGENT).await.unwrap_err();
     assert!(matches!(err, ModelsError::Parse(_)), "{err:?}");
 }
+
+#[tokio::test]
+async fn a_redirect_to_another_port_is_not_followed_and_the_other_server_gets_no_connection() {
+    // The key and the custom header must not follow a redirect to another origin.
+    let other = TcpListener::bind("127.0.0.1:0").expect("bind other server");
+    other.set_nonblocking(true).expect("non-blocking");
+    let other_url = format!("http://{}/api/v1/models", other.local_addr().expect("local addr"));
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake server");
+    let url = format!("http://{}/api/v1/models", listener.local_addr().expect("local addr"));
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let Ok((mut sock, _)) = listener.accept() else { return };
+        let _ = tx.send(read_request(&mut sock));
+        let head = format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: {other_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let _ = sock.write_all(head.as_bytes());
+        let _ = sock.flush();
+    });
+
+    let custom = headers(&[("x-custom-key", "custom-value-123")]);
+    let err = fetch_models(&http_client().unwrap(), &url, KEY, &custom, USER_AGENT).await.unwrap_err();
+    assert_eq!(err, ModelsError::Transport("the server redirected to another origin; not followed".to_string()));
+    let raw = rx.recv().unwrap();
+    assert!(raw.to_ascii_lowercase().starts_with("get /api/v1/models "), "{raw}");
+    let accepted = other.accept();
+    assert!(
+        matches!(&accepted, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+        "the other origin must get no connection: {accepted:?}"
+    );
+}

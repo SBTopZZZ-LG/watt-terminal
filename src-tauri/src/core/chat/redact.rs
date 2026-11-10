@@ -40,6 +40,19 @@ static PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
             r#"(?i)\b(?P<name>[A-Za-z_][A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)[A-Za-z0-9_]*)=(?:"[^"\n]*"?|'[^'\n]*'?|[^\s"']+)"#,
             "${name}=[REDACTED:env]",
         ),
+        // Credential headers, `x-api-key: value` or `Authorization: Basic value`: the header name and an optional
+        // scheme word stay, the value goes. The value is at least 8 characters with no space, quote or comma, and
+        // never starts with `[`, so an existing marker is not replaced again.
+        (
+            r#"(?i)\b((?:x-api-key|api-key|x-auth-token|authorization|proxy-authorization)[ \t]*:[ \t]*)((?:bearer|basic|token)[ \t]+)?[^\s"',;\[][^\s"',;]{7,}"#,
+            "${1}${2}[REDACTED:header]",
+        ),
+        // A JSON or YAML entry whose key is exactly a credential name, with a quoted value of at least 8 characters and
+        // no space. The key and the quotes stay. A value that is already a marker is left alone, as above.
+        (
+            r#"(?i)(\b(?:api_key|apikey|api-key|secret|client_secret|password|access_token|auth_token|refresh_token)"?[ \t]*[:=][ \t]*)"[^\s"\[][^\s"]{7,}""#,
+            "${1}\"[REDACTED:secret]\"",
+        ),
         // Password in URL userinfo: scheme://user:pass@host keeps the user and the host.
         (r"([A-Za-z][A-Za-z0-9+.\-]*://[^\s:/@]+):[^\s/@]+@", "${1}:[REDACTED:url]@"),
     ]
@@ -264,11 +277,73 @@ mod tests {
             "drwxr-xr-x  5 me staff 160 Nov 10 09:00 src",
             "if a == b then echo done; fi",
             "naïve café — 日本語 テキスト",
+            r#"{"token": "short", "count": 3}"#,
+            "Reset your password: choose a new one now",
+            "the api_key field is optional and the secret is in the vault",
+            "authorization: none",
+            "x-api-key: short",
+            "Authorization: Basic",
         ];
         let r = none();
         for text in samples {
             assert_eq!(r.redact(text), text, "changed: {text}");
         }
+    }
+
+    #[test]
+    fn credential_headers_keep_the_name_and_redact_the_value() {
+        let r = none();
+        assert_eq!(r.redact("x-api-key: abcdef123456"), "x-api-key: [REDACTED:header]");
+        assert_eq!(r.redact("api-key:abcdef123456"), "api-key:[REDACTED:header]");
+        assert_eq!(r.redact("X-Auth-Token: 0123456789abcdef"), "X-Auth-Token: [REDACTED:header]");
+        assert_eq!(
+            r.redact("Authorization: Basic dXNlcjpwYXNzd29yZA=="),
+            "Authorization: Basic [REDACTED:header]"
+        );
+        assert_eq!(r.redact("proxy-authorization: token abcdefgh1234"), "proxy-authorization: token [REDACTED:header]");
+    }
+
+    #[test]
+    fn json_and_yaml_credential_keys_keep_the_key_and_redact_the_quoted_value() {
+        let r = none();
+        assert_eq!(r.redact(r#"{"api_key": "abcdefgh12345"}"#), r#"{"api_key": "[REDACTED:secret]"}"#);
+        assert_eq!(r.redact(r#"{"refresh_token":"abcdefgh12"}"#), r#"{"refresh_token":"[REDACTED:secret]"}"#);
+        assert_eq!(r.redact("client_secret: \"abcdefgh12\""), "client_secret: \"[REDACTED:secret]\"");
+        assert_eq!(r.redact(r#"{"password": "hunter2hunter2"}"#), r#"{"password": "[REDACTED:secret]"}"#);
+    }
+
+    #[test]
+    fn credential_key_and_header_rules_do_not_match_short_values_or_other_keys() {
+        let r = none();
+        // A short value, a key that is not on the list, a value with a space, and an unquoted JSON value.
+        for text in [
+            r#"{"token": "short"}"#,
+            r#"{"my_secret_name": "abcdefgh12"}"#,
+            r#"{"password": "correct horse battery"}"#,
+            r#"{"password": 12345678}"#,
+            "password: hunter2hunter2",
+            "x-api-key:",
+        ] {
+            assert_eq!(r.redact(text), text, "changed: {text}");
+        }
+    }
+
+    #[test]
+    fn a_git_sha_and_prose_mentioning_credentials_are_kept() {
+        let r = none();
+        let sha = "9c68bfd3a1b2c4d5e6f708192a3b4c5d6e7f8091";
+        let text = format!("fixed in {sha}; the password reset page and the token list are unchanged");
+        assert_eq!(r.redact(&text), text);
+        let log = format!("commit {sha}\nAuthor: someone\n    rotate the api key next week");
+        assert_eq!(r.redact(&log), log);
+    }
+
+    #[test]
+    fn new_credential_markers_are_idempotent() {
+        let r = none();
+        let text = "Authorization: Basic dXNlcjpwYXNzd29yZA== {\"secret\": \"abcdefgh12345\"} x-api-key: abcdef123456";
+        let once = r.redact(text);
+        assert_eq!(r.redact(&once), once);
     }
 
     #[test]
