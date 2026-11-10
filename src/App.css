@@ -120,7 +120,8 @@ input {
   font: 10px/16px var(--mono);
 }
 
-/* A 1px line along the top of a prompt's row, after a command that ran. Full grid width. StripeLayer sets its top. */
+/* A 1px line between a command's output and the next prompt, after a command that ran. Full grid width. It sits in the
+   blank row before the prompt (centred there); StripeLayer sets its top. */
 .separator {
   position: absolute;
   left: 0;

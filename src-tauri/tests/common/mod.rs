@@ -165,3 +165,35 @@ pub fn run_finish(s: &Session, cmd: &str) -> Record {
 pub fn snapshot(s: &Session) -> ScreenSnapshot {
     s.screen_snapshot()
 }
+
+/// Starts a session whose raw output bytes are copied into the returned buffer, before the renderer acks them.
+pub fn start_recording() -> (Harness, Arc<Mutex<Vec<u8>>>) {
+    let seen = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let sink = seen.clone();
+    let s = start_with_hook(Some(Box::new(move |c: &[u8]| sink.lock().unwrap().extend_from_slice(c))));
+    (s, seen)
+}
+
+fn find_last(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    hay.get(from..)?.windows(needle.len()).rposition(|w| w == needle).map(|p| p + from)
+}
+
+fn find_first(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    hay.get(from..)?.windows(needle.len()).position(|w| w == needle).map(|p| p + from)
+}
+
+/// The bytes between the last prompt start (OSC 133;A) at or after `from` and the prompt end (OSC 133;B) that
+/// follows it: whatever the shell draws before the prompt text, then the prompt text. None until B has arrived.
+pub fn prompt_bytes(buf: &[u8], from: usize, nonce: &str) -> Option<Vec<u8>> {
+    let a = format!("\x1b]133;A;n={nonce}\x1b\\");
+    let b = format!("\x1b]133;B;n={nonce}\x1b\\");
+    let a_at = find_last(buf, a.as_bytes(), from)?;
+    let body = a_at + a.len();
+    let b_at = find_first(buf, b.as_bytes(), body)?;
+    Some(buf[body..b_at].to_vec())
+}
+
+/// True when the prompt body starts with a line break (CR LF from the PTY, or a bare LF) before any prompt text.
+pub fn starts_with_blank_row(body: &[u8]) -> bool {
+    body.iter().copied().find(|&b| b != b'\r') == Some(b'\n')
+}

@@ -13,6 +13,11 @@ printf -v _agentterm_pA '%%{\033]133;A;n=%s\033\\%%}' "$_AGENTTERM_NONCE"
 printf -v _agentterm_pB '%%{\033]133;B;n=%s\033\\%%}' "$_AGENTTERM_NONCE"
 printf -v _agentterm_pP '%%{\033]133;P;n=%s;k=s\033\\%%}' "$_AGENTTERM_NONCE"
 
+# A blank row before each prompt that follows a command. It is a literal newline right after pA, so A is emitted on
+# the settled cursor row and that row stays blank. The separator line sits in it. AGENT_TERM_PROMPT_GAP=0 turns it off.
+typeset -g _agentterm_gap=$'\n'
+typeset -g _agentterm_gap_on=${AGENT_TERM_PROMPT_GAP-1}
+
 # E payload escaping: backslash, ';' and every C0 byte (including ESC and BEL) become \\ or \xHH,
 # so the payload has no raw ';' or terminator bytes.
 _agentterm_escape_e() {
@@ -46,6 +51,7 @@ _agentterm_urlencode() {
 _agentterm_precmd() {
   local ret=$? pst=("${pipestatus[@]}")
   local -a fixed=()
+  local had_run=$_agentterm_ran
   if (( _agentterm_ran )); then
     _agentterm_ran=0
     printf '\033]133;D;n=%s;exit=%d;ps=%s\033\\' "$_AGENTTERM_NONCE" "$ret" "${(j:,:)pst}"
@@ -54,11 +60,16 @@ _agentterm_precmd() {
     precmd_functions=(_agentterm_precmd ${precmd_functions:#_agentterm_precmd})
     fixed+=precmd-order
   fi
+  # The gap is added back below only when a command ran, so drop the previous one first.
+  PROMPT=${PROMPT/"$_agentterm_pA$_agentterm_gap"/"$_agentterm_pA"}
   if [[ $PROMPT != *"$_agentterm_pA"* || $PROMPT != *"$_agentterm_pB"* ]]; then
     PROMPT=${PROMPT//"$_agentterm_pA"/}
     PROMPT=${PROMPT//"$_agentterm_pB"/}
     PROMPT=$_agentterm_pA$PROMPT$_agentterm_pB
     fixed+=ps1
+  fi
+  if (( had_run )) && [[ $_agentterm_gap_on != 0 ]]; then
+    PROMPT=${PROMPT/"$_agentterm_pA"/"$_agentterm_pA$_agentterm_gap"}
   fi
   if [[ $PS2 != *"$_agentterm_pP"* ]]; then
     PS2=${PS2//"$_agentterm_pP"/}

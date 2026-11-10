@@ -10,8 +10,9 @@
 // StripeLayer, outside xterm's decoration system, which hides a decoration as soon as its first row scrolls out
 // of view. While a command runs, its last row is the cursor row, so the stripe grows with the output.
 //
-// A separator line marks the row of a prompt that follows a command which ran, so output and the next prompt are
-// visibly apart. It is one marker on that prompt's row, drawn by StripeLayer too.
+// A separator line marks a prompt that follows a command which ran, so output and the next prompt are visibly apart.
+// It is one marker on the row where that prompt's A is emitted. The shell leaves a blank row before such a prompt
+// (integration.zsh), so the marker is on that blank row and StripeLayer centres the line in it. Drawn by StripeLayer too.
 
 import type { IMarker, Terminal } from '@xterm/xterm';
 import type { StripeExit, StripeMark } from './stripes';
@@ -102,8 +103,9 @@ export class CommandMarks {
   /** Shell event A: a new prompt. Any command still open ended without a D. */
   promptStart(): void {
     this.closeOpen('unknown');
-    // The prompt's row gets a separator when a command ran before it and that command still has a stripe. A clear
-    // that erased the command's first row leaves no stripe, so no line either.
+    // The row A is emitted on (the blank row, when the shell adds one) gets a separator when a command ran before
+    // it and that command still has a stripe. A clear that erased the command's first row leaves no stripe, so no
+    // line either.
     if (this.commandSincePrompt && this.lastClosed && this.range(this.lastClosed) !== null) {
       const sep = this.term.registerMarker(0);
       if (sep) {

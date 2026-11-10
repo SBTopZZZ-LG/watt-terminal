@@ -205,6 +205,30 @@ fn ctrl_l_at_prompt_clears_and_keeps_the_prompt_state() {
     assert_eq!(r.output, "after-clear");
 }
 
+/// The blank row before the prompt that follows a command: a line break comes between A and the prompt text. An
+/// empty Enter at the prompt adds none. The gap never reports a degraded integration.
+#[test]
+fn prompt_after_a_command_starts_on_a_blank_row_and_an_empty_enter_does_not() {
+    let _g = serial();
+    let (s, seen) = start_recording();
+    wait_prompt(&s);
+    let mark = seen.lock().unwrap().len();
+    run(&s, "echo hi");
+    let after_cmd = wait_until(Duration::from_secs(5), || prompt_bytes(&seen.lock().unwrap(), mark, s.nonce()))
+        .expect("prompt bytes after the command");
+    assert!(starts_with_blank_row(&after_cmd), "no blank row before the prompt: {after_cmd:?}");
+
+    let mark = seen.lock().unwrap().len();
+    s.write_user(b"\r").expect("empty enter");
+    let after_enter = wait_until(Duration::from_secs(5), || prompt_bytes(&seen.lock().unwrap(), mark, s.nonce()))
+        .expect("prompt bytes after the empty enter");
+    assert!(!starts_with_blank_row(&after_enter), "blank row after an empty enter: {after_enter:?}");
+
+    let seen = seen.lock().unwrap();
+    let degraded = b"\x1b]633;Degraded";
+    assert!(!seen.windows(degraded.len()).any(|w| w == degraded), "633;Degraded was reported");
+}
+
 struct Events(Mutex<Vec<SessionEvent>>);
 
 impl EventSink for Events {

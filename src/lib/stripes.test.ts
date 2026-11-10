@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { separatorSegments, stripeSegments } from './stripes';
+import { separatorSegments, separatorTop, stripeSegments } from './stripes';
 import type { StripeMark } from './stripes';
 
 function mark(start: number, end: number, extra: Partial<StripeMark> = {}): StripeMark {
@@ -102,5 +102,23 @@ describe('separatorSegments', () => {
 
   it('keeps the order given, and drops only the rows outside', () => {
     expect(separatorSegments([30, 5, 12, 40, 10], 10, 24)).toEqual([20, 2, 0]);
+  });
+});
+
+describe('separatorTop', () => {
+  it('centred in a blank row: the middle of the row, less half the 1px line', () => {
+    expect(separatorTop(3, 20, true)).toBe(60 + 10 - 0.5);
+  });
+
+  it('not centred: the top edge of the row', () => {
+    expect(separatorTop(3, 20, false)).toBe(60);
+  });
+
+  it('row 0 centred sits half a cell down, less half the line', () => {
+    expect(separatorTop(0, 17, true)).toBe(8.5 - 0.5);
+  });
+
+  it('a fractional cell height keeps the centre exact', () => {
+    expect(separatorTop(2, 15.5, true)).toBeCloseTo(31 + 7.75 - 0.5, 10);
   });
 });

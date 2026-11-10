@@ -63,3 +63,12 @@ export function separatorSegments(absoluteRows: readonly number[], viewportY: nu
   }
   return out;
 }
+
+/**
+ * The top edge in pixels of a 1px separator line on a grid row. When the row is the blank row the shell leaves
+ * before a prompt, the line is centred in it. Otherwise the line sits on the top edge of the row.
+ */
+export function separatorTop(row: number, cellHeight: number, centered: boolean): number {
+  const top = row * cellHeight;
+  return centered ? top + cellHeight / 2 - 0.5 : top;
+}

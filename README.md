@@ -29,6 +29,8 @@ To keep manual runs away from your real `~/.zsh_history`, use the isolated-histo
 AGENT_TERM_HISTFILE=/tmp/agent-term-hist npm run tauri dev
 ```
 
+The shell leaves a blank row before each prompt that follows a command, and a thin separator line sits in that row. `AGENT_TERM_PROMPT_GAP=0` turns the blank row off, in which case the line sits on the prompt's top edge.
+
 To try a real model instead of the mock agent, set three variables. Keep the key out of your shell history: read it from your password manager (`NAME` is the name of your entry):
 
 ```sh

@@ -5,12 +5,15 @@
 //
 // The layer is hidden in the alternate screen (full-screen programs), where the shell's marks do not apply.
 //
+// Separator lines are 1px lines between a command's output and the next prompt. They are centred in the blank row
+// the shell leaves before that prompt (see integration.zsh), or on the prompt row's top edge when that row is not blank.
+//
 // Known limitation: after a window resize that reflows the buffer, a mark (stripe or separator) that sat on a wrapped
 // row (not the first row of its logical line) can land on a neighbouring row. Accepted; the layer is positional only.
 
 import type { Terminal } from '@xterm/xterm';
 import type { CommandMarks } from './commandMarks';
-import { separatorSegments, stripeSegments } from './stripes';
+import { separatorSegments, separatorTop, stripeSegments } from './stripes';
 
 export class StripeLayer {
   private readonly layer: HTMLDivElement;
@@ -73,11 +76,14 @@ export class StripeLayer {
       this.pool[i].hidden = true;
     }
 
+    // A separator sits in the blank row the shell leaves before the prompt, centred there. When that row is not
+    // blank (the shell integration is degraded or the gap is off), the line sits on the prompt row's top edge.
     const separators = separatorSegments(this.marks.separatorRows(), buf.viewportY, rows);
     separators.forEach((row, i) => {
       const el = this.elementAt(this.separatorPool, 'separator', i);
+      const blank = buf.getLine(buf.viewportY + row)?.translateToString(true) === '';
       el.hidden = false;
-      el.style.top = `${row * cellHeight}px`;
+      el.style.top = `${separatorTop(row, cellHeight, blank)}px`;
     });
     for (let i = separators.length; i < this.separatorPool.length; i++) {
       this.separatorPool[i].hidden = true;
