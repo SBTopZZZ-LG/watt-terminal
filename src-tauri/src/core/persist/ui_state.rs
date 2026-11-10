@@ -130,17 +130,33 @@ impl UiStateStore {
             state.history_group_by = group;
         }
         state.version = UI_STATE_VERSION;
-
-        let mut text = serde_json::to_string_pretty(&state)
-            .map_err(|e| PersistError::Io(format!("cannot encode {}: {e}", self.path.display())))?;
-        text.push('\n');
-        write_private_atomic(&self.path, text.as_bytes())
-            .map_err(|e| PersistError::Io(format!("{}: {e}", self.path.display())))?;
+        self.write(&state)?;
         Ok(state)
+    }
+
+    /// Clears `last_conversation_id` when it is `id`, in one locked read and write. Writes nothing when it names another
+    /// conversation or none. Returns whether it was cleared.
+    pub fn clear_last_conversation_if(&self, id: &str) -> Result<bool, PersistError> {
+        let _guard = self.guard();
+        let mut state = self.read()?;
+        if state.last_conversation_id.as_deref() != Some(id) {
+            return Ok(false);
+        }
+        state.last_conversation_id = None;
+        self.write(&state)?;
+        Ok(true)
     }
 
     fn guard(&self) -> MutexGuard<'_, ()> {
         self.lock.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn write(&self, state: &UiState) -> Result<(), PersistError> {
+        let mut text = serde_json::to_string_pretty(state)
+            .map_err(|e| PersistError::Io(format!("cannot encode {}: {e}", self.path.display())))?;
+        text.push('\n');
+        write_private_atomic(&self.path, text.as_bytes())
+            .map_err(|e| PersistError::Io(format!("{}: {e}", self.path.display())))
     }
 
     fn read(&self) -> Result<UiState, PersistError> {

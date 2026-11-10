@@ -371,15 +371,30 @@ fn agent_message(
 }
 
 /// Starts a new conversation: the history is cleared and the id rotated. Refused while the agent is working. Takes
-/// the turn-cancel lock, as `begin_turn` does, so the check and the reset cannot interleave with a turn starting.
+/// the turn-cancel lock, as `begin_turn` does, so the check and the reset cannot interleave with a turn starting. The
+/// remembered last conversation is then forgotten; a failure to forget it is logged, not returned.
 #[tauri::command]
-fn new_conversation(session_id: String, reg: State<'_, Reg>) -> Result<(), String> {
+async fn new_conversation(
+    session_id: String,
+    reg: State<'_, Reg>,
+    persist: State<'_, PersistState>,
+) -> Result<(), String> {
     let att = session(&reg, &session_id)?;
-    let _turn = lock(&att.turn_cancel);
-    if att.agent_busy.load(Ordering::SeqCst) {
-        return Err(BUSY_REFUSAL.into());
+    {
+        let _turn = lock(&att.turn_cancel);
+        if att.agent_busy.load(Ordering::SeqCst) {
+            return Err(BUSY_REFUSAL.into());
+        }
+        att.conversation.reset().map_err(io_err)?;
     }
-    att.conversation.reset().map_err(io_err)
+    // Without a store there is no remembered conversation to forget.
+    if let Some(store) = persist.0.clone() {
+        let forgot = blocking(move || store.forget_last().map_err(|e| e.to_string())).await;
+        if let Err(e) = forgot {
+            eprintln!("agent-term: the last conversation was not forgotten ({e})");
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -499,11 +514,19 @@ async fn load_conversation(
     Ok(LoadedConversation { id, title, messages })
 }
 
-/// Deletes a saved conversation. Deleting one that does not exist is not an error.
+/// Deletes a saved conversation. Deleting one that does not exist is not an error. When it was the remembered last
+/// conversation, that is forgotten too; a failure to forget it is logged, not returned.
 #[tauri::command]
 async fn delete_conversation(id: String, persist: State<'_, PersistState>) -> Result<(), String> {
     let store = persist.get()?;
-    blocking(move || store.conversations.delete(&id).map_err(|e| e.to_string())).await
+    blocking(move || {
+        store.conversations.delete(&id).map_err(|e| e.to_string())?;
+        if let Err(e) = store.forget_if_last(&id) {
+            eprintln!("agent-term: the last conversation was not forgotten ({e})");
+        }
+        Ok(())
+    })
+    .await
 }
 
 /// Renames a saved conversation. Returns its metadata.
@@ -517,11 +540,18 @@ async fn rename_conversation(
     blocking(move || store.conversations.rename(&id, &title).map_err(|e| e.to_string())).await
 }
 
-/// Deletes every saved conversation. The live conversation is not touched.
+/// Deletes every saved conversation, and forgets the remembered last one. The live conversation is not touched.
 #[tauri::command]
 async fn delete_all_conversations(persist: State<'_, PersistState>) -> Result<(), String> {
     let store = persist.get()?;
-    blocking(move || store.conversations.delete_all().map_err(|e| e.to_string())).await
+    blocking(move || {
+        store.conversations.delete_all().map_err(|e| e.to_string())?;
+        if let Err(e) = store.forget_last() {
+            eprintln!("agent-term: the last conversation was not forgotten ({e})");
+        }
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]

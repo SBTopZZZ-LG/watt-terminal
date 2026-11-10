@@ -8,6 +8,10 @@
 //! name, so no id can point outside the directory.
 //!
 //! `save` does not prune. The caller decides the retention (`prune`) after a save.
+//!
+//! A damaged file is never overwritten in place: when a conversation is saved over one, its bytes are moved to
+//! `<id>.json.corrupt-<now>` first, and the conversation is written afresh. Those aside files are kept for inspection;
+//! `list` ignores them and `delete_all` removes them.
 
 use std::collections::HashSet;
 use std::fs;
@@ -89,6 +93,11 @@ pub struct SaveRequest {
 struct IndexFile {
     version: u32,
     conversations: Vec<ConversationMeta>,
+    /// Ids of conversation files that could not be read when the index was last rebuilt. The consistency check
+    /// leaves them out, so a damaged file does not force a rescan of every file on every call. Absent in older
+    /// indexes, which then have none.
+    #[serde(default)]
+    skipped: Vec<String>,
 }
 
 /// The conversations directory. Every operation holds one lock, so a save and a rename cannot interleave.
@@ -105,13 +114,21 @@ impl ConversationStore {
     }
 
     /// Writes the conversation and its index entry. A new id gets `created_at = now` and a title derived from the
-    /// messages. An existing id keeps its `created_at`, title and workspace. Fails, and writes nothing, when the
-    /// existing file is unreadable: a damaged file is never overwritten.
+    /// messages. An existing id keeps its `created_at`, title and workspace. A damaged existing file is moved aside
+    /// first, to `<id>.json.corrupt-<now>` with its bytes unchanged, and the conversation is written afresh.
     pub fn save(&self, req: &SaveRequest, redactor: &Redactor, now: u64) -> Result<ConversationMeta, PersistError> {
         check_id(&req.id)?;
         let _guard = self.guard();
         let messages = redact_messages(&req.messages, redactor);
-        let stored = match self.read_stored(&req.id)? {
+        let existing = match self.read_stored(&req.id) {
+            Ok(existing) => existing,
+            Err(PersistError::Corrupt(_)) => {
+                self.set_aside(&req.id, now)?;
+                None
+            }
+            Err(e) => return Err(e),
+        };
+        let stored = match existing {
             Some(old) => StoredConversation {
                 version: CONVERSATION_VERSION,
                 id: req.id.clone(),
@@ -135,7 +152,7 @@ impl ConversationStore {
         };
         self.write_file(&stored)?;
         let meta = stored.meta();
-        self.update_index_locked(|metas| {
+        self.update_index_locked(&[meta.id.as_str()], |metas| {
             metas.retain(|m| m.id != meta.id);
             metas.push(meta.clone());
         })?;
@@ -153,7 +170,7 @@ impl ConversationStore {
     /// otherwise rebuilds it from the files (skipping any that cannot be read) and rewrites it.
     pub fn list(&self) -> Result<Vec<ConversationMeta>, PersistError> {
         let _guard = self.guard();
-        self.index_locked()
+        Ok(self.index_locked()?.conversations)
     }
 
     /// Deletes one conversation and its index entry. Deleting an id that does not exist is not an error.
@@ -161,7 +178,7 @@ impl ConversationStore {
         check_id(id)?;
         let _guard = self.guard();
         remove_if_exists(&self.path_for(id))?;
-        self.update_index_locked(|metas| metas.retain(|m| m.id != id))
+        self.update_index_locked(&[id], |metas| metas.retain(|m| m.id != id))
     }
 
     /// Sets the title. The title is trimmed and must be 1 to 120 characters with no control characters. The
@@ -175,7 +192,7 @@ impl ConversationStore {
         stored.title = title;
         self.write_file(&stored)?;
         let meta = stored.meta();
-        self.update_index_locked(|metas| {
+        self.update_index_locked(&[meta.id.as_str()], |metas| {
             metas.retain(|m| m.id != meta.id);
             metas.push(meta.clone());
         })?;
@@ -189,7 +206,7 @@ impl ConversationStore {
             check_id(id)?;
         }
         let _guard = self.guard();
-        let metas = self.index_locked()?;
+        let metas = self.index_locked()?.conversations;
         let mut removed: HashSet<String> = HashSet::new();
         for (i, meta) in metas.iter().enumerate() {
             if i < keep || Some(meta.id.as_str()) == protect {
@@ -199,14 +216,15 @@ impl ConversationStore {
             removed.insert(meta.id.clone());
         }
         if !removed.is_empty() {
-            self.update_index_locked(|metas| metas.retain(|m| !removed.contains(&m.id)))?;
+            let touched: Vec<&str> = removed.iter().map(String::as_str).collect();
+            self.update_index_locked(&touched, |metas| metas.retain(|m| !removed.contains(&m.id)))?;
         }
         let mut removed: Vec<String> = removed.into_iter().collect();
         removed.sort();
         Ok(removed)
     }
 
-    /// Deletes every conversation and the index. Other files in the directory are left alone.
+    /// Deletes every conversation, the moved-aside damaged files, and the index. Other files are left alone.
     pub fn delete_all(&self) -> Result<(), PersistError> {
         let _guard = self.guard();
         let entries = match fs::read_dir(&self.dir) {
@@ -217,7 +235,9 @@ impl ConversationStore {
         for entry in entries {
             let entry = entry.map_err(|e| io_error(&self.dir, e))?;
             let name = entry.file_name().to_string_lossy().into_owned();
-            let ours = name == INDEX_FILE || name.strip_suffix(".json").is_some_and(is_valid_id);
+            let ours = name == INDEX_FILE
+                || name.strip_suffix(".json").is_some_and(is_valid_id)
+                || aside_id(&name).is_some();
             if ours && entry.file_type().is_ok_and(|t| t.is_file()) {
                 remove_if_exists(&entry.path())?;
             }
@@ -239,6 +259,10 @@ impl ConversationStore {
         let text = match fs::read_to_string(&path) {
             Ok(text) => text,
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            // Bytes that are not UTF-8 are a damaged file, not a failed read.
+            Err(e) if e.kind() == ErrorKind::InvalidData => {
+                return Err(PersistError::Corrupt(format!("{} is not valid UTF-8", path.display())));
+            }
             Err(e) => return Err(io_error(&path, e)),
         };
         // The serde message can echo a value from the file, so only the error class and position are reported.
@@ -264,43 +288,75 @@ impl ConversationStore {
         write_json(&self.path_for(&stored.id), stored)
     }
 
-    /// The index, checked against the files. Caller holds the lock.
-    fn index_locked(&self) -> Result<Vec<ConversationMeta>, PersistError> {
+    /// Moves a damaged file to `<id>.json.corrupt-<now>`, or `-<now>-<n>` when that name is taken, so earlier aside
+    /// files are never replaced. The bytes are unchanged, and the file keeps its mode (0600 when we wrote it). Caller
+    /// holds the lock.
+    fn set_aside(&self, id: &str, now: u64) -> Result<(), PersistError> {
+        let path = self.path_for(id);
+        let mut target = self.dir.join(format!("{id}.json.corrupt-{now}"));
+        let mut n = 1;
+        while target.exists() {
+            target = self.dir.join(format!("{id}.json.corrupt-{now}-{n}"));
+            n += 1;
+        }
+        fs::rename(&path, &target).map_err(|e| io_error(&path, e))
+    }
+
+    /// The index, checked against the files. Caller holds the lock. The index is trusted when its listed conversations
+    /// and its `skipped` ids together are exactly the `<id>.json` files on disk, and every skipped id is on disk.
+    /// Otherwise it is rebuilt from the files, and the rebuilt index is written.
+    fn index_locked(&self) -> Result<IndexFile, PersistError> {
         let on_disk = self.ids_on_disk()?;
         if let Some(index) = self.read_index() {
-            let listed: HashSet<&str> = index.iter().map(|m| m.id.as_str()).collect();
-            let agrees = listed.len() == index.len()
-                && listed.len() == on_disk.len()
-                && listed.iter().all(|id| on_disk.contains(*id));
+            let listed: HashSet<&str> = index.conversations.iter().map(|m| m.id.as_str()).collect();
+            let skipped: HashSet<&str> = index.skipped.iter().map(String::as_str).collect();
+            let agrees = listed.len() == index.conversations.len()
+                && skipped.len() == index.skipped.len()
+                && skipped.iter().all(|id| on_disk.contains(*id))
+                && listed.iter().all(|id| on_disk.contains(*id) && !skipped.contains(*id))
+                && listed.len() + skipped.len() == on_disk.len();
             if agrees {
                 return Ok(index);
             }
         }
-        let mut metas: Vec<ConversationMeta> =
-            on_disk.iter().filter_map(|id| self.read_stored(id).ok().flatten()).map(|s| s.meta()).collect();
-        sort_metas(&mut metas);
-        self.write_index(&metas)?;
-        Ok(metas)
+        let mut conversations = Vec::new();
+        let mut skipped = Vec::new();
+        for id in &on_disk {
+            match self.read_stored(id) {
+                Ok(Some(stored)) => conversations.push(stored.meta()),
+                _ => skipped.push(id.clone()),
+            }
+        }
+        sort_metas(&mut conversations);
+        skipped.sort();
+        let index = IndexFile { version: CONVERSATION_VERSION, conversations, skipped };
+        self.write_index(&index)?;
+        Ok(index)
     }
 
-    /// Applies `change` to the index and writes it back. Caller holds the lock.
-    fn update_index_locked(&self, change: impl FnOnce(&mut Vec<ConversationMeta>)) -> Result<(), PersistError> {
-        let mut metas = self.index_locked()?;
-        change(&mut metas);
-        sort_metas(&mut metas);
-        self.write_index(&metas)
+    /// Applies `change` to the conversations, forgets the `touched` ids as skipped, and writes the index back. Caller
+    /// holds the lock.
+    fn update_index_locked(
+        &self,
+        touched: &[&str],
+        change: impl FnOnce(&mut Vec<ConversationMeta>),
+    ) -> Result<(), PersistError> {
+        let mut index = self.index_locked()?;
+        change(&mut index.conversations);
+        sort_metas(&mut index.conversations);
+        index.skipped.retain(|id| !touched.contains(&id.as_str()));
+        self.write_index(&index)
     }
 
     /// The index file, or `None` when it is missing, unreadable, or not a version this code understands.
-    fn read_index(&self) -> Option<Vec<ConversationMeta>> {
+    fn read_index(&self) -> Option<IndexFile> {
         let text = fs::read_to_string(self.dir.join(INDEX_FILE)).ok()?;
         let index: IndexFile = serde_json::from_str(&text).ok()?;
-        (index.version == CONVERSATION_VERSION).then_some(index.conversations)
+        (index.version == CONVERSATION_VERSION).then_some(index)
     }
 
-    fn write_index(&self, metas: &[ConversationMeta]) -> Result<(), PersistError> {
-        let index = IndexFile { version: CONVERSATION_VERSION, conversations: metas.to_vec() };
-        write_json(&self.dir.join(INDEX_FILE), &index)
+    fn write_index(&self, index: &IndexFile) -> Result<(), PersistError> {
+        write_json(&self.dir.join(INDEX_FILE), index)
     }
 
     /// The ids of the `<id>.json` files in the directory. Anything that is not a valid id is ignored.
@@ -323,6 +379,13 @@ impl ConversationStore {
         }
         Ok(ids)
     }
+}
+
+/// The conversation id of an aside file, `<id>.json.corrupt-<now>` (or `-<n>`). `None` for any other name.
+fn aside_id(name: &str) -> Option<&str> {
+    let (stem, suffix) = name.split_once(".json.corrupt-")?;
+    let digits = suffix.split('-').all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()));
+    (is_valid_id(stem) && digits).then_some(stem)
 }
 
 /// True for `ses_` followed by 32 lowercase hex digits. The only shape of id that becomes a file name.
@@ -727,13 +790,66 @@ mod tests {
     }
 
     #[test]
-    fn a_damaged_file_is_never_overwritten_by_a_save() {
+    fn save_over_a_damaged_file_moves_it_aside_and_writes_a_fresh_one() {
         let tmp = TempDir::new();
         let s = store(&tmp);
         fs::create_dir_all(&s.dir).unwrap();
-        fs::write(s.path_for(&id(5)), b"{ not json").unwrap();
-        assert!(matches!(s.save(&request(&id(5), "hi"), &redactor(), 1), Err(PersistError::Corrupt(_))));
-        assert_eq!(fs::read(s.path_for(&id(5))).unwrap(), b"{ not json");
+        let damaged: &[u8] = b"{ not json";
+        fs::write(s.path_for(&id(5)), damaged).unwrap();
+
+        let meta = s.save(&request(&id(5), "fresh start"), &redactor(), 42).unwrap();
+        assert_eq!(meta.created_at, 42, "a fresh file gets the save time");
+        assert_eq!(meta.title, "fresh start", "the title comes from the new messages");
+        assert_eq!(fs::read(s.dir.join(format!("{}.json.corrupt-42", id(5)))).unwrap(), damaged);
+        let loaded = s.load(&id(5)).unwrap();
+        assert_eq!(loaded.messages[0]["content"], "fresh start");
+        assert_eq!(s.list().unwrap().iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec![id(5).as_str()]);
+    }
+
+    #[test]
+    fn a_second_damaged_file_in_the_same_second_gets_its_own_aside_name() {
+        let tmp = TempDir::new();
+        let s = store(&tmp);
+        s.save(&request(&id(15), "one"), &redactor(), 1).unwrap();
+        fs::write(s.path_for(&id(15)), b"first damage").unwrap();
+        s.save(&request(&id(15), "two"), &redactor(), 42).unwrap();
+        fs::write(s.path_for(&id(15)), b"second damage").unwrap();
+        s.save(&request(&id(15), "three"), &redactor(), 42).unwrap();
+
+        assert_eq!(fs::read(s.dir.join(format!("{}.json.corrupt-42", id(15)))).unwrap(), b"first damage");
+        assert_eq!(fs::read(s.dir.join(format!("{}.json.corrupt-42-1", id(15)))).unwrap(), b"second damage");
+        assert_eq!(s.load(&id(15)).unwrap().title, "three");
+    }
+
+    #[test]
+    fn load_of_a_damaged_file_changes_nothing_and_its_error_leaks_nothing() {
+        let tmp = TempDir::new();
+        let s = store(&tmp);
+        fs::create_dir_all(&s.dir).unwrap();
+        let damaged = format!(r#"{{"version": "sk-proj-abcdefghijklmnopqrstuvwx", "note": "{SECRET}""#);
+        fs::write(s.path_for(&id(16)), &damaged).unwrap();
+
+        let err = s.load(&id(16)).unwrap_err().to_string();
+        assert!(!err.contains("sk-proj") && !err.contains(SECRET), "{err}");
+        assert_eq!(fs::read(s.path_for(&id(16))).unwrap(), damaged.as_bytes(), "load changes nothing");
+        assert_eq!(fs::read_dir(&s.dir).unwrap().count(), 1, "load creates no aside file");
+    }
+
+    #[test]
+    fn list_ignores_aside_files() {
+        let tmp = TempDir::new();
+        let s = store(&tmp);
+        s.save(&request(&id(13), "fine"), &redactor(), 3).unwrap();
+        s.save(&request(&id(14), "was damaged"), &redactor(), 4).unwrap();
+        fs::write(s.path_for(&id(14)), b"damage").unwrap();
+        s.save(&request(&id(14), "repaired"), &redactor(), 5).unwrap();
+        assert!(s.dir.join(format!("{}.json.corrupt-5", id(14))).exists());
+
+        let listed: Vec<String> = s.list().unwrap().into_iter().map(|m| m.id).collect();
+        assert_eq!(listed, vec![id(14), id(13)]);
+        let index = read_index(&s);
+        assert_eq!(index.conversations.len(), 2);
+        assert!(index.skipped.is_empty());
     }
 
     #[test]
@@ -745,6 +861,8 @@ mod tests {
         fs::create_dir_all(&s.dir).unwrap();
         fs::write(s.path_for(&id(6)), b"[1, 2").unwrap();
         assert!(matches!(s.load(&id(6)), Err(PersistError::Corrupt(_))));
+        fs::write(s.path_for(&id(6)), [0xff, 0xfe, 0x00]).unwrap();
+        assert!(matches!(s.load(&id(6)), Err(PersistError::Corrupt(_))), "bytes that are not UTF-8");
 
         s.save(&request(&id(7), "hi"), &redactor(), 1).unwrap();
         fs::copy(s.path_for(&id(7)), s.path_for(&id(8))).unwrap();
@@ -799,6 +917,81 @@ mod tests {
         assert_eq!(listed.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec![id(21), id(20)]);
         let index = read_index(&s);
         assert_eq!(index.conversations.len(), 2, "the rewritten index lists only readable conversations");
+        assert_eq!(index.skipped, vec![id(22)], "the unreadable file is recorded as skipped");
+    }
+
+    #[test]
+    fn a_damaged_file_does_not_make_every_call_rewrite_the_index() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = TempDir::new();
+        let s = store(&tmp);
+        s.save(&request(&id(40), "ok"), &redactor(), 5).unwrap();
+        fs::write(s.path_for(&id(41)), b"garbage").unwrap();
+        s.list().unwrap();
+        let index_path = s.dir.join(INDEX_FILE);
+        let before = fs::metadata(&index_path).unwrap().ino();
+
+        // A rewrite is an atomic rename of a new file, so its inode changes. An unchanged inode means no rewrite.
+        assert_eq!(s.list().unwrap().len(), 1);
+        assert_eq!(s.list().unwrap().len(), 1);
+        assert_eq!(fs::metadata(&index_path).unwrap().ino(), before);
+
+        // A save of another conversation still writes the index, and keeps the skipped id.
+        s.save(&request(&id(42), "also ok"), &redactor(), 6).unwrap();
+        assert_eq!(read_index(&s).skipped, vec![id(41)]);
+        assert_eq!(s.list().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn saving_over_a_damaged_file_clears_its_skipped_entry() {
+        let tmp = TempDir::new();
+        let s = store(&tmp);
+        s.save(&request(&id(50), "ok"), &redactor(), 5).unwrap();
+        fs::write(s.path_for(&id(51)), b"garbage").unwrap();
+        s.list().unwrap();
+        assert_eq!(read_index(&s).skipped, vec![id(51)]);
+
+        s.save(&request(&id(51), "repaired"), &redactor(), 6).unwrap();
+        let index = read_index(&s);
+        assert!(index.skipped.is_empty());
+        assert_eq!(index.conversations.len(), 2);
+    }
+
+    #[test]
+    fn deleting_a_damaged_file_clears_its_skipped_entry() {
+        let tmp = TempDir::new();
+        let s = store(&tmp);
+        s.save(&request(&id(52), "ok"), &redactor(), 5).unwrap();
+        fs::write(s.path_for(&id(53)), b"garbage").unwrap();
+        s.list().unwrap();
+        s.delete(&id(53)).unwrap();
+        assert!(read_index(&s).skipped.is_empty());
+        assert_eq!(s.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_skipped_file_removed_by_hand_is_forgotten_by_the_next_list() {
+        let tmp = TempDir::new();
+        let s = store(&tmp);
+        s.save(&request(&id(54), "ok"), &redactor(), 5).unwrap();
+        fs::write(s.path_for(&id(55)), b"garbage").unwrap();
+        s.list().unwrap();
+        fs::remove_file(s.path_for(&id(55))).unwrap();
+        assert_eq!(s.list().unwrap().len(), 1);
+        assert!(read_index(&s).skipped.is_empty());
+    }
+
+    #[test]
+    fn an_index_without_the_skipped_field_is_read_as_having_none() {
+        let tmp = TempDir::new();
+        let s = store(&tmp);
+        s.save(&request(&id(56), "ok"), &redactor(), 5).unwrap();
+        let path = s.dir.join(INDEX_FILE);
+        let mut value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        value.as_object_mut().unwrap().remove("skipped");
+        fs::write(&path, value.to_string()).unwrap();
+        let listed: Vec<String> = s.list().unwrap().into_iter().map(|m| m.id).collect();
+        assert_eq!(listed, vec![id(56)]);
     }
 
     #[test]
@@ -938,11 +1131,18 @@ mod tests {
         s.save(&request(&id(60), "x"), &redactor(), 1).unwrap();
         s.save(&request(&id(61), "x"), &redactor(), 2).unwrap();
         fs::write(s.dir.join("notes.txt"), b"not ours").unwrap();
+        fs::write(s.dir.join("notes.json.corrupt-1"), b"not ours either").unwrap();
+        fs::write(s.path_for(&id(62)), b"damaged").unwrap();
+        s.save(&request(&id(62), "x"), &redactor(), 3).unwrap();
+        assert!(s.dir.join(format!("{}.json.corrupt-3", id(62))).exists());
         s.delete_all().unwrap();
         assert!(!s.path_for(&id(60)).exists());
         assert!(!s.path_for(&id(61)).exists());
+        assert!(!s.path_for(&id(62)).exists());
+        assert!(!s.dir.join(format!("{}.json.corrupt-3", id(62))).exists(), "aside files are removed");
         assert!(!s.dir.join(INDEX_FILE).exists());
         assert_eq!(fs::read(s.dir.join("notes.txt")).unwrap(), b"not ours");
+        assert_eq!(fs::read(s.dir.join("notes.json.corrupt-1")).unwrap(), b"not ours either");
         assert!(s.list().unwrap().is_empty());
     }
 

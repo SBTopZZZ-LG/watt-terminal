@@ -358,3 +358,25 @@ fn a_saved_unanswered_tool_call_is_closed_before_the_model_sees_the_resumed_hist
     assert_eq!(closing["content"], "skipped: not recorded");
     assert_eq!(messages.last().unwrap(), &json!({"role": "user", "content": "and now?"}));
 }
+
+#[test]
+fn a_turn_saved_over_a_damaged_conversation_file_goes_through_and_is_listed() {
+    let tmp = TempDir::new();
+    let persist = persist_in(&tmp);
+    let id = format!("ses_{:032x}", 12);
+    let damaged = tmp.path().join("data").join("conversations").join(format!("{id}.json"));
+    fs::create_dir_all(damaged.parent().unwrap()).unwrap();
+    fs::write(&damaged, b"{\"version\": 1, \"id\": ").unwrap();
+
+    let messages = vec![json!({"role": "user", "content": "start again"}), json!({"role": "assistant", "content": "ok"})];
+    let turn = FinishedTurn { conversation_id: &id, messages, model: Some(MODEL.to_string()), cwd: None };
+    let env = TurnEnv { local_host: "this-mac", home: None };
+    let saved = save_turn(&persist, turn, &Redactor::new(Vec::new()), env, 9).expect("save succeeds").expect("saved");
+    assert_eq!(saved.id, id);
+    assert_eq!(saved.title, "start again");
+
+    assert_eq!(fs::read(damaged.with_file_name(format!("{id}.json.corrupt-9"))).unwrap(), b"{\"version\": 1, \"id\": ");
+    let listed: Vec<String> = persist.conversations.list().unwrap().into_iter().map(|m| m.id).collect();
+    assert_eq!(listed, vec![id.clone()]);
+    assert_eq!(persist.ui.load().unwrap().last_conversation_id, Some(id));
+}
