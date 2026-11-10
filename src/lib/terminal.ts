@@ -22,11 +22,28 @@ import { clearActions } from './clear';
 import { defaultSizeStorage, FONT_SIZE_DEFAULT, loadFontSize, saveFontSize, stepFontSize } from './zoom';
 import type { InputState } from './types';
 
+/**
+ * The terminal background is the CSS token `--term-bg` (App.css), so it is set in one place. This is read once, when the
+ * module loads. App.tsx imports App.css before this module, so the token is in the page by then. The fallback is the same
+ * value, for code that runs without a document (vitest in node). Keep the two in step.
+ */
+const TERM_BG_FALLBACK = '#061823';
+
+function termBackground(): string {
+  if (typeof document === 'undefined') {
+    return TERM_BG_FALLBACK;
+  }
+  const value = getComputedStyle(document.documentElement).getPropertyValue('--term-bg').trim();
+  return value || TERM_BG_FALLBACK;
+}
+
+const TERM_BG = termBackground();
+
 const THEME = {
-  background: '#111318',
+  background: TERM_BG,
   foreground: '#d7dae0',
   cursor: '#d7dae0',
-  cursorAccent: '#111318',
+  cursorAccent: TERM_BG,
   selectionBackground: '#3a4150',
   black: '#1b1e24',
   red: '#e06c75',

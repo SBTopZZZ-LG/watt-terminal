@@ -1,18 +1,37 @@
+/*
+ * Theme tokens. The Blueprint theme is selected by data-theme="blueprint" on <html> (index.html). Another theme is another
+ * [data-theme="..."] block with the same token names. --term-bg is also read by src/lib/terminal.ts (see there).
+ */
 :root {
   color-scheme: dark;
-  font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+  font-family: var(--ui-font, ui-monospace, monospace);
   font-size: 13px;
   line-height: 1.4;
-  --bg: #111318;
-  --panel: #171a21;
-  --line: #262a33;
-  --text: #d7dae0;
-  --muted: #8a909c;
-  --accent: #61afef;
+}
+
+[data-theme="blueprint"] {
+  --bg: #0a2233;
+  /* The Blueprint card colour, rgba(6, 24, 35, .72), over --bg, as a solid colour. */
+  --panel: #071b27;
+  --rule: rgba(111, 211, 255, 0.28);
+  --line: var(--rule);
+  --rule-strong: rgba(111, 211, 255, 0.5);
+  --tint: rgba(111, 211, 255, 0.1);
+  --ink: #c6e4f7;
+  --text: var(--ink);
+  --muted: #7ba6c2;
+  --accent: #6fd3ff;
   --ok: #98c379;
   --fail: #e06c75;
   --warn: #e5c07b;
-  --mono: Menlo, Monaco, "SF Mono", ui-monospace, monospace;
+  --warn-tint: rgba(229, 192, 123, 0.1);
+  --ok-glow: rgba(152, 195, 121, 0.35);
+  --shadow: rgba(0, 0, 0, 0.35);
+  --code-bg: #04131d;
+  /* The terminal's background. Keep in step with the fallback in src/lib/terminal.ts. */
+  --term-bg: #061823;
+  --ui-font: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+  --mono: var(--ui-font);
 }
 
 * {
@@ -52,7 +71,7 @@ input {
 .term-host {
   position: absolute;
   inset: 0;
-  background: var(--bg);
+  background: var(--term-bg);
 }
 
 /*
@@ -118,20 +137,23 @@ input {
   right: 8px;
   top: 0;
   padding: 0 6px;
-  border-radius: 3px;
+  border-radius: 2px;
   background: var(--accent);
   color: var(--bg);
-  font: 10px/16px var(--mono);
+  font: 11px/16px var(--mono);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
 }
 
-/* A 1px line between a command's output and the next prompt, after a command that ran. Full grid width. It sits in the
-   blank row before the prompt (centred there); StripeLayer sets its top. */
+/* A 1px dashed rule between a command's output and the next prompt, after a command that ran. Full grid width. It sits in
+   the blank row before the prompt (centred there); StripeLayer sets its top. */
 .separator {
   position: absolute;
   left: 0;
   right: 0;
   height: 1px;
-  background: var(--line);
+  background-color: transparent;
+  background-image: repeating-linear-gradient(90deg, var(--rule-strong) 0 6px, transparent 6px 13px);
   pointer-events: none;
 }
 
@@ -147,10 +169,12 @@ input {
   top: 50%;
   transform: translateY(-50%);
   padding: 0 6px;
-  border-radius: 3px;
+  border-radius: 2px;
   background: var(--accent);
   color: var(--bg);
-  font: 10px/16px var(--mono);
+  font: 11px/16px var(--mono);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
 }
 
 /*
@@ -167,9 +191,9 @@ input {
   align-items: center;
   padding: 4px 6px;
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: 2px;
   background: var(--panel);
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+  box-shadow: 0 2px 8px var(--shadow);
 }
 
 .find-input {
@@ -177,7 +201,7 @@ input {
   min-width: 0;
   padding: 3px 6px;
   border: 1px solid var(--line);
-  border-radius: 4px;
+  border-radius: 2px;
   background: var(--bg);
   font: 12px var(--mono);
 }
@@ -200,7 +224,7 @@ input {
   height: 22px;
   padding: 0 4px;
   border: 1px solid transparent;
-  border-radius: 4px;
+  border-radius: 2px;
   background: transparent;
   color: var(--muted);
   font: 12px var(--mono);
@@ -256,7 +280,7 @@ input {
   position: absolute;
   inset: 0;
   border: 2px solid var(--ok);
-  box-shadow: inset 0 0 18px rgba(152, 195, 121, 0.35);
+  box-shadow: inset 0 0 18px var(--ok-glow);
   animation: agent-control-pulse 2s ease-in-out infinite;
 }
 
@@ -306,11 +330,13 @@ input {
 
 .chip {
   padding: 2px 8px;
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  background: rgba(23, 26, 33, 0.9);
+  border: 1px dashed var(--rule);
+  border-radius: 2px;
+  background: var(--panel);
   color: var(--muted);
   font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
   white-space: nowrap;
 }
 
@@ -339,6 +365,8 @@ input {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+  letter-spacing: 0;
+  text-transform: none;
 }
 
 .chip-model {
@@ -347,6 +375,8 @@ input {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+  letter-spacing: 0;
+  text-transform: none;
 }
 
 .chip-button {
@@ -357,7 +387,7 @@ input {
 .chip-warn {
   border-color: var(--warn);
   color: var(--warn);
-  background: rgba(229, 192, 123, 0.12);
+  background: var(--warn-tint);
 }
 
 /* ---------- transcript ---------- */
@@ -378,6 +408,9 @@ input {
   border: 0;
   background: transparent;
   color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
   text-align: left;
   cursor: pointer;
 }
@@ -401,12 +434,24 @@ input {
 .transcript-new {
   flex: 0 0 auto;
   padding: 2px 8px;
-  border: 1px solid var(--line);
-  border-radius: 4px;
+  border: 1px dashed var(--rule);
+  border-radius: 2px;
   background: var(--bg);
   color: var(--muted);
   font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
   cursor: pointer;
+}
+
+.transcript-new:not(:disabled):hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.transcript-new:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
 }
 
 .transcript-new:disabled {
@@ -417,6 +462,7 @@ input {
 .busy {
   color: var(--accent);
   font-size: 11px;
+  letter-spacing: 0.08em;
 }
 
 .thinking {
@@ -465,6 +511,8 @@ input {
   margin-right: 6px;
   color: var(--muted);
   font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
 }
 
 .msg.user {
@@ -491,18 +539,44 @@ input {
   overflow: auto;
   margin: 4px 0 0;
   padding: 6px 8px;
-  border-radius: 4px;
-  background: var(--bg);
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  background: var(--code-bg);
   font: 11px/1.4 var(--mono);
   white-space: pre-wrap;
 }
 
 .approval {
+  position: relative;
   margin: 6px 0;
   padding: 8px 10px;
   border: 1px solid var(--warn);
-  border-radius: 6px;
-  background: rgba(229, 192, 123, 0.08);
+  border-radius: 2px;
+  background: var(--warn-tint);
+}
+
+/* Small corner brackets on each open approval card, the Blueprint drawing-frame mark. */
+.approval::before,
+.approval::after {
+  content: "";
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  pointer-events: none;
+}
+
+.approval::before {
+  top: -1px;
+  left: -1px;
+  border-top: 2px solid var(--warn);
+  border-left: 2px solid var(--warn);
+}
+
+.approval::after {
+  bottom: -1px;
+  right: -1px;
+  border-bottom: 2px solid var(--warn);
+  border-right: 2px solid var(--warn);
 }
 
 .approval-resolved {
@@ -511,9 +585,17 @@ input {
   opacity: 0.7;
 }
 
+.approval-resolved::before,
+.approval-resolved::after {
+  display: none;
+}
+
 .approval-title {
   margin-bottom: 4px;
   color: var(--warn);
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
 }
 
 .approval-text {
@@ -531,9 +613,12 @@ input {
 
 .approval-actions button {
   padding: 4px 10px;
-  border: 1px solid var(--line);
-  border-radius: 4px;
+  border: 1px dashed var(--line);
+  border-radius: 2px;
   background: var(--bg);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
   cursor: pointer;
 }
 
@@ -563,8 +648,11 @@ input {
 .bar-mode {
   min-width: 52px;
   padding: 2px 6px;
-  border-radius: 4px;
+  border: 1px dashed var(--rule);
+  border-radius: 2px;
   font: 11px/18px var(--mono);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
   text-align: center;
   background: var(--panel);
   color: var(--muted);
@@ -579,7 +667,7 @@ input {
   min-width: 0;
   padding: 6px 8px;
   border: 1px solid var(--line);
-  border-radius: 4px;
+  border-radius: 2px;
   background: var(--panel);
   font-family: var(--mono);
 }
@@ -622,9 +710,12 @@ input {
 .bar-restart {
   padding: 4px 10px;
   border: 1px solid var(--accent);
-  border-radius: 4px;
+  border-radius: 2px;
   background: var(--panel);
   color: var(--accent);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
   cursor: pointer;
 }
 
