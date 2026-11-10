@@ -1,7 +1,9 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useMemo, useRef } from 'react';
 import { previewJson } from '../lib/format';
 import { approvalTitle } from '../lib/transcript';
 import type { TranscriptItem } from '../lib/transcript';
+import { groupTranscript, toolGroupSummary } from '../lib/toolGroups';
+import type { GroupItem } from '../lib/toolGroups';
 import { visibleEscapes } from '../lib/visibleEscapes';
 
 interface Props {
@@ -18,6 +20,7 @@ interface Props {
 /** The agent conversation, docked above the input bar. Collapsible, scrollable, and capped by CSS. */
 export function Transcript({ items, busy, thinking, open, onToggle, onApprove, onNewConversation }: Props) {
   const bodyRef = useRef<HTMLDivElement>(null);
+  const entries = useMemo(() => groupTranscript(items), [items]);
 
   useEffect(() => {
     const body = bodyRef.current;
@@ -48,12 +51,28 @@ export function Transcript({ items, busy, thinking, open, onToggle, onApprove, o
       {open && (
         <div className="transcript-body" ref={bodyRef}>
           {items.length === 0 && <div className="empty">Ask the agent something, for example "what was the last command".</div>}
-          {items.map((item) => (
-            <Entry key={item.id} item={item} onApprove={onApprove} />
-          ))}
+          {entries.map((entry) =>
+            entry.kind === 'item' ? (
+              <Entry key={entry.item.id} item={entry.item} onApprove={onApprove} />
+            ) : (
+              <ToolGroup key={entry.key} items={entry.items} onApprove={onApprove} />
+            ),
+          )}
         </div>
       )}
     </section>
+  );
+}
+
+/** A run of tool calls, collapsed to one line. Uncontrolled, and keyed by its first item, so it stays open as it grows. */
+function ToolGroup({ items, onApprove }: { items: GroupItem[]; onApprove: Props['onApprove'] }) {
+  return (
+    <details className="tool tool-group">
+      <summary>{toolGroupSummary(items)}</summary>
+      {items.map((item) => (
+        <Entry key={item.id} item={item} onApprove={onApprove} />
+      ))}
+    </details>
   );
 }
 

@@ -34,7 +34,21 @@ export function agentControlAfter(c: AgentControl, ev: WireEvent): AgentControl 
   }
 }
 
-/** The border is on while either hold is. */
+/** The agent holds the shell: the border is on while either hold is. */
 export function borderActive(c: AgentControl): boolean {
   return c.call || c.command;
+}
+
+/**
+ * How strong the border is. 'control': the agent holds the shell (see borderActive). 'working': a turn is in flight
+ * (`busy`, the transcript's isBusy, from the send until `done`) but the agent is not holding the shell yet, so it is
+ * thinking, streaming, or waiting for an approval. 'off': neither.
+ */
+export type BorderLevel = 'off' | 'working' | 'control';
+
+export function borderLevel(c: AgentControl, busy: boolean): BorderLevel {
+  if (borderActive(c)) {
+    return 'control';
+  }
+  return busy ? 'working' : 'off';
 }

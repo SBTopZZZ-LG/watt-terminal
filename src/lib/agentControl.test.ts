@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { agentControlAfter, borderActive, NO_CONTROL } from './agentControl';
+import { agentControlAfter, borderActive, borderLevel, NO_CONTROL } from './agentControl';
 import type { AgentControl } from './agentControl';
+import { EMPTY_TRANSCRIPT, isBusy, transcriptReducer } from './transcript';
+import type { TranscriptAction } from './transcript';
 import type { Source, WireEvent } from './types';
 
 const approvalRequest: WireEvent = { type: 'approval_request', call_id: 'call-1', name: 'run_command', text: 'pwd' };
@@ -99,5 +101,56 @@ describe('agentControlAfter', () => {
 
   it('keeps the flag through unrelated events', () => {
     expect(trace([{ type: 'text', text: 'hi' }, toolResult], { call: true, command: false })).toEqual([true, true]);
+  });
+});
+
+describe('borderLevel', () => {
+  it('is off when nothing holds the shell and no turn is in flight', () => {
+    expect(borderLevel(NO_CONTROL, false)).toBe('off');
+  });
+
+  it('is working during a turn that has not reached the shell yet', () => {
+    expect(borderLevel(NO_CONTROL, true)).toBe('working');
+  });
+
+  it('is control while a call or an agent command holds the shell, busy or not', () => {
+    const holds: AgentControl[] = [
+      { call: true, command: false },
+      { call: false, command: true },
+      { call: true, command: true },
+    ];
+    for (const c of holds) {
+      expect(borderLevel(c, true)).toBe('control');
+      expect(borderLevel(c, false)).toBe('control');
+    }
+  });
+
+  it('follows the transcript turn: working from the send until done, then off', () => {
+    const actions: TranscriptAction[] = [
+      { type: 'user_sent', clientId: 1, text: 'what is running' },
+      { type: 'agent_event', event: { type: 'thinking', active: true } },
+      { type: 'agent_event', event: { type: 'text_delta', text: 'Checking' } },
+      { type: 'agent_event', event: { type: 'approval_request', call_id: 'a1', name: 'run_command', text: 'ps' } },
+    ];
+    let t = EMPTY_TRANSCRIPT;
+    const level = () => borderLevel(NO_CONTROL, isBusy(t));
+    const seen: string[] = [];
+    for (const action of actions) {
+      t = transcriptReducer(t, action);
+      seen.push(level());
+    }
+    t = transcriptReducer(t, { type: 'agent_event', event: { type: 'done' } });
+    seen.push(level());
+    expect(seen).toEqual(['working', 'working', 'working', 'working', 'off']);
+  });
+
+  it('is off after a session reset and after a conversation reset, even mid-turn', () => {
+    const sent = transcriptReducer(EMPTY_TRANSCRIPT, { type: 'user_sent', clientId: 1, text: 'hi' });
+    expect(borderLevel(NO_CONTROL, isBusy(transcriptReducer(sent, { type: 'session_reset' })))).toBe('off');
+    expect(borderLevel(NO_CONTROL, isBusy(transcriptReducer(sent, { type: 'conversation_reset' })))).toBe('off');
+  });
+
+  it('a startup status with a turn running shows working', () => {
+    expect(borderLevel(NO_CONTROL, isBusy(transcriptReducer(EMPTY_TRANSCRIPT, { type: 'sync_busy', busy: true })))).toBe('working');
   });
 });

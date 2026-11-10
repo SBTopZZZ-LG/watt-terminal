@@ -7,8 +7,8 @@ import { clearTerminal, fitToContainer, markConnected, marks, receiveBytes, rese
 import { appHotkeyFor } from './lib/appHotkeys';
 import { effectiveState, focusAfter, inputReducer, INITIAL_INPUT, isFocusBarHotkey, routeFor } from './lib/inputState';
 import type { BarMode } from './lib/inputState';
-import { agentControlAfter, borderActive, NO_CONTROL } from './lib/agentControl';
-import type { AgentControl } from './lib/agentControl';
+import { agentControlAfter, borderLevel, NO_CONTROL } from './lib/agentControl';
+import type { AgentControl, BorderLevel } from './lib/agentControl';
 import { EMPTY_TRANSCRIPT, firstPendingApproval, isBusy, transcriptReducer } from './lib/transcript';
 import type { Cwd, InputState, IntegrationStatus, LlmStatus, ObserverStatus, Status, WireEvent } from './lib/types';
 import { TerminalView } from './components/TerminalView';
@@ -229,6 +229,14 @@ export default function App() {
   };
 
   const pendingApproval = firstPendingApproval(transcript);
+  const busy = isBusy(transcript);
+  // The border is 'working' for the whole agent turn, but an exited shell takes it off even if a turn is still open.
+  const border: BorderLevel = borderLevel(agentControl, busy && effective !== 'exited');
+  const borderClass: Record<BorderLevel, string> = {
+    off: 'agent-control',
+    working: 'agent-control is-working',
+    control: 'agent-control is-active',
+  };
 
   const toggleAutoApprove = () => {
     const next = !autoApprove;
@@ -291,15 +299,15 @@ export default function App() {
           onInput={handleTerminalInput}
           onAltChange={(active) => dispatchInput({ type: 'alt', active })}
         />
-        {/* Shown while the agent has the shell. Never takes clicks; sits above the terminal background, below its decorations. */}
-        <div className={borderActive(agentControl) ? 'agent-control is-active' : 'agent-control'} aria-hidden="true">
+        {/* Shown during the agent's turn ('working', softer) and while it holds the shell ('control'). Never takes clicks; sits above the terminal background, below its decorations. */}
+        <div className={borderClass[border]} aria-hidden="true">
           <div className="agent-control-glow" />
         </div>
         {findOpen && <FindBar focusToken={findToken} onClose={closeFind} />}
       </div>
       <Transcript
         items={transcript.items}
-        busy={isBusy(transcript)}
+        busy={busy}
         thinking={transcript.thinking}
         open={transcriptOpen}
         onToggle={() => setTranscriptOpen((o) => !o)}

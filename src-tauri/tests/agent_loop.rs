@@ -534,10 +534,11 @@ fn cancel_during_a_tool_call_closes_the_rest_without_another_model_call() {
 }
 
 #[test]
-fn the_ninth_command_in_one_turn_gets_the_limit_error() {
-    assert_eq!(MAX_COMMANDS_PER_TURN, 8, "the scenario below assumes the documented cap");
+fn the_command_past_the_per_turn_cap_gets_the_limit_error() {
+    // One more call than the cap, all in one reply: the last one is refused, the others run.
+    let over = MAX_COMMANDS_PER_TURN + 1;
     let calls: Vec<(String, &str, String)> =
-        (1..=9).map(|n| (format!("call_{n}"), "run_command", format!("{{\"command\":\"echo {n}\"}}"))).collect();
+        (1..=over).map(|n| (format!("call_{n}"), "run_command", format!("{{\"command\":\"echo {n}\"}}"))).collect();
     let call_refs: Vec<(&str, &str, &str)> = calls.iter().map(|(id, name, args)| (id.as_str(), *name, args.as_str())).collect();
     let provider = serve(vec![Script::json(tool_reply(&call_refs)), Script::json(text_reply("ok"))]);
     let conv = Conversation::new().unwrap();
@@ -545,12 +546,15 @@ fn the_ninth_command_in_one_turn_gets_the_limit_error() {
     let gate = no_gate();
     gate.set_auto_approve(true);
     let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
-    turn(&mut agent, &tools, &gate, "run nine things");
+    turn(&mut agent, &tools, &gate, "run too many things");
 
-    assert_eq!(tools.reached().iter().filter(|n| *n == "run_command").count(), 8);
+    assert_eq!(tools.reached().iter().filter(|n| *n == "run_command").count(), MAX_COMMANDS_PER_TURN);
     let msgs = stored(&conv.history());
-    assert!(tool_content(&msgs, "call_8").starts_with('{'), "the eighth ran");
-    assert_eq!(tool_content(&msgs, "call_9"), "error: per-turn command limit reached; ask the user to continue");
+    assert!(tool_content(&msgs, &format!("call_{MAX_COMMANDS_PER_TURN}")).starts_with('{'), "the last allowed one ran");
+    assert_eq!(
+        tool_content(&msgs, &format!("call_{over}")),
+        "error: per-turn command limit reached; ask the user to continue"
+    );
     assert_paired(&msgs);
 }
 

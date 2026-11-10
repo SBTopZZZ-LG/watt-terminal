@@ -30,9 +30,9 @@ use crate::core::chat::redact::Redactor;
 use crate::core::llm::{self, AssistantReply, ChatRequest, Delta, LlmError, ProviderConfig, ToolCall, TurnCancel};
 
 /// Model calls allowed in one turn. The tool calls of the last one are not run.
-pub const MAX_MODEL_CALLS: usize = 20;
+pub const MAX_MODEL_CALLS: usize = 50;
 /// `run_command` calls allowed in one turn. A call past the cap gets an error result and does not run.
-pub const MAX_COMMANDS_PER_TURN: usize = 8;
+pub const MAX_COMMANDS_PER_TURN: usize = 30;
 
 const SESSION_PLACEHOLDER: &str = "{session_id}";
 const USER_AGENT: &str = concat!("agent-term/", env!("CARGO_PKG_VERSION"));

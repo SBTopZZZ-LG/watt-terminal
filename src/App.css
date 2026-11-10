@@ -190,9 +190,11 @@ input {
 }
 
 /*
- * Agent control: a pulsing green border around the terminal while the agent runs an approved command. It never takes
- * pointer events, and its z-index (5) keeps it below the command stripes (6) and the scrollbar. The outer element
- * fades; the inner glow pulses, so a fade-out does not cut the pulse off mid-cycle.
+ * Agent control: a pulsing green border around the terminal. It never takes pointer events, and its z-index (5) keeps it
+ * below the command stripes (6) and the scrollbar. Two levels: is-active while the agent holds the shell (an approved
+ * call or a command it started), and is-working, the same green but softer and slower, for the rest of its turn
+ * (thinking, streaming, waiting for an approval). The outer element fades in and out; the inner glow pulses, so a
+ * fade-out does not cut the pulse off mid-cycle.
  */
 .agent-control {
   position: absolute;
@@ -201,6 +203,15 @@ input {
   pointer-events: none;
   opacity: 0;
   transition: opacity 600ms ease-out;
+}
+
+.agent-control.is-working {
+  opacity: 0.4;
+  transition: opacity 400ms ease-in;
+}
+
+.agent-control.is-working .agent-control-glow {
+  animation: agent-control-pulse-soft 4s ease-in-out infinite;
 }
 
 .agent-control.is-active {
@@ -226,8 +237,20 @@ input {
   }
 }
 
+@keyframes agent-control-pulse-soft {
+  0%,
+  100% {
+    opacity: 0.6;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .agent-control-glow {
+  /* No pulse for either level. The outer opacity keeps is-working softer than is-active. */
+  .agent-control-glow,
+  .agent-control.is-working .agent-control-glow {
     animation: none;
     opacity: 0.8;
   }
