@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { EMPTY_TRANSCRIPT, transcriptReducer } from '../lib/transcript';
 import type { TranscriptAction } from '../lib/transcript';
-import { Transcript } from './Transcript';
+import { JumpToLatest, Transcript } from './Transcript';
 
 function render(actions: TranscriptAction[]): string {
   const t = actions.reduce(transcriptReducer, EMPTY_TRANSCRIPT);
@@ -46,6 +46,25 @@ describe('Transcript: copy button', () => {
   it('is not shown on user messages', () => {
     const html = render([{ type: 'user_sent', clientId: 1, text: 'hello' }]);
     expect(html).not.toContain(COPY);
+  });
+});
+
+describe('Transcript: jump to latest', () => {
+  // The scroll behaviour needs a DOM (no jsdom here), so only the initial render is checked: the button starts hidden.
+  it('is not shown on the initial render, even with a long conversation', () => {
+    const html = render([delta('a'.repeat(50)), done, text('more'), { type: 'user_sent', clientId: 2, text: 'next' }]);
+    expect(html).not.toContain('jump-to-latest');
+  });
+
+  it('says Scroll to bottom when the agent is idle', () => {
+    const html = renderToStaticMarkup(<JumpToLatest busy={false} onClick={() => {}} />);
+    expect(html).toContain('aria-label="Scroll to bottom"');
+    expect(html).toContain('type="button"');
+  });
+
+  it('says Follow the agent while it is busy', () => {
+    const html = renderToStaticMarkup(<JumpToLatest busy onClick={() => {}} />);
+    expect(html).toContain('aria-label="Follow the agent (resume auto-scroll)"');
   });
 });
 

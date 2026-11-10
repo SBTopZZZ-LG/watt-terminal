@@ -1,6 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import type { MouseEvent, UIEvent, WheelEvent } from 'react';
 import { copyText } from '../lib/clipboard';
 import { previewJson } from '../lib/format';
+import { isAtBottom, shouldFollowAfterSend } from '../lib/stickScroll';
 import { approvalTitle } from '../lib/transcript';
 import type { TranscriptItem } from '../lib/transcript';
 import { groupTranscript, toolGroupSummary } from '../lib/toolGroups';
@@ -27,13 +29,98 @@ interface Props {
 export function Transcript({ items, busy, thinking, open, onToggle, onApprove, onNewConversation, dock, onDock }: Props) {
   const bodyRef = useRef<HTMLDivElement>(null);
   const entries = useMemo(() => groupTranscript(items), [items]);
+  /** Whether the view follows new content. A ref, read in effects and handlers, so changing it does not re-render. */
+  const following = useRef(true);
+  /** The body the scroll state belongs to. A new body (the panel opened or remounted) starts following. */
+  const shownBody = useRef<HTMLDivElement | null>(null);
+  const lastItem = useRef<TranscriptItem | undefined>(undefined);
+  /** The body's scrollTop as last seen, to tell the user scrolling up from content growing below. */
+  const lastTop = useRef(0);
+  const [showJump, setShowJump] = useState(false);
 
+  // Keyed on the items array, not its length: a streamed delta replaces the last item, and the length stops changing at the cap.
+  useLayoutEffect(() => {
+    const prev = lastItem.current;
+    const last = items[items.length - 1];
+    lastItem.current = last;
+    const body = bodyRef.current;
+    if (!body) {
+      shownBody.current = null;
+      return;
+    }
+    if (body !== shownBody.current) {
+      shownBody.current = body;
+      following.current = true;
+      setShowJump(false);
+    }
+    if (shouldFollowAfterSend(prev, last)) {
+      following.current = true;
+    }
+    if (following.current) {
+      body.scrollTop = body.scrollHeight;
+      lastTop.current = body.scrollTop;
+    }
+  }, [items, open]);
+
+  // A panel resize or dock change keeps the pin while following; when not following, being back at the bottom resumes it.
   useEffect(() => {
     const body = bodyRef.current;
-    if (body) {
-      body.scrollTop = body.scrollHeight;
+    if (!body || typeof ResizeObserver === 'undefined') {
+      return;
     }
-  }, [items.length, open]);
+    const observer = new ResizeObserver(() => {
+      if (following.current) {
+        body.scrollTop = body.scrollHeight;
+        lastTop.current = body.scrollTop;
+      } else if (isAtBottom(body)) {
+        following.current = true;
+        setShowJump(false);
+      }
+    });
+    observer.observe(body);
+    return () => observer.disconnect();
+  }, [open]);
+
+  const onScroll = (e: UIEvent<HTMLDivElement>) => {
+    const el = e.currentTarget;
+    const top = el.scrollTop;
+    const movedUp = top < lastTop.current;
+    lastTop.current = top;
+    if (isAtBottom(el)) {
+      following.current = true;
+    } else if (movedUp) {
+      // Only a scroll up stops following. Content growing below the view leaves the top where it was, and a streamed
+      // chunk can grow it by more than the threshold before our own scroll-to-bottom event is handled.
+      following.current = false;
+    }
+    setShowJump(!following.current);
+  };
+
+  // Catches a wheel up before the scroll it causes is handled, so a streamed delta in between cannot pull the view down.
+  // Without overflow there is nothing to scroll back to, so following stays on.
+  const onWheel = (e: WheelEvent<HTMLDivElement>) => {
+    const el = e.currentTarget;
+    if (e.deltaY < 0 && el.scrollHeight > el.clientHeight) {
+      following.current = false;
+      setShowJump(true);
+    }
+  };
+
+  const jumpToLatest = (e: MouseEvent<HTMLButtonElement>) => {
+    const body = bodyRef.current;
+    if (!body) {
+      return;
+    }
+    // The button unmounts on click. If it had keyboard focus, move focus to the body so it is not lost.
+    const hadFocus = document.activeElement === e.currentTarget;
+    following.current = true;
+    body.scrollTop = body.scrollHeight;
+    lastTop.current = body.scrollTop;
+    setShowJump(false);
+    if (hadFocus) {
+      body.focus({ preventScroll: true });
+    }
+  };
 
   return (
     <section className={`transcript${open ? ' open' : ''}`}>
@@ -56,7 +143,7 @@ export function Transcript({ items, busy, thinking, open, onToggle, onApprove, o
         </button>
       </div>
       {open && (
-        <div className="transcript-body" ref={bodyRef}>
+        <div className="transcript-body" ref={bodyRef} tabIndex={-1} onScroll={onScroll} onWheel={onWheel}>
           {items.length === 0 && <div className="empty">Ask the agent something, for example "what was the last command".</div>}
           {entries.map((entry) =>
             entry.kind === 'item' ? (
@@ -67,7 +154,22 @@ export function Transcript({ items, busy, thinking, open, onToggle, onApprove, o
           )}
         </div>
       )}
+      {open && showJump && <JumpToLatest busy={busy} onClick={jumpToLatest} />}
     </section>
+  );
+}
+
+/** The floating control shown when the view is not at the bottom. It sits over the body, so it changes no layout. */
+export function JumpToLatest({ busy, onClick }: { busy: boolean; onClick: (e: MouseEvent<HTMLButtonElement>) => void }) {
+  const label = busy ? 'Follow the agent (resume auto-scroll)' : 'Scroll to bottom';
+  return (
+    <button type="button" className="jump-to-latest" aria-label={label} title={label} onClick={onClick}>
+      <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+        <path d="M8 2.5v8.5" />
+        <path d="M4.5 7.5L8 11l3.5-3.5" />
+        <path d="M3 14h10" />
+      </svg>
+    </button>
   );
 }
 

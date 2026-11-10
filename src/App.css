@@ -133,11 +133,12 @@ input {
 /*
  * Only when the command's first row is on screen, so the badge never sits on a row that is not the command's start.
  * StripeLayer sets data-agent false when the badge is on the separator line instead (its separator row is blank).
+ * The stripe box is inset 5px from the right edge, so right: 3px keeps this badge flush with the separator badge (right: 8px).
  */
 .stripe[data-agent="true"][data-start-visible="true"]::after {
   content: "agent";
   position: absolute;
-  right: 8px;
+  right: 3px;
   top: 0;
   padding: 0 6px;
   border-radius: 2px;
@@ -589,7 +590,9 @@ input {
 
 /* ---------- transcript ---------- */
 
+/* position: relative is for the jump-to-latest button, which floats over the body's bottom right. */
 .transcript {
+  position: relative;
   flex: 0 0 auto;
   display: flex;
   flex-direction: column;
@@ -730,8 +733,49 @@ input {
   padding: 4px 12px 10px;
 }
 
+/* Focused by the jump button after a keyboard click, so focus is not lost. It is a scroll region, so no focus ring. */
+.transcript-body:focus {
+  outline: none;
+}
+
 .transcript-body > * {
   flex: 0 0 auto;
+}
+
+/*
+ * Shown when the view is not at the bottom (the body is scrolled up). Floats over the body's bottom right, clear of the
+ * scrollbar, and changes no layout. It is a sibling of the body, so it is not clipped by the body's overflow.
+ */
+.jump-to-latest {
+  position: absolute;
+  right: 18px;
+  bottom: 10px;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px dashed var(--rule);
+  border-radius: 2px;
+  background: var(--panel);
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.jump-to-latest svg {
+  display: block;
+}
+
+.jump-to-latest:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.jump-to-latest:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
 }
 
 .transcript-body > .tool,
