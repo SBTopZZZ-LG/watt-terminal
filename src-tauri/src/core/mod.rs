@@ -12,5 +12,6 @@ pub mod record;
 pub mod registry;
 pub mod scanner;
 pub mod session;
+pub mod settings;
 pub mod shim;
 pub mod tools;
