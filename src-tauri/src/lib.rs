@@ -206,29 +206,46 @@ fn local_host() -> &'static str {
     })
 }
 
-/// Saves the conversation at the end of a model turn. A failure is logged without any content and never fails the turn.
-fn save_finished_turn(
-    store: &Persist,
-    session: &Session,
-    conversation_id: &str,
-    history: &Mutex<History>,
-    todos: &TodoList,
-    redactor: &Redactor,
+/// What a save of the live conversation needs besides the store and the session: its id, history, todo list and model.
+struct SavedState {
+    conversation_id: String,
+    history: Arc<Mutex<History>>,
+    todos: TodoList,
     model: Option<String>,
-) {
+}
+
+/// Saves the conversation: the whole history and todo list, redacted, with the shell's directory. `in_turn` is true at
+/// a checkpoint inside a turn and false at the end of the turn. A failure is logged without any content and never
+/// fails the turn.
+fn save_conversation(store: &Persist, session: &Session, state: &SavedState, redactor: &Redactor, in_turn: bool) {
     let cwd = session.cwd();
     let cwd_pair = cwd.as_ref().map(|c| (c.host.as_str(), c.path.as_str()));
     let turn = FinishedTurn {
-        conversation_id,
-        messages: lock(history).snapshot(),
-        todos: lock(todos).clone(),
-        model,
+        conversation_id: &state.conversation_id,
+        messages: lock(&state.history).snapshot(),
+        todos: lock(&state.todos).clone(),
+        model: state.model.clone(),
         cwd: cwd_pair,
+        in_turn,
     };
     let home = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
     let env = TurnEnv { local_host: local_host(), home: home.as_deref() };
     if let Err(e) = save_turn(store, turn, redactor, env, now_secs()) {
         eprintln!("agent-term: the conversation was not saved ({e})");
+    }
+}
+
+/// The checkpoint of an LLM turn (see `LlmAgent::with_checkpoint`): saves the conversation with `in_turn` set. Without
+/// a store, nothing is saved.
+fn checkpoint_saver(
+    store: Option<Arc<Persist>>,
+    att: Arc<Attached>,
+    state: Arc<SavedState>,
+) -> impl FnMut(&Redactor) + Send + 'static {
+    move |redactor| {
+        if let Some(store) = store.as_ref() {
+            save_conversation(store, &att.session, &state, redactor, true);
+        }
     }
 }
 
@@ -376,20 +393,24 @@ async fn agent_message(
     let chosen = blocking(move || choose_llm(service.as_deref())).await?;
     let cancel = Arc::new(TurnCancel::new());
     let (history, todos, conversation_id) = att.begin_turn(&cancel)?;
+    let store = persist.0.clone();
     // Only the LLM agent writes history, so only its turns are saved. The mock agent never touches the history.
-    let (mut llm, model) = match chosen {
+    let (mut llm, saved) = match chosen {
         None => (None, None),
         Some((llm_settings, model)) => match agent_loop::shared_client() {
             Ok(client) => {
-                let agent = LlmAgent::new(
-                    client,
-                    llm_settings,
-                    &conversation_id,
-                    history.clone(),
-                    todos.clone(),
-                    cancel.clone(),
-                );
-                (Some(agent), Some(model))
+                let state = Arc::new(SavedState {
+                    conversation_id: conversation_id.clone(),
+                    history: history.clone(),
+                    todos: todos.clone(),
+                    model: Some(model),
+                });
+                let checkpoint = checkpoint_saver(store.clone(), att.clone(), state.clone());
+                let agent = LlmAgent::new(client, llm_settings, &conversation_id, history, todos, cancel.clone())
+                    // The note is taken only by a turn that calls the model: a turn that fails to start keeps it.
+                    .with_resume_note(att.conversation.take_resume_note())
+                    .with_checkpoint(checkpoint);
+                (Some(agent), Some(state))
             }
             Err(e) => {
                 att.end_turn();
@@ -397,7 +418,6 @@ async fn agent_message(
             }
         },
     };
-    let store = persist.0.clone();
     let worker = att.clone();
     let spawned = thread::Builder::new().name("agent".into()).spawn(move || {
         // Runs on panic too, so a crashed turn cannot leave the agent busy or in control of the shell.
@@ -416,9 +436,10 @@ async fn agent_message(
             Some(agent) => agent::run_turn(agent, &text, &ctx),
             None => agent::run_turn(&mut MockAgent, &text, &ctx),
         }
-        // The history is final now, and this is still before the turn is ended (the guard above).
-        if let (Some(agent), Some(store)) = (llm.as_ref(), store.as_ref()) {
-            save_finished_turn(store, &worker.session, &conversation_id, &history, &todos, agent.redactor(), model);
+        // The history is final now, and this is still before the turn is ended (the guard above). The end of a turn
+        // is saved as finished, whether it completed, was cancelled, or failed.
+        if let (Some(agent), Some(store), Some(state)) = (llm.as_ref(), store.as_ref(), saved.as_ref()) {
+            save_conversation(store, &worker.session, state, agent.redactor(), false);
         }
     });
     if let Err(e) = spawned {
@@ -566,13 +587,14 @@ async fn load_conversation(
     let messages = resumed.history.snapshot();
     let title = resumed.title;
     let todos = resumed.todos;
+    let in_turn = resumed.in_turn;
     {
         // The busy check and the restore happen under the turn-cancel lock, as `begin_turn` and `new_conversation` do.
         let _turn = lock(&att.turn_cancel);
         if att.agent_busy.load(Ordering::SeqCst) {
             return Err(BUSY_REFUSAL.into());
         }
-        att.conversation.restore(id.clone(), resumed.history, todos.clone());
+        att.conversation.restore(id.clone(), resumed.history, todos.clone(), in_turn);
     }
     let remember_id = id.clone();
     let remember = blocking(move || {
@@ -775,6 +797,13 @@ pub fn run() {
     // Reads the dev LLM settings now, so a bad value is reported at launch and falls back to the mock agent.
     agent_loop::settings();
     let app = tauri::Builder::default()
+        // Registered first, as the plugin requires. A second launch runs this closure in the first instance and exits.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
         .manage(Reg::new())
         .setup(|app| {
             let persist = resolve_persist(app.handle()).map(Arc::new);

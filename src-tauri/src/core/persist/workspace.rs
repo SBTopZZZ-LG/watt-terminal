@@ -2,9 +2,12 @@
 //! is first saved. Derived once and stored, never re-derived.
 //!
 //! The root is the nearest ancestor of the working directory (the directory itself included) that has a `.git`
-//! entry (a directory, or a file for worktrees and submodules). The walk is plain filesystem checks: no process is
-//! spawned. It only runs for this machine and an absolute path. For any other host the root is the working
-//! directory as the shell reported it. Without a working directory the workspace is unknown.
+//! entry (a directory, or a file for worktrees and submodules). Two kinds of `.git` do not count: one at the home
+//! directory (usually a dotfiles repository, so home is a workspace only when it is the working directory itself),
+//! and one whose directory contains another known workspace root (a container of projects, not a project). The walk
+//! is plain filesystem checks: no process is spawned. It only runs for this machine and an absolute path. For any
+//! other host the root is the working directory as the shell reported it. Without a working directory the workspace
+//! is unknown.
 
 use std::path::Path;
 
@@ -28,28 +31,56 @@ impl Workspace {
 }
 
 /// The workspace for a shell working directory given as `(host, path)`. `local_host` is this machine's name, and
-/// `home` is the user's home directory, used only to label the root "~".
-pub fn workspace_for(cwd: Option<(&str, &str)>, local_host: &str, home: Option<&Path>) -> Workspace {
+/// `home` is the user's home directory: used to label the root "~" and to ignore a `.git` there. `known` are the
+/// workspaces of the saved conversations; the local ones keep a repository that contains them from being the root.
+pub fn workspace_for(
+    cwd: Option<(&str, &str)>,
+    local_host: &str,
+    home: Option<&Path>,
+    known: &[Workspace],
+) -> Workspace {
     let Some((host, path)) = cwd else {
         return Workspace::unknown();
     };
-    let local = host.is_empty() || host == "localhost" || host == local_host;
-    let root = if local { project_root(path) } else { path.to_string() };
+    let local = is_local(host, local_host);
+    let root = if local {
+        let known_roots: Vec<&Path> = known
+            .iter()
+            .filter(|w| is_local(&w.host, local_host) && !w.root.is_empty())
+            .map(|w| Path::new(w.root.as_str()))
+            .collect();
+        project_root(path, home, &known_roots)
+    } else {
+        path.to_string()
+    };
     let label = label_for(&root, local, home);
     Workspace { host: host.to_string(), root, label }
 }
 
-/// The nearest ancestor of `path` (itself included) that contains a `.git` entry, or `path` when there is none.
-/// Only an absolute path is searched.
-fn project_root(path: &str) -> String {
+/// True for this machine: an empty host (the shell reported none), `localhost`, or this machine's name.
+fn is_local(host: &str, local_host: &str) -> bool {
+    host.is_empty() || host == "localhost" || host == local_host
+}
+
+/// The nearest ancestor of `path` (itself included) that contains a `.git` entry the walk accepts, or `path` when there
+/// is none. A `.git` at `home` is accepted only when `home` is `path` itself. A candidate is refused when a known root
+/// lies strictly below it. Only an absolute path is searched.
+fn project_root(path: &str, home: Option<&Path>, known: &[&Path]) -> String {
     let p = Path::new(path);
     if !p.is_absolute() {
         return path.to_string();
     }
     for dir in p.ancestors() {
-        if dir.join(".git").exists() {
-            return dir.to_string_lossy().into_owned();
+        if !dir.join(".git").exists() {
+            continue;
         }
+        if home == Some(dir) && dir != p {
+            continue;
+        }
+        if known.iter().any(|root| *root != dir && root.starts_with(dir)) {
+            continue;
+        }
+        return dir.to_string_lossy().into_owned();
     }
     path.to_string()
 }
@@ -112,7 +143,7 @@ mod tests {
 
     #[test]
     fn no_working_directory_is_unknown() {
-        let w = workspace_for(None, LOCAL, None);
+        let w = workspace_for(None, LOCAL, None, &[]);
         assert_eq!(w, Workspace { host: String::new(), root: String::new(), label: "Unknown".into() });
     }
 
@@ -122,7 +153,7 @@ mod tests {
         let repo = dir(&tmp.path().join("repo"));
         fs::create_dir_all(repo.join(".git")).unwrap();
         let cwd = dir(&repo.join("src").join("deep"));
-        let w = workspace_for(Some(("", &s(&cwd))), LOCAL, None);
+        let w = workspace_for(Some(("", &s(&cwd))), LOCAL, None, &[]);
         assert_eq!(w.root, s(&repo));
         assert_eq!(w.label, "repo");
         assert_eq!(w.host, "");
@@ -134,7 +165,7 @@ mod tests {
         let wt = dir(&tmp.path().join("wt"));
         fs::write(wt.join(".git"), "gitdir: /somewhere/else\n").unwrap();
         let cwd = dir(&wt.join("pkg"));
-        let w = workspace_for(Some(("", &s(&cwd))), LOCAL, None);
+        let w = workspace_for(Some(("", &s(&cwd))), LOCAL, None, &[]);
         assert_eq!(w.root, s(&wt));
         assert_eq!(w.label, "wt");
     }
@@ -144,7 +175,7 @@ mod tests {
         let tmp = TempDir::new();
         let repo = dir(&tmp.path().join("here"));
         fs::create_dir_all(repo.join(".git")).unwrap();
-        let w = workspace_for(Some(("", &s(&repo))), LOCAL, None);
+        let w = workspace_for(Some(("", &s(&repo))), LOCAL, None, &[]);
         assert_eq!(w.root, s(&repo));
         assert_eq!(w.label, "here");
     }
@@ -157,7 +188,7 @@ mod tests {
         let inner = dir(&outer.join("vendor").join("inner"));
         fs::write(inner.join(".git"), "gitdir: x\n").unwrap();
         let cwd = dir(&inner.join("src"));
-        let w = workspace_for(Some(("", &s(&cwd))), LOCAL, None);
+        let w = workspace_for(Some(("", &s(&cwd))), LOCAL, None, &[]);
         assert_eq!(w.root, s(&inner));
         assert_eq!(w.label, "inner");
     }
@@ -166,7 +197,7 @@ mod tests {
     fn no_repository_means_the_working_directory_is_the_root() {
         let tmp = TempDir::new();
         let cwd = dir(&tmp.path().join("plain").join("notes"));
-        let w = workspace_for(Some(("", &s(&cwd))), LOCAL, None);
+        let w = workspace_for(Some(("", &s(&cwd))), LOCAL, None, &[]);
         assert_eq!(w.root, s(&cwd));
         assert_eq!(w.label, "notes");
     }
@@ -176,23 +207,75 @@ mod tests {
         let tmp = TempDir::new();
         let home = dir(&tmp.path().join("home"));
         let project = dir(&home.join("proj"));
-        let w = workspace_for(Some(("", &s(&home))), LOCAL, Some(&home));
+        let w = workspace_for(Some(("", &s(&home))), LOCAL, Some(&home), &[]);
         assert_eq!(w.root, s(&home));
         assert_eq!(w.label, "~");
-        let w = workspace_for(Some(("", &s(&project))), LOCAL, Some(&home));
+        let w = workspace_for(Some(("", &s(&project))), LOCAL, Some(&home), &[]);
         assert_eq!(w.root, s(&project));
         assert_eq!(w.label, "proj");
     }
 
     #[test]
-    fn a_repository_at_home_is_labelled_tilde() {
+    fn a_dotfiles_repository_at_home_is_not_the_workspace_of_its_subdirectories() {
         let tmp = TempDir::new();
         let home = dir(&tmp.path().join("home"));
         fs::create_dir_all(home.join(".git")).unwrap();
         let cwd = dir(&home.join("code"));
-        let w = workspace_for(Some(("", &s(&cwd))), LOCAL, Some(&home));
+        let w = workspace_for(Some(("", &s(&cwd))), LOCAL, Some(&home), &[]);
+        assert_eq!(w.root, s(&cwd), "the .git at home is skipped, so the working directory is the root");
+        assert_eq!(w.label, "code");
+    }
+
+    #[test]
+    fn home_is_the_workspace_when_it_is_the_working_directory_even_with_a_git_entry() {
+        let tmp = TempDir::new();
+        let home = dir(&tmp.path().join("home"));
+        fs::create_dir_all(home.join(".git")).unwrap();
+        let w = workspace_for(Some(("", &s(&home))), LOCAL, Some(&home), &[]);
         assert_eq!(w.root, s(&home));
         assert_eq!(w.label, "~");
+    }
+
+    #[test]
+    fn a_project_under_a_dotfiles_repository_at_home_still_finds_its_own_repository() {
+        let tmp = TempDir::new();
+        let home = dir(&tmp.path().join("home"));
+        fs::create_dir_all(home.join(".git")).unwrap();
+        let project = dir(&home.join("proj"));
+        fs::create_dir_all(project.join(".git")).unwrap();
+        let cwd = dir(&project.join("src"));
+        let w = workspace_for(Some(("", &s(&cwd))), LOCAL, Some(&home), &[]);
+        assert_eq!(w.root, s(&project));
+        assert_eq!(w.label, "proj");
+    }
+
+    #[test]
+    fn a_repository_that_contains_a_known_workspace_is_skipped() {
+        let tmp = TempDir::new();
+        let outer = dir(&tmp.path().join("outer"));
+        fs::create_dir_all(outer.join(".git")).unwrap();
+        let inner = dir(&outer.join("vendor").join("inner"));
+        fs::create_dir_all(inner.join(".git")).unwrap();
+        let cwd = dir(&outer.join("scratch"));
+        let known = [Workspace { host: String::new(), root: s(&inner), label: "inner".into() }];
+        let w = workspace_for(Some(("", &s(&cwd))), LOCAL, None, &known);
+        assert_eq!(w.root, s(&cwd), "outer holds a known workspace, so it is not the root");
+        assert_eq!(w.label, "scratch");
+        // Without the known workspace the outer repository is the root, as before.
+        let w = workspace_for(Some(("", &s(&cwd))), LOCAL, None, &[]);
+        assert_eq!(w.root, s(&outer));
+    }
+
+    #[test]
+    fn a_known_workspace_on_another_host_does_not_make_a_local_repository_a_container() {
+        let tmp = TempDir::new();
+        let outer = dir(&tmp.path().join("outer"));
+        fs::create_dir_all(outer.join(".git")).unwrap();
+        let cwd = dir(&outer.join("scratch"));
+        let inner = s(&outer.join("vendor").join("inner"));
+        let known = [Workspace { host: "build-box".into(), root: inner, label: "inner".into() }];
+        let w = workspace_for(Some(("", &s(&cwd))), LOCAL, None, &known);
+        assert_eq!(w.root, s(&outer));
     }
 
     #[test]
@@ -201,7 +284,7 @@ mod tests {
         let repo = dir(&tmp.path().join("repo"));
         fs::create_dir_all(repo.join(".git")).unwrap();
         let cwd = dir(&repo.join("src"));
-        let w = workspace_for(Some(("build-box", &s(&cwd))), LOCAL, None);
+        let w = workspace_for(Some(("build-box", &s(&cwd))), LOCAL, None, &[]);
         assert_eq!(w.host, "build-box");
         assert_eq!(w.root, s(&cwd));
         assert_eq!(w.label, "src");
@@ -211,7 +294,7 @@ mod tests {
     fn a_remote_home_path_is_not_labelled_tilde() {
         let tmp = TempDir::new();
         let home = dir(&tmp.path().join("home"));
-        let w = workspace_for(Some(("build-box", &s(&home))), LOCAL, Some(&home));
+        let w = workspace_for(Some(("build-box", &s(&home))), LOCAL, Some(&home), &[]);
         assert_eq!(w.label, "home");
     }
 
@@ -222,7 +305,7 @@ mod tests {
         fs::create_dir_all(repo.join(".git")).unwrap();
         let cwd = dir(&repo.join("src"));
         for host in ["localhost", LOCAL] {
-            let w = workspace_for(Some((host, &s(&cwd))), LOCAL, None);
+            let w = workspace_for(Some((host, &s(&cwd))), LOCAL, None, &[]);
             assert_eq!(w.root, s(&repo), "host {host}");
             assert_eq!(w.host, host);
         }
@@ -230,14 +313,14 @@ mod tests {
 
     #[test]
     fn a_relative_path_is_not_searched_and_is_its_own_root() {
-        let w = workspace_for(Some(("", "relative/dir")), LOCAL, None);
+        let w = workspace_for(Some(("", "relative/dir")), LOCAL, None, &[]);
         assert_eq!(w.root, "relative/dir");
         assert_eq!(w.label, "dir");
     }
 
     #[test]
     fn filesystem_root_is_labelled_slash() {
-        let w = workspace_for(Some(("build-box", "/")), LOCAL, None);
+        let w = workspace_for(Some(("build-box", "/")), LOCAL, None, &[]);
         assert_eq!(w.root, "/");
         assert_eq!(w.label, "/");
     }
@@ -245,20 +328,20 @@ mod tests {
     #[test]
     fn hidden_and_control_characters_in_a_label_become_spaces() {
         // The remote path needs no disk access, so these names are plain strings.
-        let w = workspace_for(Some(("build-box", "/work/re\u{202E}vop")), LOCAL, None);
+        let w = workspace_for(Some(("build-box", "/work/re\u{202E}vop")), LOCAL, None, &[]);
         assert_eq!(w.label, "re vop");
-        let w = workspace_for(Some(("build-box", "/work/a\u{200B}b\u{FEFF}")), LOCAL, None);
+        let w = workspace_for(Some(("build-box", "/work/a\u{200B}b\u{FEFF}")), LOCAL, None, &[]);
         assert_eq!(w.label, "a b");
-        let w = workspace_for(Some(("build-box", "/work/\u{2066}\u{2069}")), LOCAL, None);
+        let w = workspace_for(Some(("build-box", "/work/\u{2066}\u{2069}")), LOCAL, None, &[]);
         assert_eq!(w.label, "Unknown", "a name that is only hidden characters reads as unknown");
     }
 
     #[test]
     fn zero_width_joiner_stays_in_a_label_and_ordinary_names_are_unchanged() {
         let family = "/work/family\u{200D}\u{1F467}";
-        let w = workspace_for(Some(("build-box", family)), LOCAL, None);
+        let w = workspace_for(Some(("build-box", family)), LOCAL, None, &[]);
         assert_eq!(w.label, "family\u{200D}\u{1F467}");
-        let w = workspace_for(Some(("build-box", "/work/my  proj ")), LOCAL, None);
+        let w = workspace_for(Some(("build-box", "/work/my  proj ")), LOCAL, None, &[]);
         assert_eq!(w.label, "my  proj ", "no hidden character, so the name is kept as it is");
     }
 
@@ -274,7 +357,7 @@ mod tests {
 
     #[test]
     fn an_empty_path_is_unknown_by_label() {
-        let w = workspace_for(Some(("", "")), LOCAL, None);
+        let w = workspace_for(Some(("", "")), LOCAL, None, &[]);
         assert_eq!(w.root, "");
         assert_eq!(w.label, "Unknown");
     }

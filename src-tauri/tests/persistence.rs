@@ -187,6 +187,8 @@ fn agent_for(s: &LlmSettings, conv: &Conversation) -> LlmAgent {
         conv.todos(),
         Arc::new(TurnCancel::new()),
     )
+    // As the app does for each turn: the note goes to the first turn only.
+    .with_resume_note(conv.take_resume_note())
 }
 
 /// Runs one turn of the agent, as the app does on its agent thread.
@@ -208,7 +210,14 @@ fn finish(
 ) -> Option<ConversationMeta> {
     let id = conv.id();
     let messages = conv.history().lock().unwrap().snapshot();
-    let turn = FinishedTurn { conversation_id: &id, messages, todos: conv.todos().lock().unwrap().clone(), model: Some(MODEL.to_string()), cwd };
+    let turn = FinishedTurn {
+        conversation_id: &id,
+        messages,
+        todos: conv.todos().lock().unwrap().clone(),
+        model: Some(MODEL.to_string()),
+        cwd,
+        in_turn: false,
+    };
     let env = TurnEnv { local_host: "this-mac", home: None };
     save_turn(persist, turn, agent.redactor(), env, now).expect("save succeeds")
 }
@@ -259,7 +268,7 @@ fn a_resumed_conversation_gives_the_model_its_earlier_messages() {
     // Resume it into a fresh live conversation, as load_conversation does, then run a second turn.
     let loaded = resume(&persist, &saved.id).expect("resume");
     let live = Conversation::new().unwrap();
-    live.restore(loaded.id, loaded.history, loaded.todos);
+    live.restore(loaded.id, loaded.history, loaded.todos, loaded.in_turn);
     assert_eq!(live.id(), first.id(), "the provider session id is kept");
     let mut resumed_agent = agent_for(&s, &live);
     run(&mut resumed_agent, "second question");
@@ -352,6 +361,7 @@ fn a_saved_unanswered_tool_call_is_closed_before_the_model_sees_the_resumed_hist
                 model: Some(MODEL.to_string()),
                 messages: stored_messages,
                 todos: Vec::new(),
+                in_turn: false,
             },
             &Redactor::new(vec![KEY.to_string()]),
             5,
@@ -360,7 +370,7 @@ fn a_saved_unanswered_tool_call_is_closed_before_the_model_sees_the_resumed_hist
 
     let loaded = resume(&persist, &id).expect("resume");
     let live = Conversation::new().unwrap();
-    live.restore(loaded.id, loaded.history, loaded.todos);
+    live.restore(loaded.id, loaded.history, loaded.todos, loaded.in_turn);
     let s = settings(&provider.url);
     let mut agent = agent_for(&s, &live);
     run(&mut agent, "and now?");
@@ -382,7 +392,14 @@ fn a_turn_saved_over_a_damaged_conversation_file_goes_through_and_is_listed() {
     fs::write(&damaged, b"{\"version\": 1, \"id\": ").unwrap();
 
     let messages = vec![json!({"role": "user", "content": "start again"}), json!({"role": "assistant", "content": "ok"})];
-    let turn = FinishedTurn { conversation_id: &id, messages, todos: Vec::new(), model: Some(MODEL.to_string()), cwd: None };
+    let turn = FinishedTurn {
+        conversation_id: &id,
+        messages,
+        todos: Vec::new(),
+        model: Some(MODEL.to_string()),
+        cwd: None,
+        in_turn: false,
+    };
     let env = TurnEnv { local_host: "this-mac", home: None };
     let saved = save_turn(&persist, turn, &Redactor::new(Vec::new()), env, 9).expect("save succeeds").expect("saved");
     assert_eq!(saved.id, id);
@@ -438,7 +455,7 @@ fn a_todo_list_is_saved_with_the_turn_and_resumed_into_the_next_request() {
     ];
     assert_eq!(loaded.todos, expected);
     let live = Conversation::new().unwrap();
-    live.restore(loaded.id, loaded.history, loaded.todos);
+    live.restore(loaded.id, loaded.history, loaded.todos, loaded.in_turn);
     assert_eq!(live.todos().lock().unwrap().clone(), expected);
 
     let mut resumed_agent = agent_for(&s, &live);
@@ -465,6 +482,7 @@ fn an_older_file_without_todos_loads_with_an_empty_list() {
                 model: None,
                 messages: vec![json!({"role": "user", "content": "old"}), json!({"role": "assistant", "content": "ok"})],
                 todos: Vec::new(),
+                in_turn: false,
             },
             &Redactor::new(Vec::new()),
             3,
@@ -525,6 +543,7 @@ fn new_conversation_clears_the_todo_list_and_the_saved_copy_keeps_its_own() {
         todos: conv.todos().lock().unwrap().clone(),
         model: None,
         cwd: None,
+        in_turn: false,
     };
     save_turn(&persist, turn, &Redactor::new(Vec::new()), TurnEnv { local_host: "this-mac", home: None }, 4).unwrap();
 
@@ -610,4 +629,133 @@ fn deleting_another_conversation_leaves_the_live_one_alone() {
     let saved = finish(&persist, &live, &agent, None, 120).expect("saved");
     assert_eq!(saved.id, live_id);
     assert!(conversation_file(&tmp, &live_id).exists());
+}
+
+/// What each checkpoint found on disk afterwards: (in_turn, stored message count).
+type Seen = Arc<Mutex<Vec<(bool, usize)>>>;
+
+/// A checkpoint as the app makes one: it saves the turn so far with `in_turn` set, then records what the file holds
+/// afterwards. The record is shared with the test.
+fn recording_checkpoint(persist: &Arc<Persist>, conv: &Conversation) -> (impl FnMut(&Redactor) + Send + 'static, Seen) {
+    let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+    let (persist, seen_in, history, todos, id) =
+        (persist.clone(), seen.clone(), conv.history(), conv.todos(), conv.id());
+    let checkpoint = move |redactor: &Redactor| {
+        let turn = FinishedTurn {
+            conversation_id: &id,
+            messages: history.lock().unwrap().snapshot(),
+            todos: todos.lock().unwrap().clone(),
+            model: Some(MODEL.to_string()),
+            cwd: None,
+            in_turn: true,
+        };
+        let env = TurnEnv { local_host: "this-mac", home: None };
+        save_turn(&persist, turn, redactor, env, 10).expect("the checkpoint saves");
+        let stored = persist.conversations.load(&id).expect("the checkpoint is on disk");
+        seen_in.lock().unwrap().push((stored.in_turn, stored.messages.len()));
+    };
+    (checkpoint, seen)
+}
+
+#[test]
+fn a_turn_is_checkpointed_after_the_user_message_and_after_each_tool_round() {
+    let args = json!({"items": [{"content": "step one", "status": "in_progress"}]}).to_string();
+    let provider = serve(vec![tool_call_reply("call_t", "todo_write", &args), text_reply("done")]);
+    let tmp = TempDir::new();
+    let persist = Arc::new(persist_in(&tmp));
+    let s = settings(&provider.url);
+    let conv = Conversation::new().unwrap();
+    let id = conv.id();
+
+    let (checkpoint, seen) = recording_checkpoint(&persist, &conv);
+    let mut agent = agent_for(&s, &conv).with_checkpoint(checkpoint);
+    run(&mut agent, "plan it");
+    // After the user message (one message stored), then after the tool round (user, the call, its result).
+    assert_eq!(*seen.lock().unwrap(), vec![(true, 1), (true, 3)]);
+    assert!(conversation_file(&tmp, &id).exists());
+
+    // The end-of-turn save finishes the turn: the flag is cleared and the whole reply is stored.
+    finish(&persist, &conv, &agent, None, 20).expect("saved");
+    let stored = persist.conversations.load(&id).unwrap();
+    assert!(!stored.in_turn, "the end-of-turn save is not an interrupted turn");
+    assert_eq!(stored.messages.len(), 4);
+    assert_eq!(provider.requests().len(), 2);
+}
+
+#[test]
+fn a_turn_that_fails_is_saved_as_finished() {
+    let provider = serve(vec![json!({"error": {"message": "the provider is down"}})]);
+    let tmp = TempDir::new();
+    let persist = Arc::new(persist_in(&tmp));
+    let s = settings(&provider.url);
+    let conv = Conversation::new().unwrap();
+    let id = conv.id();
+
+    let (checkpoint, seen) = recording_checkpoint(&persist, &conv);
+    let mut agent = agent_for(&s, &conv).with_checkpoint(checkpoint);
+    run(&mut agent, "hello");
+    assert_eq!(*seen.lock().unwrap(), vec![(true, 1)], "the user message was checkpointed before the call failed");
+
+    finish(&persist, &conv, &agent, None, 5).expect("saved");
+    let stored = persist.conversations.load(&id).unwrap();
+    assert!(!stored.in_turn, "a failed turn ends with the flag cleared");
+    assert_eq!(stored.messages, vec![json!({"role": "user", "content": "hello"})]);
+}
+
+#[test]
+fn a_turn_cut_short_by_a_crash_resumes_with_the_interrupted_note() {
+    let provider = serve(vec![text_reply("continuing")]);
+    let tmp = TempDir::new();
+    let persist = persist_in(&tmp);
+    let s = settings(&provider.url);
+    // The app ended after a checkpoint: the file keeps in_turn and no end-of-turn save followed.
+    let id = format!("ses_{:032x}", 40);
+    let messages = vec![json!({"role": "user", "content": "migrate the database"})];
+    let turn =
+        FinishedTurn { conversation_id: &id, messages, todos: Vec::new(), model: None, cwd: None, in_turn: true };
+    save_turn(&persist, turn, &Redactor::new(Vec::new()), TurnEnv { local_host: "this-mac", home: None }, 1).unwrap();
+
+    let loaded = resume(&persist, &id).unwrap();
+    assert!(loaded.in_turn);
+    let live = Conversation::new().unwrap();
+    live.restore(loaded.id, loaded.history, loaded.todos, loaded.in_turn);
+    let mut agent = agent_for(&s, &live);
+    run(&mut agent, "what happened?");
+
+    let system = sent_messages(&provider.requests()[0])[0]["content"].as_str().unwrap().to_string();
+    assert!(system.contains("This conversation was resumed from storage."), "{system}");
+    assert!(system.contains("The previous session ended abruptly (crash, quit or kill)"), "{system}");
+}
+
+#[test]
+fn the_resume_note_reaches_the_first_turn_only_and_is_never_stored() {
+    let provider = serve(vec![text_reply("first answer"), text_reply("second answer"), text_reply("third answer")]);
+    let tmp = TempDir::new();
+    let persist = persist_in(&tmp);
+    let s = settings(&provider.url);
+
+    let first = Conversation::new().unwrap();
+    let mut agent = agent_for(&s, &first);
+    run(&mut agent, "first question");
+    let saved = finish(&persist, &first, &agent, None, 100).expect("saved");
+
+    let loaded = resume(&persist, &saved.id).unwrap();
+    let live = Conversation::new().unwrap();
+    live.restore(loaded.id, loaded.history, loaded.todos, loaded.in_turn);
+    let mut resumed_turn = agent_for(&s, &live);
+    run(&mut resumed_turn, "second question");
+    let mut later_turn = agent_for(&s, &live);
+    run(&mut later_turn, "third question");
+
+    let requests = provider.requests();
+    let system = |n: usize| sent_messages(&requests[n])[0]["content"].as_str().unwrap().to_string();
+    assert!(!system(0).contains("resumed from storage"), "a conversation that was never resumed has no note");
+    assert!(system(1).contains("This conversation was resumed from storage."));
+    assert!(!system(1).contains("ended abruptly"), "a finished turn is not called interrupted");
+    assert!(!system(2).contains("resumed from storage"), "the note is for the first turn only");
+
+    let stored_text = all_text(tmp.path());
+    assert!(!stored_text.contains("resumed from storage"), "the note is not on disk");
+    let history_text = serde_json::to_string(&live.history().lock().unwrap().snapshot()).unwrap();
+    assert!(!history_text.contains("resumed from storage"), "the note is not in the history");
 }

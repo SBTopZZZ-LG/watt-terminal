@@ -69,6 +69,10 @@ pub struct StoredConversation {
     /// with none. Read leniently (see `lenient_todos`): a damaged entry is dropped, never a reason to refuse the file.
     #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "lenient_todos")]
     pub todos: Vec<Todo>,
+    /// True when the file was saved at a checkpoint inside a turn, so the app ended before that turn finished. The
+    /// end-of-turn save writes false, and then the key is left out. Absent in older files, which read as false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub in_turn: bool,
 }
 
 impl StoredConversation {
@@ -96,6 +100,8 @@ pub struct SaveRequest {
     pub messages: Vec<Value>,
     /// The conversation's todo list at the end of the turn. Replaces the stored list. Redacted when it is saved.
     pub todos: Vec<Todo>,
+    /// True for a checkpoint inside a turn, false for the end-of-turn save. Replaces the stored flag.
+    pub in_turn: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -157,6 +163,7 @@ impl ConversationStore {
                 model: req.model.clone().or(old.model),
                 messages,
                 todos,
+                in_turn: req.in_turn,
             },
             None => StoredConversation {
                 version: CONVERSATION_VERSION,
@@ -168,6 +175,7 @@ impl ConversationStore {
                 model: req.model.clone(),
                 messages,
                 todos,
+                in_turn: req.in_turn,
             },
         };
         self.write_file(&stored)?;
@@ -529,6 +537,10 @@ fn lenient_todos<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<Todo>
         .unwrap_or_default())
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 fn message_count(messages: &[Value]) -> usize {
     messages
         .iter()
@@ -593,6 +605,7 @@ mod tests {
                 json!({"role": "assistant", "content": "reply"}),
             ],
             todos: Vec::new(),
+            in_turn: false,
         }
     }
 
@@ -821,6 +834,7 @@ mod tests {
                 json!({"role": "assistant", "content": "bye"}),
             ],
             todos: Vec::new(),
+            in_turn: false,
         };
         let meta = s.save(&req, &redactor(), 1_000).unwrap();
         assert_eq!(meta.id, id(1));
@@ -854,6 +868,7 @@ mod tests {
                 json!({"role": "tool", "tool_call_id": "c1", "content": "ok"}),
             ],
             todos: Vec::new(),
+            in_turn: false,
         };
         s.save(&req, &redactor(), 5).unwrap();
         let on_disk = fs::read_to_string(s.path_for(&id(2))).unwrap();
@@ -885,6 +900,7 @@ mod tests {
             model: None,
             messages: vec![json!({"role": "user", "content": "different now"})],
             todos: Vec::new(),
+            in_turn: false,
         };
         let meta = s.save(&again, &redactor(), 250).unwrap();
         assert_eq!(meta.created_at, 100);
@@ -1316,6 +1332,7 @@ mod tests {
             model: None,
             messages: vec![json!({"role": "user", "content": SECRET})],
             todos: Vec::new(),
+            in_turn: false,
         };
         let meta = s.save(&req, &redactor(), 1).unwrap();
         assert_eq!(meta.title, "[REDACTED]");
@@ -1359,5 +1376,21 @@ mod tests {
         assert!(stored.todos[0].content.starts_with("[REDACTED]"));
         assert_eq!(stored.todos[0].content.chars().count(), todo::MAX_CONTENT_CHARS);
         assert!(!fs::read_to_string(s.path_for(&id(81))).unwrap().contains(SECRET));
+    }
+
+    #[test]
+    fn the_in_turn_flag_is_written_only_when_set_and_older_files_read_as_false() {
+        let tmp = TempDir::new();
+        let s = store(&tmp);
+        let mid = SaveRequest { in_turn: true, ..request(&id(82), "working") };
+        s.save(&mid, &redactor(), 1).unwrap();
+        assert!(fs::read_to_string(s.path_for(&id(82))).unwrap().contains("\"in_turn\": true"));
+        assert!(s.load(&id(82)).unwrap().in_turn);
+
+        // The end-of-turn save clears it, and the key leaves the file again.
+        s.save(&request(&id(82), "working"), &redactor(), 2).unwrap();
+        assert!(!s.load(&id(82)).unwrap().in_turn);
+        // Without the key (the file as older builds wrote it) the flag reads as false.
+        assert!(!fs::read_to_string(s.path_for(&id(82))).unwrap().contains("in_turn"));
     }
 }

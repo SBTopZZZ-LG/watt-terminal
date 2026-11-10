@@ -5,6 +5,8 @@
 //! gate are the same as for the mock. Every result is projected and redacted (core/chat/project) before it enters the
 //! history. A denial or a cancel stops the turn: the calls not yet run are closed in the history, and no further
 //! model call is made. Every exit path keeps the pairing that `History` checks: no call is left without a result.
+//! The caller can ask for a save at each checkpoint (`LlmAgent::with_checkpoint`): after the user message is recorded
+//! and after each completed round of tool calls, when the history is paired.
 //!
 //! Dev configuration (replaced by a config file later): `AGENT_TERM_LLM_URL` (full chat-completions URL),
 //! `AGENT_TERM_LLM_KEY` and `AGENT_TERM_LLM_MODEL` must all be set, or the mock agent is used. Optional:
@@ -176,11 +178,26 @@ pub fn new_conversation_id() -> io::Result<String> {
     Ok(format!("ses_{}", bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()))
 }
 
-/// One session's conversation: the id sent to the provider, the history, and the todo list. `reset` starts a new one.
+/// What the model is told about a conversation that was resumed from storage: the shell is a new session.
+const RESUME_NOTE: &str = "This conversation was resumed from storage. The shell is the current session: its \
+directory, environment and running jobs may differ from earlier in this conversation, so re-check before relying on \
+earlier output.";
+/// Added when the saved copy was made in the middle of a turn: the app ended before that turn finished.
+const RESUME_NOTE_INTERRUPTED: &str = "The previous session ended abruptly (crash, quit or kill) in the middle \
+of a turn, so the last request may be unfinished or half done: verify what actually happened before continuing.";
+
+/// The resume note for a restored conversation. `in_turn` is the stored flag (see `StoredConversation::in_turn`).
+fn resume_note_for(in_turn: bool) -> String {
+    if in_turn { format!("{RESUME_NOTE} {RESUME_NOTE_INTERRUPTED}") } else { RESUME_NOTE.to_string() }
+}
+
+/// One session's conversation: the id sent to the provider, the history, the todo list, and the note the next turn
+/// gets when the conversation was resumed. `reset` starts a new one.
 pub struct Conversation {
     id: Mutex<String>,
     history: Arc<Mutex<History>>,
     todos: TodoList,
+    resume_note: Mutex<Option<String>>,
 }
 
 impl Conversation {
@@ -189,6 +206,7 @@ impl Conversation {
             id: Mutex::new(new_conversation_id()?),
             history: Arc::new(Mutex::new(History::new())),
             todos: Arc::new(Mutex::new(Vec::new())),
+            resume_note: Mutex::new(None),
         })
     }
 
@@ -204,24 +222,37 @@ impl Conversation {
         self.todos.clone()
     }
 
-    /// Clears the history and the todo list, and rotates the id. The caller makes sure no turn is running.
+    /// Clears the history, the todo list and any pending resume note, and rotates the id. The caller makes sure no
+    /// turn is running.
     pub fn reset(&self) -> io::Result<()> {
         let id = new_conversation_id()?;
         lock(&self.history).clear();
         lock_todos(&self.todos).clear();
+        *lock_note(&self.resume_note) = None;
         *lock_string(&self.id) = id;
         Ok(())
     }
 
     /// Makes a saved conversation the live one: its id, history and todo list replace the current ones. The history and
-    /// todo objects stay the same, so holders of `history()` and `todos()` see the new contents. The caller makes sure no
-    /// turn is running.
-    pub fn restore(&self, id: String, history: History, todos: Vec<Todo>) {
+    /// todo objects stay the same, so holders of `history()` and `todos()` see the new contents. The next turn gets a
+    /// resume note (see `take_resume_note`). `in_turn` is the stored flag, which adds the interrupted-turn sentence.
+    /// The caller makes sure no turn is running.
+    pub fn restore(&self, id: String, history: History, todos: Vec<Todo>, in_turn: bool) {
         *lock_string(&self.id) = id;
         *lock(&self.history) = history;
         *lock_todos(&self.todos) = todos;
+        *lock_note(&self.resume_note) = Some(resume_note_for(in_turn));
+    }
+
+    /// The resume note, once: a turn that calls the model takes it, and the next turn gets none. `None` for a
+    /// conversation that was not resumed, or after a turn has taken it.
+    pub fn take_resume_note(&self) -> Option<String> {
+        lock_note(&self.resume_note).take()
     }
 }
+
+/// A save at a checkpoint of the turn. It gets the agent's redactor, which the save uses to scrub what it writes.
+pub type Checkpoint = Box<dyn FnMut(&Redactor) + Send>;
 
 /// The agent for one turn of a conversation: the provider config with this conversation's headers, the redactor, and
 /// the shared history and cancel token.
@@ -237,6 +268,10 @@ pub struct LlmAgent {
     cancel: Arc<TurnCancel>,
     system: String,
     tools: Vec<Value>,
+    /// The resume note of a restored conversation, for this turn's model calls (see `with_resume_note`).
+    resume_note: Option<String>,
+    /// Saves the conversation at each checkpoint (see `with_checkpoint`).
+    checkpoint: Option<Checkpoint>,
 }
 
 impl LlmAgent {
@@ -269,7 +304,23 @@ impl LlmAgent {
             cancel,
             system: prompt::system_prompt(),
             tools: prompt::tool_definitions(),
+            resume_note: None,
+            checkpoint: None,
         }
+    }
+
+    /// The note about a resumed conversation (from `Conversation::take_resume_note`). It goes into the system message
+    /// of every model call of this turn and is never stored in the history.
+    pub fn with_resume_note(mut self, note: Option<String>) -> Self {
+        self.resume_note = note;
+        self
+    }
+
+    /// Calls `save` at each checkpoint: once the user message is recorded, and after each completed round of tool
+    /// calls. The history is paired at those points. The end-of-turn save is the caller's, after the turn returns.
+    pub fn with_checkpoint(mut self, save: impl FnMut(&Redactor) + Send + 'static) -> Self {
+        self.checkpoint = Some(Box::new(save));
+        self
     }
 
     /// The redactor for this turn's secrets. The persistence layer uses it to scrub what it writes to disk.
@@ -277,14 +328,25 @@ impl LlmAgent {
         &self.redactor
     }
 
+    /// Runs the checkpoint save, if one is set. Only called where the history is paired.
+    fn save_checkpoint(&mut self) {
+        if let Some(save) = self.checkpoint.as_mut() {
+            save(&self.redactor);
+        }
+    }
+
     /// One model call. Streams text as it arrives, or waits for the whole reply. Returns None when the call was
     /// cancelled or failed; a failure has already been shown to the user.
     fn ask_model(&self, ctx: &AgentCtx<'_>) -> Option<AssistantReply> {
-        // The todo block is added to this request's system message only. It is never stored in the history.
-        let system = match todo::prompt_block(&lock_todos(&self.todos)) {
-            Some(block) => format!("{}\n\n{block}", self.system),
-            None => self.system.clone(),
-        };
+        // The resume note and the todo block are added to this request's system message only. Neither is stored in the
+        // history. The todo block comes last.
+        let mut system = self.system.clone();
+        if let Some(note) = &self.resume_note {
+            system = format!("{system}\n\n{note}");
+        }
+        if let Some(block) = todo::prompt_block(&lock_todos(&self.todos)) {
+            system = format!("{system}\n\n{block}");
+        }
         let messages = lock(&self.history).messages(&system);
         let req = ChatRequest {
             model: self.model.clone(),
@@ -387,6 +449,7 @@ impl LlmAgent {
 impl Agent for LlmAgent {
     fn respond(&mut self, user_text: &str, ctx: &AgentCtx<'_>) {
         lock(&self.history).push_user(user_text);
+        self.save_checkpoint();
         let mut commands = 0;
         for call_no in 1..=MAX_MODEL_CALLS {
             if self.cancel.is_cancelled() {
@@ -412,6 +475,7 @@ impl Agent for LlmAgent {
                 }
                 return;
             }
+            self.save_checkpoint();
         }
     }
 }
@@ -464,6 +528,10 @@ fn lock_string(m: &Mutex<String>) -> MutexGuard<'_, String> {
 }
 
 fn lock_todos(m: &TodoList) -> MutexGuard<'_, Vec<Todo>> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn lock_note(m: &Mutex<Option<String>>) -> MutexGuard<'_, Option<String>> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -609,6 +677,25 @@ mod tests {
         conversation.reset().unwrap();
         assert_ne!(conversation.id(), before);
         assert!(lock(&conversation.history()).is_empty());
+    }
+
+    #[test]
+    fn a_restored_conversation_gives_its_resume_note_to_one_turn_only() {
+        let conversation = Conversation::new().unwrap();
+        assert!(conversation.take_resume_note().is_none(), "a new conversation has no note");
+
+        conversation.restore(conversation.id(), History::new(), Vec::new(), false);
+        assert_eq!(conversation.take_resume_note().as_deref(), Some(RESUME_NOTE));
+        assert!(conversation.take_resume_note().is_none(), "taking the note clears it");
+
+        conversation.restore(conversation.id(), History::new(), Vec::new(), true);
+        let note = conversation.take_resume_note().expect("a note");
+        assert!(note.starts_with(RESUME_NOTE) && note.ends_with(RESUME_NOTE_INTERRUPTED), "{note}");
+
+        // A new conversation drops a note that no turn has taken yet.
+        conversation.restore(conversation.id(), History::new(), Vec::new(), false);
+        conversation.reset().unwrap();
+        assert!(conversation.take_resume_note().is_none());
     }
 
     #[test]

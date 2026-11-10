@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use super::conversations::{ConversationMeta, SaveRequest};
 use super::ui_state::UiStatePatch;
-use super::workspace::workspace_for;
+use super::workspace::{Workspace, workspace_for};
 use super::{Persist, PersistError};
 use crate::core::chat::history::History;
 use crate::core::chat::redact::Redactor;
@@ -27,6 +27,8 @@ pub struct FinishedTurn<'a> {
     pub model: Option<String>,
     /// The shell's working directory as `(host, path)`. None before the shell has reported one.
     pub cwd: Option<(&'a str, &'a str)>,
+    /// True for a checkpoint inside the turn, false for the save at its end (see `StoredConversation::in_turn`).
+    pub in_turn: bool,
 }
 
 /// This machine, as the workspace needs it: the host name the shell reports, and the home directory.
@@ -43,6 +45,8 @@ pub struct Resumed {
     pub history: History,
     /// The stored todo list, repaired (see `todo::repair`).
     pub todos: Vec<Todo>,
+    /// The file was saved at a checkpoint inside a turn, so that turn never finished (the app ended first).
+    pub in_turn: bool,
 }
 
 /// Saves a finished turn. Returns `None`, and writes nothing, when the history has no user message. Otherwise it
@@ -70,12 +74,16 @@ fn save_turn_keeping(
         return Ok(None);
     }
     let id = turn.conversation_id.to_string();
+    // A failed read of the index leaves no known workspaces, which only makes the root choice less careful.
+    let known: Vec<Workspace> =
+        persist.conversations.list().unwrap_or_default().into_iter().map(|m| m.workspace).collect();
     let req = SaveRequest {
         id: id.clone(),
-        workspace: workspace_for(turn.cwd, env.local_host, env.home),
+        workspace: workspace_for(turn.cwd, env.local_host, env.home, &known),
         model: turn.model,
         messages: turn.messages,
         todos: turn.todos,
+        in_turn: turn.in_turn,
     };
     let meta = persist.conversations.save(&req, redactor, now)?;
     let pruned = persist.conversations.prune(keep, Some(&id)).map(|_| ());
@@ -94,6 +102,7 @@ pub fn resume(persist: &Persist, id: &str) -> Result<Resumed, PersistError> {
         title: stored.title,
         history: History::from_messages(stored.messages),
         todos: todo::repair(stored.todos),
+        in_turn: stored.in_turn,
     })
 }
 
@@ -129,7 +138,14 @@ mod tests {
     }
 
     fn turn<'a>(id: &'a str, messages: Vec<Value>, cwd: Option<(&'a str, &'a str)>) -> FinishedTurn<'a> {
-        FinishedTurn { conversation_id: id, messages, todos: Vec::new(), model: Some("model-a".into()), cwd }
+        FinishedTurn {
+            conversation_id: id,
+            messages,
+            todos: Vec::new(),
+            model: Some("model-a".into()),
+            cwd,
+            in_turn: false,
+        }
     }
 
     fn exchange(user_text: &str) -> Vec<Value> {
@@ -241,6 +257,12 @@ mod tests {
         assert_eq!(snapshot[2]["role"], "tool");
         assert_eq!(snapshot[2]["tool_call_id"], "c1");
         assert_eq!(snapshot[2]["content"], "skipped: not recorded");
+
+        assert!(!resumed.in_turn, "a turn that finished resumes as finished");
+        let id30 = id(30);
+        let mid = FinishedTurn { in_turn: true, ..turn(&id30, exchange("again"), None) };
+        save_turn(&p, mid, &redactor(), env(None), 2).unwrap();
+        assert!(resume(&p, &id30).unwrap().in_turn, "a checkpoint resumes as interrupted");
 
         assert!(matches!(resume(&p, &id(31)), Err(PersistError::NotFound(_))));
         let damaged = tmp.path().join("data").join("conversations").join(format!("{}.json", id(32)));

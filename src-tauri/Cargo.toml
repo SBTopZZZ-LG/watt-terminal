@@ -32,6 +32,8 @@ tokio = { version = "1", features = ["sync", "time"] }
 # Provider API keys and secret headers live in one Keychain item (core/settings/secrets.rs). Default features only:
 # they give the macOS Keychain backend without OpenSSL / native-tls.
 keyring = "4.2"
+# One running instance (lib.rs run): a second launch focuses the first window and exits. Registered first.
+tauri-plugin-single-instance = "=2.5.5"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
