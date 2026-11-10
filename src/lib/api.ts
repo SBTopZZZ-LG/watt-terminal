@@ -9,6 +9,7 @@ import type {
   LoadedConversation,
   ModelRef,
   ProviderPreset,
+  RecoverAction,
   SaveProviderInput,
   SettingsView,
   StartResult,
@@ -98,6 +99,17 @@ export const api = {
   /** The AI provider settings, with which secrets are stored (never their values). */
   getSettings() {
     return invoke<SettingsView>('get_settings');
+  },
+  /**
+   * Recovers from a broken settings.json. "revert" keeps the broken file aside and restores the last working copy;
+   * "use_last_good" runs the last working copy for this session and leaves settings.json as it is.
+   */
+  recoverSettings(action: RecoverAction) {
+    return invoke<SettingsView>('recover_settings', { action });
+  },
+  /** Re-reads settings.json. A file that is valid again makes the AI settings usable again. */
+  reloadSettings() {
+    return invoke<SettingsView>('reload_settings');
   },
   /** Adds or replaces a provider. Secrets in the input are stored, not returned. */
   saveProvider(input: SaveProviderInput) {

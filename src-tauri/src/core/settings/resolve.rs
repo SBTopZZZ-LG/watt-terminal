@@ -130,8 +130,13 @@ mod tests {
             chat_url: chat_url.into(),
             models_url: None,
             headers: vec![
-                HeaderEntry { name: "X-Session".into(), value: "{session_id}".into(), secret: false },
-                HeaderEntry { name: "X-Key".into(), value: String::new(), secret: true },
+                HeaderEntry {
+                    name: "X-Session".into(),
+                    value: "{session_id}".into(),
+                    secret: false,
+                    previous_name: None,
+                },
+                HeaderEntry { name: "X-Key".into(), value: String::new(), secret: true, previous_name: None },
             ],
             stream: false,
             max_tokens: Some(256),

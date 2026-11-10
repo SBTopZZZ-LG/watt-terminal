@@ -38,7 +38,8 @@ use crate::core::settings::models::fetch_models as fetch_model_list;
 use crate::core::settings::presets::{self, ProviderPreset};
 use crate::core::settings::secrets::Secrets;
 use crate::core::settings::service::{
-    FetchOutcome, SaveProviderInput, SettingsService, SettingsView, TestResult, test_model,
+    FetchOutcome, RecoverAction, SaveProviderInput, SettingsService, SettingsStateView, SettingsView, TestResult,
+    test_model,
 };
 use crate::core::settings::ModelRef;
 use crate::core::tools::SessionTools;
@@ -514,18 +515,33 @@ struct Status {
     llm: LlmStatus,
     /// The live conversation's id (the one the provider sees, and the file name of its saved copy).
     conversation_id: String,
+    /// The state of settings.json. Null when the app folders could not be found.
+    settings_state: Option<SettingsStateView>,
+}
+
+/// The environment settings as the status shows them.
+fn env_llm() -> LlmStatus {
+    let env = agent_loop::settings();
+    LlmStatus { enabled: env.is_some(), model: env.map(|s| s.model.clone()), provider: None }
 }
 
 #[tauri::command]
 fn get_status(session_id: String, reg: State<'_, Reg>, settings: State<'_, SettingsState>) -> Result<Status, String> {
     let att = session(&reg, &session_id)?;
-    // The saved default's label reads no secret; without one, the environment settings are shown.
-    let llm = match settings.0.as_ref().and_then(|s| s.default_label()) {
-        Some((provider, model)) => LlmStatus { enabled: true, model: Some(model), provider: Some(provider) },
-        None => {
-            let env = agent_loop::settings();
-            LlmStatus { enabled: env.is_some(), model: env.map(|s| s.model.clone()), provider: None }
+    // The saved default's label reads no secret. Without a saved default the environment settings are shown. While
+    // settings.json cannot be used, the agent is off and the environment settings are not shown in its place.
+    let (llm, settings_state) = match settings.0.as_ref() {
+        Some(service) => {
+            let llm = match service.default_label() {
+                Ok(Some((provider, model))) => {
+                    LlmStatus { enabled: true, model: Some(model), provider: Some(provider) }
+                }
+                Ok(None) => env_llm(),
+                Err(_) => LlmStatus { enabled: false, model: None, provider: None },
+            };
+            (llm, Some(service.settings_state()))
         }
+        None => (env_llm(), None),
     };
     Ok(Status {
         state: att.session.state(),
@@ -538,6 +554,7 @@ fn get_status(session_id: String, reg: State<'_, Reg>, settings: State<'_, Setti
         agent_control: att.agent_control.load(Ordering::SeqCst),
         llm,
         conversation_id: att.conversation.id(),
+        settings_state,
     })
 }
 
@@ -717,6 +734,26 @@ async fn get_settings(settings: State<'_, SettingsState>) -> Result<SettingsView
     blocking(move || service.view()).await
 }
 
+/// Recovers from a broken settings.json. "revert" keeps the broken file aside (settings.json.broken-<unix>) and
+/// restores the last working copy as settings.json. "use_last_good" runs the last working copy for this session and
+/// leaves settings.json exactly as it is. Both return the settings as they now are.
+#[tauri::command]
+async fn recover_settings(action: RecoverAction, settings: State<'_, SettingsState>) -> Result<SettingsView, String> {
+    let service = settings.get()?;
+    blocking(move || match action {
+        RecoverAction::Revert => service.revert_to_last_good(),
+        RecoverAction::UseLastGood => service.use_last_good(),
+    })
+    .await
+}
+
+/// Re-reads settings.json. A file that is valid again makes the AI settings usable again, without a restart.
+#[tauri::command]
+async fn reload_settings(settings: State<'_, SettingsState>) -> Result<SettingsView, String> {
+    let service = settings.get()?;
+    blocking(move || service.reload()).await
+}
+
 /// Adds a provider, or replaces the one with the same id. Keys and secret header values go to the secret store and are
 /// never returned. The result is the settings as stored.
 #[tauri::command]
@@ -835,6 +872,8 @@ pub fn run() {
             get_ui_state,
             patch_ui_state,
             get_settings,
+            recover_settings,
+            reload_settings,
             save_provider,
             delete_provider,
             set_default_model,

@@ -193,13 +193,14 @@ fn call_json(call: &ToolCall) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::llm::MAX_SSE_LINE_BYTES;
     use crate::core::llm::sse::SseParser;
 
     /// Runs a recorded SSE body through the framer and the accumulator, the same way the client does.
     fn accumulate_sse(raw: &str) -> (AssistantReply, Vec<Delta>) {
-        let mut parser = SseParser::new();
-        let mut payloads = parser.push(raw.as_bytes());
-        payloads.extend(parser.finish());
+        let mut parser = SseParser::new(MAX_SSE_LINE_BYTES);
+        let mut payloads = parser.push(raw.as_bytes()).expect("fixture is within the cap");
+        payloads.extend(parser.finish().expect("fixture is within the cap"));
         let mut acc = Accumulator::new();
         let mut deltas = Vec::new();
         for payload in payloads {

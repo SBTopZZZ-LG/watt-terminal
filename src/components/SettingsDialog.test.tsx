@@ -46,6 +46,7 @@ function view(over: Partial<SettingsView> = {}): SettingsView {
     },
     store_kind: 'keychain',
     load_error: null,
+    settings_state: { kind: 'ok', reason: null, last_good_available: false, path: '/config/settings.json' },
     ...over,
   };
 }

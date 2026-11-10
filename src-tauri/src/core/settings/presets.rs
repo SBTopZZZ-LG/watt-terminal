@@ -41,7 +41,12 @@ pub fn presets() -> Vec<ProviderPreset> {
                 "OpenCode Go",
                 "https://opencode.ai/inference/go/openai/v1/chat/completions",
                 Some("https://opencode.ai/inference/go/v1/models"),
-                vec![HeaderEntry { name: "x-opencode-session".into(), value: "{session_id}".into(), secret: false }],
+                vec![HeaderEntry {
+                    name: "x-opencode-session".into(),
+                    value: "{session_id}".into(),
+                    secret: false,
+                    previous_name: None,
+                }],
             ),
             needs_key: true,
             note: "The model list format is not officially documented. The context size is read from limit.context \

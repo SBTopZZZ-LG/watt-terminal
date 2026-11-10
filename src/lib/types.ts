@@ -101,6 +101,8 @@ export interface Status {
   llm: LlmStatus;
   /** The live conversation's id. */
   conversation_id: string;
+  /** The state of settings.json. Null when the app folders could not be found. */
+  settings_state: SettingsStateView | null;
 }
 
 /** The project a conversation belongs to: fixed when it is first saved. `label` is what the UI shows. */
@@ -188,6 +190,11 @@ export interface HeaderEntry {
   name: string;
   value: string;
   secret: boolean;
+  /**
+   * Input only (SaveProviderInput): the name this header had when it was saved. A secret header renamed with no typed
+   * value keeps its stored value. Never returned, so it is absent from SettingsView.
+   */
+  previous_name?: string | null;
 }
 
 /** `fetched` came from the provider's model list; `custom` was added by hand. */
@@ -236,13 +243,33 @@ export interface SecretsPresent {
   headers: string[];
 }
 
+/**
+ * `ok`: settings.json is in use. `broken`: it cannot be used, nothing runs on settings and changes are refused.
+ * `last_good`: it is broken and this session runs on the last working copy; the file is left as it is.
+ */
+export type SettingsStateKind = 'ok' | 'broken' | 'last_good';
+
+export interface SettingsStateView {
+  kind: SettingsStateKind;
+  /** Why the file cannot be used. Null when `kind` is "ok". */
+  reason: string | null;
+  /** Whether the last working copy exists and checks out, so the recovery actions can run. */
+  last_good_available: boolean;
+  /** The path of settings.json, for display. */
+  path: string;
+}
+
+/** The recovery actions for a broken settings.json, as `recover_settings` takes them. */
+export type RecoverAction = 'revert' | 'use_last_good';
+
 export interface SettingsView {
   settings: Settings;
   /** Keyed by provider id. */
   secrets: Record<string, SecretsPresent>;
   store_kind: 'keychain' | 'file';
-  /** Set when settings.json could not be loaded. Changes are refused until the file is fixed or removed. */
+  /** Set while settings.json cannot be used (`settings_state.kind` is not "ok"). Changes are refused until it is fixed. */
   load_error: string | null;
+  settings_state: SettingsStateView;
 }
 
 /**

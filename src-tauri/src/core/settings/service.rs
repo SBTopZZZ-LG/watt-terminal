@@ -7,13 +7,22 @@
 //! state lock is held only to read or replace the in-memory copy, so a reader (for example `get_status`) never waits
 //! on the disk or the Keychain.
 //!
-//! A `settings.json` that cannot be loaded is never overwritten. Every change is refused, with the reason, until the
-//! file is fixed or removed. Reads retry the file while it is broken, so a fix takes effect without a restart.
+//! `settings.json` is in one of three modes (see `Mode`). At every launch that finds it valid, a copy is kept as
+//! the hidden last-good file. A file that cannot be used (unreadable, bad JSON, failing validation) is never
+//! overwritten and nothing runs on it: every change and every read of the settings is refused with the reason, and the
+//! terminal keeps working. The user can then revert to the last-good copy (the broken file is kept aside), run the
+//! last-good copy for this session (the file is left as it is), or fix the file and reload it.
+//!
+//! When the file is re-read: at launch; by `reload`; and, while it is broken, on each read or change, so a fixed file
+//! takes effect on the next call. An Ok session does not re-read the file, so a hand edit that breaks it during a
+//! session is seen by `reload` or at the next launch, and a later save overwrites it, as before.
 //!
 //! Nothing here returns or logs a secret value. Errors are strings that name a provider, model or header.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
+use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -25,10 +34,14 @@ use tokio::time::timeout;
 use super::models::{FetchedModel, merge_fetched, models_url_for};
 use super::resolve::{self, api_key_for, headers_for};
 use super::secrets::{SecretMap, Secrets, api_key_name, header_secret_name, provider_prefix};
-use super::{ModelRef, ModelSource, Provider, Settings, SettingsError, load, save, settings_path};
+use super::{
+    ModelRef, ModelSource, Provider, SETTINGS_FILE, Settings, SettingsError, last_good_path, read_checked, save,
+    settings_path, write_private_atomic,
+};
 use crate::core::chat::agent_loop::{LlmSettings, USER_AGENT, new_conversation_id};
 use crate::core::chat::redact::Redactor;
 use crate::core::llm::{self, ChatRequest, ProviderConfig, TurnCancel};
+use crate::core::persist::now_secs;
 
 /// How long the connection test waits for an answer, the whole request included.
 pub const TEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -39,6 +52,12 @@ const TEST_MAX_TOKENS: u32 = 16;
 const EXCERPT_CHARS: usize = 200;
 /// The refusal for a fetch that returned no models. The saved list is kept as it was.
 const NO_MODELS_FETCHED: &str = "the provider returned no models; the saved list was not changed";
+/// The refusal for every change in last-good mode. The file stays as it is until it is fixed or reverted.
+const LAST_GOOD_REFUSAL: &str = "settings.json is broken; fix or revert it first";
+const LAST_GOOD_NO_DEFAULT: &str =
+    "settings.json is broken, and the last working settings have no default model; fix or revert settings.json";
+const NOT_BROKEN: &str = "settings.json is not broken, so there is nothing to recover";
+const NO_LAST_GOOD: &str = "there are no last working settings: none was kept from a launch with a valid settings.json";
 
 /// What the settings UI shows. It holds which secrets are stored, never their values.
 #[derive(Debug, Clone, Serialize)]
@@ -48,8 +67,31 @@ pub struct SettingsView {
     pub secrets: BTreeMap<String, SecretsPresent>,
     /// Where the secrets are kept: `"keychain"` or `"file"`.
     pub store_kind: &'static str,
-    /// Set when settings.json could not be loaded. The settings shown are then empty, and changes are refused.
+    /// Set while settings.json cannot be used (`settings_state.kind` is "broken" or "last_good"): the reason.
     pub load_error: Option<String>,
+    pub settings_state: SettingsStateView,
+}
+
+/// What settings.json is and what the app runs on. `kind` is "ok", "broken" or "last_good".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SettingsStateView {
+    pub kind: &'static str,
+    /// Why the file cannot be used. Set unless `kind` is "ok".
+    pub reason: Option<String>,
+    /// Whether the last-good copy exists and checks out, so the recovery actions can run.
+    pub last_good_available: bool,
+    /// The path of settings.json, for display.
+    pub path: String,
+}
+
+/// The two recovery actions for a broken settings.json, as the `recover_settings` command names them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoverAction {
+    /// Keeps the broken file aside and restores the last working copy as settings.json.
+    Revert,
+    /// Runs the last working copy for this session. settings.json is not touched.
+    UseLastGood,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -121,9 +163,23 @@ pub struct TestResult {
     pub millis: u64,
 }
 
+/// What settings.json is and what the app runs on. `Ok`: the file is in use. `Broken`: the file cannot be used and
+/// nothing runs on settings. `LastGood`: the file is broken and this session runs on the last working copy; the file is
+/// kept as it is, and changes are refused until the mode ends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Mode {
+    Ok,
+    Broken { reason: String },
+    LastGood { reason: String },
+}
+
+#[derive(Debug, Clone)]
 struct State {
+    /// The settings in use. Empty while `Broken`.
     settings: Settings,
-    load_error: Option<String>,
+    mode: Mode,
+    /// Whether the last-good copy exists and checks out.
+    last_good_available: bool,
 }
 
 pub struct SettingsService {
@@ -136,46 +192,103 @@ pub struct SettingsService {
 }
 
 impl SettingsService {
-    /// Loads `config_dir/settings.json` once. A file that cannot be loaded is not an error here: it is reported through
-    /// `view` and `active`, and every change is refused until it is fixed.
+    /// Loads `config_dir/settings.json` once, and keeps a copy of it as the last-good file when it checks out. A file
+    /// that cannot be used is not an error here: it is reported through `view`, and nothing runs on it until it is
+    /// fixed, reverted or bypassed.
     pub fn new(config_dir: &Path, secrets: Arc<Secrets>) -> Self {
-        let state = match load(config_dir) {
-            Ok(settings) => State { settings, load_error: None },
+        let (settings, mode) = match read_checked(&settings_path(config_dir)) {
+            Ok(Some((settings, bytes))) => {
+                copy_last_good(config_dir, &bytes);
+                (settings, Mode::Ok)
+            }
+            // A missing file is the default settings, and there is nothing to keep.
+            Ok(None) => (Settings::default(), Mode::Ok),
             Err(e) => {
-                let problem = load_error_text(config_dir, &e);
-                eprintln!("agent-term: the AI settings are not loaded: {problem}");
-                State { settings: Settings::default(), load_error: Some(problem) }
+                let reason = load_error_text(config_dir, &e);
+                eprintln!("agent-term: the AI settings are not loaded: {reason}");
+                (Settings::default(), Mode::Broken { reason })
             }
         };
+        let state = State { settings, mode, last_good_available: last_good_ok(config_dir) };
         Self { dir: config_dir.to_path_buf(), write: Mutex::new(()), state: Mutex::new(state), secrets }
     }
 
-    /// The settings and the load error, if any. While the file is broken this reads it again, so a fixed file is picked
-    /// up on the next call.
-    fn snapshot(&self) -> (Settings, Option<String>) {
+    /// The current state. While the file is broken it is read again first, so a fixed file takes effect on this call.
+    fn snapshot(&self) -> State {
         let mut state = lock(&self.state);
-        if state.load_error.is_some() {
-            match load(&self.dir) {
-                Ok(settings) => *state = State { settings, load_error: None },
-                Err(e) => state.load_error = Some(load_error_text(&self.dir, &e)),
+        self.refresh(&mut state);
+        state.clone()
+    }
+
+    /// Re-reads the file while it is broken. Ok and last-good sessions do not read it (see `reload`).
+    fn refresh(&self, state: &mut State) {
+        if matches!(state.mode, Mode::Broken { .. }) {
+            self.read_file_into(state);
+        }
+    }
+
+    /// Reads settings.json into `state`. A file that checks out makes the mode Ok. A file that does not makes the mode
+    /// Broken, except that a last-good session stays last-good and shows the new reason.
+    fn read_file_into(&self, state: &mut State) {
+        match read_checked(&settings_path(&self.dir)) {
+            Ok(found) => {
+                state.settings = found.map_or_else(Settings::default, |(settings, _)| settings);
+                state.mode = Mode::Ok;
+            }
+            Err(e) => {
+                let reason = load_error_text(&self.dir, &e);
+                if matches!(state.mode, Mode::LastGood { .. }) {
+                    state.mode = Mode::LastGood { reason };
+                } else {
+                    state.settings = Settings::default();
+                    state.mode = Mode::Broken { reason };
+                }
             }
         }
-        (state.settings.clone(), state.load_error.clone())
+        state.last_good_available = last_good_ok(&self.dir);
     }
 
-    /// The settings a read starts from. Fails while the file is broken.
-    fn usable(&self) -> Result<Settings, String> {
-        match self.snapshot() {
-            (settings, None) => Ok(settings),
-            (_, Some(problem)) => Err(format!("the AI settings cannot be used: {problem}")),
+    fn state_view(&self, state: &State) -> SettingsStateView {
+        let (kind, reason) = match &state.mode {
+            Mode::Ok => ("ok", None),
+            Mode::Broken { reason } => ("broken", Some(reason.clone())),
+            Mode::LastGood { reason } => ("last_good", Some(reason.clone())),
+        };
+        SettingsStateView {
+            kind,
+            reason,
+            last_good_available: state.last_good_available,
+            path: settings_path(&self.dir).display().to_string(),
         }
     }
 
-    /// The settings a change starts from. Refused while the file is broken, so the file is never overwritten.
+    /// The settings a read starts from. Fails while the file is broken; a last-good session reads the last working
+    /// copy.
+    fn usable(&self) -> Result<Settings, String> {
+        let State { settings, mode, .. } = self.snapshot();
+        match mode {
+            Mode::Ok | Mode::LastGood { .. } => Ok(settings),
+            Mode::Broken { reason } => Err(format!("the AI settings cannot be used: {reason}")),
+        }
+    }
+
+    /// The settings a change starts from. Refused while the file is broken, so the file is never overwritten, and in
+    /// last-good mode, where the file is kept as it is.
     fn writable(&self) -> Result<Settings, String> {
-        match self.snapshot() {
-            (settings, None) => Ok(settings),
-            (_, Some(problem)) => Err(format!("the AI settings are unchanged: {problem}")),
+        let State { settings, mode, .. } = self.snapshot();
+        match mode {
+            Mode::Ok => Ok(settings),
+            Mode::Broken { reason } => Err(format!("the AI settings are unchanged: {reason}")),
+            Mode::LastGood { .. } => Err(LAST_GOOD_REFUSAL.to_string()),
+        }
+    }
+
+    /// The last working copy, read and checked. Its text is returned too, for the restore.
+    fn last_good_copy(&self) -> Result<(Settings, Vec<u8>), String> {
+        match read_checked(&last_good_path(&self.dir)) {
+            Ok(Some(found)) => Ok(found),
+            Ok(None) => Err(NO_LAST_GOOD.to_string()),
+            Err(e) => Err(format!("the last working settings cannot be used: {e}")),
         }
     }
 
@@ -220,9 +333,9 @@ impl SettingsService {
     }
 
     pub fn view(&self) -> Result<SettingsView, String> {
-        let (settings, load_error) = self.snapshot();
+        let state = self.snapshot();
         let mut secrets = BTreeMap::new();
-        for provider in &settings.providers {
+        for provider in &state.settings.providers {
             let api_key = self.has(&api_key_name(&provider.id))?;
             let mut headers = Vec::new();
             for header in provider.headers.iter().filter(|h| h.secret) {
@@ -232,7 +345,83 @@ impl SettingsService {
             }
             secrets.insert(provider.id.clone(), SecretsPresent { api_key, headers });
         }
-        Ok(SettingsView { settings, secrets, store_kind: self.secrets.kind(), load_error })
+        let settings_state = self.state_view(&state);
+        Ok(SettingsView {
+            load_error: settings_state.reason.clone(),
+            settings_state,
+            settings: state.settings,
+            secrets,
+            store_kind: self.secrets.kind(),
+        })
+    }
+
+    /// The state of settings.json alone, for the status line. Reads neither the file nor a secret.
+    pub fn settings_state(&self) -> SettingsStateView {
+        let state = lock(&self.state);
+        self.state_view(&state)
+    }
+
+    /// Re-reads settings.json now. A file that checks out makes the settings usable again, and ends a last-good
+    /// session. A file that is still broken keeps the current mode, with the new reason.
+    pub fn reload(&self) -> Result<SettingsView, String> {
+        {
+            let _write = lock(&self.write);
+            let mut state = lock(&self.state);
+            self.read_file_into(&mut state);
+        }
+        self.view()
+    }
+
+    /// Recovers from a broken settings.json: the broken file is copied to `settings.json.broken-<unix>` (0600, never
+    /// deleted), then the last working copy replaces settings.json atomically. The copy comes first, so the broken text
+    /// is kept even if the replacement fails. The file is read again first, so a file fixed by hand is not replaced.
+    /// Secrets stay in the store.
+    pub fn revert_to_last_good(&self) -> Result<SettingsView, String> {
+        {
+            let _write = lock(&self.write);
+            let mut state = lock(&self.state);
+            self.read_file_into(&mut state);
+            if matches!(state.mode, Mode::Ok) {
+                return Err(NOT_BROKEN.to_string());
+            }
+            let (good, good_bytes) = self.last_good_copy()?;
+            let path = settings_path(&self.dir);
+            match fs::read(&path) {
+                Ok(broken) => {
+                    let aside = aside_path(&self.dir);
+                    write_private_atomic(&aside, &broken).map_err(|e| {
+                        format!("the broken settings could not be kept at {}: {e}", aside.display())
+                    })?;
+                }
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("the broken settings could not be read: {e}")),
+            }
+            write_private_atomic(&path, &good_bytes)
+                .map_err(|e| format!("the last working settings could not be restored: {e}"))?;
+            state.settings = good;
+            state.mode = Mode::Ok;
+            state.last_good_available = true;
+        }
+        self.view()
+    }
+
+    /// Runs the last working copy for this session. settings.json is not touched, and every change is refused until
+    /// the mode ends (a successful `reload`, or a restart). The file is read again first, as in `revert_to_last_good`.
+    pub fn use_last_good(&self) -> Result<SettingsView, String> {
+        {
+            let _write = lock(&self.write);
+            let mut state = lock(&self.state);
+            self.read_file_into(&mut state);
+            let reason = match &state.mode {
+                Mode::Ok => return Err(NOT_BROKEN.to_string()),
+                Mode::Broken { reason } | Mode::LastGood { reason } => reason.clone(),
+            };
+            let (good, _) = self.last_good_copy()?;
+            state.settings = good;
+            state.mode = Mode::LastGood { reason };
+            state.last_good_available = true;
+        }
+        self.view()
     }
 
     fn has(&self, name: &str) -> Result<bool, String> {
@@ -264,22 +453,26 @@ impl SettingsService {
             .provider(&id)
             .map(|p| p.headers.iter().filter(|h| h.secret).map(|h| h.name.clone()).collect())
             .unwrap_or_default();
+        // (new key, old key): a renamed secret header with no typed value keeps the value stored under its old name.
+        let mut carries: Vec<(String, String)> = Vec::new();
         for header in provider.headers.iter_mut().filter(|h| h.secret) {
             // A secret value never goes into settings.json, whatever the caller sent.
             header.value.clear();
-            let Some(value) = header_secrets.get(&header.name) else {
-                continue;
-            };
+            let previous = header.previous_name.take().filter(|old| !old.eq_ignore_ascii_case(&header.name));
             let key = header_secret_name(&id, &header.name);
-            if value.is_empty() {
-                removes.push(key);
-            } else if value.chars().any(char::is_control) {
-                problems.push(format!(
+            match header_secrets.get(&header.name).filter(|value| !value.is_empty()) {
+                // A typed value always wins over a carried one.
+                Some(value) if value.chars().any(char::is_control) => problems.push(format!(
                     "provider {id:?}: the value of secret header {:?} must not contain control characters",
                     header.name
-                ));
-            } else {
-                sets.push((key, value.clone()));
+                )),
+                Some(value) => sets.push((key, value.clone())),
+                None => match previous {
+                    Some(old) => carries.push((key, header_secret_name(&id, &old))),
+                    // An empty value removes the stored one. An absent name keeps it.
+                    None if header_secrets.contains_key(&header.name) => removes.push(key),
+                    None => {}
+                },
             }
         }
         // A stored secret header that was removed, or is no longer secret, loses its stored value.
@@ -303,6 +496,12 @@ impl SettingsService {
         }
 
         let before = self.change_secrets(move |map| {
+            // A carried value is read before the old names are removed below.
+            for (to, from) in carries {
+                if let Some(value) = map.get(&from).cloned() {
+                    map.insert(to, value);
+                }
+            }
             for key in removes {
                 map.remove(&key);
             }
@@ -393,11 +592,28 @@ impl SettingsService {
         Ok((self.view()?, FetchSummary { total, ..summary }))
     }
 
+    /// The saved default model and the settings it comes from. `Ok(None)` when there is none in normal operation, so
+    /// the environment settings apply. An error while settings.json is broken, and in last-good mode when the last
+    /// working copy has no default: nothing falls back to the environment or the mock then.
+    fn saved_default(&self) -> Result<Option<(Settings, ModelRef)>, String> {
+        let State { settings, mode, .. } = self.snapshot();
+        match mode {
+            Mode::Ok => Ok(settings.default_model.clone().map(|default| (settings, default))),
+            Mode::Broken { reason } => Err(format!(
+                "the AI settings cannot be used: {reason}. Fix settings.json, or revert to or use the last working \
+                 settings in the AI settings."
+            )),
+            Mode::LastGood { .. } => match settings.default_model.clone() {
+                Some(default) => Ok(Some((settings, default))),
+                None => Err(LAST_GOOD_NO_DEFAULT.to_string()),
+            },
+        }
+    }
+
     /// The default model with its secrets resolved. `None` when no default is set. An error when the default cannot be
     /// used (no key, a missing header value) or the settings file is broken.
     pub fn active(&self) -> Result<Option<ActiveLlm>, String> {
-        let settings = self.usable()?;
-        let Some(default) = settings.default_model.clone() else {
+        let Some((settings, default)) = self.saved_default()? else {
             return Ok(None);
         };
         let resolved = resolve::resolve(&settings, &self.secrets, &default)
@@ -406,15 +622,13 @@ impl SettingsService {
         Ok(Some(ActiveLlm { settings: resolved, provider, model: default.model_id }))
     }
 
-    /// The default model's provider name and model id, for the status line. Never reads the secret store.
-    pub fn default_label(&self) -> Option<(String, String)> {
-        let state = lock(&self.state);
-        if state.load_error.is_some() {
-            return None;
-        }
-        let default = state.settings.default_model.as_ref()?;
-        let provider = state.settings.provider(&default.provider_id)?;
-        Some((provider.name.clone(), default.model_id.clone()))
+    /// The default model's provider name and model id, for the status line. `Ok(None)` when there is no saved default,
+    /// so the environment settings apply. An error when the saved default cannot be used. Never reads the secret store.
+    pub fn default_label(&self) -> Result<Option<(String, String)>, String> {
+        let Some((settings, default)) = self.saved_default()? else {
+            return Ok(None);
+        };
+        Ok(settings.provider(&default.provider_id).map(|p| (p.name.clone(), default.model_id)))
     }
 
     /// The settings for one model, for a connection test. Works before the model is the default.
@@ -481,6 +695,31 @@ fn load_error_text(config_dir: &Path, e: &SettingsError) -> String {
     format!("{}: {e}", settings_path(config_dir).display())
 }
 
+/// Keeps `bytes`, a settings file that has just checked out, as the last working copy. A failure is logged and the
+/// launch goes on: the previous copy, if any, is still there.
+fn copy_last_good(config_dir: &Path, bytes: &[u8]) {
+    if let Err(e) = write_private_atomic(&last_good_path(config_dir), bytes) {
+        eprintln!("agent-term: the last working AI settings were not kept ({e})");
+    }
+}
+
+/// Whether the last working copy exists and checks out.
+fn last_good_ok(config_dir: &Path) -> bool {
+    matches!(read_checked(&last_good_path(config_dir)), Ok(Some(_)))
+}
+
+/// `settings.json.broken-<unix time>`, with `-<n>` added while that name is taken. Never an existing file.
+fn aside_path(dir: &Path) -> PathBuf {
+    let stamp = now_secs();
+    let mut path = dir.join(format!("{SETTINGS_FILE}.broken-{stamp}"));
+    let mut n = 1;
+    while path.exists() {
+        path = dir.join(format!("{SETTINGS_FILE}.broken-{stamp}-{n}"));
+        n += 1;
+    }
+    path
+}
+
 fn no_provider(id: &str) -> String {
     format!("no provider {id:?} is saved")
 }
@@ -495,7 +734,7 @@ mod tests {
 
     use super::super::secrets::MemoryStore;
     use super::super::test_support::TempDir;
-    use super::super::{HeaderEntry, Model, save as save_file};
+    use super::super::{HeaderEntry, Model, last_good_path, load, save as save_file};
     use super::*;
 
     const KEY: &str = "DUMMY-key-0123456789abcdef";
@@ -557,8 +796,8 @@ mod tests {
         let f = fixture();
         let mut p = provider("acme");
         p.headers = vec![
-            HeaderEntry { name: "X-Key".into(), value: String::new(), secret: true },
-            HeaderEntry { name: "X-Session".into(), value: "{session_id}".into(), secret: false },
+            HeaderEntry { name: "X-Key".into(), value: String::new(), secret: true, previous_name: None },
+            HeaderEntry { name: "X-Session".into(), value: "{session_id}".into(), secret: false, previous_name: None },
         ];
         let mut save_input = with_key(p, KEY);
         save_input.header_secrets.insert("X-Key".into(), HEADER.into());
@@ -596,14 +835,19 @@ mod tests {
     fn an_empty_key_removes_it_and_turning_a_header_plain_removes_its_secret() {
         let f = fixture();
         let mut p = provider("acme");
-        p.headers = vec![HeaderEntry { name: "X-Key".into(), value: String::new(), secret: true }];
+        p.headers = vec![HeaderEntry { name: "X-Key".into(), value: String::new(), secret: true, previous_name: None }];
         let mut first = with_key(p.clone(), KEY);
         first.header_secrets.insert("X-Key".into(), HEADER.into());
         f.service.save_provider(first).unwrap();
 
         // The header is now plain, and the key is removed.
         let mut plain = p;
-        plain.headers = vec![HeaderEntry { name: "X-Key".into(), value: "visible".into(), secret: false }];
+        plain.headers = vec![HeaderEntry {
+            name: "X-Key".into(),
+            value: "visible".into(),
+            secret: false,
+            previous_name: None,
+        }];
         let view = f.service.save_provider(SaveProviderInput {
             provider: plain,
             api_key: Some(String::new()),
@@ -620,7 +864,7 @@ mod tests {
     fn a_removed_secret_header_loses_its_stored_value() {
         let f = fixture();
         let mut p = provider("acme");
-        p.headers = vec![HeaderEntry { name: "X-Key".into(), value: String::new(), secret: true }];
+        p.headers = vec![HeaderEntry { name: "X-Key".into(), value: String::new(), secret: true, previous_name: None }];
         let mut first = with_key(p.clone(), KEY);
         first.header_secrets.insert("X-Key".into(), HEADER.into());
         f.service.save_provider(first).unwrap();
@@ -667,7 +911,7 @@ mod tests {
         assert!(err.contains("provider id"), "{err}");
 
         let mut p = provider("acme");
-        p.headers = vec![HeaderEntry { name: "X-Key".into(), value: String::new(), secret: true }];
+        p.headers = vec![HeaderEntry { name: "X-Key".into(), value: String::new(), secret: true, previous_name: None }];
         let mut control = input(p);
         control.header_secrets.insert("X-Key".into(), "line one\r\nline two".into());
         let err = f.service.save_provider(control).unwrap_err();
@@ -757,7 +1001,7 @@ mod tests {
 
         let service = service_on(&f.dir, &f.store);
         let loads_before = f.store.loads();
-        assert_eq!(service.default_label(), Some(("acme name".to_string(), "big".to_string())));
+        assert_eq!(service.default_label(), Ok(Some(("acme name".to_string(), "big".to_string()))));
         assert_eq!(f.store.loads(), loads_before, "the status line read the store");
     }
 
@@ -785,8 +1029,302 @@ mod tests {
         f.service.save_provider(with_key(provider("acme"), KEY)).unwrap();
         let plan = f.service.test_plan("acme", "big").unwrap();
         assert_eq!(plan.model, "big");
-        assert!(f.service.default_label().is_none());
+        assert_eq!(f.service.default_label(), Ok(None));
         assert!(f.service.test_plan("acme", "missing").unwrap_err().contains("does not list"));
+    }
+
+    const BROKEN: &[u8] = b"{ not settings";
+
+    fn dir_names(dir: &TempDir) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn aside_files(dir: &TempDir) -> Vec<String> {
+        dir_names(dir).into_iter().filter(|n| n.starts_with("settings.json.broken-")).collect()
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// Saves one provider with a key and a default model, then launches once, so a last-good copy is kept. Returns the
+    /// bytes of the valid settings.json.
+    fn launched_with_good_settings(f: &Fixture) -> Vec<u8> {
+        f.service.save_provider(with_key(provider("acme"), KEY)).unwrap();
+        f.service.set_default_model(Some(model_ref("acme", "big"))).unwrap();
+        let _launch = service_on(&f.dir, &f.store);
+        read_file(&f.dir)
+    }
+
+    fn break_settings(f: &Fixture) {
+        fs::create_dir_all(f.dir.path()).unwrap();
+        fs::write(settings_path(f.dir.path()), BROKEN).unwrap();
+    }
+
+    #[test]
+    fn a_launch_that_finds_a_valid_file_keeps_a_hidden_last_good_copy() {
+        let f = fixture();
+        f.service.save_provider(with_key(provider("acme"), KEY)).unwrap();
+        let settings_bytes = read_file(&f.dir);
+        assert!(!last_good_path(f.dir.path()).exists(), "no copy is made before a launch");
+
+        let service = service_on(&f.dir, &f.store);
+        assert_eq!(fs::read(last_good_path(f.dir.path())).unwrap(), settings_bytes);
+        assert_eq!(mode_of(&last_good_path(f.dir.path())), 0o600);
+        assert!(last_good_path(f.dir.path()).file_name().unwrap().to_string_lossy().starts_with('.'));
+        let view = service.view().unwrap();
+        assert_eq!(view.settings_state.kind, "ok");
+        assert_eq!(view.load_error, None);
+        assert!(view.settings_state.last_good_available);
+    }
+
+    #[test]
+    fn a_launch_without_a_settings_file_keeps_nothing() {
+        let f = fixture();
+        assert!(!last_good_path(f.dir.path()).exists());
+        let view = f.service.view().unwrap();
+        assert_eq!(view.settings_state.kind, "ok");
+        assert!(!view.settings_state.last_good_available);
+    }
+
+    #[test]
+    fn a_broken_launch_never_overwrites_the_last_good_copy() {
+        let f = fixture();
+        let good = launched_with_good_settings(&f);
+        break_settings(&f);
+
+        let service = service_on(&f.dir, &f.store);
+        assert_eq!(fs::read(last_good_path(f.dir.path())).unwrap(), good, "the copy was overwritten");
+        let view = service.view().unwrap();
+        assert_eq!(view.settings_state.kind, "broken");
+        assert!(view.settings_state.last_good_available);
+        assert!(view.settings_state.reason.is_some());
+    }
+
+    #[test]
+    fn a_broken_file_refuses_reads_and_changes_and_is_left_untouched() {
+        let f = fixture();
+        launched_with_good_settings(&f);
+        break_settings(&f);
+        let names_before = dir_names(&f.dir);
+        let blob_before = f.store.stored();
+        let service = service_on(&f.dir, &f.store);
+
+        let view = service.view().unwrap();
+        assert_eq!(view.settings_state.kind, "broken");
+        assert!(view.load_error.as_deref().unwrap().contains("settings.json"));
+        assert!(view.settings.providers.is_empty());
+        assert_eq!(view.settings_state.path, settings_path(f.dir.path()).display().to_string());
+
+        let err = service.active().unwrap_err();
+        assert!(err.contains("cannot be used") && err.contains("revert"), "{err}");
+        assert!(service.default_label().is_err());
+        assert!(service.test_plan("acme", "big").is_err());
+        assert!(service.save_provider(with_key(provider("acme"), OTHER_KEY)).unwrap_err().contains("unchanged"));
+        assert!(service.set_default_model(None).unwrap_err().contains("unchanged"));
+        assert_eq!(read_file(&f.dir), BROKEN, "the broken file was changed");
+        assert_eq!(dir_names(&f.dir), names_before);
+        assert_eq!(f.store.stored(), blob_before, "the store was touched");
+    }
+
+    #[test]
+    fn revert_keeps_the_broken_file_aside_and_restores_the_last_working_settings() {
+        let f = fixture();
+        let good = launched_with_good_settings(&f);
+        break_settings(&f);
+        let service = service_on(&f.dir, &f.store);
+        assert_eq!(service.view().unwrap().settings_state.kind, "broken");
+
+        let view = service.revert_to_last_good().unwrap();
+        assert_eq!(view.settings_state.kind, "ok");
+        assert_eq!(view.load_error, None);
+        assert_eq!(view.settings.default_model, Some(model_ref("acme", "big")));
+        assert!(view.secrets["acme"].api_key, "the secrets stay in the store");
+        assert_eq!(read_file(&f.dir), good, "settings.json is not the last working copy");
+        assert!(service.active().unwrap().is_some(), "the restored default cannot run");
+
+        let asides = aside_files(&f.dir);
+        assert_eq!(asides.len(), 1, "{asides:?}");
+        let aside = f.dir.path().join(&asides[0]);
+        assert_eq!(fs::read(&aside).unwrap(), BROKEN, "the broken text was not kept");
+        assert_eq!(mode_of(&aside), 0o600);
+        assert_eq!(fs::read(last_good_path(f.dir.path())).unwrap(), good, "the last-good copy changed");
+    }
+
+    #[test]
+    fn use_last_good_runs_the_copy_for_the_session_and_leaves_the_broken_file_byte_for_byte() {
+        let f = fixture();
+        launched_with_good_settings(&f);
+        break_settings(&f);
+        let names_before = dir_names(&f.dir);
+        let blob_before = f.store.stored();
+        let service = service_on(&f.dir, &f.store);
+
+        let view = service.use_last_good().unwrap();
+        assert_eq!(view.settings_state.kind, "last_good");
+        assert!(view.load_error.is_some());
+        assert_eq!(view.settings.default_model, Some(model_ref("acme", "big")));
+        assert_eq!(service.default_label(), Ok(Some(("acme name".to_string(), "big".to_string()))));
+        assert!(service.active().unwrap().is_some(), "the last working copy did not run");
+
+        let refused = "settings.json is broken; fix or revert it first";
+        assert_eq!(service.save_provider(with_key(provider("acme"), OTHER_KEY)).unwrap_err(), refused);
+        assert_eq!(service.set_default_model(None).unwrap_err(), refused);
+        assert_eq!(service.delete_provider("acme").unwrap_err(), refused);
+        assert_eq!(service.set_global_context_limit(Some(10)).unwrap_err(), refused);
+
+        assert_eq!(read_file(&f.dir), BROKEN, "settings.json is not byte-for-byte the broken file");
+        assert_eq!(dir_names(&f.dir), names_before, "a file was added or renamed");
+        assert_eq!(f.store.stored(), blob_before, "the store was written");
+    }
+
+    #[test]
+    fn a_last_good_session_with_no_default_refuses_instead_of_falling_back() {
+        let f = fixture();
+        f.service.save_provider(with_key(provider("acme"), KEY)).unwrap();
+        let _launch = service_on(&f.dir, &f.store);
+        break_settings(&f);
+        let service = service_on(&f.dir, &f.store);
+        service.use_last_good().unwrap();
+        let err = service.active().unwrap_err();
+        assert!(err.contains("no default model"), "{err}");
+        assert!(service.default_label().is_err());
+    }
+
+    #[test]
+    fn recovery_without_a_last_good_copy_is_an_error_and_the_state_stays_broken() {
+        let f = fixture();
+        break_settings(&f);
+        let service = service_on(&f.dir, &f.store);
+
+        let err = service.use_last_good().unwrap_err();
+        assert!(err.contains("no last working settings"), "{err}");
+        let err = service.revert_to_last_good().unwrap_err();
+        assert!(err.contains("no last working settings"), "{err}");
+        let view = service.view().unwrap();
+        assert_eq!(view.settings_state.kind, "broken");
+        assert!(!view.settings_state.last_good_available);
+        assert_eq!(read_file(&f.dir), BROKEN);
+        assert!(aside_files(&f.dir).is_empty(), "something was moved aside");
+    }
+
+    #[test]
+    fn reload_returns_to_ok_after_a_hand_fix_and_a_last_good_session_waits_for_it() {
+        let f = fixture();
+        let good = launched_with_good_settings(&f);
+        break_settings(&f);
+        let service = service_on(&f.dir, &f.store);
+        service.use_last_good().unwrap();
+
+        // A last-good session does not read the file, so a hand fix is seen only by reload.
+        fs::write(settings_path(f.dir.path()), &good).unwrap();
+        assert_eq!(service.view().unwrap().settings_state.kind, "last_good");
+        let view = service.reload().unwrap();
+        assert_eq!(view.settings_state.kind, "ok");
+        assert_eq!(view.load_error, None);
+        service.save_provider(with_key(provider("acme"), OTHER_KEY)).unwrap();
+    }
+
+    #[test]
+    fn a_reload_that_still_finds_the_file_broken_keeps_the_last_good_session() {
+        let f = fixture();
+        launched_with_good_settings(&f);
+        break_settings(&f);
+        let service = service_on(&f.dir, &f.store);
+        service.use_last_good().unwrap();
+
+        fs::write(settings_path(f.dir.path()), b"{ still broken").unwrap();
+        let view = service.reload().unwrap();
+        assert_eq!(view.settings_state.kind, "last_good");
+        assert!(view.load_error.unwrap().contains("settings.json"));
+        assert_eq!(view.settings.default_model, Some(model_ref("acme", "big")));
+    }
+
+    #[test]
+    fn a_recovery_reads_the_file_first_so_a_file_fixed_by_hand_is_not_replaced() {
+        let f = fixture();
+        let good = launched_with_good_settings(&f);
+        break_settings(&f);
+        let service = service_on(&f.dir, &f.store);
+        service.use_last_good().unwrap();
+        fs::write(settings_path(f.dir.path()), &good).unwrap();
+
+        let err = service.revert_to_last_good().unwrap_err();
+        assert!(err.contains("not broken"), "{err}");
+        assert_eq!(read_file(&f.dir), good);
+        assert!(aside_files(&f.dir).is_empty());
+        assert_eq!(service.view().unwrap().settings_state.kind, "ok");
+    }
+
+    fn secret_header_provider(id: &str, header: &str) -> Provider {
+        let mut p = provider(id);
+        p.headers = vec![HeaderEntry { name: header.into(), value: String::new(), secret: true, previous_name: None }];
+        p
+    }
+
+    /// Saves `acme` with a secret header `X-Key` holding HEADER, and the key.
+    fn with_stored_header(f: &Fixture) {
+        let mut first = with_key(secret_header_provider("acme", "X-Key"), KEY);
+        first.header_secrets.insert("X-Key".into(), HEADER.into());
+        f.service.save_provider(first).unwrap();
+    }
+
+    fn renamed_to(name: &str, previous: &str) -> SaveProviderInput {
+        let mut save = input(secret_header_provider("acme", name));
+        save.provider.headers[0].previous_name = Some(previous.into());
+        save
+    }
+
+    #[test]
+    fn a_renamed_secret_header_with_no_typed_value_keeps_its_stored_value() {
+        let f = fixture();
+        with_stored_header(&f);
+        let view = f.service.save_provider(renamed_to("X-Token", "X-Key")).unwrap();
+        assert_eq!(view.secrets["acme"].headers, vec!["X-Token".to_string()]);
+        let blob = f.store.stored().unwrap();
+        assert!(blob.contains(HEADER), "the value did not move to the new name");
+        assert!(!blob.contains("header.x-key"), "the old name was kept: {blob}");
+        let plan = f.service.provider_for_fetch("acme").unwrap();
+        assert_eq!(plan.headers, vec![("X-Token".to_string(), HEADER.to_string())]);
+        let file = String::from_utf8(read_file(&f.dir)).unwrap();
+        assert!(!file.contains("previous_name"), "the input-only field was saved");
+    }
+
+    #[test]
+    fn a_typed_value_wins_over_a_carried_one() {
+        let f = fixture();
+        with_stored_header(&f);
+        let mut save = renamed_to("X-Token", "X-Key");
+        save.header_secrets.insert("X-Token".into(), OTHER_KEY.into());
+        f.service.save_provider(save).unwrap();
+        let blob = f.store.stored().unwrap();
+        assert!(blob.contains(OTHER_KEY));
+        assert!(!blob.contains(HEADER), "the carried value survived a typed one: {blob}");
+        assert!(!blob.contains("header.x-key"));
+    }
+
+    #[test]
+    fn a_renamed_secret_header_with_nothing_stored_under_the_old_name_carries_nothing() {
+        let f = fixture();
+        f.service.save_provider(input(secret_header_provider("acme", "X-Key"))).unwrap();
+        let view = f.service.save_provider(renamed_to("X-Token", "X-Key")).unwrap();
+        assert!(view.secrets["acme"].headers.is_empty());
+    }
+
+    #[test]
+    fn a_case_only_rename_keeps_the_stored_value() {
+        let f = fixture();
+        with_stored_header(&f);
+        let view = f.service.save_provider(renamed_to("x-key", "X-Key")).unwrap();
+        assert_eq!(view.secrets["acme"].headers, vec!["x-key".to_string()]);
+        let plan = f.service.provider_for_fetch("acme").unwrap();
+        assert_eq!(plan.headers, vec![("x-key".to_string(), HEADER.to_string())]);
     }
 
     #[test]
@@ -794,8 +1332,8 @@ mod tests {
         let f = fixture();
         let mut p = provider("acme");
         p.headers = vec![
-            HeaderEntry { name: "X-Key".into(), value: String::new(), secret: true },
-            HeaderEntry { name: "X-Other".into(), value: String::new(), secret: true },
+            HeaderEntry { name: "X-Key".into(), value: String::new(), secret: true, previous_name: None },
+            HeaderEntry { name: "X-Other".into(), value: String::new(), secret: true, previous_name: None },
         ];
         let mut save_input = with_key(p, KEY);
         save_input.header_secrets.insert("X-Key".into(), HEADER.into());
@@ -857,8 +1395,8 @@ mod tests {
         let f = fixture();
         let mut p = provider("acme");
         p.headers = vec![
-            HeaderEntry { name: "X-Session".into(), value: "{session_id}".into(), secret: false },
-            HeaderEntry { name: "X-Key".into(), value: String::new(), secret: true },
+            HeaderEntry { name: "X-Session".into(), value: "{session_id}".into(), secret: false, previous_name: None },
+            HeaderEntry { name: "X-Key".into(), value: String::new(), secret: true, previous_name: None },
         ];
         let mut save_input = with_key(p, KEY);
         save_input.header_secrets.insert("X-Key".into(), HEADER.into());

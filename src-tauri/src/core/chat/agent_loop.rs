@@ -515,6 +515,7 @@ fn error_text(e: &LlmError) -> String {
         LlmError::Provider { message, .. } => format!("The provider reported an error: {message}"),
         LlmError::Transport(detail) => format!("I could not reach the provider: {detail}"),
         LlmError::Parse(detail) => format!("I could not read the provider's reply: {detail}"),
+        LlmError::TooLarge(detail) => format!("The provider's reply is too large: {detail}"),
         LlmError::Cancelled => "The request was cancelled.".to_string(),
     }
 }

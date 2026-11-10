@@ -22,6 +22,8 @@ use serde::{Deserialize, Serialize};
 
 pub const SETTINGS_VERSION: u32 = 1;
 const SETTINGS_FILE: &str = "settings.json";
+/// The hidden copy of the last settings that checked out at a launch. Written by the app only, with the same mode.
+const LAST_GOOD_FILE: &str = ".settings.last-good.json";
 
 /// Longest accepted provider name, in characters.
 const MAX_NAME_CHARS: usize = 80;
@@ -99,6 +101,10 @@ pub struct HeaderEntry {
     pub value: String,
     #[serde(default)]
     pub secret: bool,
+    /// Input only, from the settings UI: the name this header had when it was saved. A secret header renamed with no
+    /// typed value keeps its stored value under the new name (see `SettingsService::save_provider`). Never written.
+    #[serde(default, skip_serializing)]
+    pub previous_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -335,17 +341,29 @@ pub fn settings_path(config_dir: &Path) -> PathBuf {
     config_dir.join(SETTINGS_FILE)
 }
 
+/// The path of the hidden last-good copy of the settings.
+pub fn last_good_path(config_dir: &Path) -> PathBuf {
+    config_dir.join(LAST_GOOD_FILE)
+}
+
 /// Reads `config_dir/settings.json`. A missing file gives the default (empty) settings. Anything else that is wrong
 /// with the file is an error, and the file is left exactly as it was.
 pub fn load(config_dir: &Path) -> Result<Settings, SettingsError> {
-    let path = settings_path(config_dir);
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Settings::default()),
+    Ok(read_checked(&settings_path(config_dir))?.map_or_else(Settings::default, |(settings, _)| settings))
+}
+
+/// Reads and checks one settings file. `Ok(None)` when it does not exist. Otherwise also returns the file's exact
+/// bytes, so a copy of the file is the text that was checked. The file is not touched.
+pub fn read_checked(path: &Path) -> Result<Option<(Settings, Vec<u8>)>, SettingsError> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(SettingsError::Invalid(format!("cannot read {}: {e}", path.display()))),
     };
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|e| SettingsError::Invalid(format!("cannot read {}: {e}", path.display())))?;
     // The serde message can echo a value from the file, so only the position and the error class are reported.
-    let settings: Settings = serde_json::from_str(&text).map_err(|e| {
+    let settings: Settings = serde_json::from_str(text).map_err(|e| {
         SettingsError::Invalid(format!(
             "not valid JSON ({:?} error at line {}, column {})",
             e.classify(),
@@ -354,7 +372,7 @@ pub fn load(config_dir: &Path) -> Result<Settings, SettingsError> {
         ))
     })?;
     settings.validate().map_err(|problems| SettingsError::Invalid(problems.join("; ")))?;
-    Ok(settings)
+    Ok(Some((settings, bytes)))
 }
 
 /// Validates, then replaces `config_dir/settings.json` atomically. The directory is created (0700) if missing. The
@@ -488,7 +506,7 @@ mod tests {
     }
 
     fn header(name: &str, value: &str, secret: bool) -> HeaderEntry {
-        HeaderEntry { name: name.into(), value: value.into(), secret }
+        HeaderEntry { name: name.into(), value: value.into(), secret, previous_name: None }
     }
 
     /// Applies `change` to a valid settings value and returns what validation says.

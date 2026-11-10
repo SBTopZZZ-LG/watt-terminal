@@ -12,6 +12,10 @@
 //! carried a `finish_reason`; otherwise it is an error, because the reply was cut off. Cancelling a
 //! `TurnCancel` aborts either call promptly and drops the connection.
 //!
+//! Sizes are capped: a non-streaming reply and any error body may be `MAX_BODY_BYTES` (32 MiB), and one SSE line or
+//! event `MAX_SSE_LINE_BYTES` (1 MiB). Beyond that the call fails with `LlmError::TooLarge`, and reading stops
+//! at the cap.
+//!
 //! Secrets: the API key is never in `Debug` output. The key is replaced with "[redacted]" in each raw body
 //! (an error body, a 200 body, each stream payload) before that text is parsed or truncated, and error
 //! messages get a second pass before they leave this module. Error messages are truncated to `MESSAGE_LIMIT`
@@ -40,6 +44,37 @@ pub const STREAM_HEADERS_TIMEOUT: Duration = Duration::from_secs(300);
 pub const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 pub const COMPLETE_TIMEOUT: Duration = Duration::from_secs(300);
 const MESSAGE_LIMIT: usize = 500;
+
+const MIB: usize = 1024 * 1024;
+/// Largest reply body, in bytes, that a call reads: a non-streaming reply, an error body, and a streamed error body.
+/// A bigger body fails the call, and reading stops at the cap.
+pub const MAX_BODY_BYTES: usize = 32 * MIB;
+/// Longest single SSE line, and longest single event's data, in bytes. A longer one fails the streamed reply.
+pub const MAX_SSE_LINE_BYTES: usize = MIB;
+
+/// The timing and size limits of one call. `DEFAULT_BOUNDS` is what the app uses; tests pass smaller sizes, so the
+/// caps are exercised without moving megabytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Bounds {
+    /// Wait for the response headers (and for an error body).
+    headers: Duration,
+    /// Gap allowed between network chunks once the headers have arrived.
+    idle: Duration,
+    body: usize,
+    sse_line: usize,
+}
+
+const DEFAULT_BOUNDS: Bounds = Bounds {
+    headers: STREAM_HEADERS_TIMEOUT,
+    idle: STREAM_IDLE_TIMEOUT,
+    body: MAX_BODY_BYTES,
+    sse_line: MAX_SSE_LINE_BYTES,
+};
+
+/// A size as the user reads it: "32 MiB" for whole mebibytes, else bytes.
+fn size_text(bytes: usize) -> String {
+    if bytes >= MIB && bytes.is_multiple_of(MIB) { format!("{} MiB", bytes / MIB) } else { format!("{bytes} bytes") }
+}
 
 /// Everything the client needs to reach one provider. `headers` are already resolved by the caller
 /// (a `{session_id}` placeholder is the caller's job). A header whose name matches a built-in one
@@ -113,6 +148,8 @@ pub enum LlmError {
     Provider { code: Option<i64>, kind: Option<String>, message: String },
     Transport(String),
     Parse(String),
+    /// The reply is over a size cap (see `MAX_BODY_BYTES` and `MAX_SSE_LINE_BYTES`). The text says which cap.
+    TooLarge(String),
     Cancelled,
 }
 
@@ -123,6 +160,7 @@ impl fmt::Display for LlmError {
             LlmError::Provider { message, .. } => write!(f, "provider error: {message}"),
             LlmError::Transport(detail) => write!(f, "transport error: {detail}"),
             LlmError::Parse(detail) => write!(f, "could not parse the response: {detail}"),
+            LlmError::TooLarge(detail) => write!(f, "the provider's reply is too large: {detail}"),
             LlmError::Cancelled => write!(f, "cancelled"),
         }
     }
@@ -198,6 +236,16 @@ pub async fn complete(
     req: &ChatRequest,
     cancel: &TurnCancel,
 ) -> Result<AssistantReply, LlmError> {
+    complete_within(client, cfg, req, cancel, DEFAULT_BOUNDS).await
+}
+
+async fn complete_within(
+    client: &reqwest::Client,
+    cfg: &ProviderConfig,
+    req: &ChatRequest,
+    cancel: &TurnCancel,
+    bounds: Bounds,
+) -> Result<AssistantReply, LlmError> {
     if cancel.is_cancelled() {
         return Err(LlmError::Cancelled);
     }
@@ -209,7 +257,7 @@ pub async fn complete(
             .await
             .map_err(transport)?;
         let status = response.status();
-        let text = redact(&response.text().await.map_err(transport)?, &cfg.api_key);
+        let text = redact(&read_capped(response, bounds.body).await?, &cfg.api_key);
         if !status.is_success() {
             return Err(http_error(status.as_u16(), &text));
         }
@@ -227,19 +275,16 @@ pub async fn stream(
     on_delta: &mut dyn FnMut(Delta),
     cancel: &TurnCancel,
 ) -> Result<AssistantReply, LlmError> {
-    run_stream(client, cfg, req, on_delta, cancel, STREAM_HEADERS_TIMEOUT, STREAM_IDLE_TIMEOUT).await
+    run_stream(client, cfg, req, on_delta, cancel, DEFAULT_BOUNDS).await
 }
 
-/// `headers` bounds the wait for the response headers (and for a non-2xx error body). `idle` bounds the gap
-/// between network chunks after that. Both are parameters so tests can use short values.
 async fn run_stream(
     client: &reqwest::Client,
     cfg: &ProviderConfig,
     req: &ChatRequest,
     on_delta: &mut dyn FnMut(Delta),
     cancel: &TurnCancel,
-    headers: Duration,
-    idle: Duration,
+    bounds: Bounds,
 ) -> Result<AssistantReply, LlmError> {
     if cancel.is_cancelled() {
         return Err(LlmError::Cancelled);
@@ -247,27 +292,27 @@ async fn run_stream(
     let body = request_body(req, true);
     let work = async {
         let request = post(client, cfg, &body)?;
-        let response = with_idle(headers, request.send()).await?.map_err(transport)?;
+        let response = with_idle(bounds.headers, request.send()).await?.map_err(transport)?;
         let status = response.status();
         if !status.is_success() {
-            let text = with_idle(headers, response.text()).await?.map_err(transport)?;
+            let text = with_idle(bounds.headers, read_capped(response, bounds.body)).await??;
             return Err(http_error(status.as_u16(), &redact(&text, &cfg.api_key)));
         }
         let mut chunks = pin!(response.bytes_stream());
-        let mut parser = SseParser::new();
+        let mut parser = SseParser::new(bounds.sse_line);
         let mut acc = Accumulator::new();
         let mut done = false;
         while !done {
-            match with_idle(idle, chunks.next()).await? {
+            match with_idle(bounds.idle, chunks.next()).await? {
                 None => break,
                 Some(bytes) => {
                     let bytes = bytes.map_err(transport)?;
-                    done = feed(parser.push(&bytes), &cfg.api_key, &mut acc, on_delta)?;
+                    done = feed(parser.push(&bytes)?, &cfg.api_key, &mut acc, on_delta)?;
                 }
             }
         }
         if !done {
-            feed(parser.finish(), &cfg.api_key, &mut acc, on_delta)?;
+            feed(parser.finish()?, &cfg.api_key, &mut acc, on_delta)?;
         }
         // Without [DONE], a finish_reason means the reply is complete (some providers omit [DONE]). Without
         // either, the connection closed mid-reply.
@@ -315,6 +360,21 @@ async fn with_idle<F: Future>(idle: Duration, fut: F) -> Result<F::Output, LlmEr
     tokio::time::timeout(idle, fut).await.map_err(|_| {
         LlmError::Transport(format!("no data from the provider for {} s", idle.as_secs_f64()))
     })
+}
+
+/// Reads the whole body as text, up to `max` bytes. Reading stops as soon as the cap is passed, so a huge body is
+/// never held in memory. Invalid UTF-8 is replaced, since provider JSON is UTF-8.
+async fn read_capped(response: reqwest::Response, max: usize) -> Result<String, LlmError> {
+    let mut chunks = pin!(response.bytes_stream());
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.map_err(transport)?;
+        if body.len().saturating_add(chunk.len()) > max {
+            return Err(LlmError::TooLarge(format!("more than {}", size_text(max))));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 fn post(client: &reqwest::Client, cfg: &ProviderConfig, body: &Value) -> Result<reqwest::RequestBuilder, LlmError> {
@@ -454,6 +514,7 @@ fn scrub(err: LlmError, secret: &str) -> LlmError {
         }
         LlmError::Transport(detail) => LlmError::Transport(clean(detail)),
         LlmError::Parse(detail) => LlmError::Parse(clean(detail)),
+        LlmError::TooLarge(detail) => LlmError::TooLarge(clean(detail)),
         LlmError::Cancelled => LlmError::Cancelled,
     }
 }
@@ -611,10 +672,10 @@ mod tests {
     fn stream_chunks_drive_the_callback_and_the_final_reply() {
         let raw = include_str!("../../../tests/fixtures/llm/openrouter_stream.sse");
         let mut acc = Accumulator::new();
-        let mut parser = SseParser::new();
+        let mut parser = SseParser::new(MAX_SSE_LINE_BYTES);
         let mut seen = Vec::new();
         let mut on_delta = |d: Delta| seen.push(d);
-        let done = feed(parser.push(raw.as_bytes()), "", &mut acc, &mut on_delta).unwrap();
+        let done = feed(parser.push(raw.as_bytes()).unwrap(), "", &mut acc, &mut on_delta).unwrap();
         assert!(done);
         drop(on_delta);
         assert!(seen.iter().any(|d| matches!(d, Delta::Reasoning(_))));
@@ -647,20 +708,12 @@ mod tests {
                 seen.push_str(&t);
             }
         };
-        let idle = Duration::from_millis(300);
+        let bounds = Bounds { idle: Duration::from_millis(300), ..DEFAULT_BOUNDS };
         let result = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
-            .block_on(run_stream(
-                &client,
-                &cfg(&url),
-                &one_message(),
-                &mut on_delta,
-                &cancel,
-                STREAM_HEADERS_TIMEOUT,
-                idle,
-            ));
+            .block_on(run_stream(&client, &cfg(&url), &one_message(), &mut on_delta, &cancel, bounds));
         match result {
             Err(LlmError::Transport(detail)) => assert!(detail.contains("no data"), "{detail}"),
             other => panic!("expected an idle timeout, got {other:?}"),
@@ -675,24 +728,127 @@ mod tests {
         let client = http_client().unwrap();
         let cancel = TurnCancel::new();
         let mut ignore = |_d: Delta| {};
-        let headers = Duration::from_millis(300);
+        let bounds = Bounds { headers: Duration::from_millis(300), ..DEFAULT_BOUNDS };
         let result = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
-            .block_on(run_stream(
-                &client,
-                &cfg(&url),
-                &one_message(),
-                &mut ignore,
-                &cancel,
-                headers,
-                STREAM_IDLE_TIMEOUT,
-            ));
+            .block_on(run_stream(&client, &cfg(&url), &one_message(), &mut ignore, &cancel, bounds));
         match result {
             // The detail names the 0.3 s headers limit; the 60 s idle limit would have said 60 s.
             Err(LlmError::Transport(detail)) => assert!(detail.contains("0.3 s"), "{detail}"),
             other => panic!("expected a headers timeout, got {other:?}"),
         }
+    }
+
+    /// Bodies and SSE lines of 1 KiB, so the size tests stay small.
+    const SMALL_BOUNDS: Bounds = Bounds { body: 1024, sse_line: 1024, ..DEFAULT_BOUNDS };
+
+    fn block_on<T>(fut: impl Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(fut)
+    }
+
+    fn http_response(status: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
+        let mut out = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// Accepts one connection, reads the whole request (headers and the Content-Length body), sends `response` and
+    /// closes. Reading the whole request first means the close does not reset the connection under the client.
+    fn fixed_server(response: Vec<u8>) -> String {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            read_request(&mut sock);
+            let _ = sock.write_all(&response);
+            let _ = sock.flush();
+        });
+        format!("http://{addr}/v1/chat/completions")
+    }
+
+    fn read_request(sock: &mut std::net::TcpStream) {
+        use std::io::Read;
+        let mut data = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = match sock.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => n,
+            };
+            data.extend_from_slice(&buf[..n]);
+            let Some(end) = data.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&data[..end]).to_ascii_lowercase();
+            let length = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if data.len() >= end + 4 + length {
+                return;
+            }
+        }
+    }
+
+    #[test]
+    fn the_caps_are_32_mib_for_a_body_and_1_mib_for_a_line() {
+        assert_eq!(MAX_BODY_BYTES, 32 * 1024 * 1024);
+        assert_eq!(MAX_SSE_LINE_BYTES, 1024 * 1024);
+        assert_eq!(size_text(MAX_BODY_BYTES), "32 MiB");
+        assert_eq!(size_text(1000), "1000 bytes");
+    }
+
+    #[test]
+    fn a_non_streaming_reply_at_the_body_cap_is_read_and_one_over_it_fails() {
+        let client = http_client().unwrap();
+        let cancel = TurnCancel::new();
+        let json = r#"{"choices":[{"message":{"role":"assistant","content":"hi"}}]}"#;
+        let at_cap = Bounds { body: json.len(), ..DEFAULT_BOUNDS };
+        let url = fixed_server(http_response("200 OK", "application/json", json.as_bytes()));
+        let reply = block_on(complete_within(&client, &cfg(&url), &one_message(), &cancel, at_cap)).unwrap();
+        assert_eq!(reply.text, "hi");
+
+        let padded =
+            format!(r#"{{"choices":[{{"message":{{"role":"assistant","content":"{}"}}}}]}}"#, "x".repeat(2048));
+        let url = fixed_server(http_response("200 OK", "application/json", padded.as_bytes()));
+        let err = block_on(complete_within(&client, &cfg(&url), &one_message(), &cancel, SMALL_BOUNDS)).unwrap_err();
+        assert!(matches!(err, LlmError::TooLarge(_)), "{err:?}");
+        assert_eq!(err.to_string(), "the provider's reply is too large: more than 1024 bytes");
+    }
+
+    #[test]
+    fn a_streamed_error_body_over_the_cap_fails_as_too_large() {
+        let body = format!(r#"{{"error":{{"message":"{}"}}}}"#, "y".repeat(2048));
+        let url = fixed_server(http_response("500 Internal Server Error", "application/json", body.as_bytes()));
+        let client = http_client().unwrap();
+        let cancel = TurnCancel::new();
+        let mut ignore = |_d: Delta| {};
+        let err = block_on(run_stream(&client, &cfg(&url), &one_message(), &mut ignore, &cancel, SMALL_BOUNDS))
+            .unwrap_err();
+        assert!(matches!(err, LlmError::TooLarge(_)), "{err:?}");
+    }
+
+    #[test]
+    fn a_stream_line_over_the_cap_fails_the_turn() {
+        let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+        let long = format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\"}}}}]}}\n\n", "z".repeat(2048));
+        let mut response = head.as_bytes().to_vec();
+        response.extend_from_slice(long.as_bytes());
+        let url = fixed_server(response);
+        let client = http_client().unwrap();
+        let cancel = TurnCancel::new();
+        let mut ignore = |_d: Delta| {};
+        let err = block_on(run_stream(&client, &cfg(&url), &one_message(), &mut ignore, &cancel, SMALL_BOUNDS))
+            .unwrap_err();
+        assert!(matches!(err, LlmError::TooLarge(_)), "{err:?}");
+        assert!(err.to_string().contains("single line or event"), "{err}");
     }
 }
