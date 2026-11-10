@@ -21,9 +21,10 @@ function groupable(item: TranscriptItem): item is GroupItem {
 }
 
 /**
- * Collapses each run with two or more tool calls into one entry. A run with one tool call (plus any resolved approvals)
- * is returned item by item, as it was before grouping. The key is the id of the run's first item, so it stays the same
- * while the run grows and a group the user opened stays open.
+ * Collapses a run into one entry when it has two or more tool calls, or one tool call and at least one resolved
+ * approval (the approval is the reason for the call, so it is folded in with it). A run with a single tool call and
+ * no approval, or with approvals and no tool call, is returned item by item. The key is the id of the run's first
+ * item, so it stays the same while the run grows and a group the user opened stays open.
  */
 export function groupTranscript(items: TranscriptItem[]): TranscriptEntry[] {
   const entries: TranscriptEntry[] = [];
@@ -33,7 +34,8 @@ export function groupTranscript(items: TranscriptItem[]): TranscriptEntry[] {
       return;
     }
     const toolCount = run.filter((i) => i.kind === 'tool').length;
-    if (toolCount >= 2) {
+    const approvalCount = run.length - toolCount;
+    if (toolCount >= 2 || (toolCount >= 1 && approvalCount >= 1)) {
       entries.push({ kind: 'tools', key: run[0].id, items: run });
     } else {
       for (const item of run) {
@@ -65,7 +67,7 @@ export function toolGroupSummary(items: GroupItem[]): string {
     counts.set(tool.name, (counts.get(tool.name) ?? 0) + 1);
   }
   const names = [...counts].map(([name, n]) => (n > 1 ? `${visibleEscapes(name)} ×${n}` : visibleEscapes(name))).join(', ');
-  let text = `${tools.length} tool calls: ${names}`;
+  let text = `${tools.length === 1 ? '1 tool call' : `${tools.length} tool calls`}: ${names}`;
 
   const running = [...tools].reverse().find((t) => t.status === 'running');
   if (running) {

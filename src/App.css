@@ -484,10 +484,29 @@ input {
   color: var(--fail);
 }
 
+/* The entries are a column with a fixed gap. Tool rows and approval cards drop their own margins, so the gap is the spacing. */
 .transcript-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
   max-height: 35vh;
   overflow-y: auto;
   padding: 4px 12px 10px;
+}
+
+.transcript-body > * {
+  flex: 0 0 auto;
+}
+
+.transcript-body > .tool,
+.transcript-body > .approval {
+  margin: 0;
+}
+
+/* An agent message next to a tool row or group sits 14px away from it, not 10px. */
+.transcript-body > .tool + .msg.agent,
+.transcript-body > .msg.agent + .tool {
+  margin-top: 4px;
 }
 
 .empty,
@@ -795,6 +814,45 @@ input {
   background-image: repeating-linear-gradient(90deg, var(--rule-strong) 0 6px, transparent 6px 13px);
 }
 
+/* The copy button under a finished reply: small and muted, at the bottom right, clear of the corner bracket. */
+.msg-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 6px;
+}
+
+.copy-md {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px dashed transparent;
+  border-radius: 2px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.copy-md svg {
+  display: block;
+}
+
+.copy-md:hover {
+  border-color: var(--rule);
+  color: var(--accent);
+}
+
+.copy-md:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.copy-md.copied {
+  color: var(--ok);
+}
+
 .tool {
   margin: 4px 0;
   color: var(--muted);
@@ -808,6 +866,17 @@ input {
 
 .tool-failed summary {
   color: var(--fail);
+}
+
+/* The rows inside an open group hang under its summary on a dashed rule. The summary is brighter than its rows. */
+.tool-group > summary {
+  color: var(--ink);
+}
+
+.tool-group-items {
+  margin-left: 10px;
+  padding-left: 12px;
+  border-left: 1px dashed var(--rule);
 }
 
 .tool pre {

@@ -59,6 +59,24 @@ describe('groupTranscript', () => {
     expect(groupTranscript(list)).toEqual([{ kind: 'item', item: list[0] }]);
   });
 
+  it('a single tool call with a resolved approval collapses into a group', () => {
+    const entries = groupTranscript(items([call('c1', 'run_command'), approval('c1'), result('c1', 'run_command', true, 'manual')]));
+    expect(shape(entries)).toEqual([['c1', 'approval:c1']]);
+  });
+
+  it('a single tool call with a pending approval is not grouped: the approval is its own card', () => {
+    const entries = groupTranscript(items([call('c1', 'run_command'), approval('c1')]));
+    expect(shape(entries)).toEqual(['tool', 'approval']);
+    expect(entries[1]).toMatchObject({ kind: 'item', item: { kind: 'approval', state: 'pending' } });
+  });
+
+  it('a resolved approval with no tool call in its run renders as an individual item', () => {
+    // A new shell closes the pending approval (it becomes resolved) and adds a notice after it.
+    const entries = groupTranscript(items([approval('a1'), { type: 'session_reset' }]));
+    expect(shape(entries)).toEqual(['approval', 'notice']);
+    expect(entries[0]).toMatchObject({ kind: 'item', item: { kind: 'approval', state: 'resolved' } });
+  });
+
   it('a pending approval is never inside a group: it ends the run, and later tools start a new one', () => {
     const entries = groupTranscript(items([call('c1'), call('c2'), approval('a1'), call('c3'), call('c4')]));
     expect(shape(entries)).toEqual([['c1', 'c2'], 'approval', ['c3', 'c4']]);
@@ -117,6 +135,16 @@ describe('toolGroupSummary', () => {
     }
     return entry.items;
   }
+
+  it('a single tool call is counted in the singular', () => {
+    const g = group([call('c1', 'run_command'), approval('c1'), result('c1', 'run_command', true, 'manual')]);
+    expect(toolGroupSummary(g)).toBe('1 tool call: run_command');
+  });
+
+  it('a single tool call that was denied keeps the denied note', () => {
+    const g = group([call('c1', 'run_command'), approval('c1'), result('c1', 'run_command', false, 'denied')]);
+    expect(toolGroupSummary(g)).toBe('1 tool call: run_command · 1 failed · denied');
+  });
 
   it('shows the count and the tool names with repeat counts', () => {
     const g = group([

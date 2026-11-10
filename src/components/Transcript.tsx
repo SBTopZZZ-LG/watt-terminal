@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useRef } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { copyText } from '../lib/clipboard';
 import { previewJson } from '../lib/format';
 import { approvalTitle } from '../lib/transcript';
 import type { TranscriptItem } from '../lib/transcript';
@@ -70,9 +71,11 @@ function ToolGroup({ items, onApprove }: { items: GroupItem[]; onApprove: Props[
   return (
     <details className="tool tool-group">
       <summary>{toolGroupSummary(items)}</summary>
-      {items.map((item) => (
-        <Entry key={item.id} item={item} onApprove={onApprove} />
-      ))}
+      <div className="tool-group-items">
+        {items.map((item) => (
+          <Entry key={item.id} item={item} onApprove={onApprove} />
+        ))}
+      </div>
     </details>
   );
 }
@@ -90,6 +93,7 @@ function Entry({ item, onApprove }: { item: TranscriptItem; onApprove: Props['on
       return (
         <div className="msg agent">
           <Markdown text={item.text} />
+          {!item.streaming && <CopyMarkdownButton text={item.text} />}
         </div>
       );
     case 'notice':
@@ -126,4 +130,59 @@ function Entry({ item, onApprove }: { item: TranscriptItem; onApprove: Props['on
         </div>
       );
   }
+}
+
+/** How long the check mark stays after a copy. */
+const COPIED_MS = 1500;
+
+/**
+ * Copies a finished agent message as the model wrote it (its markdown source). Shown only once the message is complete.
+ * The icon swaps to a check mark for a moment; the button keeps its size, so the swap does not move the layout.
+ */
+function CopyMarkdownButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+  const timer = useRef<number | undefined>(undefined);
+
+  useEffect(() => () => window.clearTimeout(timer.current), []);
+
+  const onClick = async () => {
+    const ok = await copyText(text, { clipboard: navigator.clipboard, document });
+    if (!ok) {
+      return;
+    }
+    setCopied(true);
+    window.clearTimeout(timer.current);
+    timer.current = window.setTimeout(() => setCopied(false), COPIED_MS);
+  };
+
+  return (
+    <div className="msg-actions">
+      <button
+        type="button"
+        className={`copy-md${copied ? ' copied' : ''}`}
+        onClick={onClick}
+        title="Copy as Markdown"
+        aria-label="Copy as Markdown"
+      >
+        {copied ? <CheckIcon /> : <CopyIcon />}
+      </button>
+    </div>
+  );
+}
+
+function CopyIcon() {
+  return (
+    <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.25" aria-hidden="true">
+      <rect x="5.5" y="5.5" width="8" height="8" rx="1" />
+      <path d="M10.5 5.5V3.5a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2" />
+    </svg>
+  );
+}
+
+function CheckIcon() {
+  return (
+    <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+      <path d="M3 8.5l3 3 7-7" />
+    </svg>
+  );
 }
