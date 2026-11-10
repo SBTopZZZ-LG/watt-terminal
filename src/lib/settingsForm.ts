@@ -1,0 +1,470 @@
+// The AI provider settings form: the editable draft and the pure rules around it. Nothing here calls the backend or the DOM.
+//
+// The Rust side (src-tauri/src/core/settings) stays authoritative. validateDraft mirrors its rules lightly, so the form can
+// point at a field before a save is attempted. A refusal from the backend is still shown as it is.
+//
+// Secrets: the typed API key and the typed header values live only in the draft while the form is open. They are never
+// filled in from the store, and buildSaveInput is the only place they leave the draft.
+
+import type {
+  FetchSummary,
+  HeaderEntry,
+  Model,
+  ModelRef,
+  ModelSource,
+  Provider,
+  ProviderPreset,
+  SaveProviderInput,
+  SecretsPresent,
+  Settings,
+} from './types';
+
+/** The largest value the backend stores for a token count or a context limit (Rust u32). */
+const U32_MAX = 4294967295;
+const MAX_ID_CHARS = 40;
+const MAX_NAME_CHARS = 80;
+const MAX_MODEL_ID_CHARS = 200;
+const MAX_HEADER_VALUE_CHARS = 500;
+const CHAT_SUFFIX = '/chat/completions';
+const LOCAL_HOSTS = ['localhost', '127.0.0.1', '[::1]'];
+
+const ID_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/;
+/** RFC 7230 tchar: the characters a header name may use. */
+const TOKEN_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+/** Control characters (Rust char::is_control): C0, DEL and C1. */
+const CONTROL_RE = /[\u0000-\u001f\u007f-\u009f]/;
+const WHITESPACE_RE = /\s/;
+
+export const ID_HELP = "Use 1 to 40 characters: a-z, 0-9, '-' or '_', starting with a letter or digit.";
+
+/** One header row. A secret header's value is only what the user typed; the stored value is never read back. */
+export interface HeaderDraft {
+  /** Stable React key. Not sent. */
+  key: string;
+  name: string;
+  /** Plain headers: the value as saved or typed. Secret headers: what the user typed, normally "". */
+  value: string;
+  secret: boolean;
+  /** Secret headers: the user asked to remove the stored value. */
+  clearStored: boolean;
+}
+
+/** One model row. `context_limit` is the typed override, as text: blank means none. */
+export interface ModelDraft {
+  id: string;
+  source: ModelSource;
+  context_limit: string;
+  /** What the provider reported when the list was fetched. Shown, never edited. */
+  provider_context: number | null;
+}
+
+/** The editable state of one provider. Numbers are text while typing and parsed in buildSaveInput. */
+export interface ProviderDraft {
+  /** A provider not saved yet. Its id is editable until the first save. */
+  isNew: boolean;
+  /** Set once the user types the id. Until then the id follows the name. */
+  idEdited: boolean;
+  id: string;
+  name: string;
+  chat_url: string;
+  models_url: string;
+  stream: boolean;
+  max_tokens: string;
+  headers: HeaderDraft[];
+  models: ModelDraft[];
+  /** The typed API key. Never filled from the store. */
+  apiKey: string;
+  /** The user asked to remove the stored key. */
+  clearKey: boolean;
+  /** The user asked to replace the stored key, so the input is shown. */
+  keyEditing: boolean;
+  /** Which secrets the store has for this provider, as the backend reported them. Presence only. */
+  storedKey: boolean;
+  storedHeaders: string[];
+}
+
+/** Field problems keyed the way the editor shows them. Empty strings are never stored: a missing key means no problem. */
+export interface DraftProblems {
+  id?: string;
+  name?: string;
+  chat_url?: string;
+  models_url?: string;
+  max_tokens?: string;
+  /** Keyed by header row key. */
+  headers: Record<string, string>;
+  /** Keyed by model id. */
+  models: Record<string, string>;
+}
+
+export interface ModelOption {
+  key: string;
+  ref: ModelRef;
+  /** "Provider · model", as the default-model select shows it. */
+  label: string;
+}
+
+let headerKeySeq = 0;
+const nextHeaderKey = () => `h${++headerKeySeq}`;
+
+/** An empty header row, with a key no other row has. */
+export function newHeaderDraft(): HeaderDraft {
+  return { key: nextHeaderKey(), name: '', value: '', secret: false, clearStored: false };
+}
+
+/** Text that is a positive whole number that fits the backend's u32, or null when blank or not one. */
+export function parsePositiveInt(text: string): number | null {
+  const t = text.trim();
+  if (!/^\d+$/.test(t)) {
+    return null;
+  }
+  const n = Number(t);
+  return n >= 1 && n <= U32_MAX ? n : null;
+}
+
+/** A slug for a provider id from its name: lower case, a-z 0-9 and '-', at most 40 characters, unique among takenIds. */
+export function slugify(name: string, takenIds: readonly string[]): string {
+  const base = name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+/, '')
+    .slice(0, MAX_ID_CHARS)
+    .replace(/-+$/, '');
+  if (base === '') {
+    return '';
+  }
+  const taken = new Set(takenIds);
+  if (!taken.has(base)) {
+    return base;
+  }
+  for (let n = 2; ; n += 1) {
+    const suffix = `-${n}`;
+    const candidate = `${base.slice(0, MAX_ID_CHARS - suffix.length).replace(/-+$/, '')}${suffix}`;
+    if (!taken.has(candidate)) {
+      return candidate;
+    }
+  }
+}
+
+function headerDraft(h: HeaderEntry): HeaderDraft {
+  return { key: nextHeaderKey(), name: h.name, value: h.value, secret: h.secret, clearStored: false };
+}
+
+/** A saved provider as an editable draft. `present` says which of its secrets are stored; the draft never holds them. */
+export function draftFromProvider(provider: Provider, present?: SecretsPresent): ProviderDraft {
+  return {
+    isNew: false,
+    idEdited: true,
+    id: provider.id,
+    name: provider.name,
+    chat_url: provider.chat_url,
+    models_url: provider.models_url ?? '',
+    stream: provider.stream,
+    max_tokens: provider.max_tokens === null ? '' : String(provider.max_tokens),
+    headers: provider.headers.map(headerDraft),
+    models: provider.models.map((m) => ({
+      id: m.id,
+      source: m.source,
+      context_limit: m.context_limit === null ? '' : String(m.context_limit),
+      provider_context: m.provider_context,
+    })),
+    apiKey: '',
+    clearKey: false,
+    keyEditing: false,
+    storedKey: present?.api_key ?? false,
+    storedHeaders: present?.headers ?? [],
+  };
+}
+
+/** A new provider starting from a preset. The id is worked out from the name, unique among existingIds. */
+export function draftFromPreset(preset: ProviderPreset, existingIds: readonly string[]): ProviderDraft {
+  const p = preset.provider;
+  return {
+    isNew: true,
+    idEdited: false,
+    id: slugify(p.name, existingIds),
+    name: p.name,
+    chat_url: p.chat_url,
+    models_url: p.models_url ?? '',
+    stream: p.stream,
+    max_tokens: p.max_tokens === null ? '' : String(p.max_tokens),
+    headers: p.headers.map(headerDraft),
+    models: [],
+    apiKey: '',
+    clearKey: false,
+    keyEditing: false,
+    storedKey: false,
+    storedHeaders: [],
+  };
+}
+
+/** A blank new provider, for "Custom provider". */
+export function draftNew(): ProviderDraft {
+  return {
+    isNew: true,
+    idEdited: false,
+    id: '',
+    name: '',
+    chat_url: '',
+    models_url: '',
+    stream: true,
+    max_tokens: '',
+    headers: [],
+    models: [],
+    apiKey: '',
+    clearKey: false,
+    keyEditing: false,
+    storedKey: false,
+    storedHeaders: [],
+  };
+}
+
+/** The name as typed. While the id has not been typed by hand, a new provider's id follows the name. */
+export function withName(draft: ProviderDraft, name: string, takenIds: readonly string[]): ProviderDraft {
+  if (!draft.isNew || draft.idEdited) {
+    return { ...draft, name };
+  }
+  return { ...draft, name, id: slugify(name, takenIds) };
+}
+
+/** The id as typed, for a new provider. */
+export function withId(draft: ProviderDraft, id: string): ProviderDraft {
+  return { ...draft, id, idEdited: true };
+}
+
+/** What the save sends for the API key: a typed key wins; a requested removal sends ""; otherwise null (keep). */
+function apiKeyField(draft: ProviderDraft): string | null {
+  const typed = draft.apiKey.trim();
+  if (typed !== '') {
+    return typed;
+  }
+  return draft.clearKey ? '' : null;
+}
+
+/**
+ * The save request for a draft. Untouched secrets are not sent: api_key is null unless the key was typed or removed, and
+ * header_secrets only has the secret headers the user typed a value for or asked to clear. A secret header's entry in
+ * `provider.headers` always has value "". The models list is sent whole, since the backend replaces it.
+ */
+export function buildSaveInput(draft: ProviderDraft): SaveProviderInput {
+  const headers: HeaderEntry[] = draft.headers.map((h) => ({
+    name: h.name.trim(),
+    value: h.secret ? '' : h.value.trim(),
+    secret: h.secret,
+  }));
+  const header_secrets: Record<string, string> = {};
+  for (const h of draft.headers) {
+    if (!h.secret) {
+      continue;
+    }
+    const typed = h.value.trim();
+    if (typed !== '') {
+      header_secrets[h.name.trim()] = typed;
+    } else if (h.clearStored) {
+      header_secrets[h.name.trim()] = '';
+    }
+  }
+  const models: Model[] = draft.models.map((m) => ({
+    id: m.id.trim(),
+    context_limit: parsePositiveInt(m.context_limit),
+    provider_context: m.provider_context,
+    source: m.source,
+  }));
+  const modelsUrl = draft.models_url.trim();
+  return {
+    provider: {
+      id: draft.id.trim(),
+      name: draft.name.trim(),
+      chat_url: draft.chat_url.trim(),
+      models_url: modelsUrl === '' ? null : modelsUrl,
+      headers,
+      stream: draft.stream,
+      max_tokens: parsePositiveInt(draft.max_tokens),
+      models,
+    },
+    api_key: apiKeyField(draft),
+    header_secrets,
+  };
+}
+
+/** Whether the draft differs from what is saved. A new provider is always unsaved. */
+export function isDirty(draft: ProviderDraft, saved: ProviderDraft | null): boolean {
+  if (saved === null) {
+    return true;
+  }
+  return JSON.stringify(buildSaveInput(draft)) !== JSON.stringify(buildSaveInput(saved));
+}
+
+/** Why a URL cannot be saved, as the rest of the sentence after its label; null when it can. Mirrors Rust validate_url. */
+export function urlProblem(url: string, label: string): string | null {
+  const u = url.trim();
+  if (u === '') {
+    return `${label} is required.`;
+  }
+  if (CONTROL_RE.test(u) || WHITESPACE_RE.test(u)) {
+    return `${label} must not contain spaces or control characters.`;
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(u);
+  } catch {
+    return `${label} is not a valid URL.`;
+  }
+  if (parsed.protocol === 'http:') {
+    if (!LOCAL_HOSTS.includes(parsed.hostname)) {
+      return `${label} uses plain http. Only localhost, 127.0.0.1 and [::1] may.`;
+    }
+  } else if (parsed.protocol !== 'https:') {
+    return `${label} must use http or https.`;
+  }
+  if (parsed.username !== '' || parsed.password !== '') {
+    return `${label} must not contain a user name or password.`;
+  }
+  if (u.includes('#')) {
+    return `${label} must not contain a fragment.`;
+  }
+  if (parsed.hostname === '') {
+    return `${label} must have a host.`;
+  }
+  return null;
+}
+
+/** Whether a chat URL is plain http to a local address, which may run without a key. Mirrors Rust allows_empty_key. */
+export function isLocalHttp(url: string): boolean {
+  try {
+    const parsed = new URL(url.trim());
+    return parsed.protocol === 'http:' && LOCAL_HOSTS.includes(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
+/** The model-list URL the backend will use, or null when there is none. Mirrors Rust models_url_for. */
+export function modelsUrlFor(draft: Pick<ProviderDraft, 'models_url' | 'chat_url'>): string | null {
+  const explicit = draft.models_url.trim();
+  if (explicit !== '') {
+    return explicit;
+  }
+  const chat = draft.chat_url.trim();
+  return chat.endsWith(CHAT_SUFFIX) ? `${chat.slice(0, -CHAT_SUFFIX.length)}/models` : null;
+}
+
+/** The host of a chat URL, for the provider list. The URL itself when it does not parse. */
+export function chatHost(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return url;
+  }
+}
+
+/** Field problems for a draft. `takenIds` are the ids of the other providers. Mirrors the rules in Rust settings validate(). */
+export function validateDraft(draft: ProviderDraft, takenIds: readonly string[]): DraftProblems {
+  const problems: DraftProblems = { headers: {}, models: {} };
+
+  const id = draft.id.trim();
+  if (!ID_RE.test(id)) {
+    problems.id = ID_HELP;
+  } else if (takenIds.includes(id)) {
+    problems.id = `The id "${id}" is already used by another provider.`;
+  }
+
+  const name = draft.name.trim();
+  if (name === '') {
+    problems.name = 'Name is required.';
+  } else if ([...draft.name].length > MAX_NAME_CHARS) {
+    problems.name = `Name must be at most ${MAX_NAME_CHARS} characters.`;
+  } else if (CONTROL_RE.test(draft.name)) {
+    problems.name = 'Name must not contain control characters.';
+  }
+
+  const chatProblem = urlProblem(draft.chat_url, 'Chat URL');
+  if (chatProblem !== null) {
+    problems.chat_url = chatProblem;
+  }
+  if (draft.models_url.trim() !== '') {
+    const modelsProblem = urlProblem(draft.models_url, 'Model list URL');
+    if (modelsProblem !== null) {
+      problems.models_url = modelsProblem;
+    }
+  }
+
+  if (draft.max_tokens.trim() !== '' && parsePositiveInt(draft.max_tokens) === null) {
+    problems.max_tokens = 'Max output tokens must be a whole number of at least 1, or blank.';
+  }
+
+  const seenHeaders = new Set<string>();
+  for (const h of draft.headers) {
+    const name = h.name.trim();
+    const lower = name.toLowerCase();
+    if (name === '') {
+      problems.headers[h.key] = 'Header name is required.';
+    } else if (!TOKEN_RE.test(name)) {
+      problems.headers[h.key] = `"${name}" is not a valid HTTP header name.`;
+    } else if (seenHeaders.has(lower)) {
+      problems.headers[h.key] = `Header "${name}" is listed more than once.`;
+    } else if (lower === 'authorization' && !h.secret) {
+      problems.headers[h.key] = 'Authorization must be a secret header, so its value stays out of settings.json.';
+    } else if (CONTROL_RE.test(h.value)) {
+      problems.headers[h.key] = 'Header value must not contain control characters.';
+    } else if (!h.secret && [...h.value].length > MAX_HEADER_VALUE_CHARS) {
+      problems.headers[h.key] = `Header value must be at most ${MAX_HEADER_VALUE_CHARS} characters.`;
+    }
+    seenHeaders.add(lower);
+  }
+
+  const seenModels = new Set<string>();
+  for (const m of draft.models) {
+    const id = m.id.trim();
+    let message: string | undefined;
+    if (id === '') {
+      message = 'Model id is required.';
+    } else if ([...id].length > MAX_MODEL_ID_CHARS) {
+      message = `Model id must be at most ${MAX_MODEL_ID_CHARS} characters.`;
+    } else if (CONTROL_RE.test(id)) {
+      message = 'Model id must not contain control characters.';
+    } else if (seenModels.has(id)) {
+      message = `Model "${id}" is listed more than once.`;
+    } else if (m.context_limit.trim() !== '' && parsePositiveInt(m.context_limit) === null) {
+      message = 'Context limit must be a whole number of at least 1, or blank.';
+    }
+    seenModels.add(id);
+    if (message !== undefined) {
+      problems.models[m.id] = message;
+    }
+  }
+
+  return problems;
+}
+
+/** Whether validateDraft found anything. Save stays disabled while it did. */
+export function hasProblems(p: DraftProblems): boolean {
+  return (
+    p.id !== undefined ||
+    p.name !== undefined ||
+    p.chat_url !== undefined ||
+    p.models_url !== undefined ||
+    p.max_tokens !== undefined ||
+    Object.keys(p.headers).length > 0 ||
+    Object.keys(p.models).length > 0
+  );
+}
+
+/** The result of a model-list fetch, as one line. */
+export function fetchSummaryText(s: FetchSummary): string {
+  return `+${s.added} new, ${s.updated} updated, ${s.removed} removed. ${s.total} models in the list.`;
+}
+
+/** A stable string for a model reference, for select values. Provider ids cannot contain a quote or a comma, but JSON keeps it unambiguous anyway. */
+export function modelRefKey(ref: ModelRef): string {
+  return JSON.stringify([ref.provider_id, ref.model_id]);
+}
+
+/** Every model of every provider, in provider order, for the default-model select. */
+export function modelOptions(settings: Settings): ModelOption[] {
+  return settings.providers.flatMap((provider) =>
+    provider.models.map((model) => {
+      const ref: ModelRef = { provider_id: provider.id, model_id: model.id };
+      return { key: modelRefKey(ref), ref, label: `${provider.name} · ${model.id}` };
+    }),
+  );
+}

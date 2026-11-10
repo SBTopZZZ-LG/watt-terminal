@@ -25,6 +25,7 @@ import { FindBar } from './components/FindBar';
 import { PanelDivider } from './components/PanelDivider';
 import { AgentPanel, Workspace } from './components/AgentPanel';
 import { HistoryView } from './components/HistoryView';
+import { SettingsDialog } from './components/SettingsDialog';
 
 const CTRL_C = '\u0003';
 
@@ -66,6 +67,8 @@ export default function App() {
   // The find bar is mounted while open. Its token moves focus into it when Cmd+F is pressed again.
   const [findOpen, setFindOpen] = useState(false);
   const [findToken, setFindToken] = useState(0);
+  // The AI settings dialog (Cmd+, / Ctrl+, or the model chip).
+  const [settingsOpen, setSettingsOpen] = useState(false);
   // Which view the agent panel's body shows, the id of the live conversation, and how History is grouped.
   const [panelBody, setPanelBody] = useState<'chat' | 'history'>('chat');
   const [conversationId, setConversationId] = useState<string | null>(null);
@@ -96,6 +99,11 @@ export default function App() {
   const layoutRef = useRef(panel);
   useEffect(() => {
     layoutRef.current = panel;
+  });
+  // Read by the keydown listener, which is registered once: while the settings are open, it takes no shortcut but its own.
+  const settingsOpenRef = useRef(false);
+  useEffect(() => {
+    settingsOpenRef.current = settingsOpen;
   });
   // Read after the awaits of the startup restore, so it sees the transcript as it is then.
   const transcriptRef = useRef(transcript);
@@ -279,6 +287,15 @@ export default function App() {
   // stopped here so it never reaches the PTY.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      // While the AI settings are open they own the keyboard: only their own hotkey is taken here, so no shortcut reaches
+      // the terminal or moves focus out of the dialog.
+      if (settingsOpenRef.current) {
+        if (appHotkeyFor(e) === 'settings') {
+          e.preventDefault();
+          e.stopPropagation();
+        }
+        return;
+      }
       if (isFocusBarHotkey(e)) {
         e.preventDefault();
         e.stopPropagation();
@@ -320,6 +337,9 @@ export default function App() {
           return;
         case 'zoom-reset':
           zoomFont('reset');
+          return;
+        case 'settings':
+          setSettingsOpen(true);
           return;
       }
     };
@@ -484,6 +504,7 @@ export default function App() {
         autoApprove={autoApprove}
         onToggleAutoApprove={toggleAutoApprove}
         llm={llm}
+        onOpenSettings={() => setSettingsOpen(true)}
       />
       {/* The terminal is always the first child and the panel the last (see Workspace). The dock only changes the CSS. */}
       <Workspace
@@ -562,6 +583,7 @@ export default function App() {
           </AgentPanel>
         }
       />
+      {settingsOpen && <SettingsDialog onClose={() => setSettingsOpen(false)} onChanged={refreshStatus} />}
     </div>
   );
 }

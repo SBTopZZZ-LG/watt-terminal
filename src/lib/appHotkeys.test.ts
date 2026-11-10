@@ -53,6 +53,24 @@ describe('appHotkeyFor: mappings', () => {
   });
 });
 
+describe('appHotkeyFor: settings (comma)', () => {
+  it('maps Cmd+, and Ctrl+, to settings', () => {
+    expect(appHotkeyFor(ev(',', { meta: true }))).toBe('settings');
+    expect(appHotkeyFor(ev(',', { ctrl: true }))).toBe('settings');
+  });
+
+  it('does not map comma with Shift, Option, or both Cmd and Ctrl', () => {
+    expect(appHotkeyFor(ev(',', { meta: true, shift: true }))).toBeNull();
+    expect(appHotkeyFor(ev(',', { meta: true, alt: true }))).toBeNull();
+    expect(appHotkeyFor(ev(',', { meta: true, ctrl: true }))).toBeNull();
+    expect(appHotkeyFor(ev(',', { type: 'keyup', meta: true }))).toBeNull();
+  });
+
+  it('a bare comma is not a hotkey, so the terminal still gets it', () => {
+    expect(appHotkeyFor(ev(','))).toBeNull();
+  });
+});
+
 describe('appHotkeyFor: negatives', () => {
   it('ignores keys without Cmd', () => {
     for (const k of ['f', 'k', '=', '+', '-', '0']) {

@@ -1740,3 +1740,457 @@ input {
 .history-delete-all {
   margin-left: auto;
 }
+
+/* ---------- AI settings dialog ---------- */
+
+/* A modal over the whole window. Above the find bar (7). Clicking the backdrop closes the dialog (see SettingsDialog). */
+.settings-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: var(--shadow);
+}
+
+/* The card. Its body scrolls inside it, so the header and footer stay in view. */
+.settings-dialog {
+  display: flex;
+  flex-direction: column;
+  width: min(760px, 100vw - 32px);
+  max-height: calc(100vh - 32px);
+  min-height: 0;
+  border: 1px solid var(--rule-strong);
+  border-radius: 2px;
+  background: var(--panel);
+  box-shadow: 0 8px 24px var(--shadow);
+}
+
+.settings-dialog:focus {
+  outline: none;
+}
+
+.settings-head {
+  flex: 0 0 auto;
+  padding: 10px 14px;
+  border-bottom: 1px dashed var(--rule);
+}
+
+.settings-title {
+  margin: 0;
+  color: var(--ink-strong);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.settings-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0 14px 6px;
+}
+
+.settings-foot {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  justify-content: flex-end;
+  padding: 8px 14px;
+  border-top: 1px dashed var(--rule);
+}
+
+.settings-note {
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.settings-banner {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin: 10px 0 0;
+  padding: 8px 10px;
+  border: 1px dashed var(--fail);
+  border-radius: 2px;
+  color: var(--fail);
+  overflow-wrap: anywhere;
+}
+
+.settings-section {
+  padding: 12px 0 8px;
+  border-top: 1px dashed var(--rule);
+}
+
+.settings-section-title {
+  margin: 0 0 6px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.settings-section-block {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--rule);
+}
+
+.settings-inline {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  min-width: 0;
+  margin: 4px 0;
+}
+
+.settings-inline-label {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.settings-hint,
+.settings-dim {
+  color: var(--muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.settings-error {
+  display: block;
+  color: var(--fail);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.settings-error-block {
+  margin: 4px 0;
+}
+
+.settings-warn {
+  color: var(--warn);
+  font-size: 11px;
+}
+
+.settings-notice {
+  margin: 8px 0 4px;
+  color: var(--accent);
+  font-size: 11px;
+}
+
+.settings-label {
+  display: block;
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.settings-state {
+  padding: 12px 0;
+  color: var(--muted);
+}
+
+.settings-state-error {
+  color: var(--fail);
+  overflow-wrap: anywhere;
+}
+
+.settings-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.settings-field > label {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.settings-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 12px;
+  margin: 6px 0 4px;
+}
+
+.settings-field-wide {
+  grid-column: 1 / -1;
+}
+
+.settings-check {
+  display: flex;
+  flex-direction: row;
+  gap: 6px;
+  align-items: center;
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.settings-dialog input:not([type="checkbox"]),
+.settings-dialog select {
+  min-width: 0;
+  padding: 3px 6px;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  background: var(--bg);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.settings-dialog input[type="checkbox"] {
+  accent-color: var(--accent);
+}
+
+.settings-dialog input:focus,
+.settings-dialog select:focus {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.settings-dialog input[readonly] {
+  color: var(--muted);
+}
+
+.settings-dialog input[aria-invalid="true"] {
+  border-color: var(--fail);
+}
+
+.settings-dialog input:disabled,
+.settings-dialog select:disabled {
+  opacity: 0.55;
+}
+
+.settings-dialog button {
+  padding: 2px 8px;
+  border: 1px dashed var(--rule);
+  border-radius: 2px;
+  background: var(--bg);
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  cursor: pointer;
+}
+
+.settings-dialog button:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.settings-dialog button:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.settings-dialog button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.settings-dialog .settings-primary {
+  border-style: solid;
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.settings-dialog .settings-danger {
+  color: var(--fail);
+}
+
+.settings-dialog .settings-danger:hover:not(:disabled) {
+  border-color: var(--fail);
+  color: var(--fail);
+}
+
+.settings-tag {
+  padding: 0 5px;
+  border: 1px dashed var(--rule);
+  border-radius: 2px;
+  color: var(--ink);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.settings-tag-ok {
+  color: var(--ok);
+}
+
+.settings-tag-muted {
+  color: var(--muted);
+}
+
+.settings-tag-accent {
+  color: var(--accent);
+}
+
+.settings-providers,
+.settings-models {
+  margin: 4px 0;
+  padding: 0;
+  list-style: none;
+}
+
+.settings-provider {
+  border-bottom: 1px dashed var(--rule);
+}
+
+/* Scoped under .settings-dialog so they win over the dialog's button rules. */
+.settings-dialog .settings-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  align-items: center;
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 2px;
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+  letter-spacing: 0;
+  text-align: left;
+}
+
+.settings-dialog .settings-row:hover:not(:disabled),
+.settings-dialog .settings-row.is-open {
+  background: var(--tint);
+}
+
+.settings-dialog .settings-row.is-open {
+  color: var(--accent);
+}
+
+.settings-row-name {
+  color: var(--ink-strong);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.settings-editor,
+.settings-editor-slot {
+  margin: 6px 0 10px;
+}
+
+.settings-editor {
+  padding: 10px;
+  border: 1px dashed var(--rule-strong);
+  border-radius: 2px;
+  background: var(--bg);
+}
+
+.settings-editor-head {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+.settings-editor-title {
+  color: var(--ink-strong);
+  overflow-wrap: anywhere;
+}
+
+.settings-unsaved {
+  color: var(--warn);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.settings-headers {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.settings-headers th {
+  padding: 2px 4px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 400;
+  text-align: left;
+}
+
+.settings-headers td {
+  padding: 3px 4px;
+  vertical-align: top;
+}
+
+.settings-headers td > input[type="text"],
+.settings-headers td > input[type="password"],
+.settings-headers td > .settings-inline > input[type="password"] {
+  width: 100%;
+}
+
+.settings-headers td > .settings-inline {
+  margin: 0;
+  flex-wrap: nowrap;
+}
+
+.settings-headers td > .settings-inline > input[type="password"] {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.settings-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+.settings-model {
+  padding: 6px 0;
+  border-bottom: 1px dashed var(--rule);
+}
+
+.settings-model-id {
+  color: var(--ink-strong);
+  overflow-wrap: anywhere;
+}
+
+.settings-test {
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.settings-test-ok {
+  color: var(--ok);
+}
+
+.settings-test-fail {
+  color: var(--fail);
+}
+
+.settings-editor-foot {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--rule);
+}
+
+/* The model chip is a button, so it takes the same focus ring as the other chip buttons. */
+.chip-button:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
