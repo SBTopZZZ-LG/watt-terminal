@@ -1353,3 +1353,390 @@ input {
   opacity: 0.5;
   cursor: default;
 }
+
+/* ---------- conversation history (the panel body's History view) ---------- */
+
+/* The History button: an icon like the dock buttons, pressed while the view is shown. */
+.history-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  margin-right: 8px;
+  padding: 0;
+  border: 1px dashed transparent;
+  border-radius: 2px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.history-button svg {
+  display: block;
+}
+
+.history-button:hover {
+  border-color: var(--rule);
+  color: var(--accent);
+}
+
+.history-button[aria-pressed="true"] {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.history-button:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* The view fills the body's place. Like the chat body it is capped at 35vh when the panel is auto-sized, and fills it when sized. */
+.history-view {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  max-height: 35vh;
+  padding: 4px 12px 10px;
+  overflow: hidden;
+}
+
+.agent-panel.is-sized .history-view {
+  max-height: none;
+}
+
+.history-toolbar {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.history-filter {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  background: var(--panel);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.history-filter:focus {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+/* A segmented toggle: two buttons, the chosen one pressed and accented. */
+.history-toggle {
+  display: inline-flex;
+  flex: 0 0 auto;
+  border: 1px dashed var(--rule);
+  border-radius: 2px;
+}
+
+.history-toggle button {
+  padding: 2px 6px;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.history-toggle button + button {
+  border-left: 1px dashed var(--rule);
+}
+
+.history-toggle button[aria-pressed="true"] {
+  background: var(--tint);
+  color: var(--accent);
+}
+
+.history-toggle button:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.history-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+.history-state {
+  padding: 4px 0;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.history-state-error {
+  color: var(--fail);
+}
+
+.history-state-error button {
+  margin-left: 8px;
+  padding: 2px 8px;
+  border: 1px dashed var(--rule);
+  border-radius: 2px;
+  background: var(--bg);
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.history-state-error button:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.history-group + .history-group {
+  margin-top: 8px;
+}
+
+.history-group-head {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  width: 100%;
+  min-width: 0;
+  padding: 2px 0;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  text-align: left;
+  cursor: pointer;
+}
+
+.history-group-head:hover {
+  color: var(--accent);
+}
+
+.history-group-head:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.history-group-label {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-group-head .history-root {
+  flex: 0 1 auto;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.history-count {
+  flex: 0 0 auto;
+  margin-left: auto;
+  color: var(--muted);
+}
+
+/* The dim root path, and the workspace chip in date mode. Both truncate; neither can push the row wider. */
+.history-root,
+.history-chip {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-rows {
+  margin: 0;
+  padding: 0 0 0 10px;
+  list-style: none;
+  border-left: 1px dashed var(--rule);
+}
+
+.history-row {
+  position: relative;
+  display: flex;
+  gap: 6px;
+  align-items: flex-start;
+  min-width: 0;
+  padding: 3px 0;
+}
+
+/* The live conversation: an accent bar on the row's left edge, drawn inside the dashed rule. */
+.history-row.is-current::before {
+  content: "";
+  position: absolute;
+  top: 4px;
+  bottom: 4px;
+  left: -11px;
+  width: 2px;
+  background: var(--accent);
+}
+
+.history-open {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  padding: 2px 4px;
+  border: 1px solid transparent;
+  border-radius: 2px;
+  background: transparent;
+  color: var(--ink);
+  text-align: left;
+  cursor: pointer;
+}
+
+.history-open:hover:not(:disabled) {
+  border-color: var(--rule);
+  background: var(--tint);
+}
+
+.history-open:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.history-open:disabled {
+  color: var(--muted);
+  cursor: default;
+  opacity: 0.6;
+}
+
+.history-title {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The row's second line: chip or time, count, relative time, the current tag. Wraps before it can run wide. */
+.history-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 8px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.history-meta > * {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.history-meta .history-chip {
+  max-width: 100%;
+  padding: 0 4px;
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  color: var(--ink);
+}
+
+.history-current {
+  padding: 0 4px;
+  border: 1px solid var(--accent);
+  border-radius: 2px;
+  color: var(--accent);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.history-opening {
+  color: var(--accent);
+}
+
+.history-row-actions {
+  display: inline-flex;
+  flex: 0 0 auto;
+  gap: 4px;
+  align-items: center;
+  min-height: 22px;
+}
+
+.history-row-actions button,
+.history-footer button {
+  padding: 1px 6px;
+  border: 1px dashed var(--rule);
+  border-radius: 2px;
+  background: var(--bg);
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  cursor: pointer;
+}
+
+.history-row-actions .history-delete {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border-color: transparent;
+  background: transparent;
+}
+
+.history-delete svg {
+  display: block;
+}
+
+.history-row-actions button:hover,
+.history-footer button:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.history-row-actions button:focus-visible,
+.history-footer button:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.history-row-actions .history-danger,
+.history-footer .history-danger {
+  color: var(--fail);
+}
+
+.history-row-actions .history-danger:hover,
+.history-footer .history-danger:hover {
+  border-color: var(--fail);
+  color: var(--fail);
+}
+
+.history-confirm-text {
+  color: var(--ink);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.history-footer {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  padding-top: 6px;
+  border-top: 1px solid var(--line);
+}
+
+.history-delete-all {
+  margin-left: auto;
+}

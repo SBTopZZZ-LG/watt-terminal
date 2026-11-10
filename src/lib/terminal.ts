@@ -19,7 +19,7 @@ import { parseShellPayload } from './osc';
 import { createFitter } from './fitter';
 import type { GridMeasure } from './gridFit';
 import { clearActions } from './clear';
-import { defaultSizeStorage, FONT_SIZE_DEFAULT, loadFontSize, saveFontSize, stepFontSize } from './zoom';
+import { clampFontSize, defaultSizeStorage, FONT_SIZE_DEFAULT, loadFontSize, saveFontSize, stepFontSize } from './zoom';
 import type { InputState } from './types';
 
 /**
@@ -244,19 +244,51 @@ export function gridInfo(): GridInfo | null {
   };
 }
 
+/** The font size xterm is drawing with now. */
+export function currentFontSize(): number {
+  return term.options.fontSize ?? FONT_SIZE_DEFAULT;
+}
+
+const fontListeners = new Set<(size: number) => void>();
+
+/** Calls `listener` with the new size after each change made in the UI (zoom keys). Returns the unsubscribe. */
+export function onFontSizeChange(listener: (size: number) => void): () => void {
+  fontListeners.add(listener);
+  return () => {
+    fontListeners.delete(listener);
+  };
+}
+
 /**
- * Changes the font size by one step, or back to the default, and saves it. The fit runs on the next frame, after xterm
- * has applied the new metrics, so the PTY gets the new cols and rows. Steps past the clamp do nothing.
+ * Sets the font size and saves it to localStorage. The fit runs on the next frame, after xterm has applied the new metrics,
+ * so the PTY gets the new cols and rows. `notify` is false when the size came from the UI state file: there is nothing to
+ * write back.
  */
-export function zoomFont(action: 'in' | 'out' | 'reset'): void {
-  const current = term.options.fontSize ?? FONT_SIZE_DEFAULT;
-  const next = action === 'reset' ? FONT_SIZE_DEFAULT : stepFontSize(current, action === 'in' ? 1 : -1);
-  if (next === current) {
+export function setFontSize(size: number, notify: boolean): void {
+  const next = clampFontSize(size);
+  if (next === currentFontSize()) {
     return;
   }
   term.options.fontSize = next;
   saveFontSize(next, defaultSizeStorage());
   requestAnimationFrame(() => void fitToContainer());
+  if (notify) {
+    for (const listener of [...fontListeners]) {
+      listener(next);
+    }
+  }
+}
+
+/**
+ * Changes the font size by one step, or back to the default, and saves it. Steps past the clamp do nothing.
+ */
+export function zoomFont(action: 'in' | 'out' | 'reset'): void {
+  const current = currentFontSize();
+  const next = action === 'reset' ? FONT_SIZE_DEFAULT : stepFontSize(current, action === 'in' ? 1 : -1);
+  if (next === current) {
+    return;
+  }
+  setFontSize(next, true);
 }
 
 /**

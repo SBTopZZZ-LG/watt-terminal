@@ -45,9 +45,13 @@ export const DIVIDER_PX = 6;
 export const KEY_STEP = 16;
 export const KEY_STEP_LARGE = 64;
 
-/** A stored size outside this range is dropped on load (null). */
-export const STORED_SIZE_MIN = 1;
-export const STORED_SIZE_MAX = 10000;
+/**
+ * A stored size must be above STORED_SIZE_MIN and at most STORED_SIZE_MAX, or it is dropped on load (null). The range mirrors
+ * the Rust side, MAX_PANEL_SIZE in src-tauri/src/core/persist/ui_state.rs (`n > 0.0 && n <= MAX_PANEL_SIZE`), so a size the
+ * UI state file holds is never dropped here. The minimum is exclusive.
+ */
+export const STORED_SIZE_MIN = 0;
+export const STORED_SIZE_MAX = 20000;
 
 export const DEFAULT_SIZES: Sizes = { left: 380, right: 380, top: null, bottom: null };
 
@@ -140,10 +144,46 @@ export function keyboardSize(
   return null;
 }
 
+function isStoredSize(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value > STORED_SIZE_MIN && value <= STORED_SIZE_MAX;
+}
+
 function storedSize(value: unknown): number | null {
-  return typeof value === 'number' && Number.isFinite(value) && value >= STORED_SIZE_MIN && value <= STORED_SIZE_MAX
-    ? value
-    : null;
+  return isStoredSize(value) ? value : null;
+}
+
+/**
+ * A layout from untrusted data (the UI state file, a remote value). Every field must be valid, or the result is null:
+ * a dock that is not one of the four, a non-boolean open, a sizes object without all four docks, or a size that is not
+ * null and not a finite number in range. Unlike parsePanelLayout, nothing is defaulted field by field here.
+ */
+export function layoutFromUnknown(value: unknown): PanelLayout | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  if (!isDock(record.dock) || typeof record.open !== 'boolean') {
+    return null;
+  }
+  const rawSizes = record.sizes;
+  if (typeof rawSizes !== 'object' || rawSizes === null || Array.isArray(rawSizes)) {
+    return null;
+  }
+  const sizesRecord = rawSizes as Record<string, unknown>;
+  const sizes = { ...DEFAULT_SIZES };
+  for (const dock of DOCKS) {
+    const size = sizesRecord[dock];
+    if (size !== null && !isStoredSize(size)) {
+      return null;
+    }
+    sizes[dock] = size;
+  }
+  return { dock: record.dock, sizes, open: record.open };
+}
+
+/** Whether two layouts draw the same. */
+export function sameLayout(a: PanelLayout, b: PanelLayout): boolean {
+  return a.dock === b.dock && a.open === b.open && DOCKS.every((dock) => a.sizes[dock] === b.sizes[dock]);
 }
 
 /**
@@ -208,11 +248,15 @@ export type PanelAction =
   | { type: 'size'; dock: Dock; size: number }
   | { type: 'reset_size'; dock: Dock }
   | { type: 'open'; open: boolean }
-  | { type: 'toggle' };
+  | { type: 'toggle' }
+  /** Takes a whole layout, e.g. the one saved in the UI state file. An invalid layout is ignored. */
+  | { type: 'replace'; layout: PanelLayout };
 
 /** The layout after one action. The size is taken as given: the caller clamps it to the workspace. */
 export function panelReducer(state: PanelLayout, action: PanelAction): PanelLayout {
   switch (action.type) {
+    case 'replace':
+      return layoutFromUnknown(action.layout) ?? state;
     case 'dock':
       return action.dock === state.dock ? state : { ...state, dock: action.dock };
     case 'size':

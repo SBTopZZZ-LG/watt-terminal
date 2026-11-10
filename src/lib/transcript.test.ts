@@ -311,3 +311,54 @@ describe('approvalTitle', () => {
     expect(approvalTitle('')).toBe('The agent wants to use ');
   });
 });
+
+describe('transcriptReducer: conversation_loaded', () => {
+  const loaded = (...items: Array<{ kind: 'user'; clientId: number; text: string } | { kind: 'agent'; text: string; streaming: boolean }>) =>
+    ({ type: 'conversation_loaded', items }) as TranscriptAction;
+
+  it('replaces the items, with ids from nextId, and clears busy and thinking', () => {
+    const before = run([
+      { type: 'user_sent', clientId: 1, text: 'live' },
+      { type: 'agent_event', event: { type: 'thinking', active: true } },
+    ]);
+    const after = transcriptReducer(
+      before,
+      loaded({ kind: 'user', clientId: 0, text: 'old question' }, { kind: 'agent', text: 'old answer', streaming: false }),
+    );
+    expect(after.items.map((i) => i.kind)).toEqual(['user', 'agent']);
+    expect(after.items[0]).toMatchObject({ text: 'old question' });
+    expect(after.items[0].id).toBe(before.nextId);
+    expect(after.items[1].id).toBe(before.nextId + 1);
+    expect(after.nextId).toBe(before.nextId + 2);
+    expect(after.inFlight).toBe(0);
+    expect(after.thinking).toBe(false);
+    expect(isBusy(after)).toBe(false);
+  });
+
+  it('no loaded item is streaming, even if the input says so', () => {
+    const after = transcriptReducer(EMPTY_TRANSCRIPT, loaded({ kind: 'agent', text: 'half', streaming: true }));
+    expect(after.items[0]).toMatchObject({ kind: 'agent', text: 'half', streaming: false });
+  });
+
+  it('keeps the newest MAX_ITEMS, and ids keep increasing past the cap', () => {
+    const many = Array.from({ length: MAX_ITEMS + 10 }, (_, i) => ({ kind: 'user' as const, clientId: 0, text: `u${i}` }));
+    const after = transcriptReducer(EMPTY_TRANSCRIPT, loaded(...many));
+    expect(after.items).toHaveLength(MAX_ITEMS);
+    expect(after.items[0]).toMatchObject({ text: 'u10' });
+    expect(after.items[MAX_ITEMS - 1]).toMatchObject({ text: `u${MAX_ITEMS + 9}` });
+    const ids = after.items.map((i) => i.id);
+    expect(ids).toEqual([...ids].sort((a, b) => a - b));
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(after.nextId).toBe(EMPTY_TRANSCRIPT.nextId + MAX_ITEMS + 10);
+  });
+
+  it('an empty conversation empties the transcript', () => {
+    const after = transcriptReducer(run([{ type: 'notice', text: 'x' }]), loaded());
+    expect(after.items).toEqual([]);
+  });
+
+  it('a notice after a load gets a fresh id', () => {
+    const after = run([loaded({ kind: 'user', clientId: 0, text: 'a' }), { type: 'notice', text: 'n' }]);
+    expect(after.items[1].id).toBeGreaterThan(after.items[0].id);
+  });
+});

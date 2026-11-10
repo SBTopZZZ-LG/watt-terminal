@@ -4,7 +4,7 @@ import './App.css';
 import { api, errorText } from './lib/api';
 import { connect, reportError, restart, subscribe } from './lib/session';
 import type { Incoming } from './lib/session';
-import { clearTerminal, fitToContainer, markConnected, marks, receiveBytes, resetForNewSession, term, terminalSize, zoomFont } from './lib/terminal';
+import { clearTerminal, currentFontSize, fitToContainer, markConnected, marks, onFontSizeChange, receiveBytes, resetForNewSession, setFontSize, term, terminalSize, zoomFont } from './lib/terminal';
 import { appHotkeyFor } from './lib/appHotkeys';
 import { effectiveState, focusAfter, inputReducer, INITIAL_INPUT, isFocusBarHotkey, routeFor } from './lib/inputState';
 import type { BarMode } from './lib/inputState';
@@ -14,7 +14,9 @@ import { EMPTY_TRANSCRIPT, firstPendingApproval, isBusy, transcriptReducer } fro
 import { isSideDock, loadPanelLayout, panelReducer, panelView, savePanelLayout } from './lib/panelLayout';
 import type { Container } from './lib/panelLayout';
 import { defaultSizeStorage } from './lib/zoom';
-import type { Cwd, InputState, IntegrationStatus, LlmStatus, ObserverStatus, Status, WireEvent } from './lib/types';
+import { itemsFromMessages } from './lib/historyView';
+import { createPatchSaver, fontPatch, panelPatch, reconcileFont, reconcileGroupBy, reconcilePanel, shouldRestoreLast } from './lib/uiState';
+import type { Cwd, HistoryGroupBy, InputState, IntegrationStatus, LlmStatus, LoadedConversation, ObserverStatus, Status, UiState, UiStatePatch, WireEvent } from './lib/types';
 import { TerminalView } from './components/TerminalView';
 import { InputBar } from './components/InputBar';
 import { Transcript } from './components/Transcript';
@@ -22,8 +24,14 @@ import { StatusChip } from './components/StatusChip';
 import { FindBar } from './components/FindBar';
 import { PanelDivider } from './components/PanelDivider';
 import { AgentPanel, Workspace } from './components/AgentPanel';
+import { HistoryView } from './components/HistoryView';
 
 const CTRL_C = '\u0003';
+
+/** Writes UI state changes to the file, a short while after the last one (see uiState.ts). Failures are ignored: the state still lives in localStorage. */
+const uiSaver = createPatchSaver((patch: UiStatePatch) => {
+  api.patchUiState(patch).catch(() => undefined);
+});
 
 export default function App() {
   const [input, dispatchInput] = useReducer(inputReducer, INITIAL_INPUT);
@@ -58,6 +66,21 @@ export default function App() {
   // The find bar is mounted while open. Its token moves focus into it when Cmd+F is pressed again.
   const [findOpen, setFindOpen] = useState(false);
   const [findToken, setFindToken] = useState(0);
+  // Which view the agent panel's body shows, the id of the live conversation, and how History is grouped.
+  const [panelBody, setPanelBody] = useState<'chat' | 'history'>('chat');
+  const [conversationId, setConversationId] = useState<string | null>(null);
+  const [historyGroupBy, setHistoryGroupBy] = useState<HistoryGroupBy>('date');
+  // The UI state file, read at startup. Nothing is written to it until that read has been reconciled (see uiReady).
+  const uiLoaded = useRef<Promise<UiState | null> | null>(null);
+  const uiReady = useRef(false);
+  const restoring = useRef(false);
+
+  /** Saves a UI state change to the file, once the file has been reconciled. Before that, the change is only in localStorage. */
+  const persist = (patch: UiStatePatch) => {
+    if (uiReady.current) {
+      uiSaver.queue(patch);
+    }
+  };
 
   // Read by long-lived listeners (keystrokes, hotkey), so they always see the current route.
   const routeRef = useRef(route);
@@ -74,6 +97,11 @@ export default function App() {
   useEffect(() => {
     layoutRef.current = panel;
   });
+  // Read after the awaits of the startup restore, so it sees the transcript as it is then.
+  const transcriptRef = useRef(transcript);
+  useEffect(() => {
+    transcriptRef.current = transcript;
+  });
   const clientIds = useRef(0);
   const prevEffective = useRef<InputState>(effective);
 
@@ -85,14 +113,88 @@ export default function App() {
     setAutoApprove(s.auto_approve);
     setLlm(s.llm);
     setAgentControl((c) => ({ ...c, call: s.agent_control }));
+    setConversationId(s.conversation_id);
     dispatchTranscript({ type: 'sync_busy', busy: s.agent_busy });
     if (s.observer === 'desynced') {
       marks.observerDesynced();
     }
   }, []);
 
+  /** Takes the status snapshot again, e.g. after the live conversation changed. */
+  const refreshStatus = () => {
+    api.getStatus().then(applyStatus).catch(reportError);
+  };
+
+  // The UI state file: read once, reconciled with the localStorage values, and kept in step after that. The file wins when it
+  // has a valid value; a missing value is filled in from localStorage (see uiState.ts). With no file (no store), nothing changes.
+  useEffect(() => {
+    const load = api.getUiState().catch(() => null);
+    uiLoaded.current = load;
+    void load.then((remote) => {
+      if (remote === null) {
+        return;
+      }
+      uiReady.current = true;
+      const panelSync = reconcilePanel(layoutRef.current, remote.panel);
+      if (panelSync.apply !== null) {
+        dispatchPanel({ type: 'replace', layout: panelSync.apply });
+      }
+      if (panelSync.migrate !== null) {
+        persist(panelPatch(panelSync.migrate));
+      }
+      const fontSync = reconcileFont(currentFontSize(), remote.font_size);
+      if (fontSync.apply !== null) {
+        setFontSize(fontSync.apply, false);
+      }
+      if (fontSync.migrate !== null) {
+        persist(fontPatch(fontSync.migrate));
+      }
+      const group = reconcileGroupBy(remote.history_group_by);
+      if (group !== null) {
+        setHistoryGroupBy(group);
+      }
+    });
+    const unsubscribeFont = onFontSizeChange((size) => persist(fontPatch(size)));
+    const flushOnHide = () => uiSaver.flush();
+    window.addEventListener('pagehide', flushOnHide);
+    return () => {
+      unsubscribeFont();
+      window.removeEventListener('pagehide', flushOnHide);
+    };
+  }, []);
+
   // Connect, then load the snapshot. The snapshot covers events that arrived before this listener was up.
   useEffect(() => {
+    /**
+     * Reopens the last conversation when the transcript is empty and no turn is running (so a send cannot race it). A failure
+     * (not found, unreadable) forgets the last conversation, quietly. Nothing is shown.
+     */
+    const restoreLast = async (status: Status) => {
+      if (restoring.current) {
+        return;
+      }
+      restoring.current = true;
+      const remote = await (uiLoaded.current ?? Promise.resolve(null));
+      const lastId = remote?.last_conversation_id ?? null;
+      const current = transcriptRef.current;
+      if (lastId === null || !shouldRestoreLast({ lastId, itemCount: current.items.length, transcriptBusy: isBusy(current), statusBusy: status.agent_busy })) {
+        return;
+      }
+      try {
+        const loaded = await api.loadConversation(lastId);
+        if (transcriptRef.current.items.length > 0) {
+          // The user sent a message while the load was running. The transcript is theirs now.
+          return;
+        }
+        dispatchTranscript({ type: 'conversation_loaded', items: itemsFromMessages(loaded.messages) });
+        setConversationId(loaded.id);
+      } catch {
+        if (transcriptRef.current.items.length === 0) {
+          api.patchUiState({ last_conversation_id: null }).catch(() => undefined);
+        }
+      }
+    };
+
     const handleEvent = (ev: WireEvent) => {
       setAgentControl((c) => agentControlAfter(c, ev));
       switch (ev.type) {
@@ -136,7 +238,10 @@ export default function App() {
         markConnected();
         return api.getStatus();
       })
-      .then(applyStatus)
+      .then((status) => {
+        applyStatus(status);
+        void restoreLast(status);
+      })
       .then(() => fitToContainer())
       .catch(reportError);
     return unsubscribe;
@@ -154,9 +259,11 @@ export default function App() {
     }
   }, [effective]);
 
-  // Saved on every change. A drag saves on each move; the write is a few hundred bytes.
+  // Saved on every change. A drag saves on each move; the write is a few hundred bytes. The UI state file gets the same
+  // change, debounced (see uiSaver).
   useEffect(() => {
     savePanelLayout(panel, defaultSizeStorage());
+    persist(panelPatch(panel));
   }, [panel]);
 
   // Refits the terminal once a dock change, a rail change or a drag's end is on screen. The fit reads the settled size
@@ -254,9 +361,46 @@ export default function App() {
   // error the reason is shown in the transcript, and the conversation stays as it was.
   const newConversation = () => {
     api.newConversation().then(
-      () => dispatchTranscript({ type: 'conversation_reset' }),
+      () => {
+        dispatchTranscript({ type: 'conversation_reset' });
+        // The new conversation has a new id, which the history view marks as current.
+        refreshStatus();
+      },
       (e) => dispatchTranscript({ type: 'notice', text: errorText(e) }),
     );
+  };
+
+  /** A saved conversation was opened from the History view: it becomes the live transcript, and the chat is shown. */
+  const openConversation = (loaded: LoadedConversation) => {
+    dispatchTranscript({ type: 'conversation_loaded', items: itemsFromMessages(loaded.messages) });
+    setConversationId(loaded.id);
+    setPanelBody('chat');
+    refreshStatus();
+  };
+
+  /** Moves focus to the History header button, so it is not lost when the view closes. */
+  const focusHistoryButton = () => document.getElementById('history-button')?.focus();
+
+  /** The History button. It opens the panel first if it is collapsed, so the view is visible. Closing returns focus to it. */
+  const toggleHistory = () => {
+    if (!panel.open) {
+      dispatchPanel({ type: 'open', open: true });
+    }
+    if (panelBody === 'history') {
+      focusHistoryButton();
+    }
+    setPanelBody((b) => (b === 'history' ? 'chat' : 'history'));
+  };
+
+  /** Esc in the History view closes it, and focus goes back to the button. Opening a row does not come through here. */
+  const closeHistory = () => {
+    focusHistoryButton();
+    setPanelBody('chat');
+  };
+
+  const setGroupBy = (groupBy: HistoryGroupBy) => {
+    setHistoryGroupBy(groupBy);
+    persist({ history_group_by: groupBy });
   };
 
   const answer = (callId: string, approve: boolean) => {
@@ -385,6 +529,20 @@ export default function App() {
               onNewConversation={newConversation}
               dock={panel.dock}
               onDock={(dock) => dispatchPanel({ type: 'dock', dock })}
+              view={panelBody}
+              onToggleHistory={toggleHistory}
+              history={
+                panelBody === 'history' ? (
+                  <HistoryView
+                    currentId={conversationId}
+                    busy={busy}
+                    groupBy={historyGroupBy}
+                    onGroupBy={setGroupBy}
+                    onOpened={openConversation}
+                    onClose={closeHistory}
+                  />
+                ) : null
+              }
             />
             <InputBar
               mode={barMode}

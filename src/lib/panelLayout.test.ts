@@ -9,6 +9,7 @@ import {
   clampSize,
   defaultLayout,
   keyboardSize,
+  layoutFromUnknown,
   loadPanelLayout,
   panelBounds,
   panelReducer,
@@ -16,6 +17,7 @@ import {
   parsePanelLayout,
   resolvePanelSize,
   nextSizeFromDrag,
+  sameLayout,
   savePanelLayout,
 } from './panelLayout';
 import type { Container, Dock, PanelLayout } from './panelLayout';
@@ -275,6 +277,14 @@ describe('parsePanelLayout', () => {
     expect(edge.sizes.left).toBe(STORED_SIZE_MAX);
   });
 
+  it('keeps every size the Rust side holds: above 0 and at most 20000', () => {
+    expect(STORED_SIZE_MAX).toBe(20000);
+    const kept = parsePanelLayout(JSON.stringify({ sizes: { left: 15000, right: 20000, top: 0.5, bottom: 1 } }));
+    expect(kept.sizes).toEqual({ left: 15000, right: 20000, top: 0.5, bottom: 1 });
+    const dropped = parsePanelLayout(JSON.stringify({ sizes: { left: 20001, right: 0, top: 20000.5 } }));
+    expect(dropped.sizes).toEqual({ left: null, right: null, top: null, bottom: null });
+  });
+
   it('gives null for a sizes value that is not an object', () => {
     expect(parsePanelLayout(JSON.stringify({ dock: 'left', sizes: 380 }))).toEqual({
       dock: 'left',
@@ -449,5 +459,80 @@ describe('panelView', () => {
   it('clamps the drawn size to the workspace', () => {
     const view = panelView({ ...defaultLayout(), dock: 'left', sizes: { ...DEFAULT_SIZES, left: 900 } }, { width: 800, height: 600 });
     expect(view.style).toEqual({ width: 800 - 326 });
+  });
+});
+
+describe('panelReducer: replace', () => {
+  const start = defaultLayout();
+  const remote: PanelLayout = { dock: 'left', sizes: { left: 300, right: 420, top: null, bottom: 200 }, open: false };
+
+  it('takes a valid layout whole', () => {
+    expect(panelReducer(start, { type: 'replace', layout: remote })).toEqual(remote);
+  });
+
+  it('a layout with a bad dock is ignored', () => {
+    const bad = { ...remote, dock: 'middle' } as unknown as PanelLayout;
+    expect(panelReducer(start, { type: 'replace', layout: bad })).toBe(start);
+  });
+
+  it('a layout with a size out of range is ignored, whole', () => {
+    const bad = { ...remote, sizes: { ...remote.sizes, left: 0 } };
+    expect(panelReducer(start, { type: 'replace', layout: bad })).toBe(start);
+  });
+
+  it('a layout whose open is not a boolean is ignored', () => {
+    const bad = { ...remote, open: 'yes' } as unknown as PanelLayout;
+    expect(panelReducer(start, { type: 'replace', layout: bad })).toBe(start);
+  });
+});
+
+describe('layoutFromUnknown', () => {
+  const valid = { dock: 'top', sizes: { left: null, right: 380, top: 240, bottom: null }, open: true };
+
+  it('accepts a valid layout and returns a copy', () => {
+    const got = layoutFromUnknown(valid);
+    expect(got).toEqual(valid);
+    expect(got?.sizes).not.toBe(valid.sizes);
+  });
+
+  it('rejects anything that is not an object', () => {
+    for (const value of [null, undefined, 'bottom', 3, [], true]) {
+      expect(layoutFromUnknown(value)).toBeNull();
+    }
+  });
+
+  it('rejects a missing or unknown dock, and a non-boolean open', () => {
+    expect(layoutFromUnknown({ ...valid, dock: undefined })).toBeNull();
+    expect(layoutFromUnknown({ ...valid, dock: 'Top' })).toBeNull();
+    expect(layoutFromUnknown({ ...valid, open: 1 })).toBeNull();
+  });
+
+  it('rejects sizes that are missing a dock, not an object, or not finite and in range', () => {
+    expect(layoutFromUnknown({ ...valid, sizes: null })).toBeNull();
+    expect(layoutFromUnknown({ ...valid, sizes: { left: 1, right: 1, top: 1 } })).toBeNull();
+    expect(layoutFromUnknown({ ...valid, sizes: { ...valid.sizes, right: Number.NaN } })).toBeNull();
+    expect(layoutFromUnknown({ ...valid, sizes: { ...valid.sizes, right: '380' } })).toBeNull();
+    expect(layoutFromUnknown({ ...valid, sizes: { ...valid.sizes, right: STORED_SIZE_MAX + 1 } })).toBeNull();
+    expect(layoutFromUnknown({ ...valid, sizes: { ...valid.sizes, right: 0 } })).toBeNull();
+    expect(layoutFromUnknown({ ...valid, sizes: { ...valid.sizes, right: -1 } })).toBeNull();
+  });
+
+  it('accepts sizes in the Rust range: 15000 and 20000 are in, 20001 and 0 are out, 0.5 is in', () => {
+    const sized = (right: number) => layoutFromUnknown({ ...valid, sizes: { ...valid.sizes, right } });
+    expect(sized(15000)?.sizes.right).toBe(15000);
+    expect(sized(20000)?.sizes.right).toBe(20000);
+    expect(sized(0.5)?.sizes.right).toBe(0.5);
+    expect(sized(20001)).toBeNull();
+    expect(sized(0)).toBeNull();
+  });
+});
+
+describe('sameLayout', () => {
+  it('compares dock, open, and every size', () => {
+    const a = defaultLayout();
+    expect(sameLayout(a, { ...a, sizes: { ...a.sizes } })).toBe(true);
+    expect(sameLayout(a, { ...a, dock: 'left' })).toBe(false);
+    expect(sameLayout(a, { ...a, open: false })).toBe(false);
+    expect(sameLayout(a, { ...a, sizes: { ...a.sizes, top: 200 } })).toBe(false);
   });
 });

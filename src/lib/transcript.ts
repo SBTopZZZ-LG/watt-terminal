@@ -15,6 +15,9 @@ export type TranscriptItem =
   | { id: number; kind: 'approval'; callId: string; name: string; text: string; state: ApprovalState; approve: boolean | null }
   | { id: number; kind: 'notice'; text: string };
 
+/** A transcript item before the reducer gives it an id. `Omit` over the union would lose the variants, so it is distributed. */
+export type NewItem = TranscriptItem extends infer T ? (T extends unknown ? Omit<T, 'id'> : never) : never;
+
 export interface Transcript {
   items: TranscriptItem[];
   /** Agent turns sent but not yet finished. Each accepted message ends with exactly one `done`. */
@@ -43,7 +46,12 @@ export type TranscriptAction =
   /** A new shell replaced the old one. Pending approvals and running tools can never finish, so they are closed. */
   | { type: 'session_reset' }
   /** The agent's conversation was cleared on the Rust side. Only sent after a successful reset, never while busy. */
-  | { type: 'conversation_reset' };
+  | { type: 'conversation_reset' }
+  /**
+   * A saved conversation was opened as the live one. Replaces the items. Ids come from nextId; the newest MAX_ITEMS are kept.
+   * Never sent while busy (the backend refuses to load then).
+   */
+  | { type: 'conversation_loaded'; items: NewItem[] };
 
 export function transcriptReducer(t: Transcript, action: TranscriptAction): Transcript {
   switch (action.type) {
@@ -100,7 +108,18 @@ export function transcriptReducer(t: Transcript, action: TranscriptAction): Tran
     case 'conversation_reset':
       // Keeps nextId, so ids stay unique for the React keys of the items that come after.
       return { ...t, items: [], inFlight: 0, thinking: false };
+    case 'conversation_loaded': {
+      // Every id is used up, even for the items the cap drops, so ids keep increasing.
+      const made = action.items.map((item, i) => keyed(item, t.nextId + i));
+      const items = made.length > MAX_ITEMS ? made.slice(made.length - MAX_ITEMS) : made;
+      return { ...t, items, nextId: t.nextId + action.items.length, inFlight: 0, thinking: false };
+    }
   }
+}
+
+/** A new item with its id. A loaded message is never still streaming. */
+function keyed(item: NewItem, id: number): TranscriptItem {
+  return (item.kind === 'agent' ? { ...item, id, streaming: false } : { ...item, id }) as TranscriptItem;
 }
 
 function applyAgentEvent(t: Transcript, ev: AgentEvent): Transcript {

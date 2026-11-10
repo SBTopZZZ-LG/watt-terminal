@@ -1,0 +1,315 @@
+import { describe, expect, it } from 'vitest';
+import {
+  DENIED_PREFIX,
+  filterMetas,
+  formatWhen,
+  groupByDate,
+  groupByWorkspace,
+  itemsFromMessages,
+  NO_RESULT_TEXT,
+  relativeTime,
+} from './historyView';
+import type { ChatMessage, ConversationMeta, Workspace } from './types';
+
+/** Local time, so these tests pass in any time zone. Months are 0-based, as in Date. */
+const local = (y: number, mo: number, d: number, h = 0, mi = 0) => Math.floor(new Date(y, mo, d, h, mi, 0).getTime() / 1000);
+
+const ROOT_A: Workspace = { host: 'mac', root: '/Users/me/alpha', label: 'alpha' };
+const ROOT_B: Workspace = { host: 'mac', root: '/Users/me/beta', label: 'beta' };
+const UNKNOWN: Workspace = { host: '', root: '', label: 'Unknown' };
+
+function meta(id: string, updated: number, workspace: Workspace = ROOT_A, title = `title ${id}`, messages = 2): ConversationMeta {
+  return { id, title, created_at: updated, updated_at: updated, message_count: messages, workspace, model: null };
+}
+
+describe('itemsFromMessages', () => {
+  it('turns user text and assistant text into user and agent items, in order', () => {
+    const items = itemsFromMessages([
+      { role: 'user', content: 'what is in /tmp' },
+      { role: 'assistant', content: 'Let me look.' },
+    ]);
+    expect(items).toEqual([
+      { kind: 'user', clientId: 0, text: 'what is in /tmp' },
+      { kind: 'agent', text: 'Let me look.', streaming: false },
+    ]);
+  });
+
+  it('joins a tool call with its tool message and parses the arguments', () => {
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'ls' },
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{ id: 'c1', type: 'function', function: { name: 'run_command', arguments: '{"command":"ls"}' } }],
+      },
+      { role: 'tool', tool_call_id: 'c1', content: 'a.txt\nb.txt' },
+    ];
+    const items = itemsFromMessages(messages);
+    expect(items).toHaveLength(2);
+    expect(items[1]).toEqual({
+      kind: 'tool',
+      callId: 'c1',
+      name: 'run_command',
+      args: { command: 'ls' },
+      status: 'ok',
+      result: 'a.txt\nb.txt',
+      decision: null,
+    });
+  });
+
+  it('an assistant message with text and calls gives the agent item first, then the tool items', () => {
+    const items = itemsFromMessages([
+      {
+        role: 'assistant',
+        content: 'Checking.',
+        tool_calls: [
+          { id: 'c1', type: 'function', function: { name: 'get_cwd', arguments: '{}' } },
+          { id: 'c2', type: 'function', function: { name: 'get_screen', arguments: '{}' } },
+        ],
+      },
+      { role: 'tool', tool_call_id: 'c1', content: '/tmp' },
+      { role: 'tool', tool_call_id: 'c2', content: 'screen' },
+    ]);
+    expect(items.map((i) => i.kind)).toEqual(['agent', 'tool', 'tool']);
+    expect(items[1]).toMatchObject({ callId: 'c1', status: 'ok' });
+    expect(items[2]).toMatchObject({ callId: 'c2', status: 'ok' });
+  });
+
+  it('a tool call with no tool message is failed, with the fallback result text', () => {
+    const items = itemsFromMessages([
+      { role: 'assistant', content: null, tool_calls: [{ id: 'c9', type: 'function', function: { name: 'run_command', arguments: '{}' } }] },
+    ]);
+    expect(items).toEqual([
+      { kind: 'tool', callId: 'c9', name: 'run_command', args: {}, status: 'failed', result: NO_RESULT_TEXT, decision: null },
+    ]);
+  });
+
+  it('arguments that are not valid JSON are kept as the raw string', () => {
+    const items = itemsFromMessages([
+      { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'run_command', arguments: '{oops' } }] },
+      { role: 'tool', tool_call_id: 'c1', content: 'ok' },
+    ]);
+    expect(items[0]).toMatchObject({ kind: 'tool', args: '{oops', status: 'ok' });
+  });
+
+  it('a result starting with "error:" or the DENIED prefix is failed', () => {
+    expect(DENIED_PREFIX).toBe('not_approved');
+    const items = itemsFromMessages([
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [
+          { id: 'e', type: 'function', function: { name: 'run_command', arguments: '{}' } },
+          { id: 'd', type: 'function', function: { name: 'run_command', arguments: '{}' } },
+          { id: 'p', type: 'function', function: { name: 'get_cwd', arguments: '{}' } },
+        ],
+      },
+      { role: 'tool', tool_call_id: 'e', content: 'error: shell is busy' },
+      { role: 'tool', tool_call_id: 'd', content: `${DENIED_PREFIX}: the user did not approve this call` },
+      { role: 'tool', tool_call_id: 'p', content: 'pwd: /tmp' },
+    ]);
+    expect(items.map((i) => (i.kind === 'tool' ? i.status : null))).toEqual(['failed', 'failed', 'ok']);
+  });
+
+  it('a result starting with "skipped:" (the backend close text) is failed, and one that only contains it is not', () => {
+    const items = itemsFromMessages([
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [
+          { id: 'n', type: 'function', function: { name: 'run_command', arguments: '{}' } },
+          { id: 't', type: 'function', function: { name: 'run_command', arguments: '{}' } },
+          { id: 'o', type: 'function', function: { name: 'get_cwd', arguments: '{}' } },
+        ],
+      },
+      { role: 'tool', tool_call_id: 'n', content: 'skipped: not recorded' },
+      { role: 'tool', tool_call_id: 't', content: 'skipped: turn ended' },
+      { role: 'tool', tool_call_id: 'o', content: 'the output said skipped: twice' },
+    ]);
+    expect(items.map((i) => (i.kind === 'tool' ? i.status : null))).toEqual(['failed', 'failed', 'ok']);
+    expect(items[0]).toMatchObject({ kind: 'tool', result: 'skipped: not recorded' });
+  });
+
+  it('an empty or whitespace-only assistant message gives no agent item but keeps its calls', () => {
+    const items = itemsFromMessages([
+      { role: 'assistant', content: '   ', tool_calls: [{ id: 'c1', type: 'function', function: { name: 'get_cwd', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'c1', content: '/' },
+      { role: 'assistant', content: '' },
+    ]);
+    expect(items.map((i) => i.kind)).toEqual(['tool']);
+  });
+
+  it('tool messages that answer no call are dropped, and malformed calls are skipped', () => {
+    const items = itemsFromMessages([
+      { role: 'tool', tool_call_id: 'orphan', content: 'x' },
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{ type: 'function', function: { name: 'no_id', arguments: '{}' } }, 'not an object'],
+      },
+      { role: 'system', content: 'ignored' },
+    ]);
+    expect(items).toEqual([]);
+  });
+
+  it('a call with a missing function name is shown as unknown', () => {
+    const items = itemsFromMessages([{ role: 'assistant', content: null, tool_calls: [{ id: 'c1' }] }, { role: 'tool', tool_call_id: 'c1', content: 'ok' }]);
+    expect(items[0]).toMatchObject({ name: 'unknown', args: null });
+  });
+});
+
+describe('groupByDate', () => {
+  // now is local noon on 10 November 2026.
+  const now = local(2026, 10, 10, 12, 0);
+
+  it('groups Today, Yesterday, Previous 7 days, then by month, newest first', () => {
+    const groups = groupByDate(
+      [
+        meta('old', local(2026, 9, 3)),
+        meta('today', local(2026, 10, 10, 9)),
+        meta('week', local(2026, 10, 5)),
+        meta('yesterday', local(2026, 10, 9, 23)),
+      ],
+      now,
+    );
+    expect(groups.map((g) => g.label)).toEqual(['Today', 'Yesterday', 'Previous 7 days', 'October 2026']);
+    expect(groups.map((g) => g.items.map((m) => m.id))).toEqual([['today'], ['yesterday'], ['week'], ['old']]);
+  });
+
+  it('local midnight starts today: 00:00:00 is today, one second earlier is yesterday', () => {
+    const atMidnight = groupByDate([meta('a', local(2026, 10, 10, 0, 0))], now);
+    expect(atMidnight[0].label).toBe('Today');
+    const justBefore = groupByDate([meta('a', local(2026, 10, 10, 0, 0) - 1)], now);
+    expect(justBefore[0].label).toBe('Yesterday');
+  });
+
+  it('yesterday starts at the local midnight before today', () => {
+    expect(groupByDate([meta('a', local(2026, 10, 9, 0, 0))], now)[0].label).toBe('Yesterday');
+    expect(groupByDate([meta('a', local(2026, 10, 8, 23, 59))], now)[0].label).toBe('Previous 7 days');
+  });
+
+  it('Previous 7 days covers the seven days before yesterday, and its edge is eight days back at midnight', () => {
+    // With today 10 Nov, the group runs from 2 Nov (eight days back) up to 9 Nov, yesterday's midnight.
+    const first = groupByDate([meta('a', local(2026, 10, 2, 0, 0))], now)[0];
+    expect(first.label).toBe('Previous 7 days');
+    // One second before 2 Nov midnight is 1 Nov, which is outside the group and shown by month.
+    const beforeEdge = groupByDate([meta('a', local(2026, 10, 2, 0, 0) - 1)], now)[0];
+    expect(beforeEdge.label).toBe('November 2026');
+  });
+
+  it('an update time after now (clock skew) counts as today', () => {
+    expect(groupByDate([meta('a', now + 3600)], now)[0].label).toBe('Today');
+  });
+
+  it('omits empty groups and orders the months newest first', () => {
+    const groups = groupByDate([meta('a', local(2025, 11, 20)), meta('b', local(2026, 0, 4)), meta('c', local(2026, 4, 1))], now);
+    expect(groups.map((g) => g.label)).toEqual(['May 2026', 'January 2026', 'December 2025']);
+  });
+
+  it('keeps the newest first within a group', () => {
+    const groups = groupByDate([meta('early', local(2026, 10, 10, 1)), meta('late', local(2026, 10, 10, 11))], now);
+    expect(groups[0].items.map((m) => m.id)).toEqual(['late', 'early']);
+  });
+
+  it('does not reorder the input array', () => {
+    const input = [meta('a', 1), meta('b', 2)];
+    groupByDate(input, now);
+    expect(input.map((m) => m.id)).toEqual(['a', 'b']);
+  });
+});
+
+describe('groupByWorkspace', () => {
+  it('one group per workspace, most recently active first', () => {
+    const groups = groupByWorkspace([
+      meta('a1', 100, ROOT_A),
+      meta('b1', 300, ROOT_B),
+      meta('a2', 200, ROOT_A),
+    ]);
+    expect(groups.map((g) => g.label)).toEqual(['beta', 'alpha']);
+    expect(groups[0]).toMatchObject({ root: ROOT_B.root, host: ROOT_B.host });
+    expect(groups[1].items.map((m) => m.id)).toEqual(['a2', 'a1']);
+  });
+
+  it('the Unknown workspace is last, even when it is the most recent', () => {
+    const groups = groupByWorkspace([meta('u', 900, UNKNOWN), meta('a', 100, ROOT_A), meta('b', 50, ROOT_B)]);
+    expect(groups.map((g) => g.label)).toEqual(['alpha', 'beta', 'Unknown']);
+  });
+
+  it('two workspaces with the same label but different roots are different groups', () => {
+    const other: Workspace = { host: 'mac', root: '/Users/me/work/alpha', label: 'alpha' };
+    expect(groupByWorkspace([meta('a', 1, ROOT_A), meta('b', 2, other)])).toHaveLength(2);
+  });
+
+  it('a remote host with the same root is its own group', () => {
+    const remote: Workspace = { host: 'build-box', root: '/Users/me/alpha', label: 'alpha' };
+    expect(groupByWorkspace([meta('a', 1, ROOT_A), meta('b', 2, remote)])).toHaveLength(2);
+  });
+});
+
+describe('filterMetas', () => {
+  const metas = [
+    meta('1', 1, ROOT_A, 'Fix the build script'),
+    meta('2', 2, ROOT_B, 'Explain the log'),
+    meta('3', 3, { host: 'mac', root: '/Users/me/gamma', label: 'gamma' }, 'Rename things'),
+  ];
+
+  it('an empty or blank query keeps everything, in order', () => {
+    expect(filterMetas(metas, '')).toBe(metas);
+    expect(filterMetas(metas, '   ').map((m) => m.id)).toEqual(['1', '2', '3']);
+  });
+
+  it('matches case-insensitively over the title', () => {
+    expect(filterMetas(metas, 'BUILD').map((m) => m.id)).toEqual(['1']);
+  });
+
+  it('matches the workspace label and root', () => {
+    expect(filterMetas(metas, 'beta').map((m) => m.id)).toEqual(['2']);
+    expect(filterMetas(metas, '/users/me/gamma').map((m) => m.id)).toEqual(['3']);
+  });
+
+  it('every whitespace-separated term must match, in any field', () => {
+    expect(filterMetas(metas, 'fix alpha').map((m) => m.id)).toEqual(['1']);
+    expect(filterMetas(metas, 'fix beta')).toEqual([]);
+    expect(filterMetas(metas, '  log   beta ').map((m) => m.id)).toEqual(['2']);
+  });
+});
+
+describe('formatWhen', () => {
+  const now = local(2026, 10, 10, 15, 30);
+
+  it('shows HH:MM for the same local day', () => {
+    expect(formatWhen(local(2026, 10, 10, 9, 5), now)).toBe('09:05');
+    expect(formatWhen(local(2026, 10, 10, 0, 0), now)).toBe('00:00');
+  });
+
+  it('shows the month and day for the same year', () => {
+    expect(formatWhen(local(2026, 10, 8, 14, 0), now)).toBe('Nov 8');
+    expect(formatWhen(local(2026, 0, 3, 14, 0), now)).toBe('Jan 3');
+  });
+
+  it('adds the year for another year', () => {
+    expect(formatWhen(local(2025, 10, 8, 14, 0), now)).toBe('Nov 8, 2025');
+  });
+});
+
+describe('relativeTime', () => {
+  const now = local(2026, 10, 10, 15, 30);
+
+  it('is "just now" under a minute, and for a time slightly ahead', () => {
+    expect(relativeTime(now, now)).toBe('just now');
+    expect(relativeTime(now - 59, now)).toBe('just now');
+    expect(relativeTime(now + 30, now)).toBe('just now');
+  });
+
+  it('is minutes, then hours, then days, under a week', () => {
+    expect(relativeTime(now - 5 * 60, now)).toBe('5m ago');
+    expect(relativeTime(now - 3 * 3600, now)).toBe('3h ago');
+    expect(relativeTime(now - 2 * 86400, now)).toBe('2d ago');
+    expect(relativeTime(now - (7 * 86400 - 1), now)).toBe('6d ago');
+  });
+
+  it('is the clock time from a week on', () => {
+    const old = now - 7 * 86400;
+    expect(relativeTime(old, now)).toBe(formatWhen(old, now));
+  });
+});

@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import type { MouseEvent, UIEvent, WheelEvent } from 'react';
+import type { MouseEvent, ReactNode, UIEvent, WheelEvent } from 'react';
 import { copyText } from '../lib/clipboard';
 import { previewJson } from '../lib/format';
 import { isAtBottom, shouldFollowAfterSend } from '../lib/stickScroll';
@@ -23,10 +23,29 @@ interface Props {
   /** The dock the panel is in. With onDock, the header shows the four dock buttons, with this one marked. */
   dock?: Dock;
   onDock?: (dock: Dock) => void;
+  /** Which view the panel body shows. History replaces the chat body (the header stays). Defaults to chat. */
+  view?: 'chat' | 'history';
+  /** With onToggleHistory, the header shows the History button, pressed while the history view is shown. */
+  onToggleHistory?: () => void;
+  /** The history view. Shown in place of the chat body while `view` is 'history' and the panel is open. */
+  history?: ReactNode;
 }
 
 /** The agent conversation, docked above the input bar. Collapsible, scrollable, and capped by CSS. */
-export function Transcript({ items, busy, thinking, open, onToggle, onApprove, onNewConversation, dock, onDock }: Props) {
+export function Transcript({
+  items,
+  busy,
+  thinking,
+  open,
+  onToggle,
+  onApprove,
+  onNewConversation,
+  dock,
+  onDock,
+  view = 'chat',
+  onToggleHistory,
+  history,
+}: Props) {
   const bodyRef = useRef<HTMLDivElement>(null);
   const entries = useMemo(() => groupTranscript(items), [items]);
   /** Whether the view follows new content. A ref, read in effects and handlers, so changing it does not re-render. */
@@ -37,6 +56,8 @@ export function Transcript({ items, busy, thinking, open, onToggle, onApprove, o
   /** The body's scrollTop as last seen, to tell the user scrolling up from content growing below. */
   const lastTop = useRef(0);
   const [showJump, setShowJump] = useState(false);
+  /** The chat body is on screen. Switching to the history view and back remounts it, like closing and opening the panel. */
+  const bodyShown = open && view === 'chat';
 
   // Keyed on the items array, not its length: a streamed delta replaces the last item, and the length stops changing at the cap.
   useLayoutEffect(() => {
@@ -60,7 +81,7 @@ export function Transcript({ items, busy, thinking, open, onToggle, onApprove, o
       body.scrollTop = body.scrollHeight;
       lastTop.current = body.scrollTop;
     }
-  }, [items, open]);
+  }, [items, bodyShown]);
 
   // A panel resize or dock change keeps the pin while following; when not following, being back at the bottom resumes it.
   useEffect(() => {
@@ -79,7 +100,7 @@ export function Transcript({ items, busy, thinking, open, onToggle, onApprove, o
     });
     observer.observe(body);
     return () => observer.disconnect();
-  }, [open]);
+  }, [bodyShown]);
 
   const onScroll = (e: UIEvent<HTMLDivElement>) => {
     const el = e.currentTarget;
@@ -132,6 +153,7 @@ export function Transcript({ items, busy, thinking, open, onToggle, onApprove, o
           <span className="toggle">{open ? 'Hide' : 'Show'}</span>
         </button>
         {onDock && dock && <DockButtons dock={dock} onDock={onDock} />}
+        {onToggleHistory && <HistoryButton pressed={view === 'history'} onClick={onToggleHistory} />}
         <button
           type="button"
           className="transcript-new"
@@ -142,7 +164,8 @@ export function Transcript({ items, busy, thinking, open, onToggle, onApprove, o
           New conversation
         </button>
       </div>
-      {open && (
+      {open && view === 'history' && history}
+      {bodyShown && (
         <div className="transcript-body" ref={bodyRef} tabIndex={-1} onScroll={onScroll} onWheel={onWheel}>
           {items.length === 0 && <div className="empty">Ask the agent something, for example "what was the last command".</div>}
           {entries.map((entry) =>
@@ -154,7 +177,7 @@ export function Transcript({ items, busy, thinking, open, onToggle, onApprove, o
           )}
         </div>
       )}
-      {open && showJump && <JumpToLatest busy={busy} onClick={jumpToLatest} />}
+      {bodyShown && showJump && <JumpToLatest busy={busy} onClick={jumpToLatest} />}
     </section>
   );
 }
@@ -291,6 +314,27 @@ function CheckIcon() {
     <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
       <path d="M3 8.5l3 3 7-7" />
     </svg>
+  );
+}
+
+/** Toggles the History view in the panel body. Pressed while that view is shown. */
+function HistoryButton({ pressed, onClick }: { pressed: boolean; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      id="history-button"
+      className="history-button"
+      aria-label="Conversation history"
+      aria-pressed={pressed}
+      title="Conversation history"
+      onClick={onClick}
+    >
+      <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.25" aria-hidden="true">
+        <path d="M2.5 8a5.5 5.5 0 1 0 1.6-3.9" />
+        <path d="M2.5 2.5v2.6h2.6" />
+        <path d="M8 5v3.2l2.2 1.4" />
+      </svg>
+    </button>
   );
 }
 

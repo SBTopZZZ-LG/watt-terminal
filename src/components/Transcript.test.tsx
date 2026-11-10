@@ -83,3 +83,24 @@ describe('Transcript: tool groups', () => {
     expect(html.indexOf('class="tool-group-items"')).toBeLessThan(html.indexOf('class="approval approval-resolved"'));
   });
 });
+
+describe('Transcript: history button', () => {
+  it('has the id App focuses when the History view closes, and is pressed while the view is shown', () => {
+    const html = renderToStaticMarkup(
+      <Transcript
+        items={[]}
+        busy={false}
+        thinking={false}
+        open
+        onToggle={() => {}}
+        onApprove={() => {}}
+        onNewConversation={() => {}}
+        view="history"
+        onToggleHistory={() => {}}
+        history={<div>history</div>}
+      />,
+    );
+    expect(html).toContain('id="history-button"');
+    expect(html).toMatch(/id="history-button"[^>]*aria-pressed="true"|aria-pressed="true"[^>]*id="history-button"/);
+  });
+});
