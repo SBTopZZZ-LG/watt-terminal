@@ -18,6 +18,8 @@
   --rule-strong: rgba(111, 211, 255, 0.5);
   --tint: rgba(111, 211, 255, 0.1);
   --ink: #c6e4f7;
+  /* Brighter ink for headings and strong text in markdown. */
+  --ink-strong: #eaf7ff;
   --text: var(--ink);
   --muted: #7ba6c2;
   --accent: #6fd3ff;
@@ -517,6 +519,280 @@ input {
 
 .msg.user {
   color: var(--accent);
+}
+
+/*
+ * Agent replies, rendered as markdown (src/components/Markdown.tsx). The Blueprint markdown look, sized for the panel:
+ * no card, margins or shadow, labels at 11px or more. The .msg white-space (pre-wrap) is reset here, and only the code
+ * blocks keep their whitespace.
+ */
+.msg.agent {
+  position: relative;
+  padding: 8px 12px;
+}
+
+.msg.agent::before,
+.msg.agent::after {
+  content: "";
+  position: absolute;
+  width: 8px;
+  height: 8px;
+  pointer-events: none;
+}
+
+.msg.agent::before {
+  top: 0;
+  left: 0;
+  border-top: 2px solid var(--accent);
+  border-left: 2px solid var(--accent);
+}
+
+.msg.agent::after {
+  bottom: 0;
+  right: 0;
+  border-bottom: 2px solid var(--accent);
+  border-right: 2px solid var(--accent);
+}
+
+.msg.agent .md {
+  color: var(--ink);
+  font-size: 12px;
+  font-style: normal;
+  line-height: 1.6;
+  white-space: normal;
+  /* [NN] numbering per message: a lone h2 is not numbered (see below). */
+  counter-reset: dwg;
+}
+
+.msg.agent .md > :first-child {
+  margin-top: 0;
+}
+
+.msg.agent .md > :last-child {
+  margin-bottom: 0;
+}
+
+.msg.agent .md p {
+  max-width: 78ch;
+  margin: 0 0 0.8em;
+}
+
+.msg.agent .md h1,
+.msg.agent .md h2,
+.msg.agent .md h3 {
+  line-height: 1.35;
+}
+
+.msg.agent .md h1 {
+  margin: 0 0 0.55em;
+  font-size: 1.15rem;
+  font-weight: 500;
+  letter-spacing: 0.015em;
+  color: var(--ink-strong);
+}
+
+.msg.agent .md h2 {
+  counter-increment: dwg;
+  margin: 1.4em 0 0.6em;
+  padding-bottom: 0.45em;
+  border-bottom: 1px dashed var(--rule);
+  font-size: 1rem;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.msg.agent .md h2::before {
+  content: "[" counter(dwg, decimal-leading-zero) "] ";
+  color: var(--muted);
+}
+
+.msg.agent .md h2:only-of-type::before {
+  content: none;
+}
+
+.msg.agent .md h3 {
+  margin: 1.1em 0 0.4em;
+  font-size: 0.92rem;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  color: var(--ink-strong);
+}
+
+.msg.agent .md h3::before {
+  content: ":: ";
+  color: var(--rule-strong);
+}
+
+.msg.agent .md strong {
+  font-weight: 600;
+  color: var(--ink-strong);
+}
+
+.msg.agent .md del {
+  color: var(--muted);
+}
+
+.msg.agent .md .md-link {
+  color: var(--accent);
+  border-bottom: 1px dotted var(--rule-strong);
+  cursor: default;
+}
+
+.msg.agent .md .md-img {
+  color: var(--muted);
+}
+
+.msg.agent .md ul,
+.msg.agent .md ol {
+  max-width: 78ch;
+  margin: 0 0 0.8em;
+  padding-left: 1.6em;
+}
+
+.msg.agent .md ul {
+  list-style: none;
+  padding-left: 0;
+}
+
+.msg.agent .md ul li {
+  position: relative;
+  padding-left: 1.6em;
+}
+
+.msg.agent .md ul li::before {
+  content: "\25B8";
+  position: absolute;
+  left: 0.3em;
+  color: var(--accent);
+}
+
+.msg.agent .md ol li::marker {
+  color: var(--accent);
+}
+
+.msg.agent .md li {
+  margin: 0.25em 0;
+}
+
+/* GFM task items. The box is drawn here, and GFM's own checkbox is hidden. Done items get a filled box. */
+.msg.agent .md ul.tasks li::before {
+  content: "";
+  left: 0.25em;
+  top: 0.4em;
+  width: 0.75em;
+  height: 0.75em;
+  border: 1px dashed var(--accent);
+  border-radius: 0;
+}
+
+.msg.agent .md ul.tasks li.done::before {
+  background: var(--accent);
+  border-style: solid;
+}
+
+.msg.agent .md ul.tasks input {
+  display: none;
+}
+
+.msg.agent .md blockquote {
+  max-width: 76ch;
+  margin: 0.9em 0;
+  padding: 0.6em 0.9em;
+  border: 1px dashed var(--rule);
+  background: var(--tint);
+  color: var(--ink);
+}
+
+.msg.agent .md blockquote p {
+  margin: 0;
+}
+
+.msg.agent .md code {
+  padding: 0.05em 0.35em;
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  background: var(--tint);
+  color: var(--ink-strong);
+  font-family: var(--mono);
+  font-size: 0.9em;
+}
+
+.msg.agent .md pre {
+  position: relative;
+  margin: 0.9em 0;
+  padding: 1.9em 0.9em 0.8em;
+  overflow-x: auto;
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  background: var(--code-bg);
+  color: var(--ink-strong);
+  font-size: 11px;
+  line-height: 1.6;
+  white-space: pre;
+  tab-size: 2;
+}
+
+/* The language label: "sh — drawing". data-lang is always set (text when a fence has no language). */
+.msg.agent .md pre::before {
+  content: attr(data-lang) " \2014 drawing";
+  position: absolute;
+  top: 0.55em;
+  left: 0.9em;
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--rule-strong);
+}
+
+.msg.agent .md pre code {
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  color: inherit;
+  font-size: inherit;
+}
+
+/* Wide tables scroll inside the wrapper, so they never stretch the panel. */
+.msg.agent .md .md-table {
+  max-width: 100%;
+  margin: 0.9em 0;
+  overflow-x: auto;
+}
+
+.msg.agent .md table {
+  width: max-content;
+  min-width: 100%;
+  border-collapse: collapse;
+  border: 1px dashed var(--rule);
+  font-size: 11px;
+}
+
+.msg.agent .md th,
+.msg.agent .md td {
+  padding: 0.4em 0.6em;
+  border-bottom: 1px dashed var(--rule);
+  text-align: left;
+  vertical-align: top;
+}
+
+.msg.agent .md th {
+  border-bottom: 1px solid var(--rule);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.msg.agent .md hr {
+  height: 1px;
+  margin: 1.4em 0;
+  border: 0;
+  background-color: transparent;
+  background-image: repeating-linear-gradient(90deg, var(--rule-strong) 0 6px, transparent 6px 13px);
 }
 
 .tool {

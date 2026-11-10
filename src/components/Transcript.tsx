@@ -5,6 +5,7 @@ import type { TranscriptItem } from '../lib/transcript';
 import { groupTranscript, toolGroupSummary } from '../lib/toolGroups';
 import type { GroupItem } from '../lib/toolGroups';
 import { visibleEscapes } from '../lib/visibleEscapes';
+import { Markdown } from './Markdown';
 
 interface Props {
   items: TranscriptItem[];
@@ -86,7 +87,11 @@ function Entry({ item, onApprove }: { item: TranscriptItem; onApprove: Props['on
         </div>
       );
     case 'agent':
-      return <div className="msg agent">{item.text}</div>;
+      return (
+        <div className="msg agent">
+          <Markdown text={item.text} />
+        </div>
+      );
     case 'notice':
       return <div className="notice">{item.text}</div>;
     case 'tool': {
