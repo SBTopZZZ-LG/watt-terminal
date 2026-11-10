@@ -12,11 +12,33 @@
 //! are written (see `conversations::redact_messages`). The UI transcript is not stored.
 
 pub mod conversations;
+pub mod turn;
 pub mod ui_state;
 pub mod workspace;
 
 use std::fmt;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use self::conversations::ConversationStore;
+use self::ui_state::{UiStateStore, ui_state_path};
+
+/// The two stores. `new` only records the paths: directories are created by the first write.
+#[derive(Debug)]
+pub struct Persist {
+    pub conversations: ConversationStore,
+    pub ui: UiStateStore,
+}
+
+impl Persist {
+    /// Conversations live under `data_dir/conversations`, the UI state in `config_dir/ui-state.json`.
+    pub fn new(config_dir: &Path, data_dir: &Path) -> Self {
+        Persist {
+            conversations: ConversationStore::new(data_dir.join("conversations")),
+            ui: UiStateStore::new(ui_state_path(config_dir)),
+        }
+    }
+}
 
 /// Why a persistence operation failed. Messages never include stored message content or secret values.
 #[derive(Debug, Clone, PartialEq, Eq)]

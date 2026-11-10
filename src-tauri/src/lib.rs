@@ -8,7 +8,7 @@
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 
 use serde::Serialize;
@@ -19,11 +19,16 @@ use tauri::{Manager, RunEvent, State};
 // Core logic (PTY, shell integration, observer, agent) has no Tauri dependency, so `cargo test` runs it headless.
 pub mod core;
 
-use crate::core::agent::{self, Agent, AgentCtx, AgentEvent, ApprovalGate, MockAgent, OnDrop};
+use crate::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate, MockAgent, OnDrop};
 use crate::core::chat::agent_loop::{self, Conversation, LlmAgent};
 use crate::core::chat::history::History;
+use crate::core::chat::redact::Redactor;
 use crate::core::llm::TurnCancel;
 use crate::core::observer::{EventSink, InputState, IntegrationStatus, ObserverStatus, SessionEvent};
+use crate::core::persist::conversations::ConversationMeta;
+use crate::core::persist::turn::{FinishedTurn, TurnEnv, resume, save_turn};
+use crate::core::persist::ui_state::{UiState, UiStatePatch};
+use crate::core::persist::{Persist, now_secs};
 use crate::core::pty::OutputSink;
 use crate::core::record::Cwd;
 use crate::core::registry::Registry;
@@ -129,6 +134,74 @@ fn session(reg: &Reg, id: &str) -> Result<Arc<Attached>, String> {
 
 fn io_err(e: io::Error) -> String {
     e.to_string()
+}
+
+const BUSY_REFUSAL: &str = "the agent is busy; wait for it to finish or cancel it first";
+const NO_STORE: &str = "saved conversations are unavailable: the app folders could not be found";
+
+/// The conversation and UI-state stores. `None` when the app folders could not be resolved: nothing is saved, and the
+/// commands that use the stores return an error.
+struct PersistState(Option<Arc<Persist>>);
+
+impl PersistState {
+    fn get(&self) -> Result<Arc<Persist>, String> {
+        self.0.clone().ok_or_else(|| NO_STORE.to_string())
+    }
+}
+
+/// Resolves the config and data folders. AGENT_TERM_CONFIG_DIR and AGENT_TERM_DATA_DIR win when they are set and not
+/// empty; otherwise the Tauri app folders are used. Nothing is created here: the stores create their folders on write.
+fn resolve_persist(app: &tauri::AppHandle) -> Option<Persist> {
+    let config = dir_override("AGENT_TERM_CONFIG_DIR").or_else(|| app.path().app_config_dir().ok());
+    let data = dir_override("AGENT_TERM_DATA_DIR").or_else(|| app.path().app_data_dir().ok());
+    match (config, data) {
+        (Some(config), Some(data)) => Some(Persist::new(&config, &data)),
+        _ => {
+            eprintln!("agent-term: the app folders could not be resolved; conversations and UI state are not saved");
+            None
+        }
+    }
+}
+
+fn dir_override(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
+/// This machine's host name, as the shell reports it in OSC 7 (`$HOST`). Read once with `hostname`; "" when that fails.
+fn local_host() -> &'static str {
+    static HOST: OnceLock<String> = OnceLock::new();
+    HOST.get_or_init(|| {
+        std::process::Command::new("/bin/hostname")
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .unwrap_or_default()
+    })
+}
+
+/// Saves the conversation at the end of a model turn. A failure is logged without any content and never fails the turn.
+fn save_finished_turn(
+    store: &Persist,
+    session: &Session,
+    conversation_id: &str,
+    history: &Mutex<History>,
+    redactor: &Redactor,
+    model: Option<String>,
+) {
+    let cwd = session.cwd();
+    let cwd_pair = cwd.as_ref().map(|c| (c.host.as_str(), c.path.as_str()));
+    let turn = FinishedTurn { conversation_id, messages: lock(history).snapshot(), model, cwd: cwd_pair };
+    let home = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
+    let env = TurnEnv { local_host: local_host(), home: home.as_deref() };
+    if let Err(e) = save_turn(store, turn, redactor, env, now_secs()) {
+        eprintln!("agent-term: the conversation was not saved ({e})");
+    }
+}
+
+/// Runs blocking storage work on Tauri's blocking pool, so file access never runs on the async runtime.
+async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(work).await.map_err(|e| e.to_string())?
 }
 
 /// Dev only. AGENT_TERM_HISTFILE, when non-empty, is the HISTFILE the shell uses instead of the real
@@ -242,20 +315,30 @@ fn cancel_agent(session_id: String, reg: State<'_, Reg>) -> Result<(), String> {
 /// Starts one agent turn on its own thread. Events arrive on the events channel. The LLM agent runs when the dev
 /// environment configures a provider (core/chat/agent_loop); otherwise the mock agent answers.
 #[tauri::command]
-fn agent_message(session_id: String, text: String, reg: State<'_, Reg>) -> Result<(), String> {
+fn agent_message(
+    session_id: String,
+    text: String,
+    reg: State<'_, Reg>,
+    persist: State<'_, PersistState>,
+) -> Result<(), String> {
     let att = session(&reg, &session_id)?;
     let cancel = Arc::new(TurnCancel::new());
     let (history, conversation_id) = att.begin_turn(&cancel)?;
-    let mut agent: Box<dyn Agent + Send> = match agent_loop::settings() {
-        None => Box::new(MockAgent),
+    // Only the LLM agent writes history, so only its turns are saved. The mock agent never touches the history.
+    let (mut llm, model) = match agent_loop::settings() {
+        None => (None, None),
         Some(settings) => match agent_loop::shared_client() {
-            Ok(client) => Box::new(LlmAgent::new(client, settings, &conversation_id, history, cancel.clone())),
+            Ok(client) => {
+                let agent = LlmAgent::new(client, settings, &conversation_id, history.clone(), cancel.clone());
+                (Some(agent), Some(settings.model.clone()))
+            }
             Err(e) => {
                 att.end_turn();
                 return Err(e);
             }
         },
     };
+    let store = persist.0.clone();
     let worker = att.clone();
     let spawned = thread::Builder::new().name("agent".into()).spawn(move || {
         // Runs on panic too, so a crashed turn cannot leave the agent busy or in control of the shell.
@@ -270,7 +353,14 @@ fn agent_message(session_id: String, text: String, reg: State<'_, Reg>) -> Resul
             channels.send_json(&ev);
         };
         let ctx = AgentCtx::new(&tools, &worker.approvals, &emit);
-        agent::run_turn(agent.as_mut(), &text, &ctx);
+        match llm.as_mut() {
+            Some(agent) => agent::run_turn(agent, &text, &ctx),
+            None => agent::run_turn(&mut MockAgent, &text, &ctx),
+        }
+        // The history is final now, and this is still before the turn is ended (the guard above).
+        if let (Some(agent), Some(store)) = (llm.as_ref(), store.as_ref()) {
+            save_finished_turn(store, &worker.session, &conversation_id, &history, agent.redactor(), model);
+        }
     });
     if let Err(e) = spawned {
         *lock(&att.turn_cancel) = None;
@@ -287,7 +377,7 @@ fn new_conversation(session_id: String, reg: State<'_, Reg>) -> Result<(), Strin
     let att = session(&reg, &session_id)?;
     let _turn = lock(&att.turn_cancel);
     if att.agent_busy.load(Ordering::SeqCst) {
-        return Err("the agent is busy; wait for it to finish or cancel it first".into());
+        return Err(BUSY_REFUSAL.into());
     }
     att.conversation.reset().map_err(io_err)
 }
@@ -325,6 +415,8 @@ struct Status {
     agent_busy: bool,
     agent_control: bool,
     llm: LlmStatus,
+    /// The live conversation's id (the one the provider sees, and the file name of its saved copy).
+    conversation_id: String,
 }
 
 #[tauri::command]
@@ -341,6 +433,7 @@ fn get_status(session_id: String, reg: State<'_, Reg>) -> Result<Status, String>
         agent_busy: att.agent_busy.load(Ordering::SeqCst),
         agent_control: att.agent_control.load(Ordering::SeqCst),
         llm: LlmStatus { enabled: llm.is_some(), model: llm.map(|s| s.model.clone()) },
+        conversation_id: att.conversation.id(),
     })
 }
 
@@ -356,11 +449,104 @@ async fn kill_session(session_id: String, reg: State<'_, Reg>) -> Result<(), Str
     }
 }
 
+/// The saved conversations, most recently updated first.
+#[tauri::command]
+async fn list_conversations(persist: State<'_, PersistState>) -> Result<Vec<ConversationMeta>, String> {
+    let store = persist.get()?;
+    blocking(move || store.conversations.list().map_err(|e| e.to_string())).await
+}
+
+#[derive(Serialize)]
+struct LoadedConversation {
+    id: String,
+    title: String,
+    messages: Vec<Value>,
+}
+
+/// A saved conversation as the live one. The file is read and repaired first. Then, when the agent is idle, the live
+/// conversation takes its id and history, and the id is remembered as the last conversation. Returns the repaired
+/// messages, so the UI is built from exactly what the backend now holds. Refused while the agent is working.
+#[tauri::command]
+async fn load_conversation(
+    session_id: String,
+    id: String,
+    reg: State<'_, Reg>,
+    persist: State<'_, PersistState>,
+) -> Result<LoadedConversation, String> {
+    let att = session(&reg, &session_id)?;
+    let store = persist.get()?;
+    let read_store = store.clone();
+    let read_id = id.clone();
+    let resumed = blocking(move || resume(&read_store, &read_id).map_err(|e| e.to_string())).await?;
+    let messages = resumed.history.snapshot();
+    let title = resumed.title;
+    {
+        // The busy check and the restore happen under the turn-cancel lock, as `begin_turn` and `new_conversation` do.
+        let _turn = lock(&att.turn_cancel);
+        if att.agent_busy.load(Ordering::SeqCst) {
+            return Err(BUSY_REFUSAL.into());
+        }
+        att.conversation.restore(id.clone(), resumed.history);
+    }
+    let remember_id = id.clone();
+    let remember = blocking(move || {
+        let patch = UiStatePatch { last_conversation_id: Some(Some(remember_id)), ..UiStatePatch::default() };
+        store.ui.patch(patch).map(|_| ()).map_err(|e| e.to_string())
+    });
+    if let Err(e) = remember.await {
+        eprintln!("agent-term: the last conversation was not remembered ({e})");
+    }
+    Ok(LoadedConversation { id, title, messages })
+}
+
+/// Deletes a saved conversation. Deleting one that does not exist is not an error.
+#[tauri::command]
+async fn delete_conversation(id: String, persist: State<'_, PersistState>) -> Result<(), String> {
+    let store = persist.get()?;
+    blocking(move || store.conversations.delete(&id).map_err(|e| e.to_string())).await
+}
+
+/// Renames a saved conversation. Returns its metadata.
+#[tauri::command]
+async fn rename_conversation(
+    id: String,
+    title: String,
+    persist: State<'_, PersistState>,
+) -> Result<ConversationMeta, String> {
+    let store = persist.get()?;
+    blocking(move || store.conversations.rename(&id, &title).map_err(|e| e.to_string())).await
+}
+
+/// Deletes every saved conversation. The live conversation is not touched.
+#[tauri::command]
+async fn delete_all_conversations(persist: State<'_, PersistState>) -> Result<(), String> {
+    let store = persist.get()?;
+    blocking(move || store.conversations.delete_all().map_err(|e| e.to_string())).await
+}
+
+#[tauri::command]
+async fn get_ui_state(persist: State<'_, PersistState>) -> Result<UiState, String> {
+    let store = persist.get()?;
+    blocking(move || store.ui.load().map_err(|e| e.to_string())).await
+}
+
+/// Applies a patch to the UI state and returns the state as stored.
+#[tauri::command]
+async fn patch_ui_state(patch: UiStatePatch, persist: State<'_, PersistState>) -> Result<UiState, String> {
+    let store = persist.get()?;
+    blocking(move || store.ui.patch(patch).map_err(|e| e.to_string())).await
+}
+
 pub fn run() {
     // Reads the dev LLM settings now, so a bad value is reported at launch and falls back to the mock agent.
     agent_loop::settings();
     let app = tauri::Builder::default()
         .manage(Reg::new())
+        .setup(|app| {
+            let persist = resolve_persist(app.handle()).map(Arc::new);
+            app.manage(PersistState(persist));
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             start_session,
             restart_session,
@@ -373,7 +559,14 @@ pub fn run() {
             approve_tool,
             set_auto_approve,
             get_status,
-            kill_session
+            kill_session,
+            list_conversations,
+            load_conversation,
+            delete_conversation,
+            rename_conversation,
+            delete_all_conversations,
+            get_ui_state,
+            patch_ui_state
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

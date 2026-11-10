@@ -192,6 +192,13 @@ impl Conversation {
         *lock_string(&self.id) = id;
         Ok(())
     }
+
+    /// Makes a saved conversation the live one: its id and its history replace the current ones. The history object
+    /// stays the same, so holders of `history()` see the new contents. The caller makes sure no turn is running.
+    pub fn restore(&self, id: String, history: History) {
+        *lock_string(&self.id) = id;
+        *lock(&self.history) = history;
+    }
 }
 
 /// The agent for one turn of a conversation: the provider config with this conversation's headers, the redactor, and
@@ -238,6 +245,11 @@ impl LlmAgent {
             system: prompt::system_prompt(),
             tools: prompt::tool_definitions(),
         }
+    }
+
+    /// The redactor for this turn's secrets. The persistence layer uses it to scrub what it writes to disk.
+    pub fn redactor(&self) -> &Redactor {
+        &self.redactor
     }
 
     /// One model call. Streams text as it arrives, or waits for the whole reply. Returns None when the call was

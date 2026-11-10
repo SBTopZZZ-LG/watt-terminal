@@ -2,7 +2,15 @@
 // Tauri maps the Rust snake_case argument names to camelCase here (session_id -> sessionId).
 
 import { Channel, invoke } from '@tauri-apps/api/core';
-import type { StartResult, Status, WireEvent } from './types';
+import type {
+  ConversationMeta,
+  LoadedConversation,
+  StartResult,
+  Status,
+  UiState,
+  UiStatePatch,
+  WireEvent,
+} from './types';
 
 /** Slice 1 runs one session. Every call still passes its id, so more sessions later need no call-site change. */
 export const SESSION_ID = 'main';
@@ -53,5 +61,29 @@ export const api = {
   },
   getStatus() {
     return invoke<Status>('get_status', { sessionId: SESSION_ID });
+  },
+  /** The saved conversations, most recently updated first. */
+  listConversations() {
+    return invoke<ConversationMeta[]>('list_conversations');
+  },
+  /** Opens a saved conversation as the live one. Refused while the agent is busy. */
+  loadConversation(id: string) {
+    return invoke<LoadedConversation>('load_conversation', { sessionId: SESSION_ID, id });
+  },
+  deleteConversation(id: string) {
+    return invoke<void>('delete_conversation', { id });
+  },
+  renameConversation(id: string, title: string) {
+    return invoke<ConversationMeta>('rename_conversation', { id, title });
+  },
+  deleteAllConversations() {
+    return invoke<void>('delete_all_conversations');
+  },
+  getUiState() {
+    return invoke<UiState>('get_ui_state');
+  },
+  /** Applies a patch to the UI state and returns the state as stored. */
+  patchUiState(patch: UiStatePatch) {
+    return invoke<UiState>('patch_ui_state', { patch });
   },
 };

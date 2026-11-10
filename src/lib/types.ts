@@ -93,4 +93,68 @@ export interface Status {
   agent_busy: boolean;
   agent_control: boolean;
   llm: LlmStatus;
+  /** The live conversation's id. */
+  conversation_id: string;
+}
+
+/** The project a conversation belongs to: fixed when it is first saved. `label` is what the UI shows. */
+export interface Workspace {
+  host: string;
+  root: string;
+  label: string;
+}
+
+/** A saved conversation's metadata, as the history list shows it. Times are Unix seconds. */
+export interface ConversationMeta {
+  id: string;
+  title: string;
+  created_at: number;
+  updated_at: number;
+  /** User and assistant messages only. */
+  message_count: number;
+  workspace: Workspace;
+  model: string | null;
+}
+
+/** A chat-completions message as stored (role, content, tool_calls, tool_call_id). */
+export type ChatMessage = Record<string, unknown>;
+
+/** A saved conversation opened as the live one. `messages` are the repaired messages, as the backend now holds them. */
+export interface LoadedConversation {
+  id: string;
+  title: string;
+  messages: ChatMessage[];
+}
+
+export type Dock = 'left' | 'top' | 'right' | 'bottom';
+export type HistoryGroupBy = 'date' | 'workspace';
+
+export interface PanelSizes {
+  left: number | null;
+  right: number | null;
+  top: number | null;
+  bottom: number | null;
+}
+
+export interface PanelState {
+  dock: Dock;
+  sizes: PanelSizes;
+  open: boolean;
+}
+
+/** The UI state file (`ui-state.json`). Each field is null when it has no value yet. */
+export interface UiState {
+  version: number;
+  panel: PanelState | null;
+  font_size: number | null;
+  last_conversation_id: string | null;
+  history_group_by: HistoryGroupBy | null;
+}
+
+/** A change to the UI state. An absent field is left alone, `null` clears it, a value sets it. */
+export interface UiStatePatch {
+  panel?: PanelState | null;
+  font_size?: number | null;
+  last_conversation_id?: string | null;
+  history_group_by?: HistoryGroupBy | null;
 }

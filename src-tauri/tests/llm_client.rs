@@ -309,15 +309,21 @@ async fn cancel_during_a_stalled_stream_returns_cancelled_within_a_second() {
     let (url, _rx) = serve(Script { status: "200 OK", body: body.to_vec(), pieces: false, stall: true });
     let cancel = Arc::new(TurnCancel::new());
     let trigger = cancel.clone();
+    // The cancel is issued only once the first delta has arrived, so the text before the stall is always delivered.
+    let (first_tx, first_rx) = mpsc::channel::<()>();
     let (cancelled_at_tx, cancelled_at_rx) = mpsc::channel();
     thread::spawn(move || {
-        thread::sleep(Duration::from_millis(300));
+        // The timeout is only a safety net: if no delta ever arrives, cancel anyway and let the assertions report it.
+        let _ = first_rx.recv_timeout(Duration::from_secs(10));
         let _ = cancelled_at_tx.send(Instant::now());
         trigger.cancel();
     });
 
     let mut deltas = Vec::new();
-    let mut on_delta = |d: Delta| deltas.push(d);
+    let mut on_delta = |d: Delta| {
+        deltas.push(d);
+        let _ = first_tx.send(());
+    };
     let result = stream(&http_client().unwrap(), &cfg(url), &request(), &mut on_delta, &cancel).await;
     let returned_at = Instant::now();
     let cancelled_at = cancelled_at_rx.recv().unwrap();
