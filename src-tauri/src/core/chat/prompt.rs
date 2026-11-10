@@ -2,7 +2,8 @@
 
 use serde_json::{Value, json};
 
-use crate::core::tools;
+use crate::core::chat::todo;
+use crate::core::tools::{self, ToolSchema};
 
 /// Tools the model is never offered. `send_keys` is a stub and stays out of the request until it has its own approval.
 const HIDDEN_TOOLS: [&str; 1] = ["send_keys"];
@@ -15,15 +16,25 @@ The user must approve each command and may deny it. After a denial, stop and ask
 never try to work around a refusal. Don't print or ask for secrets such as keys, tokens or passwords. \
 If run_command comes back with the command still running, use wait rather than repeated get_screen calls, and set \
 ignore_updates when only the end of the command matters. \
+For work with three or more steps, keep a todo list with todo_write: keep exactly one item in_progress and mark items \
+completed as you go. Don't use it for a trivial one-step request. \
 Answer concisely.";
 
 pub fn system_prompt() -> String {
     SYSTEM_PROMPT.to_string()
 }
 
-/// The tools as OpenAI-format function definitions, built from `tools::schemas()` minus the hidden ones.
+/// Every tool the model may be offered before the hidden ones are removed: the backend tools, then `todo_write`, which
+/// the agent loop handles itself.
+fn all_schemas() -> Vec<ToolSchema> {
+    let mut all = tools::schemas();
+    all.push(todo::schema());
+    all
+}
+
+/// The tools as OpenAI-format function definitions, built from `all_schemas()` minus the hidden ones.
 pub fn tool_definitions() -> Vec<Value> {
-    tools::schemas()
+    all_schemas()
         .into_iter()
         .filter(|t| !HIDDEN_TOOLS.contains(&t.name))
         .map(|t| {
@@ -48,14 +59,22 @@ mod tests {
     #[test]
     fn every_other_schema_tool_is_advertised_exactly_once() {
         let defs = tool_definitions();
-        for schema in tools::schemas() {
+        for schema in all_schemas() {
             if HIDDEN_TOOLS.contains(&schema.name) {
                 continue;
             }
             let count = defs.iter().filter(|d| d["function"]["name"] == schema.name).count();
             assert_eq!(count, 1, "tool {} advertised {count} times", schema.name);
         }
-        assert_eq!(defs.len(), tools::schemas().len() - HIDDEN_TOOLS.len());
+        assert_eq!(defs.len(), all_schemas().len() - HIDDEN_TOOLS.len());
+    }
+
+    #[test]
+    fn todo_write_is_advertised_once_and_the_backend_list_is_unchanged() {
+        let defs = tool_definitions();
+        let todo_defs = defs.iter().filter(|d| d["function"]["name"] == "todo_write").count();
+        assert_eq!(todo_defs, 1);
+        assert_eq!(tools::schemas().len(), 7, "todo_write is not a backend tool");
     }
 
     #[test]

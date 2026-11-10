@@ -62,6 +62,8 @@ export type AgentEvent =
   | { type: 'approval_request'; call_id: string; name: string; text: string }
   /** The agent is executing an approved shell call (true) and has finished it (false). */
   | { type: 'agent_control'; active: boolean }
+  /** The conversation's todo list was replaced by a successful todo_write. `items` is the whole list. */
+  | { type: 'todo_update'; items: TodoItem[] }
   | { type: 'done' };
 
 export type WireEvent = SessionEvent | AgentEvent;
@@ -123,11 +125,21 @@ export interface ConversationMeta {
 /** A chat-completions message as stored (role, content, tool_calls, tool_call_id). */
 export type ChatMessage = Record<string, unknown>;
 
+/** One item of the conversation's todo list. Position-based: the list is replaced as a whole. */
+export type TodoStatus = 'pending' | 'in_progress' | 'completed';
+
+export interface TodoItem {
+  content: string;
+  status: TodoStatus;
+}
+
 /** A saved conversation opened as the live one. `messages` are the repaired messages, as the backend now holds them. */
 export interface LoadedConversation {
   id: string;
   title: string;
   messages: ChatMessage[];
+  /** The repaired todo list. Absent or empty when the conversation had none. */
+  todos?: TodoItem[];
 }
 
 export type Dock = 'left' | 'top' | 'right' | 'bottom';

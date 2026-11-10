@@ -12,6 +12,7 @@ use super::workspace::workspace_for;
 use super::{Persist, PersistError};
 use crate::core::chat::history::History;
 use crate::core::chat::redact::Redactor;
+use crate::core::chat::todo::{self, Todo};
 
 /// Conversations kept on disk. After each saved turn the oldest beyond this are deleted, never the one just saved.
 pub const MAX_CONVERSATIONS: usize = 500;
@@ -21,6 +22,8 @@ pub struct FinishedTurn<'a> {
     pub conversation_id: &'a str,
     /// The History snapshot (no system message). Redacted when it is saved.
     pub messages: Vec<Value>,
+    /// The conversation's todo list at the end of the turn. Redacted when it is saved.
+    pub todos: Vec<Todo>,
     pub model: Option<String>,
     /// The shell's working directory as `(host, path)`. None before the shell has reported one.
     pub cwd: Option<(&'a str, &'a str)>,
@@ -38,6 +41,8 @@ pub struct Resumed {
     pub title: String,
     /// The stored messages, repaired (see `History::from_messages`). This is what the live conversation then holds.
     pub history: History,
+    /// The stored todo list, repaired (see `todo::repair`).
+    pub todos: Vec<Todo>,
 }
 
 /// Saves a finished turn. Returns `None`, and writes nothing, when the history has no user message. Otherwise it
@@ -70,6 +75,7 @@ fn save_turn_keeping(
         workspace: workspace_for(turn.cwd, env.local_host, env.home),
         model: turn.model,
         messages: turn.messages,
+        todos: turn.todos,
     };
     let meta = persist.conversations.save(&req, redactor, now)?;
     let pruned = persist.conversations.prune(keep, Some(&id)).map(|_| ());
@@ -83,7 +89,12 @@ fn save_turn_keeping(
 /// Reads a saved conversation for resuming. A missing, unreadable or invalid file is an error, and nothing is changed.
 pub fn resume(persist: &Persist, id: &str) -> Result<Resumed, PersistError> {
     let stored = persist.conversations.load(id)?;
-    Ok(Resumed { id: stored.id, title: stored.title, history: History::from_messages(stored.messages) })
+    Ok(Resumed {
+        id: stored.id,
+        title: stored.title,
+        history: History::from_messages(stored.messages),
+        todos: todo::repair(stored.todos),
+    })
 }
 
 fn has_user_message(messages: &[Value]) -> bool {
@@ -118,7 +129,7 @@ mod tests {
     }
 
     fn turn<'a>(id: &'a str, messages: Vec<Value>, cwd: Option<(&'a str, &'a str)>) -> FinishedTurn<'a> {
-        FinishedTurn { conversation_id: id, messages, model: Some("model-a".into()), cwd }
+        FinishedTurn { conversation_id: id, messages, todos: Vec::new(), model: Some("model-a".into()), cwd }
     }
 
     fn exchange(user_text: &str) -> Vec<Value> {

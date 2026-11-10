@@ -23,6 +23,7 @@ use crate::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate, MockAgent, On
 use crate::core::chat::agent_loop::{self, Conversation, LlmAgent, LlmSettings, USER_AGENT};
 use crate::core::chat::history::History;
 use crate::core::chat::redact::Redactor;
+use crate::core::chat::todo::{Todo, TodoList};
 use crate::core::llm::TurnCancel;
 use crate::core::observer::{EventSink, InputState, IntegrationStatus, ObserverStatus, SessionEvent};
 use crate::core::persist::conversations::ConversationMeta;
@@ -119,15 +120,15 @@ impl Attached {
         agent::cancel_turn(&self.turn_cancel, &self.approvals);
     }
 
-    /// Marks the agent busy and installs the turn's cancel token. Returns the conversation's history and id for the
-    /// turn. Held under the turn-cancel lock, which `new_conversation` also takes, so a reset cannot land mid-start.
-    fn begin_turn(&self, cancel: &Arc<TurnCancel>) -> Result<(Arc<Mutex<History>>, String), String> {
+    /// Marks the agent busy and installs the turn's cancel token. Returns the conversation's history, todo list and id for
+    /// the turn. Held under the turn-cancel lock, which `new_conversation` also takes, so a reset cannot land mid-start.
+    fn begin_turn(&self, cancel: &Arc<TurnCancel>) -> Result<(Arc<Mutex<History>>, TodoList, String), String> {
         let mut slot = lock(&self.turn_cancel);
         if self.agent_busy.swap(true, Ordering::SeqCst) {
             return Err("the agent is still working on the previous message".into());
         }
         *slot = Some(cancel.clone());
-        Ok((self.conversation.history(), self.conversation.id()))
+        Ok((self.conversation.history(), self.conversation.todos(), self.conversation.id()))
     }
 }
 
@@ -211,12 +212,19 @@ fn save_finished_turn(
     session: &Session,
     conversation_id: &str,
     history: &Mutex<History>,
+    todos: &TodoList,
     redactor: &Redactor,
     model: Option<String>,
 ) {
     let cwd = session.cwd();
     let cwd_pair = cwd.as_ref().map(|c| (c.host.as_str(), c.path.as_str()));
-    let turn = FinishedTurn { conversation_id, messages: lock(history).snapshot(), model, cwd: cwd_pair };
+    let turn = FinishedTurn {
+        conversation_id,
+        messages: lock(history).snapshot(),
+        todos: lock(todos).clone(),
+        model,
+        cwd: cwd_pair,
+    };
     let home = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
     let env = TurnEnv { local_host: local_host(), home: home.as_deref() };
     if let Err(e) = save_turn(store, turn, redactor, env, now_secs()) {
@@ -367,13 +375,20 @@ async fn agent_message(
     let service = settings.0.clone();
     let chosen = blocking(move || choose_llm(service.as_deref())).await?;
     let cancel = Arc::new(TurnCancel::new());
-    let (history, conversation_id) = att.begin_turn(&cancel)?;
+    let (history, todos, conversation_id) = att.begin_turn(&cancel)?;
     // Only the LLM agent writes history, so only its turns are saved. The mock agent never touches the history.
     let (mut llm, model) = match chosen {
         None => (None, None),
         Some((llm_settings, model)) => match agent_loop::shared_client() {
             Ok(client) => {
-                let agent = LlmAgent::new(client, llm_settings, &conversation_id, history.clone(), cancel.clone());
+                let agent = LlmAgent::new(
+                    client,
+                    llm_settings,
+                    &conversation_id,
+                    history.clone(),
+                    todos.clone(),
+                    cancel.clone(),
+                );
                 (Some(agent), Some(model))
             }
             Err(e) => {
@@ -403,7 +418,7 @@ async fn agent_message(
         }
         // The history is final now, and this is still before the turn is ended (the guard above).
         if let (Some(agent), Some(store)) = (llm.as_ref(), store.as_ref()) {
-            save_finished_turn(store, &worker.session, &conversation_id, &history, agent.redactor(), model);
+            save_finished_turn(store, &worker.session, &conversation_id, &history, &todos, agent.redactor(), model);
         }
     });
     if let Err(e) = spawned {
@@ -529,6 +544,8 @@ struct LoadedConversation {
     id: String,
     title: String,
     messages: Vec<Value>,
+    /// The todo list the conversation ended with (repaired). Empty when it had none.
+    todos: Vec<Todo>,
 }
 
 /// A saved conversation as the live one. The file is read and repaired first. Then, when the agent is idle, the live
@@ -548,13 +565,14 @@ async fn load_conversation(
     let resumed = blocking(move || resume(&read_store, &read_id).map_err(|e| e.to_string())).await?;
     let messages = resumed.history.snapshot();
     let title = resumed.title;
+    let todos = resumed.todos;
     {
         // The busy check and the restore happen under the turn-cancel lock, as `begin_turn` and `new_conversation` do.
         let _turn = lock(&att.turn_cancel);
         if att.agent_busy.load(Ordering::SeqCst) {
             return Err(BUSY_REFUSAL.into());
         }
-        att.conversation.restore(id.clone(), resumed.history);
+        att.conversation.restore(id.clone(), resumed.history, todos.clone());
     }
     let remember_id = id.clone();
     let remember = blocking(move || {
@@ -564,7 +582,7 @@ async fn load_conversation(
     if let Err(e) = remember.await {
         eprintln!("agent-term: the last conversation was not remembered ({e})");
     }
-    Ok(LoadedConversation { id, title, messages })
+    Ok(LoadedConversation { id, title, messages, todos })
 }
 
 /// Deletes a saved conversation. Deleting one that does not exist is not an error. When it was the remembered last

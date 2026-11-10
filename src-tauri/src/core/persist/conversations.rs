@@ -19,12 +19,13 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use super::PersistError;
 use super::workspace::Workspace;
 use crate::core::chat::redact::Redactor;
+use crate::core::chat::todo::{self, Todo};
 use crate::core::settings::write_private_atomic;
 
 pub const CONVERSATION_VERSION: u32 = 1;
@@ -62,6 +63,10 @@ pub struct StoredConversation {
     pub workspace: Workspace,
     pub model: Option<String>,
     pub messages: Vec<Value>,
+    /// The todo list the conversation ended its last turn with. Absent in files saved without one, so older files load
+    /// with none. Read leniently (see `lenient_todos`): a damaged entry is dropped, never a reason to refuse the file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "lenient_todos")]
+    pub todos: Vec<Todo>,
 }
 
 impl StoredConversation {
@@ -87,6 +92,8 @@ pub struct SaveRequest {
     pub model: Option<String>,
     /// The History snapshot: stored messages, no system message.
     pub messages: Vec<Value>,
+    /// The conversation's todo list at the end of the turn. Replaces the stored list. Redacted when it is saved.
+    pub todos: Vec<Todo>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -120,6 +127,7 @@ impl ConversationStore {
         check_id(&req.id)?;
         let _guard = self.guard();
         let messages = redact_messages(&req.messages, redactor);
+        let todos = redact_todos(&req.todos, redactor);
         let existing = match self.read_stored(&req.id) {
             Ok(existing) => existing,
             Err(PersistError::Corrupt(_)) => {
@@ -138,6 +146,7 @@ impl ConversationStore {
                 workspace: old.workspace,
                 model: req.model.clone().or(old.model),
                 messages,
+                todos,
             },
             None => StoredConversation {
                 version: CONVERSATION_VERSION,
@@ -148,6 +157,7 @@ impl ConversationStore {
                 workspace: req.workspace.clone(),
                 model: req.model.clone(),
                 messages,
+                todos,
             },
         };
         self.write_file(&stored)?;
@@ -470,6 +480,28 @@ pub fn redact_messages(messages: &[Value], redactor: &Redactor) -> Vec<Value> {
         .collect()
 }
 
+/// The todo list with the redactor applied to each content. A redacted content can grow past the limit when a short secret
+/// is replaced by the longer marker, so it is cut back to `todo::MAX_CONTENT_CHARS`.
+pub fn redact_todos(todos: &[Todo], redactor: &Redactor) -> Vec<Todo> {
+    todos
+        .iter()
+        .map(|todo| Todo {
+            content: redactor.redact(&todo.content).chars().take(todo::MAX_CONTENT_CHARS).collect(),
+            status: todo.status,
+        })
+        .collect()
+}
+
+/// Reads the stored todos one entry at a time: an entry that is not a todo is dropped, and a value that is not an array
+/// reads as no todos. A hand-edited file therefore never fails to load over its todo list.
+fn lenient_todos<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<Todo>, D::Error> {
+    let raw = Value::deserialize(deserializer)?;
+    Ok(raw
+        .as_array()
+        .map(|entries| entries.iter().filter_map(|entry| Todo::deserialize(entry).ok()).collect())
+        .unwrap_or_default())
+}
+
 fn message_count(messages: &[Value]) -> usize {
     messages
         .iter()
@@ -533,6 +565,7 @@ mod tests {
                 json!({"role": "user", "content": user_text}),
                 json!({"role": "assistant", "content": "reply"}),
             ],
+            todos: Vec::new(),
         }
     }
 
@@ -717,6 +750,7 @@ mod tests {
                 json!({"role": "tool", "tool_call_id": "c1", "content": "out"}),
                 json!({"role": "assistant", "content": "bye"}),
             ],
+            todos: Vec::new(),
         };
         let meta = s.save(&req, &redactor(), 1_000).unwrap();
         assert_eq!(meta.id, id(1));
@@ -749,6 +783,7 @@ mod tests {
                 json!({"role": "assistant", "content": null, "tool_calls": [tool_call("c1", &format!("{{\"k\":\"{SECRET}\"}}"))]}),
                 json!({"role": "tool", "tool_call_id": "c1", "content": "ok"}),
             ],
+            todos: Vec::new(),
         };
         s.save(&req, &redactor(), 5).unwrap();
         let on_disk = fs::read_to_string(s.path_for(&id(2))).unwrap();
@@ -779,6 +814,7 @@ mod tests {
             workspace: other_ws,
             model: None,
             messages: vec![json!({"role": "user", "content": "different now"})],
+            todos: Vec::new(),
         };
         let meta = s.save(&again, &redactor(), 250).unwrap();
         assert_eq!(meta.created_at, 100);
@@ -1161,8 +1197,49 @@ mod tests {
             workspace: workspace(),
             model: None,
             messages: vec![json!({"role": "user", "content": SECRET})],
+            todos: Vec::new(),
         };
         let meta = s.save(&req, &redactor(), 1).unwrap();
         assert_eq!(meta.title, "[REDACTED]");
+    }
+
+    #[test]
+    fn stored_todos_are_read_leniently_and_a_missing_or_odd_list_is_none() {
+        let base = json!({"version": 1, "id": id(80), "title": "t", "created_at": 1, "updated_at": 1,
+            "workspace": workspace(), "model": null, "messages": []});
+        let with = |todos: Value| {
+            let mut file = base.clone();
+            file["todos"] = todos;
+            serde_json::from_value::<StoredConversation>(file).expect("the file still loads")
+        };
+        assert!(serde_json::from_value::<StoredConversation>(base.clone()).unwrap().todos.is_empty());
+        assert!(with(json!("not a list")).todos.is_empty());
+        assert!(with(Value::Null).todos.is_empty());
+        let mixed = with(json!([
+            {"content": "good", "status": "pending"},
+            {"content": "bad status", "status": "doing"},
+            {"content": 7, "status": "pending"},
+            "not an object",
+            {"content": "also good", "status": "completed"},
+        ]));
+        let contents: Vec<&str> = mixed.todos.iter().map(|t| t.content.as_str()).collect();
+        assert_eq!(contents, ["good", "also good"]);
+    }
+
+    #[test]
+    fn todos_are_redacted_and_kept_within_the_content_limit_on_save() {
+        let tmp = TempDir::new();
+        let s = store(&tmp);
+        let long = format!("{SECRET}{}", "a".repeat(todo::MAX_CONTENT_CHARS));
+        let req = SaveRequest {
+            todos: vec![Todo { content: long, status: todo::TodoStatus::InProgress }],
+            ..request(&id(81), "hi")
+        };
+        s.save(&req, &redactor(), 1).unwrap();
+        let stored = s.load(&id(81)).unwrap();
+        assert_eq!(stored.todos.len(), 1);
+        assert!(stored.todos[0].content.starts_with("[REDACTED]"));
+        assert_eq!(stored.todos[0].content.chars().count(), todo::MAX_CONTENT_CHARS);
+        assert!(!fs::read_to_string(s.path_for(&id(81))).unwrap().contains(SECRET));
     }
 }

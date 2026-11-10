@@ -12,6 +12,7 @@ use agent_term_lib::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate};
 use agent_term_lib::core::chat::agent_loop::{Conversation, LlmAgent, LlmSettings, MAX_COMMANDS_PER_TURN, MAX_MODEL_CALLS};
 use agent_term_lib::core::chat::history::History;
 use agent_term_lib::core::chat::prompt;
+use agent_term_lib::core::chat::todo;
 use agent_term_lib::core::llm::{TurnCancel, http_client};
 use agent_term_lib::core::record::{Cwd, RecordSummary};
 use agent_term_lib::core::tools::{AgentTools, CommandView, RunOutcome, ScreenView, WaitView};
@@ -254,7 +255,7 @@ fn settings(url: &str, stream: bool) -> LlmSettings {
 }
 
 fn agent_for(s: &LlmSettings, conv: &Conversation, cancel: Arc<TurnCancel>) -> LlmAgent {
-    LlmAgent::new(&http_client().expect("client"), s.clone(), &conv.id(), conv.history(), cancel)
+    LlmAgent::new(&http_client().expect("client"), s.clone(), &conv.id(), conv.history(), conv.todos(), cancel)
 }
 
 /// Runs one turn and returns every event it emitted, `Done` included.
@@ -715,4 +716,107 @@ fn new_conversation_clears_the_history_and_rotates_the_id() {
     conv.reset().unwrap();
     assert!(stored(&conv.history()).is_empty());
     assert_ne!(conv.id(), before);
+}
+
+/// The arguments of a `todo_write` call, as the model sends them (a JSON string).
+fn todo_args(items: &[(&str, &str)]) -> String {
+    let items: Vec<Value> = items.iter().map(|(content, status)| json!({"content": content, "status": status})).collect();
+    json!({"items": items}).to_string()
+}
+
+/// The system message of a request, as the provider received it.
+fn system_of(raw: &str) -> String {
+    body_of(raw)["messages"][0]["content"].as_str().expect("system content").to_string()
+}
+
+const LIST_BLOCK: &str = "Your todo list (update it with todo_write):\nCurrent: fix the bug\nDone: read the code\nPending: run the tests";
+
+#[test]
+fn todo_write_replaces_the_list_is_shown_on_the_next_call_and_is_reported_as_a_tool() {
+    let args = todo_args(&[("read the code", "completed"), ("fix the bug", "in_progress"), ("run the tests", "pending")]);
+    let provider = serve(vec![
+        Script::json(tool_reply(&[("call_t1", "todo_write", &args)])),
+        Script::json(text_reply("working on it")),
+    ]);
+    let conv = Conversation::new().unwrap();
+    let tools = FakeTools::default();
+    let gate = no_gate();
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
+    let events = turn(&mut agent, &tools, &gate, "plan the work");
+
+    // Handled inside the loop: no backend call, no approval card, and no command counted.
+    assert!(tools.reached().is_empty(), "todo_write reached the backend: {:?}", tools.reached());
+    assert!(!events.iter().any(|e| matches!(e, AgentEvent::ApprovalRequest { .. } | AgentEvent::AgentControl { .. })));
+    assert_eq!(decisions(&events), [("todo_write".to_string(), "read", true)]);
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolCall { name, .. } if name == "todo_write")));
+    let update: Vec<&Vec<todo::Todo>> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TodoUpdate { items } => Some(items),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(update.len(), 1, "one update event for one successful call");
+    assert_eq!(update[0].len(), 3);
+    assert_eq!(update[0][1].status, todo::TodoStatus::InProgress);
+    assert_eq!(conv.todos().lock().unwrap().clone(), update[0].clone(), "the conversation holds the list");
+
+    // The model is told the outcome under its call id, and the next request carries the list.
+    let requests = provider.requests();
+    assert!(body_of(&requests[0])["tools"].as_array().unwrap().iter().any(|t| t["function"]["name"] == "todo_write"));
+    assert_eq!(system_of(&requests[1]), format!("{}\n\n{LIST_BLOCK}", prompt::system_prompt()));
+    let msgs = stored(&conv.history());
+    assert_paired(&msgs);
+    assert_eq!(tool_content(&msgs, "call_t1"), "todo list updated: 1 done, 1 in progress, 1 pending");
+    assert!(!serde_json::to_string(&msgs).unwrap().contains("Your todo list"), "the block is never stored");
+}
+
+#[test]
+fn the_list_survives_across_turns_and_an_empty_list_clears_the_block() {
+    let first = todo_args(&[("read the code", "completed"), ("fix the bug", "in_progress")]);
+    let provider = serve(vec![
+        Script::json(tool_reply(&[("call_a", "todo_write", &first)])),
+        Script::json(text_reply("step one done")),
+        // Second turn: no tool call, the list is still in the request.
+        Script::json(text_reply("still going")),
+        // Third turn: the model clears the list.
+        Script::json(tool_reply(&[("call_b", "todo_write", "{\"items\":[]}")])),
+        Script::json(text_reply("cleared")),
+    ]);
+    let conv = Conversation::new().unwrap();
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
+    turn(&mut agent, &FakeTools::default(), &no_gate(), "start");
+    turn(&mut agent, &FakeTools::default(), &no_gate(), "continue");
+    let requests = provider.requests();
+    assert_eq!(system_of(&requests[2]), format!("{}\n\n{}", prompt::system_prompt(), "Your todo list (update it with todo_write):\nCurrent: fix the bug\nDone: read the code"));
+
+    let events = turn(&mut agent, &FakeTools::default(), &no_gate(), "finish up");
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 5);
+    assert!(conv.todos().lock().unwrap().clone().is_empty(), "the empty list cleared the conversation's list");
+    let cleared = events.iter().any(|e| matches!(e, AgentEvent::TodoUpdate { items } if items.is_empty()));
+    assert!(cleared, "clearing is reported as an update with no items");
+    assert_eq!(system_of(&requests[4]), prompt::system_prompt(), "no block once the list is empty");
+}
+
+#[test]
+fn an_invalid_todo_write_changes_nothing_and_the_model_reads_why() {
+    let bad = todo_args(&[("a", "in_progress"), ("b", "in_progress")]);
+    let provider = serve(vec![
+        Script::json(tool_reply(&[("call_bad", "todo_write", &bad)])),
+        Script::json(text_reply("I will fix that")),
+    ]);
+    let conv = Conversation::new().unwrap();
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
+    let events = turn(&mut agent, &FakeTools::default(), &no_gate(), "plan");
+
+    assert!(!events.iter().any(|e| matches!(e, AgentEvent::TodoUpdate { .. })), "a refused list is not announced");
+    assert_eq!(decisions(&events), [("todo_write".to_string(), "read", false)]);
+    assert!(conv.todos().lock().unwrap().clone().is_empty());
+    let requests = provider.requests();
+    assert_eq!(system_of(&requests[1]), prompt::system_prompt());
+    let msgs = stored(&conv.history());
+    assert_paired(&msgs);
+    let text = tool_content(&msgs, "call_bad");
+    assert!(text.starts_with("error: ") && text.contains("exactly one in_progress"), "{text}");
 }

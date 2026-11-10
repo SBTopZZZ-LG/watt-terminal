@@ -20,13 +20,14 @@ use std::io::{self, Read};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use reqwest::header::{HeaderName, HeaderValue};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::core::agent::{Agent, AgentCtx, AgentEvent, DENIED};
 use crate::core::chat::history::History;
 use crate::core::chat::project::project;
 use crate::core::chat::prompt;
 use crate::core::chat::redact::Redactor;
+use crate::core::chat::todo::{self, Todo, TodoList};
 use crate::core::llm::{self, AssistantReply, ChatRequest, Delta, LlmError, ProviderConfig, ToolCall, TurnCancel};
 
 /// Model calls allowed in one turn. The tool calls of the last one are not run.
@@ -175,15 +176,20 @@ pub fn new_conversation_id() -> io::Result<String> {
     Ok(format!("ses_{}", bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()))
 }
 
-/// One session's conversation: the id sent to the provider and the history. `reset` starts a new one.
+/// One session's conversation: the id sent to the provider, the history, and the todo list. `reset` starts a new one.
 pub struct Conversation {
     id: Mutex<String>,
     history: Arc<Mutex<History>>,
+    todos: TodoList,
 }
 
 impl Conversation {
     pub fn new() -> io::Result<Self> {
-        Ok(Conversation { id: Mutex::new(new_conversation_id()?), history: Arc::new(Mutex::new(History::new())) })
+        Ok(Conversation {
+            id: Mutex::new(new_conversation_id()?),
+            history: Arc::new(Mutex::new(History::new())),
+            todos: Arc::new(Mutex::new(Vec::new())),
+        })
     }
 
     pub fn id(&self) -> String {
@@ -194,19 +200,26 @@ impl Conversation {
         self.history.clone()
     }
 
-    /// Clears the history and rotates the id. The caller makes sure no turn is running.
+    pub fn todos(&self) -> TodoList {
+        self.todos.clone()
+    }
+
+    /// Clears the history and the todo list, and rotates the id. The caller makes sure no turn is running.
     pub fn reset(&self) -> io::Result<()> {
         let id = new_conversation_id()?;
         lock(&self.history).clear();
+        lock_todos(&self.todos).clear();
         *lock_string(&self.id) = id;
         Ok(())
     }
 
-    /// Makes a saved conversation the live one: its id and its history replace the current ones. The history object
-    /// stays the same, so holders of `history()` see the new contents. The caller makes sure no turn is running.
-    pub fn restore(&self, id: String, history: History) {
+    /// Makes a saved conversation the live one: its id, history and todo list replace the current ones. The history and
+    /// todo objects stay the same, so holders of `history()` and `todos()` see the new contents. The caller makes sure no
+    /// turn is running.
+    pub fn restore(&self, id: String, history: History, todos: Vec<Todo>) {
         *lock_string(&self.id) = id;
         *lock(&self.history) = history;
+        *lock_todos(&self.todos) = todos;
     }
 }
 
@@ -220,6 +233,7 @@ pub struct LlmAgent {
     stream: bool,
     redactor: Redactor,
     history: Arc<Mutex<History>>,
+    todos: TodoList,
     cancel: Arc<TurnCancel>,
     system: String,
     tools: Vec<Value>,
@@ -231,6 +245,7 @@ impl LlmAgent {
         settings: LlmSettings,
         conversation_id: &str,
         history: Arc<Mutex<History>>,
+        todos: TodoList,
         cancel: Arc<TurnCancel>,
     ) -> Self {
         let headers = settings.resolved_headers(conversation_id);
@@ -250,6 +265,7 @@ impl LlmAgent {
             stream: settings.stream,
             redactor: Redactor::new(known),
             history,
+            todos,
             cancel,
             system: prompt::system_prompt(),
             tools: prompt::tool_definitions(),
@@ -264,7 +280,12 @@ impl LlmAgent {
     /// One model call. Streams text as it arrives, or waits for the whole reply. Returns None when the call was
     /// cancelled or failed; a failure has already been shown to the user.
     fn ask_model(&self, ctx: &AgentCtx<'_>) -> Option<AssistantReply> {
-        let messages = lock(&self.history).messages(&self.system);
+        // The todo block is added to this request's system message only. It is never stored in the history.
+        let system = match todo::prompt_block(&lock_todos(&self.todos)) {
+            Some(block) => format!("{}\n\n{block}", self.system),
+            None => self.system.clone(),
+        };
+        let messages = lock(&self.history).messages(&system);
         let req = ChatRequest {
             model: self.model.clone(),
             messages,
@@ -337,6 +358,7 @@ impl LlmAgent {
                 *commands += 1;
                 ctx.call_tool("run_command", args)
             }
+            todo::TOOL_NAME => ctx.local_tool(name, &args, |args| self.write_todos(args, ctx)),
             _ if READ_NAMES.contains(&name) => ctx.read_tool(name, args),
             "send_keys" => return failed("send_keys is not available in this version"),
             _ => {
@@ -350,6 +372,15 @@ impl LlmAgent {
             Err(e) => project(name, false, &Value::String(e), &self.redactor),
         };
         (content, denied)
+    }
+
+    /// Validates a `todo_write` call and, when it is valid, replaces the conversation's list and reports it. A refused
+    /// call leaves the list as it was. The error text is what the model reads back.
+    fn write_todos(&self, args: &Value, ctx: &AgentCtx<'_>) -> Result<Value, String> {
+        let items = todo::parse(args)?;
+        *lock_todos(&self.todos) = items.clone();
+        ctx.emit(AgentEvent::TodoUpdate { items: items.clone() });
+        Ok(json!({"items": items}))
     }
 }
 
@@ -429,6 +460,10 @@ fn lock(m: &Mutex<History>) -> MutexGuard<'_, History> {
 }
 
 fn lock_string(m: &Mutex<String>) -> MutexGuard<'_, String> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn lock_todos(m: &TodoList) -> MutexGuard<'_, Vec<Todo>> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 

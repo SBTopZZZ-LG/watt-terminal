@@ -7,3 +7,4 @@ pub mod history;
 pub mod project;
 pub mod prompt;
 pub mod redact;
+pub mod todo;

@@ -9,6 +9,7 @@
 use serde_json::{Value, json};
 
 use crate::core::chat::redact::Redactor;
+use crate::core::chat::todo;
 
 /// `run_command` output longer than this is cut to a head and tail. Output at or under it is sent whole.
 const RUN_OUTPUT_LIMIT: usize = 4500;
@@ -39,6 +40,7 @@ pub fn project(name: &str, ok: bool, result: &Value, redactor: &Redactor) -> Str
             "get_command" => get_command_text(result, redactor),
             "get_screen" => get_screen_text(result, redactor),
             "wait" => wait_text(result, redactor),
+            todo::TOOL_NAME => todo_write_text(result),
             "list_commands" => list_commands_text(result, redactor),
             "get_cwd" => cwd_text(Some(result)),
             _ => compact_json(result),
@@ -239,6 +241,21 @@ fn command_line(c: &Value, r: &Redactor) -> String {
         scalar(c.get("output_bytes")),
         source,
         cap(&command, COMMAND_TEXT_LIMIT),
+    )
+}
+
+/// The result of a `todo_write` call: the counts of the list it now holds, or "cleared" for an empty list.
+fn todo_write_text(v: &Value) -> String {
+    let items = v.get("items").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
+    if items.is_empty() {
+        return "todo list cleared".to_string();
+    }
+    let count = |status: &str| items.iter().filter(|item| item["status"] == status).count();
+    format!(
+        "todo list updated: {} done, {} in progress, {} pending",
+        count("completed"),
+        count("in_progress"),
+        count("pending")
     )
 }
 
@@ -611,6 +628,26 @@ mod tests {
             "rows": rows, "cursor": [0, 0], "alternate_screen": false, "size": [24, 80],
             "state": "prompt", "observer_status": "ok", "integration_status": "live",
         })
+    }
+
+    #[test]
+    fn todo_write_reports_the_counts_of_the_list_it_holds() {
+        let v = json!({"items": [
+            {"content": "a", "status": "completed"},
+            {"content": "b", "status": "in_progress"},
+            {"content": "c", "status": "pending"},
+            {"content": "d", "status": "pending"},
+            {"content": "e", "status": "completed"},
+            {"content": "f", "status": "pending"},
+        ]});
+        assert_eq!(project("todo_write", true, &v, &none()), "todo list updated: 2 done, 1 in progress, 3 pending");
+        assert_eq!(project("todo_write", true, &json!({"items": []}), &none()), "todo list cleared");
+    }
+
+    #[test]
+    fn todo_write_errors_reach_the_model_as_text() {
+        let err = Value::String("item 2: content is empty".to_string());
+        assert_eq!(project("todo_write", false, &err, &none()), "error: item 2: content is empty");
     }
 
     #[test]

@@ -266,6 +266,7 @@ mod tests {
             resolved,
             "ses_0123456789abcdef0123456789abcdef",
             history,
+            Arc::new(Mutex::new(Vec::new())),
             Arc::new(TurnCancel::new()),
         );
         let echoed = format!("header {HEADER_SECRET} and key {KEY}");

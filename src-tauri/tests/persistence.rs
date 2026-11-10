@@ -15,6 +15,7 @@ use std::time::Duration;
 use agent_term_lib::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate};
 use agent_term_lib::core::chat::agent_loop::{Conversation, LlmAgent, LlmSettings};
 use agent_term_lib::core::chat::redact::Redactor;
+use agent_term_lib::core::chat::todo::{self, Todo, TodoStatus};
 use agent_term_lib::core::llm::{TurnCancel, http_client};
 use agent_term_lib::core::persist::conversations::{ConversationMeta, SaveRequest};
 use agent_term_lib::core::persist::turn::{FinishedTurn, TurnEnv, resume, save_turn};
@@ -178,7 +179,14 @@ fn settings(url: &str) -> LlmSettings {
 }
 
 fn agent_for(s: &LlmSettings, conv: &Conversation) -> LlmAgent {
-    LlmAgent::new(&http_client().expect("client"), s.clone(), &conv.id(), conv.history(), Arc::new(TurnCancel::new()))
+    LlmAgent::new(
+        &http_client().expect("client"),
+        s.clone(),
+        &conv.id(),
+        conv.history(),
+        conv.todos(),
+        Arc::new(TurnCancel::new()),
+    )
 }
 
 /// Runs one turn of the agent, as the app does on its agent thread.
@@ -200,7 +208,7 @@ fn finish(
 ) -> Option<ConversationMeta> {
     let id = conv.id();
     let messages = conv.history().lock().unwrap().snapshot();
-    let turn = FinishedTurn { conversation_id: &id, messages, model: Some(MODEL.to_string()), cwd };
+    let turn = FinishedTurn { conversation_id: &id, messages, todos: conv.todos().lock().unwrap().clone(), model: Some(MODEL.to_string()), cwd };
     let env = TurnEnv { local_host: "this-mac", home: None };
     save_turn(persist, turn, agent.redactor(), env, now).expect("save succeeds")
 }
@@ -251,7 +259,7 @@ fn a_resumed_conversation_gives_the_model_its_earlier_messages() {
     // Resume it into a fresh live conversation, as load_conversation does, then run a second turn.
     let loaded = resume(&persist, &saved.id).expect("resume");
     let live = Conversation::new().unwrap();
-    live.restore(loaded.id, loaded.history);
+    live.restore(loaded.id, loaded.history, loaded.todos);
     assert_eq!(live.id(), first.id(), "the provider session id is kept");
     let mut resumed_agent = agent_for(&s, &live);
     run(&mut resumed_agent, "second question");
@@ -343,6 +351,7 @@ fn a_saved_unanswered_tool_call_is_closed_before_the_model_sees_the_resumed_hist
                 workspace: Workspace::unknown(),
                 model: Some(MODEL.to_string()),
                 messages: stored_messages,
+                todos: Vec::new(),
             },
             &Redactor::new(vec![KEY.to_string()]),
             5,
@@ -351,7 +360,7 @@ fn a_saved_unanswered_tool_call_is_closed_before_the_model_sees_the_resumed_hist
 
     let loaded = resume(&persist, &id).expect("resume");
     let live = Conversation::new().unwrap();
-    live.restore(loaded.id, loaded.history);
+    live.restore(loaded.id, loaded.history, loaded.todos);
     let s = settings(&provider.url);
     let mut agent = agent_for(&s, &live);
     run(&mut agent, "and now?");
@@ -373,7 +382,7 @@ fn a_turn_saved_over_a_damaged_conversation_file_goes_through_and_is_listed() {
     fs::write(&damaged, b"{\"version\": 1, \"id\": ").unwrap();
 
     let messages = vec![json!({"role": "user", "content": "start again"}), json!({"role": "assistant", "content": "ok"})];
-    let turn = FinishedTurn { conversation_id: &id, messages, model: Some(MODEL.to_string()), cwd: None };
+    let turn = FinishedTurn { conversation_id: &id, messages, todos: Vec::new(), model: Some(MODEL.to_string()), cwd: None };
     let env = TurnEnv { local_host: "this-mac", home: None };
     let saved = save_turn(&persist, turn, &Redactor::new(Vec::new()), env, 9).expect("save succeeds").expect("saved");
     assert_eq!(saved.id, id);
@@ -383,4 +392,147 @@ fn a_turn_saved_over_a_damaged_conversation_file_goes_through_and_is_listed() {
     let listed: Vec<String> = persist.conversations.list().unwrap().into_iter().map(|m| m.id).collect();
     assert_eq!(listed, vec![id.clone()]);
     assert_eq!(persist.ui.load().unwrap().last_conversation_id, Some(id));
+}
+
+/// A provider reply that calls one tool, as (id, name, arguments).
+fn tool_call_reply(id: &str, name: &str, arguments: &str) -> Value {
+    json!({"choices": [{"index": 0, "finish_reason": "tool_calls", "message": {"role": "assistant", "content": null,
+        "tool_calls": [{"id": id, "type": "function", "function": {"name": name, "arguments": arguments}}]}}]})
+}
+
+fn todo_of(content: &str, status: TodoStatus) -> Todo {
+    Todo { content: content.to_string(), status }
+}
+
+/// The conversation file for `id` under the test's data directory.
+fn conversation_file(tmp: &TempDir, id: &str) -> PathBuf {
+    tmp.path().join("data").join("conversations").join(format!("{id}.json"))
+}
+
+#[test]
+fn a_todo_list_is_saved_with_the_turn_and_resumed_into_the_next_request() {
+    let args = json!({"items": [
+        {"content": "read the code", "status": "completed"},
+        {"content": "fix the bug", "status": "in_progress"},
+        {"content": "run the tests", "status": "pending"},
+    ]})
+    .to_string();
+    let provider = serve(vec![tool_call_reply("call_t", "todo_write", &args), text_reply("noted"), text_reply("continuing")]);
+    let tmp = TempDir::new();
+    let persist = persist_in(&tmp);
+    let s = settings(&provider.url);
+
+    let first = Conversation::new().unwrap();
+    let mut agent = agent_for(&s, &first);
+    run(&mut agent, "plan the work");
+    let saved = finish(&persist, &first, &agent, None, 100).expect("the turn is saved");
+    let on_disk = fs::read_to_string(conversation_file(&tmp, &saved.id)).unwrap();
+    assert!(on_disk.contains("\"todos\""), "the list is in the file");
+    assert!(!on_disk.contains("Your todo list"), "the injected block is never stored");
+
+    let loaded = resume(&persist, &saved.id).expect("resume");
+    let expected = vec![
+        todo_of("read the code", TodoStatus::Completed),
+        todo_of("fix the bug", TodoStatus::InProgress),
+        todo_of("run the tests", TodoStatus::Pending),
+    ];
+    assert_eq!(loaded.todos, expected);
+    let live = Conversation::new().unwrap();
+    live.restore(loaded.id, loaded.history, loaded.todos);
+    assert_eq!(live.todos().lock().unwrap().clone(), expected);
+
+    let mut resumed_agent = agent_for(&s, &live);
+    run(&mut resumed_agent, "continue");
+    let requests = provider.requests();
+    let system = sent_messages(&requests[2])[0]["content"].as_str().unwrap().to_string();
+    assert!(
+        system.ends_with("Your todo list (update it with todo_write):\nCurrent: fix the bug\nDone: read the code\nPending: run the tests"),
+        "{system}"
+    );
+}
+
+#[test]
+fn an_older_file_without_todos_loads_with_an_empty_list() {
+    let tmp = TempDir::new();
+    let persist = persist_in(&tmp);
+    let id = format!("ses_{:032x}", 21);
+    persist
+        .conversations
+        .save(
+            &SaveRequest {
+                id: id.clone(),
+                workspace: Workspace::unknown(),
+                model: None,
+                messages: vec![json!({"role": "user", "content": "old"}), json!({"role": "assistant", "content": "ok"})],
+                todos: Vec::new(),
+            },
+            &Redactor::new(Vec::new()),
+            3,
+        )
+        .expect("save");
+    let on_disk = fs::read_to_string(conversation_file(&tmp, &id)).unwrap();
+    assert!(!on_disk.contains("todos"), "an empty list is not written, so the file stays in the older shape");
+
+    assert!(persist.conversations.load(&id).unwrap().todos.is_empty());
+    assert!(resume(&persist, &id).unwrap().todos.is_empty());
+}
+
+#[test]
+fn damaged_todos_are_repaired_on_load_and_never_break_the_file() {
+    let tmp = TempDir::new();
+    let persist = persist_in(&tmp);
+    let id = format!("ses_{:032x}", 22);
+    let file = json!({
+        "version": 1, "id": id, "title": "hand edited", "created_at": 1, "updated_at": 1,
+        "workspace": Workspace::unknown(), "model": null,
+        "messages": [{"role": "user", "content": "hi"}],
+        "todos": [
+            {"content": "kept", "status": "pending"},
+            {"content": "", "status": "pending"},
+            {"content": "unknown status", "status": "doing"},
+            42,
+            {"content": "first active", "status": "in_progress"},
+            {"content": "second active", "status": "in_progress"},
+            {"content": "two\nlines", "status": "completed"},
+        ],
+    });
+    fs::create_dir_all(conversation_file(&tmp, &id).parent().unwrap()).unwrap();
+    fs::write(conversation_file(&tmp, &id), file.to_string()).unwrap();
+
+    let loaded = resume(&persist, &id).expect("the file still loads");
+    assert_eq!(
+        loaded.todos,
+        vec![
+            todo_of("kept", TodoStatus::Pending),
+            todo_of("first active", TodoStatus::InProgress),
+            todo_of("second active", TodoStatus::Pending),
+        ]
+    );
+    assert!(persist.conversations.load(&id).is_ok());
+    assert_eq!(persist.conversations.list().unwrap().len(), 1, "the file is listed");
+}
+
+#[test]
+fn new_conversation_clears_the_todo_list_and_the_saved_copy_keeps_its_own() {
+    let tmp = TempDir::new();
+    let persist = persist_in(&tmp);
+    let conv = Conversation::new().unwrap();
+    let saved_id = conv.id();
+    *conv.todos().lock().unwrap() = vec![todo_of("still here", TodoStatus::InProgress)];
+    let turn = FinishedTurn {
+        conversation_id: &saved_id,
+        messages: vec![json!({"role": "user", "content": "hi"}), json!({"role": "assistant", "content": "ok"})],
+        todos: conv.todos().lock().unwrap().clone(),
+        model: None,
+        cwd: None,
+    };
+    save_turn(&persist, turn, &Redactor::new(Vec::new()), TurnEnv { local_host: "this-mac", home: None }, 4).unwrap();
+
+    conv.reset().unwrap();
+    assert!(conv.todos().lock().unwrap().is_empty(), "a new conversation starts with no list");
+    assert_ne!(conv.id(), saved_id);
+    let saved = resume(&persist, &saved_id).expect("the saved copy is untouched");
+    assert_eq!(saved.todos, vec![todo_of("still here", TodoStatus::InProgress)]);
+    // The todo module is used by name here so the import is exercised by the test as well.
+    assert!(todo::prompt_block(&saved.todos).is_some());
 }

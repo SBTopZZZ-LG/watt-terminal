@@ -16,6 +16,7 @@ use std::time::Duration;
 use serde::Serialize;
 use serde_json::{json, Value};
 
+use crate::core::chat::todo::Todo;
 use crate::core::llm::TurnCancel;
 use crate::core::session::{Session, USER_TEXT_CODE};
 use crate::core::tools::AgentTools;
@@ -126,8 +127,8 @@ impl<F: FnOnce()> Drop for OnDrop<F> {
 pub enum AgentEvent {
     Text { text: String },
     ToolCall { call_id: String, name: String, args: Value },
-    /// `decision` says how the call was allowed or stopped: "read" (a read tool, no approval), "manual" (the user
-    /// approved), "auto" (auto-approve skipped the card), "denied" (not approved: denied, cancelled or timed out),
+    /// `decision` says how the call was allowed or stopped: "read" (a read tool, or `todo_write`: no approval), "manual"
+    /// (the user approved), "auto" (auto-approve skipped the card), "denied" (not approved: denied, cancelled or timed out),
     /// or "refused" (refused before it ran, without asking, or by the tool when auto-approve skipped the card).
     ToolResult { call_id: String, name: String, ok: bool, decision: &'static str, result: Value },
     /// A call waits for the user. `name` is the tool name, so the card can say what is being asked.
@@ -140,10 +141,16 @@ pub enum AgentEvent {
     /// the call and false after it. A denied call sends nothing. A call the tool refuses (for example, the shell is
     /// busy) is bracketed too, but the bracket is immediate.
     AgentControl { active: bool },
+    /// The conversation's todo list was replaced by a successful `todo_write`. `items` is the whole list.
+    TodoUpdate { items: Vec<Todo> },
     Done,
 }
 
 static NEXT_CALL: AtomicU64 = AtomicU64::new(1);
+
+fn new_call_id() -> String {
+    format!("call-{}", NEXT_CALL.fetch_add(1, Ordering::Relaxed))
+}
 
 /// Tools that never change the shell. `read_tool` accepts only these. Must match `READ_NAMES` in core/chat/agent_loop.rs.
 const READ_TOOLS: [&str; 5] = ["list_commands", "get_command", "get_screen", "get_cwd", "wait"];
@@ -184,8 +191,27 @@ impl<'a> AgentCtx<'a> {
         self.run(name, args, true)
     }
 
+    /// Runs a tool the agent loop handles itself (`todo_write`): no approval, no shell, no backend. It reports the call
+    /// and its result like any tool, with the "read" decision, since no approval was asked.
+    pub fn local_tool(
+        &self,
+        name: &str,
+        args: &Value,
+        run: impl FnOnce(&Value) -> Result<Value, String>,
+    ) -> Result<Value, String> {
+        let call_id = new_call_id();
+        self.emit(AgentEvent::ToolCall { call_id: call_id.clone(), name: name.to_string(), args: args.clone() });
+        let result = run(args);
+        let (ok, value) = match &result {
+            Ok(v) => (true, v.clone()),
+            Err(e) => (false, json!({"error": e})),
+        };
+        self.emit(AgentEvent::ToolResult { call_id, name: name.to_string(), ok, decision: "read", result: value });
+        result
+    }
+
     fn run(&self, name: &str, args: Value, gated: bool) -> Result<Value, String> {
-        let call_id = format!("call-{}", NEXT_CALL.fetch_add(1, Ordering::Relaxed));
+        let call_id = new_call_id();
         self.emit(AgentEvent::ToolCall { call_id: call_id.clone(), name: name.to_string(), args: args.clone() });
         let (decision, result) = self.gate_and_execute(&call_id, name, &args, gated);
         let (ok, value) = match &result {
@@ -521,6 +547,12 @@ mod tests {
         assert_eq!(wire(AgentEvent::TextDelta { text: "Hel".into() }), json!({"type": "text_delta", "text": "Hel"}));
         assert_eq!(wire(AgentEvent::Thinking { active: true }), json!({"type": "thinking", "active": true}));
         assert_eq!(wire(AgentEvent::Done), json!({"type": "done"}));
+        assert_eq!(
+            wire(AgentEvent::TodoUpdate {
+                items: vec![Todo { content: "fix it".into(), status: crate::core::chat::todo::TodoStatus::InProgress }],
+            }),
+            json!({"type": "todo_update", "items": [{"content": "fix it", "status": "in_progress"}]})
+        );
     }
 
     #[test]

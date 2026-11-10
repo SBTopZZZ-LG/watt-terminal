@@ -183,6 +183,9 @@ function applyAgentEvent(t: Transcript, ev: AgentEvent): Transcript {
     // Drives the terminal border (see agentControl.ts), not the transcript.
     case 'agent_control':
       return t;
+    // Ignored until the todo panel's reducer lands (the UI task). Listed so the switch stays exhaustive.
+    case 'todo_update':
+      return t;
   }
 }
 
