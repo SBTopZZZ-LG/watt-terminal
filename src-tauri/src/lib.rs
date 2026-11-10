@@ -19,7 +19,9 @@ use tauri::{Manager, RunEvent, State};
 // Core logic (PTY, shell integration, observer, agent) has no Tauri dependency, so `cargo test` runs it headless.
 pub mod core;
 
-use crate::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate, MockAgent, OnDrop};
+use crate::core::agent::{self, Agent, AgentCtx, AgentEvent, ApprovalGate, MockAgent, OnDrop};
+use crate::core::chat::agent_loop::{self, Conversation, LlmAgent};
+use crate::core::chat::history::History;
 use crate::core::llm::TurnCancel;
 use crate::core::observer::{EventSink, InputState, IntegrationStatus, ObserverStatus, SessionEvent};
 use crate::core::pty::OutputSink;
@@ -85,6 +87,8 @@ pub struct Attached {
     agent_control: AtomicBool,
     /// The running turn's cancel token. Set when a turn starts, cleared when it ends. Ctrl-C and `cancel_agent` set it.
     turn_cancel: Mutex<Option<Arc<TurnCancel>>>,
+    /// The conversation: its id (sent to the provider) and its history. `new_conversation` resets it.
+    conversation: Conversation,
 }
 
 impl Attached {
@@ -101,6 +105,17 @@ impl Attached {
     /// Cancels the running turn, if any, and denies its pending approvals. Harmless when no turn is running.
     fn cancel_turn(&self) {
         agent::cancel_turn(&self.turn_cancel, &self.approvals);
+    }
+
+    /// Marks the agent busy and installs the turn's cancel token. Returns the conversation's history and id for the
+    /// turn. Held under the turn-cancel lock, which `new_conversation` also takes, so a reset cannot land mid-start.
+    fn begin_turn(&self, cancel: &Arc<TurnCancel>) -> Result<(Arc<Mutex<History>>, String), String> {
+        let mut slot = lock(&self.turn_cancel);
+        if self.agent_busy.swap(true, Ordering::SeqCst) {
+            return Err("the agent is still working on the previous message".into());
+        }
+        *slot = Some(cancel.clone());
+        Ok((self.conversation.history(), self.conversation.id()))
     }
 }
 
@@ -186,6 +201,7 @@ fn attach_or_spawn(
             agent_busy: AtomicBool::new(false),
             agent_control: AtomicBool::new(false),
             turn_cancel: Mutex::new(None),
+            conversation: Conversation::new().map_err(io_err)?,
         })
     })?;
     if let Some((data, events)) = pending.take() {
@@ -223,15 +239,23 @@ fn cancel_agent(session_id: String, reg: State<'_, Reg>) -> Result<(), String> {
     Ok(())
 }
 
-/// Starts one agent turn on its own thread. Events arrive on the events channel.
+/// Starts one agent turn on its own thread. Events arrive on the events channel. The LLM agent runs when the dev
+/// environment configures a provider (core/chat/agent_loop); otherwise the mock agent answers.
 #[tauri::command]
 fn agent_message(session_id: String, text: String, reg: State<'_, Reg>) -> Result<(), String> {
     let att = session(&reg, &session_id)?;
-    if att.agent_busy.swap(true, Ordering::SeqCst) {
-        return Err("the agent is still working on the previous message".into());
-    }
     let cancel = Arc::new(TurnCancel::new());
-    *lock(&att.turn_cancel) = Some(cancel.clone());
+    let (history, conversation_id) = att.begin_turn(&cancel)?;
+    let mut agent: Box<dyn Agent + Send> = match agent_loop::settings() {
+        None => Box::new(MockAgent),
+        Some(settings) => match agent_loop::shared_client() {
+            Ok(client) => Box::new(LlmAgent::new(client, settings, &conversation_id, history, cancel.clone())),
+            Err(e) => {
+                att.end_turn();
+                return Err(e);
+            }
+        },
+    };
     let worker = att.clone();
     let spawned = thread::Builder::new().name("agent".into()).spawn(move || {
         // Runs on panic too, so a crashed turn cannot leave the agent busy or in control of the shell.
@@ -246,7 +270,7 @@ fn agent_message(session_id: String, text: String, reg: State<'_, Reg>) -> Resul
             channels.send_json(&ev);
         };
         let ctx = AgentCtx::new(&tools, &worker.approvals, &emit);
-        agent::run_turn(&mut MockAgent, &text, &ctx);
+        agent::run_turn(agent.as_mut(), &text, &ctx);
     });
     if let Err(e) = spawned {
         *lock(&att.turn_cancel) = None;
@@ -254,6 +278,18 @@ fn agent_message(session_id: String, text: String, reg: State<'_, Reg>) -> Resul
         return Err(e.to_string());
     }
     Ok(())
+}
+
+/// Starts a new conversation: the history is cleared and the id rotated. Refused while the agent is working. Takes
+/// the turn-cancel lock, as `begin_turn` does, so the check and the reset cannot interleave with a turn starting.
+#[tauri::command]
+fn new_conversation(session_id: String, reg: State<'_, Reg>) -> Result<(), String> {
+    let att = session(&reg, &session_id)?;
+    let _turn = lock(&att.turn_cancel);
+    if att.agent_busy.load(Ordering::SeqCst) {
+        return Err("the agent is busy; wait for it to finish or cancel it first".into());
+    }
+    att.conversation.reset().map_err(io_err)
 }
 
 #[tauri::command]
@@ -271,6 +307,13 @@ fn set_auto_approve(session_id: String, on: bool, reg: State<'_, Reg>) -> Result
     Ok(())
 }
 
+/// Whether the LLM agent is configured, and its model. Never the key or the URL.
+#[derive(Serialize)]
+struct LlmStatus {
+    enabled: bool,
+    model: Option<String>,
+}
+
 #[derive(Serialize)]
 struct Status {
     state: InputState,
@@ -281,11 +324,13 @@ struct Status {
     auto_approve: bool,
     agent_busy: bool,
     agent_control: bool,
+    llm: LlmStatus,
 }
 
 #[tauri::command]
 fn get_status(session_id: String, reg: State<'_, Reg>) -> Result<Status, String> {
     let att = session(&reg, &session_id)?;
+    let llm = agent_loop::settings();
     Ok(Status {
         state: att.session.state(),
         integration: att.session.integration_status(),
@@ -295,6 +340,7 @@ fn get_status(session_id: String, reg: State<'_, Reg>) -> Result<Status, String>
         auto_approve: att.approvals.auto_approve(),
         agent_busy: att.agent_busy.load(Ordering::SeqCst),
         agent_control: att.agent_control.load(Ordering::SeqCst),
+        llm: LlmStatus { enabled: llm.is_some(), model: llm.map(|s| s.model.clone()) },
     })
 }
 
@@ -311,6 +357,8 @@ async fn kill_session(session_id: String, reg: State<'_, Reg>) -> Result<(), Str
 }
 
 pub fn run() {
+    // Reads the dev LLM settings now, so a bad value is reported at launch and falls back to the mock agent.
+    agent_loop::settings();
     let app = tauri::Builder::default()
         .manage(Reg::new())
         .invoke_handler(tauri::generate_handler![
@@ -321,6 +369,7 @@ pub fn run() {
             write_user,
             agent_message,
             cancel_agent,
+            new_conversation,
             approve_tool,
             set_auto_approve,
             get_status,

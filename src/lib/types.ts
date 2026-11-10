@@ -77,6 +77,12 @@ export interface SessionStats {
   dropped_bytes: number;
 }
 
+/** Whether the LLM agent is configured (dev environment variables), and its model. Never the key or the URL. */
+export interface LlmStatus {
+  enabled: boolean;
+  model: string | null;
+}
+
 export interface Status {
   state: InputState;
   integration: IntegrationStatus;
@@ -86,4 +92,5 @@ export interface Status {
   auto_approve: boolean;
   agent_busy: boolean;
   agent_control: boolean;
+  llm: LlmStatus;
 }

@@ -29,6 +29,17 @@ To keep manual runs away from your real `~/.zsh_history`, use the isolated-histo
 AGENT_TERM_HISTFILE=/tmp/agent-term-hist npm run tauri dev
 ```
 
+To try a real model instead of the mock agent, set three variables. Keep the key out of your shell history: read it from your password manager (`NAME` is the name of your entry):
+
+```sh
+AGENT_TERM_LLM_URL=https://openrouter.ai/api/v1/chat/completions \
+AGENT_TERM_LLM_MODEL=deepseek/deepseek-v4.1-flash \
+AGENT_TERM_LLM_KEY="$(gopass show -o NAME)" \
+npm run tauri dev
+```
+
+Optional: `AGENT_TERM_LLM_HEADERS` (`Name: value` lines, or separated by `;`; `{session_id}` is replaced by the conversation id, for example `x-opencode-session: {session_id}` for OpenCode Go), `AGENT_TERM_LLM_STREAM=0` (wait for each whole reply instead of streaming), and `AGENT_TERM_LLM_MAX_TOKENS` (a positive number). When URL, key or model is missing, the mock agent is used. A bad value is printed to the terminal at launch and the mock agent is used. These variables are for development only; they will move to a settings file.
+
 ## Input
 
 - The terminal is the main input. Type at the prompt as you would in any terminal. Keys go to the shell, or to the program that is running (vim, ssh, and so on).
