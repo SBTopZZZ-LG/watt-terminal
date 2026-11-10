@@ -7,6 +7,7 @@ pub mod agent;
 pub mod chat;
 pub mod llm;
 pub mod observer;
+pub mod persist;
 pub mod pty;
 pub mod record;
 pub mod registry;
