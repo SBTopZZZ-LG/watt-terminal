@@ -285,6 +285,14 @@ input {
   text-overflow: ellipsis;
 }
 
+.chip-model {
+  font-family: var(--mono);
+  max-width: 260px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .chip-button {
   cursor: pointer;
   background: var(--panel);
@@ -318,14 +326,58 @@ input {
   cursor: pointer;
 }
 
+.transcript-header {
+  display: flex;
+  align-items: center;
+  padding-right: 12px;
+}
+
+.transcript-header .transcript-head {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
 .transcript-head .toggle {
   margin-left: auto;
   font-size: 11px;
 }
 
+.transcript-new {
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.transcript-new:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 .busy {
   color: var(--accent);
   font-size: 11px;
+}
+
+.thinking {
+  color: var(--muted);
+  font-size: 11px;
+  font-style: italic;
+}
+
+.decision {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.decision-denied,
+.decision-refused {
+  color: var(--fail);
 }
 
 .transcript-body {

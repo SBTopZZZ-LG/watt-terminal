@@ -10,7 +10,7 @@ import type { BarMode } from './lib/inputState';
 import { agentControlAfter, borderActive, NO_CONTROL } from './lib/agentControl';
 import type { AgentControl } from './lib/agentControl';
 import { EMPTY_TRANSCRIPT, firstPendingApproval, isBusy, transcriptReducer } from './lib/transcript';
-import type { Cwd, InputState, IntegrationStatus, ObserverStatus, Status, WireEvent } from './lib/types';
+import type { Cwd, InputState, IntegrationStatus, LlmStatus, ObserverStatus, Status, WireEvent } from './lib/types';
 import { TerminalView } from './components/TerminalView';
 import { InputBar } from './components/InputBar';
 import { Transcript } from './components/Transcript';
@@ -35,6 +35,7 @@ export default function App() {
   const [observer, setObserver] = useState<ObserverStatus>('ok');
   const [cwd, setCwd] = useState<Cwd | null>(null);
   const [autoApprove, setAutoApprove] = useState(false);
+  const [llm, setLlm] = useState<LlmStatus>({ enabled: false, model: null });
   const [focusToken, setFocusToken] = useState(0);
   const [restarting, setRestarting] = useState(false);
   // The agent's hold on the shell: an approved call executing, or a command it started still running (see
@@ -63,6 +64,7 @@ export default function App() {
     setObserver(s.observer);
     setCwd(s.cwd);
     setAutoApprove(s.auto_approve);
+    setLlm(s.llm);
     setAgentControl((c) => ({ ...c, call: s.agent_control }));
     dispatchTranscript({ type: 'sync_busy', busy: s.agent_busy });
     if (s.observer === 'desynced') {
@@ -210,6 +212,15 @@ export default function App() {
     }
   };
 
+  // Clears the agent's conversation. The backend refuses while the agent is busy; the button is also disabled then. On
+  // error the reason is shown in the transcript, and the conversation stays as it was.
+  const newConversation = () => {
+    api.newConversation().then(
+      () => dispatchTranscript({ type: 'conversation_reset' }),
+      (e) => dispatchTranscript({ type: 'notice', text: errorText(e) }),
+    );
+  };
+
   const answer = (callId: string, approve: boolean) => {
     dispatchTranscript({ type: 'approval_answering', callId, approve });
     api.approveTool(callId, approve).catch((e) => {
@@ -271,6 +282,7 @@ export default function App() {
         cwd={cwd}
         autoApprove={autoApprove}
         onToggleAutoApprove={toggleAutoApprove}
+        llm={llm}
       />
       <div className="terminal-area">
         <TerminalView
@@ -288,9 +300,11 @@ export default function App() {
       <Transcript
         items={transcript.items}
         busy={isBusy(transcript)}
+        thinking={transcript.thinking}
         open={transcriptOpen}
         onToggle={() => setTranscriptOpen((o) => !o)}
         onApprove={answer}
+        onNewConversation={newConversation}
       />
       <InputBar
         mode={barMode}

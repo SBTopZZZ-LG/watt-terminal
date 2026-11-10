@@ -1,17 +1,22 @@
 import { useEffect, useRef } from 'react';
 import { previewJson } from '../lib/format';
+import { approvalTitle } from '../lib/transcript';
 import type { TranscriptItem } from '../lib/transcript';
+import { visibleEscapes } from '../lib/visibleEscapes';
 
 interface Props {
   items: TranscriptItem[];
   busy: boolean;
+  /** The model is working and has not produced output yet. */
+  thinking: boolean;
   open: boolean;
   onToggle: () => void;
   onApprove: (callId: string, approve: boolean) => void;
+  onNewConversation: () => void;
 }
 
 /** The agent conversation, docked above the input bar. Collapsible, scrollable, and capped by CSS. */
-export function Transcript({ items, busy, open, onToggle, onApprove }: Props) {
+export function Transcript({ items, busy, thinking, open, onToggle, onApprove, onNewConversation }: Props) {
   const bodyRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -23,11 +28,23 @@ export function Transcript({ items, busy, open, onToggle, onApprove }: Props) {
 
   return (
     <section className={`transcript${open ? ' open' : ''}`}>
-      <button type="button" className="transcript-head" onClick={onToggle}>
-        <span>Agent</span>
-        {busy && <span className="busy">working...</span>}
-        <span className="toggle">{open ? 'Hide' : 'Show'}</span>
-      </button>
+      <div className="transcript-header">
+        <button type="button" className="transcript-head" onClick={onToggle}>
+          <span>Agent</span>
+          {busy && <span className="busy">working...</span>}
+          {thinking && <span className="thinking">thinking...</span>}
+          <span className="toggle">{open ? 'Hide' : 'Show'}</span>
+        </button>
+        <button
+          type="button"
+          className="transcript-new"
+          disabled={busy}
+          onClick={onNewConversation}
+          title={busy ? 'Wait for the agent to finish, or cancel it with Ctrl-C, first' : 'Clears the agent conversation'}
+        >
+          New conversation
+        </button>
+      </div>
       {open && (
         <div className="transcript-body" ref={bodyRef}>
           {items.length === 0 && <div className="empty">Ask the agent something, for example "what was the last command".</div>}
@@ -58,7 +75,8 @@ function Entry({ item, onApprove }: { item: TranscriptItem; onApprove: Props['on
       return (
         <details className={`tool tool-${status}`}>
           <summary>
-            {item.name}: {status}
+            {item.name}
+            {item.decision !== null && <span className={`decision decision-${item.decision}`}> {item.decision}</span>}: {status}
           </summary>
           <pre>{previewJson({ args: item.args, result: item.result })}</pre>
         </details>
@@ -67,8 +85,8 @@ function Entry({ item, onApprove }: { item: TranscriptItem; onApprove: Props['on
     case 'approval':
       return (
         <div className={`approval approval-${item.state}`}>
-          <div className="approval-title">The agent wants to run a command</div>
-          <code className="approval-text">{item.text}</code>
+          <div className="approval-title">{approvalTitle(item.name)}</div>
+          <code className="approval-text">{visibleEscapes(item.text)}</code>
           {item.state === 'pending' && (
             <div className="approval-actions">
               <button type="button" className="approve" onClick={() => onApprove(item.callId, true)}>

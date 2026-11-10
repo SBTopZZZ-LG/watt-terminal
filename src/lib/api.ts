@@ -41,6 +41,10 @@ export const api = {
   cancelAgent() {
     return invoke<void>('cancel_agent', { sessionId: SESSION_ID });
   },
+  /** Clears the agent's conversation. Refused while the agent is busy. */
+  newConversation() {
+    return invoke<void>('new_conversation', { sessionId: SESSION_ID });
+  },
   approveTool(callId: string, approve: boolean) {
     return invoke<void>('approve_tool', { sessionId: SESSION_ID, callId, approve });
   },

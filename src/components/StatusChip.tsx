@@ -1,6 +1,6 @@
 import { formatCwd } from '../lib/format';
 import { GridChip } from './GridChip';
-import type { InputState, IntegrationStatus, ObserverStatus, Cwd } from '../lib/types';
+import type { Cwd, InputState, IntegrationStatus, LlmStatus, ObserverStatus } from '../lib/types';
 
 interface Props {
   integration: IntegrationStatus;
@@ -9,6 +9,7 @@ interface Props {
   cwd: Cwd | null;
   autoApprove: boolean;
   onToggleAutoApprove: () => void;
+  llm: LlmStatus;
 }
 
 const INPUT_LABEL: Record<InputState, string> = {
@@ -30,13 +31,17 @@ const INTEGRATION_LABEL: Record<IntegrationStatus, string> = {
 
 /** Slim status strip above the terminal, in normal flow. */
 export function StatusChip(props: Props) {
-  const { integration, observer, input, cwd, autoApprove, onToggleAutoApprove } = props;
+  const { integration, observer, input, cwd, autoApprove, onToggleAutoApprove, llm } = props;
+  const modelLabel = llm.enabled ? `model: ${llm.model ?? 'unknown'}` : 'mock agent';
   return (
     <div className="status-chip" role="status">
       <span className={`chip chip-${integration}`}>{INTEGRATION_LABEL[integration]}</span>
       <span className={`chip chip-${observer}`}>{observer === 'ok' ? 'observer ok' : 'observer desynced'}</span>
       <span className="chip">{INPUT_LABEL[input]}</span>
       <GridChip />
+      <span className="chip chip-model" title={modelLabel}>
+        {modelLabel}
+      </span>
       <span className="chip chip-cwd" title={cwd ? `${cwd.host}:${cwd.path}` : undefined}>
         {formatCwd(cwd)}
       </span>

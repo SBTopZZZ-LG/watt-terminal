@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { EMPTY_TRANSCRIPT, firstPendingApproval, isBusy, MAX_ITEMS, transcriptReducer } from './transcript';
+import { approvalTitle, EMPTY_TRANSCRIPT, firstPendingApproval, isBusy, MAX_ITEMS, transcriptReducer } from './transcript';
 import type { Transcript, TranscriptAction } from './transcript';
 
 function run(actions: TranscriptAction[], start: Transcript = EMPTY_TRANSCRIPT): Transcript {
@@ -104,19 +104,6 @@ describe('transcriptReducer: local actions', () => {
     expect(back.items[1]).toMatchObject({ kind: 'notice', text: 'no pending approval a1' });
   });
 
-  it('streamed text and thinking leave the transcript as it is until the chat UI shows them', () => {
-    const start = run([{ type: 'user_sent', clientId: 1, text: 'hi' }]);
-    const t = run(
-      [
-        { type: 'agent_event', event: { type: 'thinking', active: true } },
-        { type: 'agent_event', event: { type: 'text_delta', text: 'Hel' } },
-        { type: 'agent_event', event: { type: 'thinking', active: false } },
-      ],
-      start,
-    );
-    expect(t).toEqual(start);
-  });
-
   it('the first pending approval is the oldest one', () => {
     const t = run([
       { type: 'agent_event', event: { type: 'approval_request', call_id: 'a1', name: 'run_command', text: 'x' } },
@@ -159,5 +146,168 @@ describe('transcriptReducer: local actions', () => {
     expect(t.items[0]).toMatchObject({ text: 'n25' });
     const ids = t.items.map((i) => i.id);
     expect(ids).toEqual([...ids].sort((a, b) => a - b));
+  });
+});
+
+const delta = (text: string): TranscriptAction => ({ type: 'agent_event', event: { type: 'text_delta', text } });
+const thinking = (active: boolean): TranscriptAction => ({ type: 'agent_event', event: { type: 'thinking', active } });
+const done: TranscriptAction = { type: 'agent_event', event: { type: 'done' } };
+const toolCall = (callId: string): TranscriptAction => ({
+  type: 'agent_event',
+  event: { type: 'tool_call', call_id: callId, name: 'get_cwd', args: {} },
+});
+
+describe('transcriptReducer: streamed text', () => {
+  it('deltas accumulate into one agent message', () => {
+    const t = run([delta('Hel'), delta('lo'), delta(', world')]);
+    expect(t.items).toHaveLength(1);
+    expect(t.items[0]).toMatchObject({ kind: 'agent', text: 'Hello, world', streaming: true });
+  });
+
+  it('a delta after a tool call starts a new agent message', () => {
+    const t = run([delta('Checking.'), toolCall('c1'), delta('It is'), delta(' /tmp.')]);
+    expect(t.items.map((i) => i.kind)).toEqual(['agent', 'tool', 'agent']);
+    expect(t.items[0]).toMatchObject({ kind: 'agent', text: 'Checking.', streaming: false });
+    expect(t.items[2]).toMatchObject({ kind: 'agent', text: 'It is /tmp.', streaming: true });
+  });
+
+  it('an approval, notice, or user item closes the open message', () => {
+    const approval = run([delta('A'), { type: 'agent_event', event: { type: 'approval_request', call_id: 'a', name: 'run_command', text: 'ls' } }, delta('B')]);
+    expect(approval.items.map((i) => i.kind)).toEqual(['agent', 'approval', 'agent']);
+    expect(approval.items[0]).toMatchObject({ text: 'A', streaming: false });
+
+    const notice = run([delta('A'), { type: 'notice', text: 'n' }, delta('B')]);
+    expect(notice.items.map((i) => i.kind)).toEqual(['agent', 'notice', 'agent']);
+    expect(notice.items[2]).toMatchObject({ text: 'B' });
+
+    const user = run([delta('A'), { type: 'user_sent', clientId: 1, text: 'next' }, delta('B')]);
+    expect(user.items.map((i) => i.kind)).toEqual(['agent', 'user', 'agent']);
+    expect(user.items[0]).toMatchObject({ text: 'A', streaming: false });
+  });
+
+  it('done closes the open message, so the next turn starts a new one', () => {
+    const t = run([{ type: 'user_sent', clientId: 1, text: 'hi' }, delta('Hello'), done, delta('Again')]);
+    expect(t.items.map((i) => i.kind)).toEqual(['user', 'agent', 'agent']);
+    expect(t.items[1]).toMatchObject({ text: 'Hello', streaming: false });
+    expect(t.items[2]).toMatchObject({ text: 'Again', streaming: true });
+  });
+
+  it('an empty delta changes nothing', () => {
+    const start = run([delta('a')]);
+    expect(run([delta('')], start)).toEqual(start);
+    expect(run([delta('')])).toEqual(EMPTY_TRANSCRIPT);
+  });
+
+  it('a whole text event creates its own message and does not join a streamed one', () => {
+    const t = run([delta('part'), { type: 'agent_event', event: { type: 'text', text: 'whole' } }]);
+    expect(t.items).toHaveLength(2);
+    expect(t.items[0]).toMatchObject({ kind: 'agent', text: 'part', streaming: false });
+    expect(t.items[1]).toMatchObject({ kind: 'agent', text: 'whole', streaming: false });
+  });
+
+  it('a whole text event after another whole text stays separate', () => {
+    const t = run([
+      { type: 'agent_event', event: { type: 'text', text: 'one' } },
+      { type: 'agent_event', event: { type: 'text', text: 'two' } },
+    ]);
+    expect(t.items.map((i) => (i.kind === 'agent' ? i.text : ''))).toEqual(['one', 'two']);
+  });
+
+  it('a streamed message at the cap is extended, then closed by the next item, and trimming does not break it', () => {
+    const fill: TranscriptAction[] = Array.from({ length: MAX_ITEMS - 1 }, (_, i) => ({ type: 'notice', text: `n${i}` }));
+    const atCap = run([...fill, delta('a'), delta('b')]);
+    expect(atCap.items).toHaveLength(MAX_ITEMS);
+    expect(atCap.items[MAX_ITEMS - 1]).toMatchObject({ kind: 'agent', text: 'ab', streaming: true });
+
+    const past = run([...fill, delta('a'), delta('b'), { type: 'notice', text: 'after' }]);
+    expect(past.items).toHaveLength(MAX_ITEMS);
+    expect(past.items[MAX_ITEMS - 2]).toMatchObject({ kind: 'agent', text: 'ab', streaming: false });
+    expect(past.items[MAX_ITEMS - 1]).toMatchObject({ kind: 'notice', text: 'after' });
+
+    // Trimming while a streamed message is open, then more deltas: nothing crashes and the message keeps growing.
+    const manyDeltas = run([...Array.from({ length: MAX_ITEMS + 5 }, (_, i) => ({ type: 'notice' as const, text: `n${i}` })), delta('x'), delta('y')]);
+    expect(manyDeltas.items).toHaveLength(MAX_ITEMS);
+    expect(manyDeltas.items[MAX_ITEMS - 1]).toMatchObject({ kind: 'agent', text: 'xy', streaming: true });
+  });
+});
+
+describe('transcriptReducer: thinking', () => {
+  it('thinking true shows the indicator, and false clears it', () => {
+    expect(run([thinking(true)]).thinking).toBe(true);
+    expect(run([thinking(true), thinking(false)]).thinking).toBe(false);
+  });
+
+  it('the first text_delta clears thinking', () => {
+    const t = run([thinking(true), delta('H')]);
+    expect(t.thinking).toBe(false);
+    expect(t.items[0]).toMatchObject({ text: 'H' });
+  });
+
+  it('done clears thinking', () => {
+    expect(run([thinking(true), done]).thinking).toBe(false);
+  });
+
+  it('a session reset clears thinking', () => {
+    expect(run([thinking(true), { type: 'session_reset' }]).thinking).toBe(false);
+  });
+
+  it('thinking is not cleared by a whole text event or a tool call', () => {
+    expect(run([thinking(true), { type: 'agent_event', event: { type: 'text', text: 'x' } }]).thinking).toBe(true);
+    expect(run([thinking(true), toolCall('c1')]).thinking).toBe(true);
+  });
+});
+
+describe('transcriptReducer: approvals and decisions', () => {
+  it('an approval request stores the tool name', () => {
+    const t = run([{ type: 'agent_event', event: { type: 'approval_request', call_id: 'a1', name: 'send_keys', text: 'ls' } }]);
+    expect(t.items[0]).toMatchObject({ kind: 'approval', name: 'send_keys', text: 'ls', state: 'pending' });
+  });
+
+  it('a tool result stores its decision on the tool item', () => {
+    const t = run([
+      toolCall('c1'),
+      { type: 'agent_event', event: { type: 'tool_result', call_id: 'c1', name: 'get_cwd', ok: true, decision: 'read', result: {} } },
+    ]);
+    expect(t.items[0]).toMatchObject({ kind: 'tool', decision: 'read', status: 'ok' });
+  });
+
+  it('a tool call has no decision until its result arrives', () => {
+    expect(run([toolCall('c1')]).items[0]).toMatchObject({ kind: 'tool', decision: null });
+  });
+
+  it('an orphan result keeps its decision', () => {
+    const t = run([{ type: 'agent_event', event: { type: 'tool_result', call_id: 'o', name: 'run_command', ok: false, decision: 'denied', result: {} } }]);
+    expect(t.items[0]).toMatchObject({ kind: 'tool', decision: 'denied', status: 'failed' });
+  });
+});
+
+describe('transcriptReducer: conversation_reset', () => {
+  it('empties the items and the thinking flag, and keeps ids increasing', () => {
+    const before = run([
+      { type: 'user_sent', clientId: 1, text: 'hi' },
+      delta('Hello'),
+      done,
+      thinking(true),
+    ]);
+    const after = transcriptReducer(before, { type: 'conversation_reset' });
+    expect(after.items).toEqual([]);
+    expect(after.thinking).toBe(false);
+    expect(after.inFlight).toBe(0);
+
+    const next = transcriptReducer(after, { type: 'notice', text: 'fresh' });
+    expect(next.items[0].id).toBeGreaterThan(before.nextId - 1);
+  });
+});
+
+describe('approvalTitle', () => {
+  it('names run_command and send_keys', () => {
+    expect(approvalTitle('run_command')).toBe('The agent wants to run a command');
+    expect(approvalTitle('send_keys')).toBe('The agent wants to send keystrokes');
+  });
+
+  it('names any other tool, escaping the name', () => {
+    expect(approvalTitle('fetch_url')).toBe('The agent wants to use fetch_url');
+    expect(approvalTitle('x‮y')).toBe('The agent wants to use x\\u{202E}y');
+    expect(approvalTitle('')).toBe('The agent wants to use ');
   });
 });
