@@ -7,6 +7,7 @@ import { groupTranscript, toolGroupSummary } from '../lib/toolGroups';
 import type { GroupItem } from '../lib/toolGroups';
 import { visibleEscapes } from '../lib/visibleEscapes';
 import { Markdown } from './Markdown';
+import type { Dock } from '../lib/panelLayout';
 
 interface Props {
   items: TranscriptItem[];
@@ -17,10 +18,13 @@ interface Props {
   onToggle: () => void;
   onApprove: (callId: string, approve: boolean) => void;
   onNewConversation: () => void;
+  /** The dock the panel is in. With onDock, the header shows the four dock buttons, with this one marked. */
+  dock?: Dock;
+  onDock?: (dock: Dock) => void;
 }
 
 /** The agent conversation, docked above the input bar. Collapsible, scrollable, and capped by CSS. */
-export function Transcript({ items, busy, thinking, open, onToggle, onApprove, onNewConversation }: Props) {
+export function Transcript({ items, busy, thinking, open, onToggle, onApprove, onNewConversation, dock, onDock }: Props) {
   const bodyRef = useRef<HTMLDivElement>(null);
   const entries = useMemo(() => groupTranscript(items), [items]);
 
@@ -40,6 +44,7 @@ export function Transcript({ items, busy, thinking, open, onToggle, onApprove, o
           {thinking && <span className="thinking">thinking...</span>}
           <span className="toggle">{open ? 'Hide' : 'Show'}</span>
         </button>
+        {onDock && dock && <DockButtons dock={dock} onDock={onDock} />}
         <button
           type="button"
           className="transcript-new"
@@ -183,6 +188,46 @@ function CheckIcon() {
   return (
     <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
       <path d="M3 8.5l3 3 7-7" />
+    </svg>
+  );
+}
+
+/** Where each dock button sends the panel, in the order the buttons show. */
+const DOCK_BUTTONS: Dock[] = ['left', 'top', 'bottom', 'right'];
+
+/** Four icon buttons. The current dock's button is pressed (aria-pressed), and drawn accented. */
+function DockButtons({ dock, onDock }: { dock: Dock; onDock: (dock: Dock) => void }) {
+  return (
+    <div className="dock-buttons" role="group" aria-label="Agent panel position">
+      {DOCK_BUTTONS.map((d) => (
+        <button
+          key={d}
+          type="button"
+          className="dock-button"
+          aria-label={`Dock ${d}`}
+          aria-pressed={d === dock}
+          title={`Dock ${d}`}
+          onClick={() => onDock(d)}
+        >
+          <DockIcon dock={d} />
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/** A window frame with the side the panel docks to filled in. */
+function DockIcon({ dock }: { dock: Dock }) {
+  const fill: Record<Dock, string> = {
+    left: 'M1.5 1.5h4v11h-4z',
+    top: 'M1.5 1.5h11v4h-11z',
+    bottom: 'M1.5 10.5h11v4h-11z',
+    right: 'M10.5 1.5h4v11h-4z',
+  };
+  return (
+    <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.25" aria-hidden="true">
+      <rect x="1.5" y="1.5" width="13" height="13" rx="1" />
+      <path d={fill[dock]} fill="currentColor" stroke="none" />
     </svg>
   );
 }

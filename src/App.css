@@ -67,6 +67,7 @@ input {
 .terminal-area {
   position: relative;
   flex: 1 1 auto;
+  min-width: 0;
   min-height: 0;
 }
 
@@ -392,6 +393,200 @@ input {
   background: var(--warn-tint);
 }
 
+/*
+ * ---------- workspace: the terminal and the agent panel ----------
+ * The DOM order is fixed (terminal, divider, panel). The dock only sets the direction, so the terminal is never remounted.
+ * Left and top reverse the order on screen, so the panel comes first there. No overflow rule here: nothing between
+ * .xterm-rows and the window may clip the glyph overflow (see the CLIPPING GUARD note at .term-host .xterm-rows).
+ */
+.workspace {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.workspace.dock-right {
+  flex-direction: row;
+}
+
+.workspace.dock-left {
+  flex-direction: row-reverse;
+}
+
+.workspace.dock-bottom {
+  flex-direction: column;
+}
+
+.workspace.dock-top {
+  flex-direction: column-reverse;
+}
+
+.agent-panel {
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* Side panels hold their width and clip anything wider, so nothing can run over the divider or the terminal. */
+.agent-panel.dock-left,
+.agent-panel.dock-right {
+  overflow: hidden;
+}
+
+/* The input bar keeps its height when a fixed-size panel is short of room. */
+.agent-panel > .bar {
+  flex: 0 0 auto;
+}
+
+/*
+ * A fixed size (sized): the transcript takes what the bar leaves, and its body scrolls. Auto top and bottom panels keep
+ * the 35vh cap on .transcript-body instead, so they grow with their content up to it.
+ */
+.agent-panel.is-sized > .transcript {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.agent-panel.is-sized .transcript-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
+}
+
+/* A side panel: no top rule (the panel edge is the divider), long words wrap, and the input row takes the free width. */
+.agent-panel.dock-left > .transcript,
+.agent-panel.dock-right > .transcript {
+  border-top: 0;
+}
+
+.agent-panel.dock-left .transcript-body,
+.agent-panel.dock-right .transcript-body,
+.agent-panel.dock-left > .bar,
+.agent-panel.dock-right > .bar {
+  overflow-wrap: anywhere;
+}
+
+.agent-panel.dock-left .bar-input,
+.agent-panel.dock-right .bar-input {
+  flex: 1 1 0;
+}
+
+.agent-panel.dock-left .approval-actions,
+.agent-panel.dock-right .approval-actions {
+  flex-wrap: wrap;
+}
+
+/* The header wraps: the title and the dock buttons on the first line, New conversation on the second, to the right. */
+.agent-panel.dock-left .transcript-header,
+.agent-panel.dock-right .transcript-header {
+  flex-wrap: wrap;
+  row-gap: 2px;
+}
+
+.agent-panel.dock-left .transcript-new,
+.agent-panel.dock-right .transcript-new {
+  margin-left: auto;
+}
+
+/* Collapsed side panel: a 32px rail with one button. The children stay mounted, hidden. */
+.agent-rail {
+  display: none;
+}
+
+.agent-panel.is-rail {
+  width: 32px;
+}
+
+.agent-panel.is-rail > .transcript,
+.agent-panel.is-rail > .bar {
+  display: none;
+}
+
+.agent-panel.is-rail.dock-left {
+  border-right: 1px solid var(--line);
+}
+
+.agent-panel.is-rail.dock-right {
+  border-left: 1px solid var(--line);
+}
+
+.agent-panel.is-rail > .agent-rail {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  justify-content: center;
+  padding: 8px 0;
+  border: 0;
+  background: var(--panel);
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.agent-panel.is-rail > .agent-rail:hover {
+  color: var(--accent);
+}
+
+.agent-panel.is-rail > .agent-rail:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.agent-rail-label {
+  writing-mode: vertical-rl;
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+/*
+ * The divider between the panel and the terminal: a 6px hit area, with a 1px dashed rule down its middle (2px in).
+ * It sits between the two, so it never overlaps the terminal's right padding.
+ */
+.panel-divider {
+  position: relative;
+  flex: 0 0 6px;
+  cursor: col-resize;
+  touch-action: none;
+  user-select: none;
+}
+
+.panel-divider.is-horizontal {
+  cursor: row-resize;
+}
+
+.panel-divider::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 2px;
+  border-left: 1px dashed var(--rule);
+  pointer-events: none;
+}
+
+.panel-divider.is-horizontal::before {
+  top: 2px;
+  bottom: auto;
+  left: 0;
+  right: 0;
+  border-left: 0;
+  border-top: 1px dashed var(--rule);
+}
+
+.panel-divider:hover::before,
+.panel-divider.is-active::before {
+  border-color: var(--accent);
+}
+
+.panel-divider:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
 /* ---------- transcript ---------- */
 
 .transcript {
@@ -459,6 +654,47 @@ input {
 .transcript-new:disabled {
   opacity: 0.5;
   cursor: default;
+}
+
+/* The dock buttons: four icons, the current dock's pressed and accented. Same size and edge as the copy button. */
+.dock-buttons {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 2px;
+  margin: 0 8px;
+}
+
+.dock-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px dashed transparent;
+  border-radius: 2px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.dock-button svg {
+  display: block;
+}
+
+.dock-button:hover {
+  border-color: var(--rule);
+  color: var(--accent);
+}
+
+.dock-button[aria-pressed="true"] {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.dock-button:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
 }
 
 .busy {

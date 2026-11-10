@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useReducer, useRef, useState } from 'react';
+import type { RefObject } from 'react';
 import './App.css';
 import { api, errorText } from './lib/api';
 import { connect, reportError, restart, subscribe } from './lib/session';
@@ -10,12 +11,17 @@ import type { BarMode } from './lib/inputState';
 import { agentControlAfter, borderLevel, NO_CONTROL } from './lib/agentControl';
 import type { AgentControl, BorderLevel } from './lib/agentControl';
 import { EMPTY_TRANSCRIPT, firstPendingApproval, isBusy, transcriptReducer } from './lib/transcript';
+import { isSideDock, loadPanelLayout, panelReducer, panelView, savePanelLayout } from './lib/panelLayout';
+import type { Container } from './lib/panelLayout';
+import { defaultSizeStorage } from './lib/zoom';
 import type { Cwd, InputState, IntegrationStatus, LlmStatus, ObserverStatus, Status, WireEvent } from './lib/types';
 import { TerminalView } from './components/TerminalView';
 import { InputBar } from './components/InputBar';
 import { Transcript } from './components/Transcript';
 import { StatusChip } from './components/StatusChip';
 import { FindBar } from './components/FindBar';
+import { PanelDivider } from './components/PanelDivider';
+import { AgentPanel, Workspace } from './components/AgentPanel';
 
 const CTRL_C = '\u0003';
 
@@ -30,7 +36,15 @@ export default function App() {
   const barMode: BarMode = route.bar === 'collapsed' && barOpen ? 'chat' : route.bar;
 
   const [transcript, dispatchTranscript] = useReducer(transcriptReducer, EMPTY_TRANSCRIPT);
-  const [transcriptOpen, setTranscriptOpen] = useState(true);
+  // The agent panel's dock, sizes and open state. Saved on every change (see the effect below).
+  const [panel, dispatchPanel] = useReducer(panelReducer, undefined, () => loadPanelLayout(defaultSizeStorage()));
+  const workspaceRef = useRef<HTMLDivElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+  const workspace = useElementSize(workspaceRef, { width: window.innerWidth, height: window.innerHeight });
+  const panelBox = useElementSize(panelRef, { width: 0, height: 0 });
+  // Bumped when a drag or key step ends, so the terminal refits once the new size is on screen.
+  const [settle, setSettle] = useState(0);
+  const settleLayout = useCallback(() => setSettle((s) => s + 1), []);
   const [integration, setIntegration] = useState<IntegrationStatus>('booting');
   const [observer, setObserver] = useState<ObserverStatus>('ok');
   const [cwd, setCwd] = useState<Cwd | null>(null);
@@ -54,6 +68,11 @@ export default function App() {
   const effectiveRef = useRef(effective);
   useEffect(() => {
     effectiveRef.current = effective;
+  });
+  // Read by the Ctrl/Cmd+Shift+A listener, which is registered once.
+  const layoutRef = useRef(panel);
+  useEffect(() => {
+    layoutRef.current = panel;
   });
   const clientIds = useRef(0);
   const prevEffective = useRef<InputState>(effective);
@@ -135,6 +154,19 @@ export default function App() {
     }
   }, [effective]);
 
+  // Saved on every change. A drag saves on each move; the write is a few hundred bytes.
+  useEffect(() => {
+    savePanelLayout(panel, defaultSizeStorage());
+  }, [panel]);
+
+  // Refits the terminal once a dock change, a rail change or a drag's end is on screen. The fit reads the settled size
+  // of .term-host. The ResizeObserver on .term-host refits too (with its own debounce); this one makes the final fit
+  // land on the final layout. Runs after React has committed the change, so it never measures the old layout.
+  useEffect(() => {
+    const frame = requestAnimationFrame(() => void fitToContainer());
+    return () => cancelAnimationFrame(frame);
+  }, [panel.dock, panel.open, settle]);
+
   // Ctrl+Shift+A (Cmd+Shift+A) focuses the agent bar, from anywhere it is offered. Cmd+F, Cmd+K and Cmd+=/-/0 (see
   // appHotkeys.ts) are handled here too. Capture phase, so xterm does not also get the key, and a handled key is
   // stopped here so it never reaches the PTY.
@@ -143,6 +175,12 @@ export default function App() {
       if (isFocusBarHotkey(e)) {
         e.preventDefault();
         e.stopPropagation();
+        // A side panel collapsed to the rail opens first. Both state changes land in one render, so the input is
+        // visible when the focus effect in InputBar runs.
+        const { dock, open } = layoutRef.current;
+        if (!open && isSideDock(dock)) {
+          dispatchPanel({ type: 'open', open: true });
+        }
         const { bar } = routeRef.current;
         if (bar !== 'exited') {
           if (bar === 'collapsed') {
@@ -281,6 +319,17 @@ export default function App() {
     }
   };
 
+  const view = panelView(panel, workspace);
+  // The panel's size on its axis as it is drawn now, read live for a drag's start and for each key.
+  const measurePanel = () => {
+    const el = panelRef.current;
+    if (!el) {
+      return 0;
+    }
+    const box = el.getBoundingClientRect();
+    return view.side ? box.width : box.height;
+  };
+
   return (
     <div className="app">
       <StatusChip
@@ -292,43 +341,92 @@ export default function App() {
         onToggleAutoApprove={toggleAutoApprove}
         llm={llm}
       />
-      <div className="terminal-area">
-        <TerminalView
-          keysToPty={route.keys === 'pty'}
-          inputState={effective}
-          onInput={handleTerminalInput}
-          onAltChange={(active) => dispatchInput({ type: 'alt', active })}
-        />
-        {/* Shown during the agent's turn ('working', softer) and while it holds the shell ('control'). Never takes clicks; sits above the terminal background, below its decorations. */}
-        <div className={borderClass[border]} aria-hidden="true">
-          <div className="agent-control-glow" />
-        </div>
-        {findOpen && <FindBar focusToken={findToken} onClose={closeFind} />}
-      </div>
-      <Transcript
-        items={transcript.items}
-        busy={busy}
-        thinking={transcript.thinking}
-        open={transcriptOpen}
-        onToggle={() => setTranscriptOpen((o) => !o)}
-        onApprove={answer}
-        onNewConversation={newConversation}
-      />
-      <InputBar
-        mode={barMode}
-        hint={route.hint}
-        hintInline={route.hintInline}
-        hasPendingApproval={pendingApproval !== null}
-        focusToken={focusToken}
-        onFocusChange={setBarOpen}
-        onRestart={restartShell}
-        restarting={restarting}
-        onAgent={onAgent}
-        onInterrupt={() => sendRaw(CTRL_C)}
-        onApproveFirst={approveFirst}
-        onDenyFirst={denyFirst}
-        onClose={closeBar}
+      {/* The terminal is always the first child and the panel the last (see Workspace). The dock only changes the CSS. */}
+      <Workspace
+        ref={workspaceRef}
+        dock={panel.dock}
+        terminal={
+          <div className="terminal-area">
+            <TerminalView
+              keysToPty={route.keys === 'pty'}
+              inputState={effective}
+              onInput={handleTerminalInput}
+              onAltChange={(active) => dispatchInput({ type: 'alt', active })}
+            />
+            {/* Shown during the agent's turn ('working', softer) and while it holds the shell ('control'). Never takes clicks; sits above the terminal background, below its decorations. */}
+            <div className={borderClass[border]} aria-hidden="true">
+              <div className="agent-control-glow" />
+            </div>
+            {findOpen && <FindBar focusToken={findToken} onClose={closeFind} />}
+          </div>
+        }
+        divider={
+          view.divider ? (
+            <PanelDivider
+              dock={panel.dock}
+              container={workspace}
+              valueNow={view.side ? panelBox.width : panelBox.height}
+              measure={measurePanel}
+              onResize={(size) => dispatchPanel({ type: 'size', dock: panel.dock, size })}
+              onReset={() => dispatchPanel({ type: 'reset_size', dock: panel.dock })}
+              onSettle={settleLayout}
+            />
+          ) : null
+        }
+        panel={
+          <AgentPanel ref={panelRef} view={view} onExpand={() => dispatchPanel({ type: 'toggle' })}>
+            <Transcript
+              items={transcript.items}
+              busy={busy}
+              thinking={transcript.thinking}
+              open={panel.open}
+              onToggle={() => dispatchPanel({ type: 'toggle' })}
+              onApprove={answer}
+              onNewConversation={newConversation}
+              dock={panel.dock}
+              onDock={(dock) => dispatchPanel({ type: 'dock', dock })}
+            />
+            <InputBar
+              mode={barMode}
+              hint={route.hint}
+              hintInline={route.hintInline}
+              hasPendingApproval={pendingApproval !== null}
+              focusToken={focusToken}
+              onFocusChange={setBarOpen}
+              onRestart={restartShell}
+              restarting={restarting}
+              onAgent={onAgent}
+              onInterrupt={() => sendRaw(CTRL_C)}
+              onApproveFirst={approveFirst}
+              onDenyFirst={denyFirst}
+              onClose={closeBar}
+            />
+          </AgentPanel>
+        }
       />
     </div>
   );
+}
+
+/**
+ * The border-box size of an element, kept current with a ResizeObserver. `initial` is what the first render sees, before
+ * the element has been measured (the layout effect measures before the first paint).
+ */
+function useElementSize(ref: RefObject<HTMLElement | null>, initial: Container): Container {
+  const [size, setSize] = useState(initial);
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) {
+      return;
+    }
+    const measure = () => {
+      const box = el.getBoundingClientRect();
+      setSize((prev) => (prev.width === box.width && prev.height === box.height ? prev : { width: box.width, height: box.height }));
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [ref]);
+  return size;
 }
