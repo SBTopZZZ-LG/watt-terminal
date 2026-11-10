@@ -120,6 +120,16 @@ input {
   font: 10px/16px var(--mono);
 }
 
+/* A 1px line along the top of a prompt's row, after a command that ran. Full grid width. StripeLayer sets its top. */
+.separator {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: var(--line);
+  pointer-events: none;
+}
+
 /*
  * Find bar: a small overlay at the top right of the terminal area. It sits above the stripes (6) and the agent control (5).
  * The status strip is outside .terminal-area, so the bar never covers it.

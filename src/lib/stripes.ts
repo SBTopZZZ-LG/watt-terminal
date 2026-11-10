@@ -48,3 +48,18 @@ export function stripeSegments(marks: readonly StripeMark[], viewportY: number, 
   }
   return segments;
 }
+
+/**
+ * The viewport-relative row of each absolute row that lies in the viewport, in the order given. Rows outside
+ * the viewport give nothing. Used for the separator lines, which are one row each.
+ */
+export function separatorSegments(absoluteRows: readonly number[], viewportY: number, viewportRows: number): number[] {
+  const bottom = viewportY + viewportRows - 1;
+  const out: number[] = [];
+  for (const row of absoluteRows) {
+    if (row >= viewportY && row <= bottom) {
+      out.push(row - viewportY);
+    }
+  }
+  return out;
+}

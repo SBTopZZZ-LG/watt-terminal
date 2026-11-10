@@ -9,6 +9,9 @@
 // A mark is two xterm markers, one on its first row and one on its last row. The stripes are drawn from them by
 // StripeLayer, outside xterm's decoration system, which hides a decoration as soon as its first row scrolls out
 // of view. While a command runs, its last row is the cursor row, so the stripe grows with the output.
+//
+// A separator line marks the row of a prompt that follows a command which ran, so output and the next prompt are
+// visibly apart. It is one marker on that prompt's row, drawn by StripeLayer too.
 
 import type { IMarker, Terminal } from '@xterm/xterm';
 import type { StripeExit, StripeMark } from './stripes';
@@ -45,6 +48,15 @@ export class CommandMarks {
   private trusted = true;
   /** Every mark that may still have a stripe. Finished marks with no rows left are dropped when stripes are read. */
   private marks: Mark[] = [];
+  /**
+   * Separator lines: one marker on the row of each prompt that follows a command which ran. Dropped by xterm with
+   * their rows, and pruned when read.
+   */
+  private separators: IMarker[] = [];
+  /** A command started since the last prompt. An empty Enter, or a Ctrl-L redraw, leaves it false. */
+  private commandSincePrompt = false;
+  /** The most recently finished mark, which the next prompt's separator belongs to. */
+  private lastClosed: Mark | undefined;
 
   /** `changed` is called when a stripe may have changed, so the layer can repaint. */
   constructor(
@@ -64,6 +76,7 @@ export class CommandMarks {
   commandStart(): void {
     // A C while a command is still open: the earlier command ended without a D we can trust.
     this.closeOpen('unknown');
+    this.commandSincePrompt = true;
     const start: IMarker | undefined = this.term.registerMarker(0);
     const mark: Mark = { start, end: undefined, exit: null, agent: false, dropped: false };
     this.marks.push(mark);
@@ -89,7 +102,25 @@ export class CommandMarks {
   /** Shell event A: a new prompt. Any command still open ended without a D. */
   promptStart(): void {
     this.closeOpen('unknown');
+    // The prompt's row gets a separator when a command ran before it and that command still has a stripe. A clear
+    // that erased the command's first row leaves no stripe, so no line either.
+    if (this.commandSincePrompt && this.lastClosed && this.range(this.lastClosed) !== null) {
+      const sep = this.term.registerMarker(0);
+      if (sep) {
+        this.separators.push(sep);
+      }
+    }
+    this.commandSincePrompt = false;
     this.changed();
+  }
+
+  /**
+   * The absolute rows that get a separator line, pruned of disposed markers. Rows are read by StripeLayer on each
+   * repaint, and the separators are not drawn in the alternate screen.
+   */
+  separatorRows(): number[] {
+    this.separators = this.separators.filter((sep) => !sep.isDisposed && sep.line >= 0);
+    return this.separators.map((sep) => sep.line);
   }
 
   /** Rust reported a record started. `agent` is true when the agent ran it. */
@@ -122,7 +153,13 @@ export class CommandMarks {
       mark.start?.dispose();
       mark.end?.dispose();
     }
+    for (const sep of this.separators) {
+      sep.dispose();
+    }
     this.marks = [];
+    this.separators = [];
+    this.commandSincePrompt = false;
+    this.lastClosed = undefined;
     this.open = [];
     this.unpairedMarks = [];
     this.unpairedStarts = [];
@@ -154,6 +191,7 @@ export class CommandMarks {
 
   private finish(mark: Mark, exit: Exit): void {
     mark.exit = exit;
+    this.lastClosed = mark;
     mark.end?.dispose();
     mark.end = undefined;
     const startRow = this.startRow(mark);

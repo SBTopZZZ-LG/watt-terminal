@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { stripeSegments } from './stripes';
+import { separatorSegments, stripeSegments } from './stripes';
 import type { StripeMark } from './stripes';
 
 function mark(start: number, end: number, extra: Partial<StripeMark> = {}): StripeMark {
@@ -75,5 +75,32 @@ describe('stripeSegments', () => {
   it('gives nothing for an empty list or a zero-row viewport', () => {
     expect(stripeSegments([], 0, 24)).toEqual([]);
     expect(stripeSegments([mark(0, 5)], 0, 0)).toEqual([]);
+  });
+});
+
+describe('separatorSegments', () => {
+  it('a row inside the viewport gives its row relative to the viewport top', () => {
+    expect(separatorSegments([12], 10, 24)).toEqual([2]);
+  });
+
+  it('rows above the viewport give nothing', () => {
+    expect(separatorSegments([0, 9], 10, 24)).toEqual([]);
+  });
+
+  it('rows below the viewport give nothing', () => {
+    expect(separatorSegments([34, 50], 10, 24)).toEqual([]);
+  });
+
+  it('the first and last viewport rows are included', () => {
+    expect(separatorSegments([10, 33], 10, 24)).toEqual([0, 23]);
+  });
+
+  it('an empty list or a zero-row viewport gives nothing', () => {
+    expect(separatorSegments([], 0, 24)).toEqual([]);
+    expect(separatorSegments([5], 0, 0)).toEqual([]);
+  });
+
+  it('keeps the order given, and drops only the rows outside', () => {
+    expect(separatorSegments([30, 5, 12, 40, 10], 10, 24)).toEqual([20, 2, 0]);
   });
 });
