@@ -4,9 +4,15 @@
 import { Channel, invoke } from '@tauri-apps/api/core';
 import type {
   ConversationMeta,
+  FetchOutcome,
   LoadedConversation,
+  ModelRef,
+  ProviderPreset,
+  SaveProviderInput,
+  SettingsView,
   StartResult,
   Status,
+  TestResult,
   UiState,
   UiStatePatch,
   WireEvent,
@@ -85,5 +91,35 @@ export const api = {
   /** Applies a patch to the UI state and returns the state as stored. */
   patchUiState(patch: UiStatePatch) {
     return invoke<UiState>('patch_ui_state', { patch });
+  },
+  /** The AI provider settings, with which secrets are stored (never their values). */
+  getSettings() {
+    return invoke<SettingsView>('get_settings');
+  },
+  /** Adds or replaces a provider. Secrets in the input are stored, not returned. */
+  saveProvider(input: SaveProviderInput) {
+    return invoke<SettingsView>('save_provider', { input });
+  },
+  deleteProvider(providerId: string) {
+    return invoke<SettingsView>('delete_provider', { id: providerId });
+  },
+  /** Sets the default model, or clears it with null. */
+  setDefaultModel(model: ModelRef | null) {
+    return invoke<SettingsView>('set_default_model', { model });
+  },
+  /** Sets the global context cap in tokens, or clears it with null. */
+  setGlobalContextLimit(limit: number | null) {
+    return invoke<SettingsView>('set_global_context_limit', { limit });
+  },
+  providerPresets() {
+    return invoke<ProviderPreset[]>('provider_presets');
+  },
+  /** Fetches the provider's model list (one request to the provider) and merges it into the saved models. */
+  fetchModels(providerId: string) {
+    return invoke<FetchOutcome>('fetch_models', { providerId });
+  },
+  /** Sends one short test message (a few tokens) to a model. The model need not be the default. */
+  testConnection(providerId: string, modelId: string) {
+    return invoke<TestResult>('test_connection', { providerId, modelId });
   },
 };

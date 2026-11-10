@@ -20,7 +20,7 @@ use tauri::{Manager, RunEvent, State};
 pub mod core;
 
 use crate::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate, MockAgent, OnDrop};
-use crate::core::chat::agent_loop::{self, Conversation, LlmAgent};
+use crate::core::chat::agent_loop::{self, Conversation, LlmAgent, LlmSettings, USER_AGENT};
 use crate::core::chat::history::History;
 use crate::core::chat::redact::Redactor;
 use crate::core::llm::TurnCancel;
@@ -33,6 +33,13 @@ use crate::core::pty::OutputSink;
 use crate::core::record::Cwd;
 use crate::core::registry::Registry;
 use crate::core::session::{Session, SessionStats, SpawnConfig};
+use crate::core::settings::models::fetch_models as fetch_model_list;
+use crate::core::settings::presets::{self, ProviderPreset};
+use crate::core::settings::secrets::Secrets;
+use crate::core::settings::service::{
+    FetchOutcome, SaveProviderInput, SettingsService, SettingsView, TestResult, test_model,
+};
+use crate::core::settings::ModelRef;
 use crate::core::tools::SessionTools;
 
 type Reg = Registry<Attached>;
@@ -149,10 +156,16 @@ impl PersistState {
     }
 }
 
+/// The AI settings and the UI state live here. AGENT_TERM_CONFIG_DIR wins when it is set and not empty; otherwise the
+/// Tauri app config folder is used. Nothing is created here.
+fn resolve_config_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
+    dir_override("AGENT_TERM_CONFIG_DIR").or_else(|| app.path().app_config_dir().ok())
+}
+
 /// Resolves the config and data folders. AGENT_TERM_CONFIG_DIR and AGENT_TERM_DATA_DIR win when they are set and not
 /// empty; otherwise the Tauri app folders are used. Nothing is created here: the stores create their folders on write.
 fn resolve_persist(app: &tauri::AppHandle) -> Option<Persist> {
-    let config = dir_override("AGENT_TERM_CONFIG_DIR").or_else(|| app.path().app_config_dir().ok());
+    let config = resolve_config_dir(app);
     let data = dir_override("AGENT_TERM_DATA_DIR").or_else(|| app.path().app_data_dir().ok());
     match (config, data) {
         (Some(config), Some(data)) => Some(Persist::new(&config, &data)),
@@ -165,6 +178,18 @@ fn resolve_persist(app: &tauri::AppHandle) -> Option<Persist> {
 
 fn dir_override(name: &str) -> Option<PathBuf> {
     std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
+/// The AI provider settings. `None` when the app folders could not be resolved: the settings commands then return an
+/// error, and the environment settings still work.
+struct SettingsState(Option<Arc<SettingsService>>);
+
+const NO_SETTINGS: &str = "AI settings are unavailable: the app folders could not be found";
+
+impl SettingsState {
+    fn get(&self) -> Result<Arc<SettingsService>, String> {
+        self.0.clone().ok_or_else(|| NO_SETTINGS.to_string())
+    }
 }
 
 /// This machine's host name, as the shell reports it in OSC 7 (`$HOST`). Read once with `hostname`; "" when that fails.
@@ -312,25 +337,44 @@ fn cancel_agent(session_id: String, reg: State<'_, Reg>) -> Result<(), String> {
     Ok(())
 }
 
-/// Starts one agent turn on its own thread. Events arrive on the events channel. The LLM agent runs when the dev
-/// environment configures a provider (core/chat/agent_loop); otherwise the mock agent answers.
+/// The model for the next turn: the saved default model when there is one, else the environment settings
+/// (core/chat/agent_loop), else `None`, which means the mock agent. Returns the settings and the model id.
+/// A saved default that cannot be used is an error, not a fallback, so the user sees why.
+fn choose_llm(service: Option<&SettingsService>) -> Result<Option<(LlmSettings, String)>, String> {
+    if let Some(service) = service
+        && let Some(active) = service.active()?
+    {
+        return Ok(Some((active.settings, active.model)));
+    }
+    Ok(agent_loop::settings_cloned().map(|env| {
+        let model = env.model.clone();
+        (env, model)
+    }))
+}
+
+/// Starts one agent turn on its own thread. Events arrive on the events channel. The model is chosen by `choose_llm`.
+/// The choice is made before the turn starts, so an error leaves the agent idle.
 #[tauri::command]
-fn agent_message(
+async fn agent_message(
     session_id: String,
     text: String,
     reg: State<'_, Reg>,
     persist: State<'_, PersistState>,
+    settings: State<'_, SettingsState>,
 ) -> Result<(), String> {
     let att = session(&reg, &session_id)?;
+    // Reading a saved model touches the Keychain, so it runs on the blocking pool.
+    let service = settings.0.clone();
+    let chosen = blocking(move || choose_llm(service.as_deref())).await?;
     let cancel = Arc::new(TurnCancel::new());
     let (history, conversation_id) = att.begin_turn(&cancel)?;
     // Only the LLM agent writes history, so only its turns are saved. The mock agent never touches the history.
-    let (mut llm, model) = match agent_loop::settings() {
+    let (mut llm, model) = match chosen {
         None => (None, None),
-        Some(settings) => match agent_loop::shared_client() {
+        Some((llm_settings, model)) => match agent_loop::shared_client() {
             Ok(client) => {
-                let agent = LlmAgent::new(client, settings, &conversation_id, history.clone(), cancel.clone());
-                (Some(agent), Some(settings.model.clone()))
+                let agent = LlmAgent::new(client, llm_settings, &conversation_id, history.clone(), cancel.clone());
+                (Some(agent), Some(model))
             }
             Err(e) => {
                 att.end_turn();
@@ -412,11 +456,13 @@ fn set_auto_approve(session_id: String, on: bool, reg: State<'_, Reg>) -> Result
     Ok(())
 }
 
-/// Whether the LLM agent is configured, and its model. Never the key or the URL.
+/// Whether the LLM agent is configured, which model, and from which saved provider. `provider` is null for the
+/// environment settings. Never the key or the URL.
 #[derive(Serialize)]
 struct LlmStatus {
     enabled: bool,
     model: Option<String>,
+    provider: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -435,9 +481,16 @@ struct Status {
 }
 
 #[tauri::command]
-fn get_status(session_id: String, reg: State<'_, Reg>) -> Result<Status, String> {
+fn get_status(session_id: String, reg: State<'_, Reg>, settings: State<'_, SettingsState>) -> Result<Status, String> {
     let att = session(&reg, &session_id)?;
-    let llm = agent_loop::settings();
+    // The saved default's label reads no secret; without one, the environment settings are shown.
+    let llm = match settings.0.as_ref().and_then(|s| s.default_label()) {
+        Some((provider, model)) => LlmStatus { enabled: true, model: Some(model), provider: Some(provider) },
+        None => {
+            let env = agent_loop::settings();
+            LlmStatus { enabled: env.is_some(), model: env.map(|s| s.model.clone()), provider: None }
+        }
+    };
     Ok(Status {
         state: att.session.state(),
         integration: att.session.integration_status(),
@@ -447,7 +500,7 @@ fn get_status(session_id: String, reg: State<'_, Reg>) -> Result<Status, String>
         auto_approve: att.approvals.auto_approve(),
         agent_busy: att.agent_busy.load(Ordering::SeqCst),
         agent_control: att.agent_control.load(Ordering::SeqCst),
-        llm: LlmStatus { enabled: llm.is_some(), model: llm.map(|s| s.model.clone()) },
+        llm,
         conversation_id: att.conversation.id(),
     })
 }
@@ -567,6 +620,90 @@ async fn patch_ui_state(patch: UiStatePatch, persist: State<'_, PersistState>) -
     blocking(move || store.ui.patch(patch).map_err(|e| e.to_string())).await
 }
 
+/// The AI provider settings as the settings UI shows them: the settings and which secrets are stored, never their
+/// values. Reading which secrets are stored touches the secret store, so this runs when the UI asks, not at startup.
+#[tauri::command]
+async fn get_settings(settings: State<'_, SettingsState>) -> Result<SettingsView, String> {
+    let service = settings.get()?;
+    blocking(move || service.view()).await
+}
+
+/// Adds a provider, or replaces the one with the same id. Keys and secret header values go to the secret store and are
+/// never returned. The result is the settings as stored.
+#[tauri::command]
+async fn save_provider(input: SaveProviderInput, settings: State<'_, SettingsState>) -> Result<SettingsView, String> {
+    let service = settings.get()?;
+    blocking(move || service.save_provider(input)).await
+}
+
+/// Deletes a provider and its secrets. A default model that used it is cleared.
+#[tauri::command]
+async fn delete_provider(id: String, settings: State<'_, SettingsState>) -> Result<SettingsView, String> {
+    let service = settings.get()?;
+    blocking(move || service.delete_provider(&id)).await
+}
+
+/// Sets the default model, or clears it with null. The model must be listed by its provider.
+#[tauri::command]
+async fn set_default_model(
+    model: Option<ModelRef>,
+    settings: State<'_, SettingsState>,
+) -> Result<SettingsView, String> {
+    let service = settings.get()?;
+    blocking(move || service.set_default_model(model)).await
+}
+
+/// Sets the global context cap in tokens, or clears it with null.
+#[tauri::command]
+async fn set_global_context_limit(
+    limit: Option<u32>,
+    settings: State<'_, SettingsState>,
+) -> Result<SettingsView, String> {
+    let service = settings.get()?;
+    blocking(move || service.set_global_context_limit(limit)).await
+}
+
+/// The built-in provider presets the settings UI offers. Nothing is stored until the user saves one.
+#[tauri::command]
+fn provider_presets() -> Vec<ProviderPreset> {
+    presets::presets()
+}
+
+/// Fetches a provider's model list (one GET to the provider) and folds it into the saved models. The result is the
+/// settings as stored, plus what changed.
+#[tauri::command]
+async fn fetch_models(provider_id: String, settings: State<'_, SettingsState>) -> Result<FetchOutcome, String> {
+    let service = settings.get()?;
+    let plan = {
+        let service = service.clone();
+        let id = provider_id.clone();
+        blocking(move || service.provider_for_fetch(&id)).await?
+    };
+    let client = agent_loop::shared_client()?;
+    let fetched = fetch_model_list(client, &plan.url, &plan.api_key, &plan.headers, USER_AGENT)
+        .await
+        .map_err(|e| e.to_string())?;
+    blocking(move || {
+        let (view, summary) = service.apply_fetched(&provider_id, fetched)?;
+        Ok(FetchOutcome { view, summary })
+    })
+    .await
+}
+
+/// Sends one short test message to a model and reports whether it answered. It is one request, with the reply capped at
+/// 16 output tokens, so it costs a few tokens. The model does not have to be the default.
+#[tauri::command]
+async fn test_connection(
+    provider_id: String,
+    model_id: String,
+    settings: State<'_, SettingsState>,
+) -> Result<TestResult, String> {
+    let service = settings.get()?;
+    let plan = blocking(move || service.test_plan(&provider_id, &model_id)).await?;
+    let client = agent_loop::shared_client()?;
+    Ok(test_model(client, &plan).await)
+}
+
 pub fn run() {
     // Reads the dev LLM settings now, so a bad value is reported at launch and falls back to the mock agent.
     agent_loop::settings();
@@ -575,6 +712,10 @@ pub fn run() {
         .setup(|app| {
             let persist = resolve_persist(app.handle()).map(Arc::new);
             app.manage(PersistState(persist));
+            // Loads settings.json only. The secret store is read on first use, so startup never touches the Keychain.
+            let settings = resolve_config_dir(app.handle())
+                .map(|dir| Arc::new(SettingsService::new(&dir, Arc::new(Secrets::from_env(&dir)))));
+            app.manage(SettingsState(settings));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -596,7 +737,15 @@ pub fn run() {
             rename_conversation,
             delete_all_conversations,
             get_ui_state,
-            patch_ui_state
+            patch_ui_state,
+            get_settings,
+            save_provider,
+            delete_provider,
+            set_default_model,
+            set_global_context_limit,
+            provider_presets,
+            fetch_models,
+            test_connection
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

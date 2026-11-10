@@ -175,7 +175,7 @@ fn settings(url: &str) -> LlmSettings {
 }
 
 fn agent_for(s: &LlmSettings, conv: &Conversation) -> LlmAgent {
-    LlmAgent::new(&http_client().expect("client"), s, &conv.id(), conv.history(), Arc::new(TurnCancel::new()))
+    LlmAgent::new(&http_client().expect("client"), s.clone(), &conv.id(), conv.history(), Arc::new(TurnCancel::new()))
 }
 
 /// Runs one turn of the agent, as the app does on its agent thread.

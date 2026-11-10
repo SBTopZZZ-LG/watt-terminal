@@ -35,7 +35,7 @@ pub const MAX_MODEL_CALLS: usize = 50;
 pub const MAX_COMMANDS_PER_TURN: usize = 30;
 
 const SESSION_PLACEHOLDER: &str = "{session_id}";
-const USER_AGENT: &str = concat!("agent-term/", env!("CARGO_PKG_VERSION"));
+pub const USER_AGENT: &str = concat!("agent-term/", env!("CARGO_PKG_VERSION"));
 const ENV_URL: &str = "AGENT_TERM_LLM_URL";
 const ENV_KEY: &str = "AGENT_TERM_LLM_KEY";
 const ENV_MODEL: &str = "AGENT_TERM_LLM_MODEL";
@@ -145,6 +145,11 @@ pub fn settings() -> Option<&'static LlmSettings> {
     SETTINGS.get_or_init(|| settings_or_warn(|name| std::env::var(name).ok())).as_ref()
 }
 
+/// An owned copy of `settings()`, for callers that keep the settings past the turn (the agent takes ownership).
+pub fn settings_cloned() -> Option<LlmSettings> {
+    settings().cloned()
+}
+
 fn settings_or_warn(lookup: impl Fn(&str) -> Option<String>) -> Option<LlmSettings> {
     match settings_from_env(lookup) {
         Ok(settings) => settings,
@@ -222,7 +227,7 @@ pub struct LlmAgent {
 impl LlmAgent {
     pub fn new(
         client: &reqwest::Client,
-        settings: &LlmSettings,
+        settings: LlmSettings,
         conversation_id: &str,
         history: Arc<Mutex<History>>,
         cancel: Arc<TurnCancel>,
@@ -234,12 +239,12 @@ impl LlmAgent {
         LlmAgent {
             client: client.clone(),
             cfg: ProviderConfig {
-                chat_url: settings.chat_url.clone(),
-                api_key: settings.api_key.clone(),
+                chat_url: settings.chat_url,
+                api_key: settings.api_key,
                 headers,
                 user_agent: USER_AGENT.to_string(),
             },
-            model: settings.model.clone(),
+            model: settings.model,
             max_tokens: settings.max_tokens,
             stream: settings.stream,
             redactor: Redactor::new(known),

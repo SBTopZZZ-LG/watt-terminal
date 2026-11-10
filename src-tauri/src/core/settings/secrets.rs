@@ -170,7 +170,7 @@ impl SecretStore for MemoryStore {
     }
 }
 
-type SecretMap = BTreeMap<String, String>;
+pub type SecretMap = BTreeMap<String, String>;
 
 /// The secrets, read through a `SecretStore`. The blob is read on first use, not at construction, so starting the app
 /// never touches the Keychain.
@@ -202,9 +202,30 @@ impl Secrets {
         }
     }
 
+    /// `"keychain"` or `"file"` (or `"memory"` in tests): where the blob is kept. Names the store, holds no value.
+    pub fn kind(&self) -> &'static str {
+        self.store.kind()
+    }
+
     pub fn get(&self, key: &str) -> Result<Option<String>, SecretError> {
         let mut cache = self.lock()?;
         Ok(self.loaded(&mut cache)?.get(key).cloned())
+    }
+
+    /// A copy of every stored secret, for rolling a multi-step change back with `edit`.
+    pub fn snapshot(&self) -> Result<SecretMap, SecretError> {
+        let mut cache = self.lock()?;
+        Ok(self.loaded(&mut cache)?.clone())
+    }
+
+    /// Applies `change` to the whole map and saves it once, if the map changed. Used so one save covers a whole
+    /// provider edit. A failed save puts the cache back.
+    pub fn edit(&self, change: impl FnOnce(&mut SecretMap)) -> Result<(), SecretError> {
+        self.update(|map| {
+            let before = map.clone();
+            change(map);
+            *map != before
+        })
     }
 
     pub fn has(&self, key: &str) -> Result<bool, SecretError> {

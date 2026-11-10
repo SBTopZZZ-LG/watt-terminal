@@ -77,10 +77,14 @@ export interface SessionStats {
   dropped_bytes: number;
 }
 
-/** Whether the LLM agent is configured (dev environment variables), and its model. Never the key or the URL. */
+/**
+ * Whether the LLM agent is configured, and its model. `provider` is the saved provider's name, or absent or null when
+ * the model comes from the dev environment variables. Never the key or the URL.
+ */
 export interface LlmStatus {
   enabled: boolean;
   model: string | null;
+  provider?: string | null;
 }
 
 export interface Status {
@@ -157,4 +161,105 @@ export interface UiStatePatch {
   font_size?: number | null;
   last_conversation_id?: string | null;
   history_group_by?: HistoryGroupBy | null;
+}
+
+// AI provider settings (src-tauri/src/core/settings). Secrets are never in these types: they are only written, as
+// `api_key` or `header_secrets` in a SaveProviderInput, and read back as presence flags in SettingsView.
+
+/** A header of a provider. A secret header's `value` is always "" here; its real value is in the secret store. */
+export interface HeaderEntry {
+  name: string;
+  value: string;
+  secret: boolean;
+}
+
+/** `fetched` came from the provider's model list; `custom` was added by hand. */
+export type ModelSource = 'fetched' | 'custom';
+
+export interface Model {
+  id: string;
+  /** The user's override, in tokens. */
+  context_limit: number | null;
+  /** What the provider reported when the list was fetched, in tokens. */
+  provider_context: number | null;
+  source: ModelSource;
+}
+
+export interface Provider {
+  /** Slug: a-z, 0-9, '-' or '_', 1 to 40 characters, starting with a-z or 0-9. */
+  id: string;
+  name: string;
+  /** The full chat-completions URL. */
+  chat_url: string;
+  /** The full model-list URL, or null when the provider has none. */
+  models_url: string | null;
+  headers: HeaderEntry[];
+  stream: boolean;
+  max_tokens: number | null;
+  models: Model[];
+}
+
+export interface ModelRef {
+  provider_id: string;
+  model_id: string;
+}
+
+export interface Settings {
+  version: number;
+  providers: Provider[];
+  default_model: ModelRef | null;
+  /** Tokens. null means no cap. */
+  global_context_limit: number | null;
+}
+
+/** Which secrets a provider has stored. Never their values. */
+export interface SecretsPresent {
+  api_key: boolean;
+  /** Names of the secret headers that have a stored value. */
+  headers: string[];
+}
+
+export interface SettingsView {
+  settings: Settings;
+  /** Keyed by provider id. */
+  secrets: Record<string, SecretsPresent>;
+  store_kind: 'keychain' | 'file';
+  /** Set when settings.json could not be loaded. Changes are refused until the file is fixed or removed. */
+  load_error: string | null;
+}
+
+/**
+ * A provider as saved. `api_key`: absent or null keeps the stored key, "" removes it, anything else replaces it.
+ * `header_secrets`: header name to value for secret headers. An absent name keeps the stored value, "" removes it.
+ */
+export interface SaveProviderInput {
+  provider: Provider;
+  api_key?: string | null;
+  header_secrets?: Record<string, string>;
+}
+
+export interface ProviderPreset {
+  key: string;
+  label: string;
+  provider: Provider;
+  needs_key: boolean;
+  note: string;
+}
+
+export interface FetchSummary {
+  added: number;
+  updated: number;
+  removed: number;
+  total: number;
+}
+
+export interface FetchOutcome {
+  view: SettingsView;
+  summary: FetchSummary;
+}
+
+export interface TestResult {
+  ok: boolean;
+  message: string;
+  millis: number;
 }

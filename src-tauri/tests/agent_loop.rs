@@ -246,7 +246,7 @@ fn settings(url: &str, stream: bool) -> LlmSettings {
 }
 
 fn agent_for(s: &LlmSettings, conv: &Conversation, cancel: Arc<TurnCancel>) -> LlmAgent {
-    LlmAgent::new(&http_client().expect("client"), s, &conv.id(), conv.history(), cancel)
+    LlmAgent::new(&http_client().expect("client"), s.clone(), &conv.id(), conv.history(), cancel)
 }
 
 /// Runs one turn and returns every event it emitted, `Done` included.

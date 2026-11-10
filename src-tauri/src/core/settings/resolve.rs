@@ -8,7 +8,7 @@ use std::fmt;
 use std::io;
 
 use super::secrets::{SecretError, Secrets, api_key_name, header_secret_name};
-use super::{ModelRef, Settings};
+use super::{ModelRef, Provider, Settings};
 use crate::core::chat::agent_loop::{LlmSettings, new_conversation_id};
 
 const SESSION_PLACEHOLDER: &str = "{session_id}";
@@ -53,12 +53,28 @@ pub fn resolve(settings: &Settings, secrets: &Secrets, model: &ModelRef) -> Resu
         return Err(ResolveError::UnknownModel { provider: provider.id.clone(), model: model.model_id.clone() });
     }
 
-    let api_key = match stored(secrets, &api_key_name(&provider.id))? {
-        Some(key) => key,
-        None if allows_empty_key(&provider.chat_url) => String::new(),
-        None => return Err(ResolveError::MissingApiKey { provider: provider.id.clone() }),
-    };
+    Ok(LlmSettings {
+        chat_url: provider.chat_url.clone(),
+        api_key: api_key_for(provider, secrets)?,
+        model: model.model_id.clone(),
+        headers: headers_for(provider, secrets)?,
+        stream: provider.stream,
+        max_tokens: provider.max_tokens,
+        context_limit: provider.effective_context_limit(&model.model_id, settings.global_context_limit),
+    })
+}
 
+/// The provider's API key. An empty string is allowed only for a plain-http local chat URL.
+pub fn api_key_for(provider: &Provider, secrets: &Secrets) -> Result<String, ResolveError> {
+    match stored(secrets, &api_key_name(&provider.id))? {
+        Some(key) => Ok(key),
+        None if allows_empty_key(&provider.chat_url) => Ok(String::new()),
+        None => Err(ResolveError::MissingApiKey { provider: provider.id.clone() }),
+    }
+}
+
+/// The provider's header pairs in order: plain values as saved, secret values from the store. `{session_id}` is kept.
+pub fn headers_for(provider: &Provider, secrets: &Secrets) -> Result<Vec<(String, String)>, ResolveError> {
     let mut headers = Vec::with_capacity(provider.headers.len());
     for header in &provider.headers {
         let value = if header.secret {
@@ -70,16 +86,7 @@ pub fn resolve(settings: &Settings, secrets: &Secrets, model: &ModelRef) -> Resu
         };
         headers.push((header.name.clone(), value));
     }
-
-    Ok(LlmSettings {
-        chat_url: provider.chat_url.clone(),
-        api_key,
-        model: model.model_id.clone(),
-        headers,
-        stream: provider.stream,
-        max_tokens: provider.max_tokens,
-        context_limit: provider.effective_context_limit(&model.model_id, settings.global_context_limit),
-    })
+    Ok(headers)
 }
 
 /// Header pairs for a model-list request. `{session_id}` becomes a fresh conversation-style id. Other values are
@@ -256,7 +263,7 @@ mod tests {
         let history = Arc::new(Mutex::new(History::new()));
         let agent = crate::core::chat::agent_loop::LlmAgent::new(
             &http_client().unwrap(),
-            &resolved,
+            resolved,
             "ses_0123456789abcdef0123456789abcdef",
             history,
             Arc::new(TurnCancel::new()),

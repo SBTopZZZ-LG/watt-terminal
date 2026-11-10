@@ -2,12 +2,13 @@
 //!
 //! The file holds everything except secrets. API keys and secret header values live in a `SecretStore` (see
 //! `secrets.rs`), so a copy of `settings.json` never contains a credential. `load` and `save` are the only functions
-//! here that touch the disk. Nothing outside this module uses them yet.
+//! here that touch the disk. `service.rs` is the one place that changes settings at runtime and is what the app uses.
 
 pub mod models;
 pub mod presets;
 pub mod resolve;
 pub mod secrets;
+pub mod service;
 
 use std::collections::HashSet;
 use std::fmt;
