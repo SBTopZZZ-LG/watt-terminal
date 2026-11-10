@@ -362,3 +362,79 @@ describe('transcriptReducer: conversation_loaded', () => {
     expect(after.items[1].id).toBeGreaterThan(after.items[0].id);
   });
 });
+
+describe('transcriptReducer: todo list', () => {
+  const todo = (content: string, status: 'pending' | 'in_progress' | 'completed' = 'pending') => ({ content, status });
+  const call = (callId: string, name: string): TranscriptAction => ({
+    type: 'agent_event',
+    event: { type: 'tool_call', call_id: callId, name, args: { items: [] } },
+  });
+  const result = (callId: string, name: string, ok = true): TranscriptAction => ({
+    type: 'agent_event',
+    event: { type: 'tool_result', call_id: callId, name, ok, decision: 'auto', result: 'todo list updated' },
+  });
+  const update = (items: Array<{ content: string; status: 'pending' | 'in_progress' | 'completed' }>): TranscriptAction => ({
+    type: 'agent_event',
+    event: { type: 'todo_update', items },
+  });
+
+  it('starts empty', () => {
+    expect(EMPTY_TRANSCRIPT.todos).toEqual([]);
+  });
+
+  it('todo_update replaces the whole list', () => {
+    const first = run([update([todo('a', 'in_progress'), todo('b')])]);
+    expect(first.todos).toEqual([todo('a', 'in_progress'), todo('b')]);
+    const second = transcriptReducer(first, update([todo('b', 'in_progress')]));
+    expect(second.todos).toEqual([todo('b', 'in_progress')]);
+  });
+
+  it('todo_update does not add a transcript item or change the in-flight count', () => {
+    const before = run([{ type: 'user_sent', clientId: 1, text: 'plan' }]);
+    const after = transcriptReducer(before, update([todo('a', 'in_progress')]));
+    expect(after.items).toEqual(before.items);
+    expect(after.inFlight).toBe(before.inFlight);
+  });
+
+  it('conversation_reset clears the list', () => {
+    const after = run([update([todo('a')]), { type: 'conversation_reset' }]);
+    expect(after.todos).toEqual([]);
+  });
+
+  it('conversation_loaded sets the list from the loaded todos', () => {
+    const after = run([
+      update([todo('live')]),
+      { type: 'conversation_loaded', items: [], todos: [todo('saved', 'in_progress')] },
+    ]);
+    expect(after.todos).toEqual([todo('saved', 'in_progress')]);
+  });
+
+  it('conversation_loaded without todos leaves the list empty', () => {
+    const after = run([update([todo('live')]), { type: 'conversation_loaded', items: [] }]);
+    expect(after.todos).toEqual([]);
+  });
+
+  it('session_reset keeps the list, since the conversation is kept', () => {
+    const after = run([update([todo('a', 'in_progress')]), { type: 'session_reset' }]);
+    expect(after.todos).toEqual([todo('a', 'in_progress')]);
+  });
+
+  it('todo_write calls and results are not items, and a running todo_write is not in flight', () => {
+    const before = run([{ type: 'user_sent', clientId: 1, text: 'plan' }]);
+    const after = run([call('c1', 'todo_write'), result('c1', 'todo_write')], before);
+    expect(after.items).toEqual(before.items);
+    expect(after.inFlight).toBe(before.inFlight);
+    expect(after.nextId).toBe(before.nextId);
+  });
+
+  it('a todo_write result with no call is not shown as an orphan row', () => {
+    const after = run([result('c9', 'todo_write', false)]);
+    expect(after.items).toEqual([]);
+  });
+
+  it('other tools are still shown next to a todo_write call', () => {
+    const after = run([call('c1', 'todo_write'), call('c2', 'run_command'), result('c2', 'run_command'), result('c1', 'todo_write')]);
+    expect(after.items.map((i) => (i.kind === 'tool' ? i.name : i.kind))).toEqual(['run_command']);
+    expect(after.items[0]).toMatchObject({ kind: 'tool', status: 'ok' });
+  });
+});

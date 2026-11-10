@@ -7,15 +7,22 @@ import { approvalTitle } from '../lib/transcript';
 import type { TranscriptItem } from '../lib/transcript';
 import { groupTranscript, toolGroupSummary } from '../lib/toolGroups';
 import type { GroupItem } from '../lib/toolGroups';
+import type { TodoItem } from '../lib/types';
 import { visibleEscapes } from '../lib/visibleEscapes';
 import { Markdown } from './Markdown';
+import { TodoPanel } from './TodoPanel';
 import type { Dock } from '../lib/panelLayout';
+
+/** The default for `todos`, so the prop can be left out. A constant, so it is not a new array on every render. */
+const NO_TODOS: TodoItem[] = [];
 
 interface Props {
   items: TranscriptItem[];
   busy: boolean;
   /** The model is working and has not produced output yet. */
   thinking: boolean;
+  /** The conversation's todo list. The panel above the body shows it; empty hides the panel. */
+  todos?: TodoItem[];
   open: boolean;
   onToggle: () => void;
   onApprove: (callId: string, approve: boolean) => void;
@@ -36,6 +43,7 @@ export function Transcript({
   items,
   busy,
   thinking,
+  todos = NO_TODOS,
   open,
   onToggle,
   onApprove,
@@ -165,6 +173,8 @@ export function Transcript({
         </button>
       </div>
       {open && view === 'history' && history}
+      {/* Pinned: a sibling above the body, so it never scrolls away and the body's scroll and follow logic is untouched. */}
+      {bodyShown && <TodoPanel items={todos} />}
       {bodyShown && (
         <div className="transcript-body" ref={bodyRef} tabIndex={-1} onScroll={onScroll} onWheel={onWheel}>
           {items.length === 0 && <div className="empty">Ask the agent something, for example "what was the last command".</div>}

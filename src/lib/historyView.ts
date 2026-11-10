@@ -8,6 +8,7 @@
 
 import type { ChatMessage, ConversationMeta } from './types';
 import type { NewItem, ToolStatus } from './transcript';
+import { TODO_TOOL } from './todoView';
 
 /**
  * The start of a denied call's error text. Mirrors DENIED in src-tauri/src/core/agent.rs. A stored tool message carries the
@@ -93,7 +94,8 @@ function callsOf(toolCalls: unknown): ToolCall[] {
  * gives an agent item (when it has text), then one tool item per tool call. Each tool item takes the content of the tool
  * message with the same tool_call_id: failed when that content starts with `error:`, the DENIED prefix or `skipped:`, ok otherwise.
  * A call with no tool message is failed, with NO_RESULT_TEXT. Tool messages that answer no call are dropped. Empty
- * assistant text is skipped. Ids are not set here; the transcript reducer gives them (conversation_loaded).
+ * assistant text is skipped. A todo_write call gets no item (nor its tool message): the todo panel shows the list instead.
+ * Ids are not set here; the transcript reducer gives them (conversation_loaded).
  */
 export function itemsFromMessages(messages: ChatMessage[]): NewItem[] {
   const results = new Map<string, string>();
@@ -115,6 +117,9 @@ export function itemsFromMessages(messages: ChatMessage[]): NewItem[] {
         items.push({ kind: 'agent', text, streaming: false });
       }
       for (const call of callsOf(m.tool_calls)) {
+        if (call.name === TODO_TOOL) {
+          continue;
+        }
         const content = results.get(call.id);
         const status: ToolStatus = content !== undefined && !isFailure(content) ? 'ok' : 'failed';
         items.push({

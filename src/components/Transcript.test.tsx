@@ -104,3 +104,34 @@ describe('Transcript: history button', () => {
     expect(html).toMatch(/id="history-button"[^>]*aria-pressed="true"|aria-pressed="true"[^>]*id="history-button"/);
   });
 });
+
+describe('Transcript: todo panel', () => {
+  const todos = [{ content: 'plan', status: 'in_progress' as const }];
+  const base = { items: [], busy: false, thinking: false, onToggle: () => {}, onApprove: () => {}, onNewConversation: () => {} };
+
+  it('is pinned above the scrolling body, not inside it', () => {
+    const html = renderToStaticMarkup(<Transcript {...base} todos={todos} open />);
+    const panel = html.indexOf('class="todo-panel"');
+    expect(panel).toBeGreaterThan(-1);
+    expect(panel).toBeLessThan(html.indexOf('class="transcript-body"'));
+  });
+
+  it('is hidden when the list is empty, and when the chat body is not shown', () => {
+    expect(renderToStaticMarkup(<Transcript {...base} todos={[]} open />)).not.toContain('todo-panel');
+    expect(renderToStaticMarkup(<Transcript {...base} todos={todos} open={false} />)).not.toContain('todo-panel');
+    expect(renderToStaticMarkup(<Transcript {...base} todos={todos} open view="history" history={<div />} />)).not.toContain('todo-panel');
+  });
+
+  it('todo_write rows never render as tool rows', () => {
+    // Run through the reducer, as the view gets them: the reducer drops the call and its result.
+    const t = [
+      { type: 'user_sent' as const, clientId: 1, text: 'plan' },
+      { type: 'agent_event' as const, event: { type: 'tool_call' as const, call_id: 't1', name: 'todo_write', args: {} } },
+      { type: 'agent_event' as const, event: { type: 'tool_result' as const, call_id: 't1', name: 'todo_write', ok: true, decision: 'read' as const, result: {} } },
+    ].reduce(transcriptReducer, EMPTY_TRANSCRIPT);
+    const html = renderToStaticMarkup(<Transcript {...base} items={t.items} open />);
+    expect(html).toContain('plan');
+    expect(html).not.toContain('todo_write');
+    expect(html).not.toContain('class="tool');
+  });
+});

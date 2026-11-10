@@ -313,3 +313,23 @@ describe('relativeTime', () => {
     expect(relativeTime(old, now)).toBe(formatWhen(old, now));
   });
 });
+
+describe('itemsFromMessages: todo_write', () => {
+  const todoCall = (id: string) => ({ id, type: 'function', function: { name: 'todo_write', arguments: '{"items":[]}' } });
+
+  it('a todo_write call and its tool message give no item, and the rest of the turn is kept', () => {
+    const items = itemsFromMessages([
+      { role: 'user', content: 'plan it' },
+      { role: 'assistant', content: 'Planning.', tool_calls: [todoCall('t1')] },
+      { role: 'tool', tool_call_id: 't1', content: 'todo list updated: 0 done, 0 in progress, 2 pending' },
+      { role: 'assistant', content: '', tool_calls: [{ id: 'c2', type: 'function', function: { name: 'run_command', arguments: '{"command":"ls"}' } }] },
+      { role: 'tool', tool_call_id: 'c2', content: 'ok' },
+    ]);
+    expect(items.map((i) => (i.kind === 'tool' ? `tool:${i.name}` : i.kind))).toEqual(['user', 'agent', 'tool:run_command']);
+  });
+
+  it('a todo_write call with no tool message gives no item and no failed row', () => {
+    const items = itemsFromMessages([{ role: 'assistant', content: '', tool_calls: [todoCall('t1')] }]);
+    expect(items).toEqual([]);
+  });
+});

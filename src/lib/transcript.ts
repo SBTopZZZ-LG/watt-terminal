@@ -1,8 +1,9 @@
 // The agent transcript: what the user said, what the agent said, its tool calls, and approval requests.
 // Pure reducer over AgentEvents (from Rust) and local actions (sent messages, clicks, errors).
 
-import type { AgentEvent, ToolDecision } from './types';
+import type { AgentEvent, TodoItem, ToolDecision } from './types';
 import { visibleEscapes } from './visibleEscapes';
+import { TODO_TOOL } from './todoView';
 
 export type ToolStatus = 'running' | 'ok' | 'failed';
 export type ApprovalState = 'pending' | 'answering' | 'resolved';
@@ -25,9 +26,11 @@ export interface Transcript {
   nextId: number;
   /** The model is working on a reply and has not produced output yet. */
   thinking: boolean;
+  /** The conversation's todo list, shown by the todo panel. Replaced as a whole. */
+  todos: TodoItem[];
 }
 
-export const EMPTY_TRANSCRIPT: Transcript = { items: [], inFlight: 0, nextId: 1, thinking: false };
+export const EMPTY_TRANSCRIPT: Transcript = { items: [], inFlight: 0, nextId: 1, thinking: false, todos: [] };
 
 /** Keeps the transcript bounded; the oldest items go first. */
 export const MAX_ITEMS = 500;
@@ -45,13 +48,13 @@ export type TranscriptAction =
   | { type: 'sync_busy'; busy: boolean }
   /** A new shell replaced the old one. Pending approvals and running tools can never finish, so they are closed. */
   | { type: 'session_reset' }
-  /** The agent's conversation was cleared on the Rust side. Only sent after a successful reset, never while busy. */
+  /** The agent's conversation was cleared on the Rust side. Only sent after a successful reset, never while busy. Clears the todos too. */
   | { type: 'conversation_reset' }
   /**
    * A saved conversation was opened as the live one. Replaces the items. Ids come from nextId; the newest MAX_ITEMS are kept.
-   * Never sent while busy (the backend refuses to load then).
+   * Never sent while busy (the backend refuses to load then). `todos` is the loaded conversation's list; absent means none.
    */
-  | { type: 'conversation_loaded'; items: NewItem[] };
+  | { type: 'conversation_loaded'; items: NewItem[]; todos?: TodoItem[] };
 
 export function transcriptReducer(t: Transcript, action: TranscriptAction): Transcript {
   switch (action.type) {
@@ -107,12 +110,12 @@ export function transcriptReducer(t: Transcript, action: TranscriptAction): Tran
     }
     case 'conversation_reset':
       // Keeps nextId, so ids stay unique for the React keys of the items that come after.
-      return { ...t, items: [], inFlight: 0, thinking: false };
+      return { ...t, items: [], inFlight: 0, thinking: false, todos: [] };
     case 'conversation_loaded': {
       // Every id is used up, even for the items the cap drops, so ids keep increasing.
       const made = action.items.map((item, i) => keyed(item, t.nextId + i));
       const items = made.length > MAX_ITEMS ? made.slice(made.length - MAX_ITEMS) : made;
-      return { ...t, items, nextId: t.nextId + action.items.length, inFlight: 0, thinking: false };
+      return { ...t, items, nextId: t.nextId + action.items.length, inFlight: 0, thinking: false, todos: action.todos ?? [] };
     }
   }
 }
@@ -131,6 +134,10 @@ function applyAgentEvent(t: Transcript, ev: AgentEvent): Transcript {
     case 'thinking':
       return { ...t, thinking: ev.active };
     case 'tool_call':
+      // The todo tool's rows are not shown: the panel is the view of the list, so the call is not an item (or in flight).
+      if (ev.name === TODO_TOOL) {
+        return t;
+      }
       return add(t, (id) => ({
         id,
         kind: 'tool',
@@ -142,6 +149,9 @@ function applyAgentEvent(t: Transcript, ev: AgentEvent): Transcript {
         decision: null,
       }));
     case 'tool_result': {
+      if (ev.name === TODO_TOOL) {
+        return t;
+      }
       const hasTool = t.items.some((i) => i.kind === 'tool' && i.callId === ev.call_id);
       const items = t.items.map((i) => {
         if (i.kind === 'tool' && i.callId === ev.call_id) {
@@ -183,9 +193,8 @@ function applyAgentEvent(t: Transcript, ev: AgentEvent): Transcript {
     // Drives the terminal border (see agentControl.ts), not the transcript.
     case 'agent_control':
       return t;
-    // Ignored until the todo panel's reducer lands (the UI task). Listed so the switch stays exhaustive.
     case 'todo_update':
-      return t;
+      return { ...t, todos: ev.items };
   }
 }
 

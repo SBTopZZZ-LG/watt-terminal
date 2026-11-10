@@ -194,7 +194,7 @@ export default function App() {
           // The user sent a message while the load was running. The transcript is theirs now.
           return;
         }
-        dispatchTranscript({ type: 'conversation_loaded', items: itemsFromMessages(loaded.messages) });
+        dispatchTranscript({ type: 'conversation_loaded', items: itemsFromMessages(loaded.messages), todos: loaded.todos });
         setConversationId(loaded.id);
       } catch {
         if (transcriptRef.current.items.length === 0) {
@@ -392,7 +392,7 @@ export default function App() {
 
   /** A saved conversation was opened from the History view: it becomes the live transcript, and the chat is shown. */
   const openConversation = (loaded: LoadedConversation) => {
-    dispatchTranscript({ type: 'conversation_loaded', items: itemsFromMessages(loaded.messages) });
+    dispatchTranscript({ type: 'conversation_loaded', items: itemsFromMessages(loaded.messages), todos: loaded.todos });
     setConversationId(loaded.id);
     setPanelBody('chat');
     refreshStatus();
@@ -544,6 +544,7 @@ export default function App() {
               items={transcript.items}
               busy={busy}
               thinking={transcript.thinking}
+              todos={transcript.todos}
               open={panel.open}
               onToggle={() => dispatchPanel({ type: 'toggle' })}
               onApprove={answer}
