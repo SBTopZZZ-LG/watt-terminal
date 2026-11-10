@@ -299,13 +299,17 @@ fn post(client: &reqwest::Client, cfg: &ProviderConfig, body: &Value) -> Result<
     Ok(client.post(&cfg.chat_url).headers(build_headers(cfg)?).json(body))
 }
 
-/// Authorization, Content-Type and User-Agent first, then the caller's headers. A caller header with the
-/// same name replaces the built-in one.
-fn build_headers(cfg: &ProviderConfig) -> Result<HeaderMap, LlmError> {
+/// Authorization (only when there is a key), Content-Type and User-Agent first, then the caller's headers. A caller
+/// header with the same name replaces the built-in one.
+pub(crate) fn build_headers(cfg: &ProviderConfig) -> Result<HeaderMap, LlmError> {
     let mut headers = HeaderMap::new();
-    let bearer = HeaderValue::from_str(&format!("Bearer {}", cfg.api_key))
-        .map_err(|_| LlmError::Transport("the API key has characters that are not allowed in a header".to_string()))?;
-    headers.insert(AUTHORIZATION, bearer);
+    // A local server may need no key at all. An empty key sends no Authorization header.
+    if !cfg.api_key.is_empty() {
+        let bearer = HeaderValue::from_str(&format!("Bearer {}", cfg.api_key)).map_err(|_| {
+            LlmError::Transport("the API key has characters that are not allowed in a header".to_string())
+        })?;
+        headers.insert(AUTHORIZATION, bearer);
+    }
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     let user_agent = HeaderValue::from_str(&cfg.user_agent)
         .map_err(|_| LlmError::Transport("the User-Agent is not a valid header value".to_string()))?;
@@ -331,7 +335,7 @@ fn request_body(req: &ChatRequest, stream: bool) -> Value {
     body
 }
 
-fn transport(err: reqwest::Error) -> LlmError {
+pub(crate) fn transport(err: reqwest::Error) -> LlmError {
     // The URL is dropped: a configured endpoint may carry a token in its userinfo or query.
     let err = err.without_url();
     if err.is_timeout() {
@@ -406,7 +410,7 @@ fn truncate(text: &str) -> String {
 
 /// Replaces the key in a raw body or payload. Runs before parsing and truncation, so a key that would
 /// straddle the message cut is removed whole. An empty key replaces nothing.
-fn redact(text: &str, secret: &str) -> String {
+pub(crate) fn redact(text: &str, secret: &str) -> String {
     if secret.is_empty() { text.to_string() } else { text.replace(secret, "[redacted]") }
 }
 

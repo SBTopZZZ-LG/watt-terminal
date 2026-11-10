@@ -4,6 +4,9 @@
 //! `secrets.rs`), so a copy of `settings.json` never contains a credential. `load` and `save` are the only functions
 //! here that touch the disk. Nothing outside this module uses them yet.
 
+pub mod models;
+pub mod presets;
+pub mod resolve;
 pub mod secrets;
 
 use std::collections::HashSet;

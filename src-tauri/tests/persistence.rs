@@ -170,6 +170,7 @@ fn settings(url: &str) -> LlmSettings {
         headers: vec![("x-session".to_string(), "{session_id}".to_string())],
         stream: false,
         max_tokens: None,
+        context_limit: None,
     }
 }
 

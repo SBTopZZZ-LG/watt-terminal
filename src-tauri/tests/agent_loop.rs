@@ -241,6 +241,7 @@ fn settings(url: &str, stream: bool) -> LlmSettings {
         headers: Vec::new(),
         stream,
         max_tokens: None,
+        context_limit: None,
     }
 }
 

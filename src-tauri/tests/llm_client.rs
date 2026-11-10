@@ -285,6 +285,18 @@ async fn mid_stream_error_chunk_is_a_provider_error_after_the_text_before_it() {
 }
 
 #[tokio::test]
+async fn request_has_no_authorization_header_when_the_key_is_empty() {
+    let (url, rx) = serve(Script::ok(OPENCODE_TOOLS));
+    let mut config = cfg(url);
+    config.api_key = String::new();
+    complete(&http_client().unwrap(), &config, &request(), &TurnCancel::new()).await.unwrap();
+
+    let lower = rx.recv().unwrap().to_ascii_lowercase();
+    assert!(!lower.contains("authorization:"), "an empty key must send no Authorization header: {lower}");
+    assert!(lower.contains("user-agent: agent-term-test/1.0"));
+}
+
+#[tokio::test]
 async fn request_carries_authorization_user_agent_and_the_custom_header() {
     let (url, rx) = serve(Script::ok(OPENCODE_TOOLS));
     let mut config = cfg(url);

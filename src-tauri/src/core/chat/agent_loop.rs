@@ -62,6 +62,8 @@ pub struct LlmSettings {
     /// True streams the reply (text appears as it arrives); false waits for the whole reply.
     pub stream: bool,
     pub max_tokens: Option<u32>,
+    /// The context limit that applies to this model, in tokens (core/settings). Not used by the loop yet.
+    pub context_limit: Option<u32>,
 }
 
 impl LlmSettings {
@@ -84,6 +86,7 @@ impl fmt::Debug for LlmSettings {
             .field("header_names", &header_names)
             .field("stream", &self.stream)
             .field("max_tokens", &self.max_tokens)
+            .field("context_limit", &self.context_limit)
             .finish()
     }
 }
@@ -111,7 +114,7 @@ pub fn settings_from_env(lookup: impl Fn(&str) -> Option<String>) -> Result<Opti
             Some(n.ok_or_else(|| format!("{ENV_MAX_TOKENS} must be a positive whole number"))?)
         }
     };
-    Ok(Some(LlmSettings { chat_url, api_key, model, headers, stream, max_tokens }))
+    Ok(Some(LlmSettings { chat_url, api_key, model, headers, stream, max_tokens, context_limit: None }))
 }
 
 /// `Name: value` entries, one per line or separated by `;`. Each name and value is checked now, with the placeholder
