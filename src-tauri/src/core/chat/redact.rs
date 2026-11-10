@@ -32,6 +32,8 @@ static PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
         (r"\bAIza[0-9A-Za-z_\-]{35}", "[REDACTED:google_key]"),
         (r"\bsk_live_[0-9A-Za-z]{10,}", "[REDACTED:stripe_key]"),
         (r"\beyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]*", "[REDACTED:jwt]"),
+        // `Authorization: Bearer <token>`. Case-insensitive; the 16-character minimum keeps ordinary words out.
+        (r"(?i)\bbearer\s+[A-Za-z0-9._~+/=\-]{16,}", "Bearer [REDACTED:bearer]"),
         // `NAME=value` and `export NAME=value` where NAME contains a credential word. The name stays, the value goes.
         // The value is a quoted string (closed or cut at the end of the line) or a run of non-space characters.
         (
@@ -178,6 +180,34 @@ mod tests {
     fn jwt_is_redacted() {
         let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
         assert_eq!(none().redact(&format!("token {jwt} end")), "token [REDACTED:jwt] end");
+    }
+
+    #[test]
+    fn bearer_token_in_an_authorization_header_is_redacted() {
+        assert_eq!(
+            none().redact("Authorization: Bearer abcDEF123456789xyz.tok_en~+/=-"),
+            "Authorization: Bearer [REDACTED:bearer]"
+        );
+    }
+
+    #[test]
+    fn bearer_token_is_redacted_in_any_case() {
+        assert_eq!(none().redact("authorization: bearer abcdefghijklmnop1234"), "authorization: Bearer [REDACTED:bearer]");
+        assert_eq!(none().redact("BEARER abcdefghijklmnop1234 end"), "Bearer [REDACTED:bearer] end");
+    }
+
+    #[test]
+    fn short_word_after_bearer_is_kept() {
+        let text = "the bearer token is fine, a bearer of news, bearer 0123456789abcde";
+        assert_eq!(none().redact(text), text);
+    }
+
+    #[test]
+    fn bearer_redaction_is_idempotent() {
+        let r = none();
+        let once = r.redact("Authorization: bearer abcdefghijklmnop1234");
+        assert_eq!(once, "Authorization: Bearer [REDACTED:bearer]");
+        assert_eq!(r.redact(&once), once);
     }
 
     #[test]

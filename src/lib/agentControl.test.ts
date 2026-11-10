@@ -3,9 +3,16 @@ import { agentControlAfter, borderActive, NO_CONTROL } from './agentControl';
 import type { AgentControl } from './agentControl';
 import type { Source, WireEvent } from './types';
 
-const approvalRequest: WireEvent = { type: 'approval_request', call_id: 'call-1', text: 'pwd' };
+const approvalRequest: WireEvent = { type: 'approval_request', call_id: 'call-1', name: 'run_command', text: 'pwd' };
 const toolCall: WireEvent = { type: 'tool_call', call_id: 'call-1', name: 'run_command', args: { command: 'pwd' } };
-const toolResult: WireEvent = { type: 'tool_result', call_id: 'call-1', name: 'run_command', ok: true, result: {} };
+const toolResult: WireEvent = {
+  type: 'tool_result',
+  call_id: 'call-1',
+  name: 'run_command',
+  ok: true,
+  decision: 'manual',
+  result: {},
+};
 const controlOn: WireEvent = { type: 'agent_control', active: true };
 const controlOff: WireEvent = { type: 'agent_control', active: false };
 const done: WireEvent = { type: 'done' };

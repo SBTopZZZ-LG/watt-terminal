@@ -19,20 +19,20 @@ describe('transcriptReducer: agent events', () => {
   it('a tool result sets the call status and keeps the result', () => {
     const ok = run([
       { type: 'agent_event', event: { type: 'tool_call', call_id: 'c1', name: 'get_cwd', args: {} } },
-      { type: 'agent_event', event: { type: 'tool_result', call_id: 'c1', name: 'get_cwd', ok: true, result: { path: '/' } } },
+      { type: 'agent_event', event: { type: 'tool_result', call_id: 'c1', name: 'get_cwd', ok: true, decision: 'read', result: { path: '/' } } },
     ]);
     expect(ok.items[0]).toMatchObject({ kind: 'tool', status: 'ok', result: { path: '/' } });
 
     const failed = run([
       { type: 'agent_event', event: { type: 'tool_call', call_id: 'c2', name: 'run_command', args: {} } },
-      { type: 'agent_event', event: { type: 'tool_result', call_id: 'c2', name: 'run_command', ok: false, result: { error: 'busy' } } },
+      { type: 'agent_event', event: { type: 'tool_result', call_id: 'c2', name: 'run_command', ok: false, decision: 'refused', result: { error: 'busy' } } },
     ]);
     expect(failed.items[0]).toMatchObject({ kind: 'tool', status: 'failed' });
   });
 
   it('a tool result without its call is still shown', () => {
     const t = run([
-      { type: 'agent_event', event: { type: 'tool_result', call_id: 'orphan', name: 'get_cwd', ok: true, result: null } },
+      { type: 'agent_event', event: { type: 'tool_result', call_id: 'orphan', name: 'get_cwd', ok: true, decision: 'read', result: null } },
     ]);
     expect(t.items).toHaveLength(1);
     expect(t.items[0]).toMatchObject({ kind: 'tool', callId: 'orphan', status: 'ok' });
@@ -40,14 +40,14 @@ describe('transcriptReducer: agent events', () => {
 
   it('an approval request is pending until its tool result arrives', () => {
     const asked = run([
-      { type: 'agent_event', event: { type: 'approval_request', call_id: 'a1', text: 'pwd' } },
+      { type: 'agent_event', event: { type: 'approval_request', call_id: 'a1', name: 'run_command', text: 'pwd' } },
     ]);
     expect(asked.items[0]).toMatchObject({ kind: 'approval', state: 'pending' });
     expect(firstPendingApproval(asked)).toBe('a1');
 
     const done = transcriptReducer(asked, {
       type: 'agent_event',
-      event: { type: 'tool_result', call_id: 'a1', name: 'run_command', ok: true, result: {} },
+      event: { type: 'tool_result', call_id: 'a1', name: 'run_command', ok: true, decision: 'manual', result: {} },
     });
     expect(done.items[0]).toMatchObject({ kind: 'approval', state: 'resolved' });
     expect(firstPendingApproval(done)).toBeNull();
@@ -92,7 +92,9 @@ describe('transcriptReducer: local actions', () => {
   });
 
   it('approving marks the card as answering, and a failed call returns it to pending', () => {
-    const asked = run([{ type: 'agent_event', event: { type: 'approval_request', call_id: 'a1', text: 'pwd' } }]);
+    const asked = run([
+      { type: 'agent_event', event: { type: 'approval_request', call_id: 'a1', name: 'run_command', text: 'pwd' } },
+    ]);
     const answering = transcriptReducer(asked, { type: 'approval_answering', callId: 'a1', approve: true });
     expect(answering.items[0]).toMatchObject({ kind: 'approval', state: 'answering', approve: true });
     expect(firstPendingApproval(answering)).toBeNull();
@@ -102,10 +104,23 @@ describe('transcriptReducer: local actions', () => {
     expect(back.items[1]).toMatchObject({ kind: 'notice', text: 'no pending approval a1' });
   });
 
+  it('streamed text and thinking leave the transcript as it is until the chat UI shows them', () => {
+    const start = run([{ type: 'user_sent', clientId: 1, text: 'hi' }]);
+    const t = run(
+      [
+        { type: 'agent_event', event: { type: 'thinking', active: true } },
+        { type: 'agent_event', event: { type: 'text_delta', text: 'Hel' } },
+        { type: 'agent_event', event: { type: 'thinking', active: false } },
+      ],
+      start,
+    );
+    expect(t).toEqual(start);
+  });
+
   it('the first pending approval is the oldest one', () => {
     const t = run([
-      { type: 'agent_event', event: { type: 'approval_request', call_id: 'a1', text: 'x' } },
-      { type: 'agent_event', event: { type: 'approval_request', call_id: 'a2', text: 'y' } },
+      { type: 'agent_event', event: { type: 'approval_request', call_id: 'a1', name: 'run_command', text: 'x' } },
+      { type: 'agent_event', event: { type: 'approval_request', call_id: 'a2', name: 'run_command', text: 'y' } },
     ]);
     expect(firstPendingApproval(t)).toBe('a1');
   });
@@ -119,9 +134,9 @@ describe('transcriptReducer: local actions', () => {
     const before = run([
       { type: 'user_sent', clientId: 1, text: 'list files' },
       { type: 'agent_event', event: { type: 'tool_call', call_id: 'c1', name: 'run_command', args: {} } },
-      { type: 'agent_event', event: { type: 'approval_request', call_id: 'a1', text: 'ls' } },
+      { type: 'agent_event', event: { type: 'approval_request', call_id: 'a1', name: 'run_command', text: 'ls' } },
       { type: 'agent_event', event: { type: 'tool_call', call_id: 'c0', name: 'get_cwd', args: {} } },
-      { type: 'agent_event', event: { type: 'tool_result', call_id: 'c0', name: 'get_cwd', ok: true, result: {} } },
+      { type: 'agent_event', event: { type: 'tool_result', call_id: 'c0', name: 'get_cwd', ok: true, decision: 'read', result: {} } },
     ]);
     const after = transcriptReducer(before, { type: 'session_reset' });
 

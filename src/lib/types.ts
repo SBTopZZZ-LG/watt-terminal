@@ -45,11 +45,21 @@ export type SessionEvent =
   | { type: 'record_started'; id: number; command: string; source: Source }
   | { type: 'record_finished'; record: RecordSummary };
 
+/**
+ * How a tool call was allowed or stopped. read: a read tool, no approval. manual: the user approved. auto: auto-approve
+ * skipped the card. denied: not approved (denied, cancelled or timed out). refused: refused before it ran, without asking.
+ */
+export type ToolDecision = 'read' | 'manual' | 'auto' | 'denied' | 'refused';
+
 export type AgentEvent =
   | { type: 'text'; text: string }
+  /** Streamed assistant text. `text` events still carry whole messages. */
+  | { type: 'text_delta'; text: string }
+  /** The model is working on a reply (true) or has produced its first output (false). */
+  | { type: 'thinking'; active: boolean }
   | { type: 'tool_call'; call_id: string; name: string; args: unknown }
-  | { type: 'tool_result'; call_id: string; name: string; ok: boolean; result: unknown }
-  | { type: 'approval_request'; call_id: string; text: string }
+  | { type: 'tool_result'; call_id: string; name: string; ok: boolean; decision: ToolDecision; result: unknown }
+  | { type: 'approval_request'; call_id: string; name: string; text: string }
   /** The agent is executing an approved shell call (true) and has finished it (false). */
   | { type: 'agent_control'; active: boolean }
   | { type: 'done' };

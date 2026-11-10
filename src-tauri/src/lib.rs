@@ -20,6 +20,7 @@ use tauri::{Manager, RunEvent, State};
 pub mod core;
 
 use crate::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate, MockAgent, OnDrop};
+use crate::core::llm::TurnCancel;
 use crate::core::observer::{EventSink, InputState, IntegrationStatus, ObserverStatus, SessionEvent};
 use crate::core::pty::OutputSink;
 use crate::core::record::Cwd;
@@ -82,15 +83,24 @@ pub struct Attached {
     agent_busy: AtomicBool,
     /// True while the agent is executing a shell-acting call (see `AgentEvent::AgentControl`).
     agent_control: AtomicBool,
+    /// The running turn's cancel token. Set when a turn starts, cleared when it ends. Ctrl-C and `cancel_agent` set it.
+    turn_cancel: Mutex<Option<Arc<TurnCancel>>>,
 }
 
 impl Attached {
-    /// Ends a turn: clears the control flag (telling the UI) and the busy flag. Runs even when the turn panicked.
+    /// Ends a turn: clears the cancel token, the control flag (telling the UI) and the busy flag. Runs even when the
+    /// turn panicked.
     fn end_turn(&self) {
+        *lock(&self.turn_cancel) = None;
         if self.agent_control.swap(false, Ordering::SeqCst) {
             self.channels.send_json(&AgentEvent::AgentControl { active: false });
         }
         self.agent_busy.store(false, Ordering::SeqCst);
+    }
+
+    /// Cancels the running turn, if any, and denies its pending approvals. Harmless when no turn is running.
+    fn cancel_turn(&self) {
+        agent::cancel_turn(&self.turn_cancel, &self.approvals);
     }
 }
 
@@ -175,6 +185,7 @@ fn attach_or_spawn(
             approvals: ApprovalGate::new(),
             agent_busy: AtomicBool::new(false),
             agent_control: AtomicBool::new(false),
+            turn_cancel: Mutex::new(None),
         })
     })?;
     if let Some((data, events)) = pending.take() {
@@ -194,11 +205,22 @@ fn resize(session_id: String, rows: u16, cols: u16, reg: State<'_, Reg>) -> Resu
     session(&reg, &session_id)?.session.resize(rows, cols).map_err(io_err)
 }
 
-/// Keystrokes from the terminal, as text (sent as UTF-8). Ctrl-C also cancels pending approvals.
+/// Keystrokes from the terminal, as text (sent as UTF-8). Ctrl-C also cancels the running agent turn and pending approvals.
 #[tauri::command]
 fn write_user(session_id: String, text: String, reg: State<'_, Reg>) -> Result<(), String> {
     let att = session(&reg, &session_id)?;
+    if text.contains('\u{3}') {
+        att.cancel_turn();
+    }
     agent::user_input(&att.session, &att.approvals, &text).map_err(io_err)
+}
+
+/// Cancels the running agent turn, if any: its pending approvals are denied and its `run_command` stops waiting.
+/// Harmless when no turn is running.
+#[tauri::command]
+fn cancel_agent(session_id: String, reg: State<'_, Reg>) -> Result<(), String> {
+    session(&reg, &session_id)?.cancel_turn();
+    Ok(())
 }
 
 /// Starts one agent turn on its own thread. Events arrive on the events channel.
@@ -208,11 +230,13 @@ fn agent_message(session_id: String, text: String, reg: State<'_, Reg>) -> Resul
     if att.agent_busy.swap(true, Ordering::SeqCst) {
         return Err("the agent is still working on the previous message".into());
     }
+    let cancel = Arc::new(TurnCancel::new());
+    *lock(&att.turn_cancel) = Some(cancel.clone());
     let worker = att.clone();
     let spawned = thread::Builder::new().name("agent".into()).spawn(move || {
         // Runs on panic too, so a crashed turn cannot leave the agent busy or in control of the shell.
         let _end = OnDrop::new(|| worker.end_turn());
-        let tools = SessionTools::new(&worker.session);
+        let tools = SessionTools::new(&worker.session).with_cancel(cancel);
         let channels = worker.channels.clone();
         let owner = worker.clone();
         let emit = move |ev: AgentEvent| {
@@ -225,6 +249,7 @@ fn agent_message(session_id: String, text: String, reg: State<'_, Reg>) -> Resul
         agent::run_turn(&mut MockAgent, &text, &ctx);
     });
     if let Err(e) = spawned {
+        *lock(&att.turn_cancel) = None;
         att.agent_busy.store(false, Ordering::SeqCst);
         return Err(e.to_string());
     }
@@ -295,6 +320,7 @@ pub fn run() {
             resize,
             write_user,
             agent_message,
+            cancel_agent,
             approve_tool,
             set_auto_approve,
             get_status,

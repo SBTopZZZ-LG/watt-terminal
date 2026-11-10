@@ -10,16 +10,21 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::{json, Value};
 
+use crate::core::llm::TurnCancel;
 use crate::core::session::{Session, USER_TEXT_CODE};
 use crate::core::tools::AgentTools;
 
 pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Prefix of the error for a call the user did not approve: denied, cancelled, or timed out. Callers match on it to tell
+/// a denial from a tool error. The text after it is for people.
+pub const DENIED: &str = "not_approved";
 
 /// Pending approvals, keyed by call id. A request that is not answered in time counts as a denial.
 pub struct ApprovalGate {
@@ -88,6 +93,17 @@ pub fn user_input(session: &Session, approvals: &ApprovalGate, text: &str) -> io
     session.write_user(text.as_bytes())
 }
 
+/// Cancels the turn running on this session, if there is one, and denies every pending approval. Ctrl-C and the
+/// cancel command both call it. Idempotent, and harmless when no turn is running. A cancelled `run_command` returns
+/// at once; a command it already sent keeps running in the shell.
+pub fn cancel_turn(current: &Mutex<Option<Arc<TurnCancel>>>, approvals: &ApprovalGate) {
+    let token = current.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some(token) = token {
+        token.cancel();
+    }
+    approvals.cancel_all();
+}
+
 /// Runs a closure when dropped, including while a panic unwinds. Used so a turn cannot leave flags set.
 pub struct OnDrop<F: FnOnce()>(Option<F>);
 
@@ -110,8 +126,16 @@ impl<F: FnOnce()> Drop for OnDrop<F> {
 pub enum AgentEvent {
     Text { text: String },
     ToolCall { call_id: String, name: String, args: Value },
-    ToolResult { call_id: String, name: String, ok: bool, result: Value },
-    ApprovalRequest { call_id: String, text: String },
+    /// `decision` says how the call was allowed or stopped: "read" (a read tool, no approval), "manual" (the user
+    /// approved), "auto" (auto-approve skipped the card), "denied" (not approved: denied, cancelled or timed out),
+    /// or "refused" (refused before it ran, without asking, or by the tool when auto-approve skipped the card).
+    ToolResult { call_id: String, name: String, ok: bool, decision: &'static str, result: Value },
+    /// A call waits for the user. `name` is the tool name, so the card can say what is being asked.
+    ApprovalRequest { call_id: String, name: String, text: String },
+    /// Streamed assistant text. `Text` is still used for whole messages.
+    TextDelta { text: String },
+    /// The model is working on a reply (true) or has produced its first output (false).
+    Thinking { active: bool },
     /// The agent is in control of the shell: an approved `run_command` or `send_keys` is executing. Sent true before
     /// the call and false after it. A denied call sends nothing. A call the tool refuses (for example, the shell is
     /// busy) is bracketed too, but the bracket is immediate.
@@ -163,37 +187,56 @@ impl<'a> AgentCtx<'a> {
     fn run(&self, name: &str, args: Value, gated: bool) -> Result<Value, String> {
         let call_id = format!("call-{}", NEXT_CALL.fetch_add(1, Ordering::Relaxed));
         self.emit(AgentEvent::ToolCall { call_id: call_id.clone(), name: name.to_string(), args: args.clone() });
-        // A run_command the user's typed text would block is refused before the approval card: the user is not asked to
-        // approve it. The tool checks again when it injects, in case the user types while the card waits.
-        let precheck = if gated && name == "run_command" { self.tools.run_command_precheck() } else { Ok(()) };
-        let needs_approval = precheck.is_ok()
-            && gated
-            && match name {
-                "send_keys" => true,
-                "run_command" => !self.approvals.auto_approve(),
-                _ => false,
-            };
-        let result = if let Err(e) = precheck {
-            Err(e)
-        } else if !needs_approval {
-            self.execute(name, &args, gated)
-        } else {
-            let text = args.get("command").and_then(Value::as_str).map_or_else(|| args.to_string(), str::to_string);
-            let approved = self.approvals.ask(&call_id, || {
-                self.emit(AgentEvent::ApprovalRequest { call_id: call_id.clone(), text: text.clone() })
-            });
-            if approved {
-                self.execute(name, &args, gated)
-            } else {
-                Err("not approved (denied, cancelled, or timed out)".to_string())
-            }
-        };
+        let (decision, result) = self.gate_and_execute(&call_id, name, &args, gated);
         let (ok, value) = match &result {
             Ok(v) => (true, v.clone()),
             Err(e) => (false, json!({"error": e})),
         };
-        self.emit(AgentEvent::ToolResult { call_id, name: name.to_string(), ok, result: value });
+        self.emit(AgentEvent::ToolResult { call_id, name: name.to_string(), ok, decision, result: value });
         result
+    }
+
+    /// Applies the gate to one call and runs it if allowed. Returns the decision label with the result.
+    fn gate_and_execute(
+        &self,
+        call_id: &str,
+        name: &str,
+        args: &Value,
+        gated: bool,
+    ) -> (&'static str, Result<Value, String>) {
+        if !gated || READ_TOOLS.contains(&name) {
+            return ("read", self.execute(name, args, false));
+        }
+        // A run_command the user's typed text would block is refused before the approval card: the user is not asked to
+        // approve it. The tool checks again when it injects, in case the user types while the card waits.
+        if name == "run_command"
+            && let Err(e) = self.tools.run_command_precheck()
+        {
+            return ("refused", Err(e));
+        }
+        let needs_approval = match name {
+            "send_keys" => true,
+            "run_command" => !self.approvals.auto_approve(),
+            _ => false,
+        };
+        if !needs_approval {
+            // Auto-approve skipped the card. A tool that refuses here did not run and the user was never asked.
+            let result = self.execute(name, args, true);
+            return (if result.is_ok() { "auto" } else { "refused" }, result);
+        }
+        let text = args.get("command").and_then(Value::as_str).map_or_else(|| args.to_string(), str::to_string);
+        let approved = self.approvals.ask(call_id, || {
+            self.emit(AgentEvent::ApprovalRequest {
+                call_id: call_id.to_string(),
+                name: name.to_string(),
+                text: text.clone(),
+            })
+        });
+        if !approved {
+            return ("denied", Err(format!("{DENIED}: the user did not approve this call (denied, cancelled, or timed out)")));
+        }
+        // The user approved, so the decision stays "manual" even if the tool then refuses.
+        ("manual", self.execute(name, args, true))
     }
 
     /// Calls the tool. For the calls that act on the shell, the agent is in control from before the call until after it.
@@ -272,6 +315,9 @@ fn run_and_report(ctx: &AgentCtx<'_>, cmd: &str) {
         Err(e) if e.starts_with(USER_TEXT_CODE) => {
             ctx.say("I can't run that: you have text typed at the prompt. Clear it (Ctrl-C) and ask again.")
         }
+        Err(e) if e.starts_with(DENIED) => {
+            ctx.say(format!("I did not run `{cmd}`: it was not approved (denied, cancelled, or timed out)."))
+        }
         Err(e) => ctx.say(format!("I did not run `{cmd}`: {e}.")),
     }
 }
@@ -297,6 +343,9 @@ fn outcome_text(cmd: &str, v: &Value) -> String {
         ),
         Some("not_run") if v["reason"] == "abandoned" => format!(
             "`{cmd}` did not run: the shell went back to the prompt without executing it (the input was cancelled or incomplete)."
+        ),
+        Some("not_run") if v["reason"] == "cancelled" => format!(
+            "I stopped waiting for `{cmd}` because you cancelled it. If it had already been sent to the shell, it keeps running there; Ctrl-C in the terminal stops it."
         ),
         Some("not_run") => format!(
             "`{cmd}` did not run yet: the shell is waiting for the rest of a multi-line command (an unclosed quote or backslash). Press Ctrl-C in the terminal to cancel it, then ask again."
@@ -371,6 +420,7 @@ fn output_text(out: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+    use std::thread;
 
     use super::*;
     use crate::core::observer::{InputState, IntegrationStatus, ObserverStatus};
@@ -379,11 +429,17 @@ mod tests {
 
     /// Records every tool call the agent manages to reach. Nothing here touches a shell.
     #[derive(Default)]
-    struct Recorder(Mutex<Vec<String>>);
+    struct Recorder {
+        reached: Mutex<Vec<String>>,
+        /// What `run_command_precheck` returns as an error. None means the precheck passes.
+        precheck: Option<String>,
+        /// When set, every `call` fails with this error after it is recorded.
+        call_error: Option<String>,
+    }
 
     impl Recorder {
         fn reached(&self) -> Vec<String> {
-            self.0.lock().unwrap().clone()
+            self.reached.lock().unwrap().clone()
         }
     }
 
@@ -414,10 +470,179 @@ mod tests {
         fn send_keys(&self, _bytes: &[u8]) -> Result<(), String> {
             Err("not used".into())
         }
-        fn call(&self, name: &str, _args: &Value) -> Result<Value, String> {
-            self.0.lock().unwrap().push(name.to_string());
-            Ok(json!({"ok": true}))
+        fn run_command_precheck(&self) -> Result<(), String> {
+            self.precheck.clone().map_or(Ok(()), Err)
         }
+        fn call(&self, name: &str, _args: &Value) -> Result<Value, String> {
+            self.reached.lock().unwrap().push(name.to_string());
+            match &self.call_error {
+                Some(e) => Err(e.clone()),
+                None => Ok(json!({"ok": true})),
+            }
+        }
+    }
+
+    /// `(name, decision, ok)` of every ToolResult, in order.
+    fn decisions(log: &Mutex<Vec<AgentEvent>>) -> Vec<(String, &'static str, bool)> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ToolResult { name, decision, ok, .. } => Some((name.clone(), *decision, *ok)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn named(name: &str, decision: &'static str, ok: bool) -> (String, &'static str, bool) {
+        (name.to_string(), decision, ok)
+    }
+
+    #[test]
+    fn serialized_events_use_the_wire_names() {
+        let wire = |e: AgentEvent| serde_json::to_value(&e).unwrap();
+        assert_eq!(
+            wire(AgentEvent::ApprovalRequest { call_id: "c1".into(), name: "run_command".into(), text: "pwd".into() }),
+            json!({"type": "approval_request", "call_id": "c1", "name": "run_command", "text": "pwd"})
+        );
+        assert_eq!(
+            wire(AgentEvent::ToolResult {
+                call_id: "c1".into(),
+                name: "run_command".into(),
+                ok: false,
+                decision: "denied",
+                result: json!({"error": "x"}),
+            }),
+            json!({"type": "tool_result", "call_id": "c1", "name": "run_command", "ok": false, "decision": "denied", "result": {"error": "x"}})
+        );
+        assert_eq!(wire(AgentEvent::TextDelta { text: "Hel".into() }), json!({"type": "text_delta", "text": "Hel"}));
+        assert_eq!(wire(AgentEvent::Thinking { active: true }), json!({"type": "thinking", "active": true}));
+        assert_eq!(wire(AgentEvent::Done), json!({"type": "done"}));
+    }
+
+    #[test]
+    fn decision_is_read_for_read_tools() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        assert!(ctx.read_tool("get_screen", json!({})).is_ok());
+        assert!(ctx.call_tool("get_cwd", json!({})).is_ok());
+        assert_eq!(decisions(&log), [named("get_screen", "read", true), named("get_cwd", "read", true)]);
+    }
+
+    #[test]
+    fn decision_is_manual_when_the_user_approves() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let log = Mutex::new(Vec::new());
+        // The card's emit runs after the call is registered, so the answer is already waiting when `ask` reads it.
+        let emit = |ev: AgentEvent| {
+            if let AgentEvent::ApprovalRequest { call_id, name, .. } = &ev {
+                assert_eq!(name, "run_command", "the card names the tool");
+                assert!(gate.decide(call_id, true));
+            }
+            log.lock().unwrap().push(ev);
+        };
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        assert!(ctx.call_tool("run_command", json!({"command": "pwd"})).is_ok());
+        assert_eq!(decisions(&log), [named("run_command", "manual", true)]);
+        assert_eq!(tools.reached(), ["run_command"]);
+    }
+
+    #[test]
+    fn decision_is_auto_when_auto_approve_skips_the_card() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        gate.set_auto_approve(true);
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        assert!(ctx.call_tool("run_command", json!({"command": "pwd"})).is_ok());
+        assert_eq!(decisions(&log), [named("run_command", "auto", true)]);
+        assert!(!log.lock().unwrap().iter().any(|e| matches!(e, AgentEvent::ApprovalRequest { .. })));
+    }
+
+    #[test]
+    fn decision_is_denied_when_nobody_approves_and_the_error_says_so() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        let err = ctx.call_tool("run_command", json!({"command": "pwd"})).expect_err("timed out");
+        assert!(err.starts_with(DENIED), "{err}");
+        assert_eq!(decisions(&log), [named("run_command", "denied", false)]);
+        assert!(tools.reached().is_empty());
+    }
+
+    #[test]
+    fn decision_is_refused_when_the_precheck_refuses_without_a_card() {
+        let tools = Recorder { precheck: Some("prompt_has_user_text: typed".into()), ..Default::default() };
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        let err = ctx.call_tool("run_command", json!({"command": "pwd"})).expect_err("refused");
+        assert!(!err.starts_with(DENIED), "a precheck refusal is not a denial: {err}");
+        assert_eq!(decisions(&log), [named("run_command", "refused", false)]);
+        assert!(!log.lock().unwrap().iter().any(|e| matches!(e, AgentEvent::ApprovalRequest { .. })));
+    }
+
+    #[test]
+    fn decision_is_refused_when_auto_approved_tool_refuses_and_manual_when_approved_tool_refuses() {
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+
+        // Auto-approve skipped the card, then the tool refused: the user never saw it, so it is "refused".
+        let tools = Recorder { call_error: Some("shell is busy".into()), ..Default::default() };
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        gate.set_auto_approve(true);
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        let err = ctx.call_tool("run_command", json!({"command": "pwd"})).expect_err("tool error");
+        assert!(!err.starts_with(DENIED), "{err}");
+        assert_eq!(decisions(&log), [named("run_command", "refused", false)]);
+
+        // The user approved, then the tool refused: the approval happened, so it stays "manual".
+        log.lock().unwrap().clear();
+        let tools = Recorder { call_error: Some("shell is busy".into()), ..Default::default() };
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let emit = |ev: AgentEvent| {
+            if let AgentEvent::ApprovalRequest { call_id, .. } = &ev {
+                assert!(gate.decide(call_id, true));
+            }
+            log.lock().unwrap().push(ev);
+        };
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        assert!(ctx.call_tool("run_command", json!({"command": "pwd"})).is_err());
+        assert_eq!(decisions(&log), [named("run_command", "manual", false)]);
+    }
+
+    #[test]
+    fn cancel_turn_cancels_the_token_and_denies_pending_approvals() {
+        let slot: Mutex<Option<Arc<TurnCancel>>> = Mutex::new(None);
+        let gate = ApprovalGate::new();
+        // No turn running: harmless, and repeatable.
+        cancel_turn(&slot, &gate);
+        cancel_turn(&slot, &gate);
+
+        let token = Arc::new(TurnCancel::new());
+        *slot.lock().unwrap() = Some(token.clone());
+        let approved = thread::scope(|s| {
+            let (tx, rx) = mpsc::channel();
+            let gate_ref = &gate;
+            // The waiter reports once its request is registered, so the cancel finds it pending.
+            let waiter = s.spawn(move || gate_ref.ask("pending-call", move || tx.send(()).unwrap()));
+            rx.recv().unwrap();
+            cancel_turn(&slot, &gate);
+            waiter.join().unwrap()
+        });
+        assert!(!approved, "a cancelled approval must count as a denial");
+        assert!(token.is_cancelled());
+        cancel_turn(&slot, &gate);
+        assert!(token.is_cancelled());
+        assert!(!gate.decide("pending-call", true), "the cancelled request is no longer pending");
     }
 
     #[test]
@@ -513,6 +738,9 @@ mod tests {
         let waiting = text(json!({"outcome": "not_run", "reason": "waiting_for_input"}));
         assert!(waiting.contains("waiting for the rest") && waiting.contains("Press Ctrl-C"), "{waiting}");
         assert!(!waiting.contains("still running"), "{waiting}");
+        let cancelled = text(json!({"outcome": "not_run", "reason": "cancelled"}));
+        assert!(cancelled.contains("you cancelled it") && cancelled.contains("keeps running"), "{cancelled}");
+        assert!(!cancelled.contains("waiting for the rest"), "{cancelled}");
     }
 
     #[test]

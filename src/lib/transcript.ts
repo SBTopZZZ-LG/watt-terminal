@@ -147,6 +147,10 @@ function applyAgentEvent(t: Transcript, ev: AgentEvent): Transcript {
     // Drives the terminal border (see agentControl.ts), not the transcript.
     case 'agent_control':
       return t;
+    // Streamed text and the thinking state are not shown yet: the chat UI for them comes with the transcript work.
+    case 'text_delta':
+    case 'thinking':
+      return t;
   }
 }
 

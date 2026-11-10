@@ -5,9 +5,10 @@ mod common;
 use std::fs;
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use agent_term_lib::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate, MockAgent, user_input};
+use agent_term_lib::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate, DENIED, MockAgent, user_input};
+use agent_term_lib::core::llm::TurnCancel;
 use agent_term_lib::core::observer::{InputState, IntegrationStatus, ObserverStatus};
 use agent_term_lib::core::record::Source;
 use agent_term_lib::core::session::{Session, USER_TEXT_CODE};
@@ -48,7 +49,7 @@ fn approval_ids(log: &Log) -> Vec<(String, String)> {
         .unwrap()
         .iter()
         .filter_map(|e| match e {
-            AgentEvent::ApprovalRequest { call_id, text } => Some((call_id.clone(), text.clone())),
+            AgentEvent::ApprovalRequest { call_id, text, .. } => Some((call_id.clone(), text.clone())),
             _ => None,
         })
         .collect()
@@ -348,6 +349,8 @@ fn denied_command_never_runs() {
     h.join().expect("turn");
     assert!(!s.records().iter().any(|r| r.command == "echo denied-cmd"), "denied command ran");
     assert_eq!(run_command_ok(&log), Some(false));
+    let err = run_command_error(&log).expect("the denial is an error result");
+    assert!(err.starts_with(DENIED), "a denial must carry the DENIED prefix: {err}");
     assert!(control_events(&log).is_empty(), "a denied command put the agent in control");
     run(&s, "echo still-here");
 }
@@ -388,6 +391,130 @@ fn approved_command_runs_in_the_session() {
     assert!(!approvals.decide(&id, true), "a decided request cannot be decided again");
 }
 
+/// Waits for the record of `command` to finish, and returns its id.
+fn finished_id(s: &Session, command: &str) -> u64 {
+    wait_until(Duration::from_secs(10), || {
+        s.records().into_iter().find(|r| r.command == command && r.exit_code.is_some()).map(|r| r.id)
+    })
+    .unwrap_or_else(|| panic!("`{command}` never finished"))
+}
+
+/// A cancel while run_command waits returns NotRun{Cancelled} within a poll, and sends nothing to stop the command: the
+/// command finishes on its own.
+#[test]
+fn cancel_while_run_command_waits_returns_at_once_and_the_command_keeps_running() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let cancel = Arc::new(TurnCancel::new());
+    let (s1, c1) = (s.arc(), cancel.clone());
+    let call = thread::spawn(move || SessionTools::new(&s1).with_cancel(c1).run_command("sleep 2; echo cancel-kept", DEFAULT_RUN_TIMEOUT));
+    assert!(wait_state(&s, InputState::Running, Duration::from_secs(10)), "state={:?}", s.state());
+    let cancelled_at = Instant::now();
+    cancel.cancel();
+    let outcome = call.join().expect("call thread").expect("run_command");
+    let took = cancelled_at.elapsed();
+    assert!(matches!(outcome, RunOutcome::NotRun { reason: NotRunReason::Cancelled }), "got {outcome:?}");
+    assert!(took < Duration::from_secs(1), "the cancelled call took {took:?}");
+    assert_eq!(s.state(), InputState::Running, "the cancel must not touch the running command");
+
+    let id = finished_id(&s, "sleep 2; echo cancel-kept");
+    let view = SessionTools::new(&s).get_command(id, 0, 100).expect("the command has a record");
+    assert_eq!(view.output, "cancel-kept");
+    assert_eq!(view.record.exit_code, Some(0), "the command was stopped instead of finishing");
+}
+
+/// A cancel that is already set when run_command is called sends nothing: the line never reaches the shell.
+#[test]
+fn cancel_before_run_command_sends_nothing() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let cancel = Arc::new(TurnCancel::new());
+    cancel.cancel();
+    let outcome = SessionTools::new(&s).with_cancel(cancel).run_command("echo never-sent", DEFAULT_RUN_TIMEOUT).expect("run_command");
+    assert!(matches!(outcome, RunOutcome::NotRun { reason: NotRunReason::Cancelled }), "got {outcome:?}");
+    assert_eq!(s.state(), InputState::Prompt, "the line reached the shell");
+    run(&s, "echo after-cancel");
+    assert!(!s.records().iter().any(|r| r.command.contains("never-sent")), "a cancelled call sent its command");
+}
+
+/// The cancel path the app uses (`agent::cancel_turn`, which Ctrl-C and cancel_agent both call) stops a turn that is
+/// waiting in run_command: the turn ends at once with the cancelled sentence, and its command keeps running.
+#[test]
+fn cancel_turn_ends_a_turn_waiting_in_run_command_and_keeps_its_command() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let approvals = Arc::new(ApprovalGate::new());
+    approvals.set_auto_approve(true);
+    let token = Arc::new(TurnCancel::new());
+    let slot = Arc::new(Mutex::new(Some(token.clone())));
+    let log: Log = Arc::default();
+    let (s1, a1, sink) = (s.arc(), approvals.clone(), log.clone());
+    let turn = thread::spawn(move || {
+        let emit = move |ev: AgentEvent| sink.lock().unwrap().push(ev);
+        let tools = SessionTools::new(&s1).with_cancel(token);
+        let ctx = AgentCtx::new(&tools, &a1, &emit);
+        agent::run_turn(&mut MockAgent, "please run `sleep 2; echo turn-kept`", &ctx);
+    });
+    assert!(wait_state(&s, InputState::Running, Duration::from_secs(10)), "state={:?}", s.state());
+    let cancelled_at = Instant::now();
+    agent::cancel_turn(&slot, &approvals);
+    turn.join().expect("turn");
+    assert!(cancelled_at.elapsed() < Duration::from_secs(1), "the cancelled turn took {:?}", cancelled_at.elapsed());
+    let text = text_of(&log.lock().unwrap());
+    assert!(text.contains("you cancelled it"), "{text}");
+    let id = finished_id(&s, "sleep 2; echo turn-kept");
+    assert_eq!(SessionTools::new(&s).get_command(id, 0, 100).expect("record").output, "turn-kept");
+}
+
+/// The decision on each ToolResult, through the real turn: read, auto, manual, denied and refused.
+#[test]
+fn tool_result_decisions_on_the_real_path() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let decision = |events: &[AgentEvent]| -> Vec<(String, &'static str, bool)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ToolResult { name, decision, ok, .. } => Some((name.clone(), *decision, *ok)),
+                _ => None,
+            })
+            .collect()
+    };
+
+    let read = turn(&s, &ApprovalGate::new(), "where am I");
+    assert_eq!(decision(&read), [("get_cwd".to_string(), "read", true)]);
+
+    let auto = ApprovalGate::new();
+    auto.set_auto_approve(true);
+    let events = turn(&s, &auto, "please run `echo dec-auto`");
+    assert_eq!(decision(&events), [("run_command".to_string(), "auto", true)]);
+
+    let approvals = Arc::new(ApprovalGate::new());
+    let (h, log) = turn_in_thread(s.arc(), approvals.clone(), "please run `echo dec-manual`");
+    let (id, _) = wait_approval(&log);
+    assert!(approvals.decide(&id, true));
+    h.join().expect("turn");
+    assert_eq!(decision(&log.lock().unwrap()), [("run_command".to_string(), "manual", true)]);
+
+    let approvals = Arc::new(ApprovalGate::new());
+    let (h, log) = turn_in_thread(s.arc(), approvals.clone(), "please run `echo dec-denied`");
+    let (id, _) = wait_approval(&log);
+    assert!(approvals.decide(&id, false));
+    h.join().expect("turn");
+    assert_eq!(decision(&log.lock().unwrap()), [("run_command".to_string(), "denied", false)]);
+
+    s.write_user(b"echo typed-for-refusal").expect("typed");
+    assert!(wait_until(Duration::from_secs(5), || screen_has(&s, "typed-for-refusal").then_some(())).is_some());
+    let refused = turn(&s, &ApprovalGate::new(), "please run `echo dec-refused`");
+    assert_eq!(decision(&refused), [("run_command".to_string(), "refused", false)]);
+    s.write_user(&[0x03]).expect("ctrl-c");
+    wait_prompt(&s);
+}
+
 #[test]
 fn ctrl_c_cancels_a_pending_approval() {
     let _g = serial();
@@ -400,6 +527,8 @@ fn ctrl_c_cancels_a_pending_approval() {
     h.join().expect("turn");
     assert!(!s.records().iter().any(|r| r.command == "echo cancelled-cmd"), "cancelled command ran");
     assert_eq!(run_command_ok(&log), Some(false));
+    let err = run_command_error(&log).expect("the cancellation is an error result");
+    assert!(err.starts_with(DENIED), "a cancelled approval must carry the DENIED prefix: {err}");
 }
 
 #[test]

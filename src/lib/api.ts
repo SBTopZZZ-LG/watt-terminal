@@ -37,6 +37,10 @@ export const api = {
   agentMessage(text: string) {
     return invoke<void>('agent_message', { sessionId: SESSION_ID, text });
   },
+  /** Cancels the running agent turn, if any. Harmless when none is running. */
+  cancelAgent() {
+    return invoke<void>('cancel_agent', { sessionId: SESSION_ID });
+  },
   approveTool(callId: string, approve: boolean) {
     return invoke<void>('approve_tool', { sessionId: SESSION_ID, callId, approve });
   },

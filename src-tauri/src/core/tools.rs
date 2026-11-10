@@ -5,12 +5,14 @@
 //! Approval is not checked here; `agent::AgentCtx::call_tool` asks for it before calling these methods.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::{json, Value};
 
+use crate::core::llm::TurnCancel;
 use crate::core::observer::{CallStatus, InputState, IntegrationStatus, ObserverStatus};
 use crate::core::record::{Cwd, Record, RecordSummary, Source};
 use crate::core::session::{user_text_refusal, Session};
@@ -60,6 +62,9 @@ pub enum NotRunReason {
     Abandoned,
     /// zsh has been waiting for the rest of the line for `WAITING_FOR_INPUT_AFTER`. Nothing was sent to cancel it.
     WaitingForInput,
+    /// The turn was cancelled while the call waited. Nothing is sent to the shell to stop it: if the line was already
+    /// sent, it keeps running, and the user can Ctrl-C it in the terminal.
+    Cancelled,
 }
 
 // `Finished` carries a whole Record. Boxing it would change the public RunOutcome type, so it stays inline.
@@ -130,16 +135,29 @@ pub struct SessionTools<'a> {
     session: &'a Session,
     /// The continuation wait `run_command` uses. `WAITING_FOR_INPUT_AFTER` unless a test overrides it.
     input_wait: Duration,
+    /// When set, `run_command` checks it while it waits and before it sends anything.
+    cancel: Option<Arc<TurnCancel>>,
 }
 
 impl<'a> SessionTools<'a> {
     pub fn new(session: &'a Session) -> Self {
-        SessionTools { session, input_wait: WAITING_FOR_INPUT_AFTER }
+        SessionTools { session, input_wait: WAITING_FOR_INPUT_AFTER, cancel: None }
     }
 
     /// Like `new`, with a different continuation wait. For tests.
     pub fn with_input_wait(session: &'a Session, input_wait: Duration) -> Self {
-        SessionTools { session, input_wait }
+        SessionTools { session, input_wait, cancel: None }
+    }
+
+    /// Lets the turn's cancel stop `run_command`'s wait. A cancelled call returns `NotRun { Cancelled }` within one poll.
+    /// It never sends a command that has not been sent yet, and it does not stop one that was: nothing is written to the
+    /// shell for a cancel.
+    pub fn with_cancel(self, cancel: Arc<TurnCancel>) -> Self {
+        SessionTools { cancel: Some(cancel), ..self }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel.as_ref().is_some_and(|c| c.is_cancelled())
     }
 }
 
@@ -202,6 +220,9 @@ impl AgentTools for SessionTools<'_> {
         if state != InputState::Prompt {
             return Err(format!("cannot run a command now: the session is {state:?}, not at an idle prompt"));
         }
+        if self.cancelled() {
+            return Ok(RunOutcome::NotRun { reason: NotRunReason::Cancelled });
+        }
         let call_id = format!("run-{}", NEXT_RUN.fetch_add(1, Ordering::Relaxed));
         // submit() re-checks the prompt, and the user's text, atomically, so a racing user submit or keystroke wins or
         // loses cleanly.
@@ -217,6 +238,9 @@ impl AgentTools for SessionTools<'_> {
                 CallStatus::Abandoned => return Ok(RunOutcome::NotRun { reason: NotRunReason::Abandoned }),
                 CallStatus::WaitingForInput => return Ok(RunOutcome::NotRun { reason: NotRunReason::WaitingForInput }),
                 CallStatus::Pending(state) => {
+                    if self.cancelled() {
+                        return Ok(RunOutcome::NotRun { reason: NotRunReason::Cancelled });
+                    }
                     if Instant::now() >= deadline {
                         return Ok(RunOutcome::TimedOut { state });
                     }
