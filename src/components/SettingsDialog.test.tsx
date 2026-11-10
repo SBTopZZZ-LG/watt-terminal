@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { SettingsBody, storeNote } from './SettingsDialog';
+import { NO_RECOVERY, SettingsBody, storeNote } from './SettingsDialog';
 import type { LoadState, SettingsBodyProps } from './SettingsDialog';
 import { modelRefKey } from '../lib/settingsForm';
 import type { Provider, ProviderPreset, Settings, SettingsView } from '../lib/types';
@@ -79,6 +79,10 @@ function props(over: Partial<SettingsBodyProps> = {}): SettingsBodyProps {
     onLimitClear: NOOP,
     onOpenProvider: NOOP,
     onAddProvider: NOOP,
+    recovery: NO_RECOVERY,
+    onAskRevert: NOOP,
+    onRecover: NOOP,
+    onReload: NOOP,
     ...over,
   };
 }
@@ -246,5 +250,83 @@ describe('SettingsBody: providers', () => {
     const out = html({ load: { kind: 'ready', view: view({ settings: { ...SETTINGS, providers: [named] } }) } });
     expect(out).not.toContain('<img src=x>');
     expect(out).toContain('&lt;img src=x&gt;');
+  });
+});
+
+describe('SettingsBody: recovery panel (settings.json cannot be used)', () => {
+  const REASON = 'settings are invalid: not valid JSON';
+  const BROKEN_STATE = { kind: 'broken' as const, reason: REASON, last_good_available: true, path: '/config/settings.json' };
+  const LAST_GOOD_STATE = { kind: 'last_good' as const, reason: REASON, last_good_available: true, path: '/config/settings.json' };
+  const NO_LAST_GOOD_STATE = { kind: 'broken' as const, reason: REASON, last_good_available: false, path: '/config/settings.json' };
+  const withState = (settings_state: SettingsView['settings_state'], over: Partial<SettingsBodyProps> = {}) =>
+    html({
+      load: { kind: 'ready', view: view({ settings_state, load_error: settings_state.kind === 'ok' ? null : REASON }) },
+      locked: settings_state.kind !== 'ok',
+      ...over,
+    });
+
+  it('ok: no recovery panel and no recovery buttons', () => {
+    const out = html();
+    expect(out).not.toContain('settings-recovery');
+    expect(out).not.toContain('Reload settings file');
+    expect(out).not.toContain('Revert to last working settings');
+  });
+
+  it('broken with a last working copy: the reason, the path, Revert, Use and Reload, and the use-last explanation', () => {
+    const out = withState(BROKEN_STATE);
+    expect(out).toContain('settings-recovery');
+    expect(out).toContain('settings.json is broken');
+    expect(out).toContain(`The file could not be used: ${REASON}`);
+    expect(out).toContain('class="settings-path">/config/settings.json</p>');
+    expect(out).toContain('>Revert to last working settings</button>');
+    expect(out).toContain('>Use last working settings this session</button>');
+    expect(out).toContain('>Reload settings file</button>');
+    expect(out).toContain('settings.json stays as it is on disk; editing is disabled until you fix it and reload or restart.');
+    expect(out).toContain('Changes are disabled until the file is fixed, reverted or reloaded.');
+  });
+
+  it('broken without a last working copy: the reason, the path and Reload only', () => {
+    const out = withState(NO_LAST_GOOD_STATE);
+    expect(out).toContain(REASON);
+    expect(out).toContain('/config/settings.json');
+    expect(out).toContain('>Reload settings file</button>');
+    expect(out).not.toContain('Revert to last working settings');
+    expect(out).not.toContain('Use last working settings this session');
+  });
+
+  it('last good: the running state, Revert and Reload, with no Use button (it is already in use)', () => {
+    const out = withState(LAST_GOOD_STATE);
+    expect(out).toContain('Running on the last working settings');
+    expect(out).toContain('>Revert to last working settings</button>');
+    expect(out).toContain('>Reload settings file</button>');
+    expect(out).not.toContain('Use last working settings this session');
+    expect(out).toContain('settings.json stays as it is on disk');
+  });
+
+  it('the rest of the dialog is read-only while the file is broken', () => {
+    const out = withState(BROKEN_STATE);
+    expect(out).toMatch(/<select[^>]*id="[^"]*-default"[^>]*disabled=""/);
+    expect(out).toMatch(/<button[^>]*disabled=""[^>]*>Add provider<\/button>/);
+  });
+
+  it('the revert confirm step names the kept file and offers Yes and No', () => {
+    const out = withState(BROKEN_STATE, { recovery: { busy: null, confirming: true, error: null } });
+    expect(out).toContain('This keeps the broken file as settings.json.broken-&lt;unix time&gt; and restores the last working one. Revert?');
+    expect(out).toContain('>Yes</button>');
+    expect(out).toContain('>No</button>');
+    expect(out).not.toContain('>Revert to last working settings</button>');
+  });
+
+  it('a running action shows its busy label and disables the actions', () => {
+    const out = withState(BROKEN_STATE, { recovery: { busy: 'use_last_good', confirming: false, error: null } });
+    expect(out).toContain('>Switching...</button>');
+    expect(out).toMatch(/<button[^>]*disabled=""[^>]*>Switching\.\.\.<\/button>/);
+    expect(out).toMatch(/<button[^>]*disabled=""[^>]*>Reload settings file<\/button>/);
+  });
+
+  it('a failed action shows its error as an alert', () => {
+    const out = withState(BROKEN_STATE, { recovery: { busy: null, confirming: false, error: 'there are no last working settings' } });
+    expect(out).toContain('there are no last working settings');
+    expect(out.match(/role="alert"/g)?.length ?? 0).toBeGreaterThanOrEqual(2);
   });
 });

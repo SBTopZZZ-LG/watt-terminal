@@ -16,7 +16,8 @@ import type { Container } from './lib/panelLayout';
 import { defaultSizeStorage } from './lib/zoom';
 import { itemsFromMessages } from './lib/historyView';
 import { createPatchSaver, fontPatch, panelPatch, reconcileFont, reconcileGroupBy, reconcilePanel, shouldRestoreLast } from './lib/uiState';
-import type { Cwd, HistoryGroupBy, InputState, IntegrationStatus, LlmStatus, LoadedConversation, ObserverStatus, Status, UiState, UiStatePatch, WireEvent } from './lib/types';
+import type { Cwd, HistoryGroupBy, InputState, IntegrationStatus, LlmStatus, LoadedConversation, ObserverStatus, SettingsStateView, Status, UiState, UiStatePatch, WireEvent } from './lib/types';
+import { recoveryKind } from './lib/settingsRecovery';
 import { TerminalView } from './components/TerminalView';
 import { InputBar } from './components/InputBar';
 import { Transcript } from './components/Transcript';
@@ -26,6 +27,7 @@ import { PanelDivider } from './components/PanelDivider';
 import { AgentPanel, Workspace } from './components/AgentPanel';
 import { HistoryView } from './components/HistoryView';
 import { SettingsDialog } from './components/SettingsDialog';
+import { SettingsBanner } from './components/SettingsBanner';
 
 const CTRL_C = '\u0003';
 
@@ -69,6 +71,9 @@ export default function App() {
   const [findToken, setFindToken] = useState(0);
   // The AI settings dialog (Cmd+, / Ctrl+, or the model chip).
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // The state of settings.json, from the status. The banner in the chat view can be dismissed until the next status says so again.
+  const [settingsState, setSettingsState] = useState<SettingsStateView | null>(null);
+  const [settingsBannerHidden, setSettingsBannerHidden] = useState(false);
   // Which view the agent panel's body shows, the id of the live conversation, and how History is grouped.
   const [panelBody, setPanelBody] = useState<'chat' | 'history'>('chat');
   const [conversationId, setConversationId] = useState<string | null>(null);
@@ -123,6 +128,10 @@ export default function App() {
     setCwd(s.cwd);
     setAutoApprove(s.auto_approve);
     setLlm(s.llm);
+    setSettingsState(s.settings_state ?? null);
+    if (recoveryKind(s.settings_state) !== 'ok') {
+      setSettingsBannerHidden(false);
+    }
     setAgentControl((c) => ({ ...c, call: s.agent_control }));
     setConversationId(s.conversation_id);
     dispatchTranscript({ type: 'sync_busy', busy: s.agent_busy });
@@ -545,6 +554,7 @@ export default function App() {
         autoApprove={autoApprove}
         onToggleAutoApprove={toggleAutoApprove}
         llm={llm}
+        settingsState={settingsState}
         onOpenSettings={() => setSettingsOpen(true)}
       />
       {/* The terminal is always the first child and the panel the last (see Workspace). The dock only changes the CSS. */}
@@ -590,6 +600,19 @@ export default function App() {
               onToggle={() => dispatchPanel({ type: 'toggle' })}
               onApprove={answer}
               onNewConversation={newConversation}
+              banner={
+                settingsState !== null && recoveryKind(settingsState) !== 'ok' && !settingsBannerHidden ? (
+                  <SettingsBanner
+                    state={settingsState}
+                    onOpenSettings={() => setSettingsOpen(true)}
+                    onDismiss={() => {
+                      setSettingsBannerHidden(true);
+                      // The button unmounts with the banner. Focus goes to the panel's header button, which stays put.
+                      document.querySelector<HTMLElement>('.transcript-head')?.focus();
+                    }}
+                  />
+                ) : null
+              }
               dock={panel.dock}
               onDock={(dock) => dispatchPanel({ type: 'dock', dock })}
               view={panelBody}

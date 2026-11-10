@@ -1,6 +1,7 @@
 import { formatCwd } from '../lib/format';
+import { chipBrokenTitle, chipLabel, recoveryKind } from '../lib/settingsRecovery';
 import { GridChip } from './GridChip';
-import type { Cwd, InputState, IntegrationStatus, LlmStatus, ObserverStatus } from '../lib/types';
+import type { Cwd, InputState, IntegrationStatus, LlmStatus, ObserverStatus, SettingsStateView } from '../lib/types';
 
 interface Props {
   integration: IntegrationStatus;
@@ -10,6 +11,8 @@ interface Props {
   autoApprove: boolean;
   onToggleAutoApprove: () => void;
   llm: LlmStatus;
+  /** The state of settings.json. While it cannot be used, the model chip says so (warning colour). */
+  settingsState?: SettingsStateView | null;
   /** Opens the AI settings. The model chip is the button for it. */
   onOpenSettings: () => void;
 }
@@ -33,16 +36,22 @@ const INTEGRATION_LABEL: Record<IntegrationStatus, string> = {
 
 /** Slim status strip above the terminal, in normal flow. */
 export function StatusChip(props: Props) {
-  const { integration, observer, input, cwd, autoApprove, onToggleAutoApprove, llm, onOpenSettings } = props;
-  const modelLabel = llm.enabled ? `model: ${llm.model ?? 'unknown'}` : 'mock agent';
-  const modelTitle = `${llm.provider ? `${llm.provider} · ` : ''}${modelLabel}. Open AI settings`;
+  const { integration, observer, input, cwd, autoApprove, onToggleAutoApprove, llm, settingsState = null, onOpenSettings } = props;
+  const modelLabel = chipLabel(settingsState, llm);
+  const broken = recoveryKind(settingsState) !== 'ok';
+  const modelTitle = chipBrokenTitle(settingsState) ?? `${llm.provider ? `${llm.provider} · ` : ''}${modelLabel}. Open AI settings`;
   return (
     <div className="status-chip" role="status">
       <span className={`chip chip-${integration}`}>{INTEGRATION_LABEL[integration]}</span>
       <span className={`chip chip-${observer}`}>{observer === 'ok' ? 'observer ok' : 'observer desynced'}</span>
       <span className="chip">{INPUT_LABEL[input]}</span>
       <GridChip />
-      <button type="button" className="chip chip-model chip-button" title={modelTitle} onClick={onOpenSettings}>
+      <button
+        type="button"
+        className={`chip chip-model chip-button${broken ? ' chip-warn' : ''}`}
+        title={modelTitle}
+        onClick={onOpenSettings}
+      >
         {modelLabel}
       </button>
       <span className="chip chip-cwd" title={cwd ? `${cwd.host}:${cwd.path}` : undefined}>

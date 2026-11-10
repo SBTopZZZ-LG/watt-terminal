@@ -36,6 +36,8 @@ interface Props {
   onToggleHistory?: () => void;
   /** The history view. Shown in place of the chat body while `view` is 'history' and the panel is open. */
   history?: ReactNode;
+  /** A notice shown above the chat body (the settings banner). Shown with the chat view only, and it never moves the body's scroll. */
+  banner?: ReactNode;
 }
 
 /** The agent conversation, docked above the input bar. Collapsible, scrollable, and capped by CSS. */
@@ -53,6 +55,7 @@ export function Transcript({
   view = 'chat',
   onToggleHistory,
   history,
+  banner = null,
 }: Props) {
   const bodyRef = useRef<HTMLDivElement>(null);
   const entries = useMemo(() => groupTranscript(items), [items]);
@@ -173,7 +176,8 @@ export function Transcript({
         </button>
       </div>
       {open && view === 'history' && history}
-      {/* Pinned: a sibling above the body, so it never scrolls away and the body's scroll and follow logic is untouched. */}
+      {/* Pinned: siblings above the body, so they never scroll away and the body's scroll and follow logic is untouched. */}
+      {bodyShown && banner}
       {bodyShown && <TodoPanel items={todos} />}
       {bodyShown && (
         <div className="transcript-body" ref={bodyRef} tabIndex={-1} onScroll={onScroll} onWheel={onWheel}>

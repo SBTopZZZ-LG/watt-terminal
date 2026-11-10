@@ -15,9 +15,20 @@ import {
   validateDraft,
 } from '../lib/settingsForm';
 import type { ProviderDraft } from '../lib/settingsForm';
-import type { ProviderPreset, SettingsView } from '../lib/types';
+import { RECOVERY_BUSY_LABEL, REVERT_CONFIRM, reasonText, recoveryExplanation, recoveryKind } from '../lib/settingsRecovery';
+import type { ProviderPreset, RecoverAction, SettingsStateView, SettingsView } from '../lib/types';
 import { ProviderEditor } from './ProviderEditor';
 import type { TestState } from './ProviderEditor';
+
+/** The recovery actions in flight or waiting for their confirm step. `busy` names the action that is running. */
+export interface RecoveryState {
+  busy: RecoverAction | 'reload' | null;
+  /** The "Revert to last working settings" confirm step is showing. */
+  confirming: boolean;
+  error: string | null;
+}
+
+export const NO_RECOVERY: RecoveryState = { busy: null, confirming: false, error: null };
 
 /** The settings as loaded. A failed load shows the error with Retry. */
 export type LoadState = { kind: 'loading' } | { kind: 'error'; message: string } | { kind: 'ready'; view: SettingsView };
@@ -82,6 +93,73 @@ function restoreFocus(opener: Element | null) {
 
 const FOCUSABLE = 'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
+interface RecoveryPanelProps {
+  state: SettingsStateView;
+  recovery: RecoveryState;
+  onAskRevert(ask: boolean): void;
+  onRecover(action: RecoverAction): void;
+  onReload(): void;
+}
+
+/**
+ * What to do about a settings.json that cannot be used: the reason, the file's path (selectable), what the state means, and
+ * the actions. "Revert" keeps the broken file aside and restores the last working copy, after a confirm step. "Use last
+ * working settings" runs the last copy for this session and leaves the file as it is. "Reload" re-reads the file, so a file
+ * fixed by hand takes effect without a restart. Without a last working copy only the reason, the path and Reload are shown.
+ */
+function RecoveryPanel({ state, recovery, onAskRevert, onRecover, onReload }: RecoveryPanelProps) {
+  const uid = useId();
+  const kind = recoveryKind(state) === 'last_good' ? 'last_good' : 'broken';
+  const { busy, confirming, error } = recovery;
+  const title = kind === 'broken' ? 'settings.json is broken' : 'Running on the last working settings';
+  const canUseLast = kind === 'broken' && state.last_good_available;
+  return (
+    <section className="settings-recovery" aria-labelledby={`${uid}-title`}>
+      <h3 className="settings-section-title" id={`${uid}-title`}>
+        {title}
+      </h3>
+      <p className="settings-error" role="alert">
+        {`The file could not be used: ${reasonText(state)}`}
+      </p>
+      <p className="settings-path">{state.path}</p>
+      <p className="settings-hint">{recoveryExplanation(kind)}</p>
+      {error !== null && (
+        <p className="settings-error" role="alert">
+          {error}
+        </p>
+      )}
+      {confirming ? (
+        <div className="settings-inline">
+          <span className="settings-warn">{REVERT_CONFIRM}</span>
+          <button type="button" className="settings-danger" disabled={busy !== null} onClick={() => onRecover('revert')}>
+            {busy === 'revert' ? RECOVERY_BUSY_LABEL.revert : 'Yes'}
+          </button>
+          <button type="button" disabled={busy !== null} onClick={() => onAskRevert(false)}>
+            No
+          </button>
+        </div>
+      ) : (
+        <div className="settings-inline">
+          {state.last_good_available && (
+            <button type="button" disabled={busy !== null} onClick={() => onAskRevert(true)}>
+              Revert to last working settings
+            </button>
+          )}
+          {canUseLast && (
+            <button type="button" disabled={busy !== null} onClick={() => onRecover('use_last_good')}>
+              {busy === 'use_last_good' ? RECOVERY_BUSY_LABEL.use_last_good : 'Use last working settings this session'}
+            </button>
+          )}
+          <button type="button" disabled={busy !== null} onClick={onReload}>
+            {busy === 'reload' ? RECOVERY_BUSY_LABEL.reload : 'Reload settings file'}
+          </button>
+        </div>
+      )}
+      {!confirming && canUseLast && <p className="settings-hint">{recoveryExplanation('last_good')}</p>}
+    </section>
+  );
+}
+
 export interface SettingsBodyProps {
   load: LoadState;
   /** The settings file is broken: every change is disabled. */
@@ -89,12 +167,17 @@ export interface SettingsBodyProps {
   presets: ProviderPreset[];
   defaults: { busy: boolean; error: string | null };
   limit: { text: string; error: string | null; busy: boolean };
+  /** The recovery panel's state: which action runs, the revert confirm step, and the last error. */
+  recovery: RecoveryState;
   /** A message about the providers, such as "Save or cancel the open provider first." */
   notice: string | null;
   /** The open editor, drawn under its row, or at the end of the list when `forId` is null. */
   editor: { forId: string | null; node: ReactNode } | null;
   onRetry(): void;
   onCheckAgain(): void;
+  onAskRevert(ask: boolean): void;
+  onRecover(action: RecoverAction): void;
+  onReload(): void;
   onDefault(key: string): void;
   onLimitText(text: string): void;
   onLimitCommit(): void;
@@ -132,10 +215,20 @@ export function SettingsBody(p: SettingsBodyProps) {
   const defaultKey = settings.default_model ? modelRefKey(settings.default_model) : BLANK_PRESET;
   const defaultProviderId = settings.default_model?.provider_id ?? null;
   const off = p.locked;
+  const recovering = recoveryKind(view.settings_state) !== 'ok';
 
   return (
     <>
-      {view.load_error !== null && (
+      {recovering && (
+        <RecoveryPanel
+          state={view.settings_state}
+          recovery={p.recovery}
+          onAskRevert={p.onAskRevert}
+          onRecover={p.onRecover}
+          onReload={p.onReload}
+        />
+      )}
+      {!recovering && view.load_error !== null && (
         <div className="settings-banner" role="alert">
           <span>{`settings.json could not be read: ${view.load_error}. Changes are disabled until it is fixed or removed.`}</span>
           <button type="button" onClick={p.onCheckAgain}>
@@ -303,6 +396,7 @@ export function SettingsDialog({ onClose, onChanged }: SettingsDialogProps) {
   const [notice, setNotice] = useState<string | null>(null);
   const [editor, setEditor] = useState<EditorState | null>(null);
   const [askClose, setAskClose] = useState(false);
+  const [recovery, setRecovery] = useState<RecoveryState>(NO_RECOVERY);
 
   const view = load.kind === 'ready' ? load.view : null;
   const dirty = editor !== null && isDirty(editor.draft, editor.saved);
@@ -407,6 +501,8 @@ export function SettingsDialog({ onClose, onChanged }: SettingsDialogProps) {
         setEditor({ ...editor, askDiscard: false });
       } else if (editor?.askDelete) {
         setEditor({ ...editor, askDelete: false });
+      } else if (recovery.confirming) {
+        setRecovery((r) => ({ ...r, confirming: false }));
       } else {
         requestClose();
       }
@@ -536,16 +632,22 @@ export function SettingsDialog({ onClose, onChanged }: SettingsDialogProps) {
     setNotice(null);
   };
 
+  // The save button is disabled while saving. This ref guard holds for any other call (a second click or key) that lands before
+  // that render, since the state read by the handler is the one from the render the click came from.
+  const saveInFlight = useRef(false);
+
   const save = () => {
-    if (view === null || editor === null) {
+    if (view === null || editor === null || editor.saving || saveInFlight.current) {
       return;
     }
     const input = buildSaveInput(editor.draft);
     const id = input.provider.id;
+    saveInFlight.current = true;
     setAskClose(false);
     setEditor({ ...editor, saving: true, saveError: null });
     api.saveProvider(input).then(
       (v) => {
+        saveInFlight.current = false;
         applyView(v);
         const provider = v.settings.providers.find((p) => p.id === id);
         if (provider === undefined) {
@@ -558,7 +660,10 @@ export function SettingsDialog({ onClose, onChanged }: SettingsDialogProps) {
         setNotice(null);
         onChanged();
       },
-      (e: unknown) => setEditor((cur) => (cur ? { ...cur, saving: false, saveError: errorText(e) } : cur)),
+      (e: unknown) => {
+        saveInFlight.current = false;
+        setEditor((cur) => (cur ? { ...cur, saving: false, saveError: errorText(e) } : cur));
+      },
     );
   };
 
@@ -616,6 +721,31 @@ export function SettingsDialog({ onClose, onChanged }: SettingsDialogProps) {
     api.testConnection(id, modelId).then(
       (result) => show({ kind: 'done', result }),
       (e: unknown) => show({ kind: 'failed', message: errorText(e) }),
+    );
+  };
+
+  /**
+   * A recovery action: revert, use the last working copy, or reload the file. Refused while a provider has unsaved changes,
+   * since the file underneath it changes. On success the returned view replaces the dialog's, and the status is read again.
+   */
+  const runRecovery = (action: RecoverAction | 'reload') => {
+    if (view === null || recovery.busy !== null || !mayReplaceEditor()) {
+      setRecovery((r) => ({ ...r, confirming: false }));
+      return;
+    }
+    setRecovery({ busy: action, confirming: false, error: null });
+    const call = action === 'reload' ? api.reloadSettings() : api.recoverSettings(action);
+    call.then(
+      (v) => {
+        applyView(v);
+        setEditor(null);
+        setAskClose(false);
+        setDefaults({ busy: false, error: null });
+        setLimit({ text: limitText(v), error: null, busy: false });
+        setRecovery(NO_RECOVERY);
+        onChanged();
+      },
+      (e: unknown) => setRecovery((r) => ({ ...r, busy: null, error: errorText(e) })),
     );
   };
 
@@ -701,6 +831,10 @@ export function SettingsDialog({ onClose, onChanged }: SettingsDialogProps) {
               setLoad({ kind: 'loading' });
               setAttempt((a) => a + 1);
             }}
+            recovery={recovery}
+            onAskRevert={(ask) => setRecovery((r) => ({ ...r, confirming: ask, error: null }))}
+            onRecover={runRecovery}
+            onReload={() => runRecovery('reload')}
             onDefault={setDefault}
             onLimitText={(text) => setLimit((l) => ({ ...l, text, error: null }))}
             onLimitCommit={() => commitLimit(limit.text)}

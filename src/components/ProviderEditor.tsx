@@ -2,10 +2,14 @@ import { useId, useState } from 'react';
 import type { TestResult } from '../lib/types';
 import {
   hasProblems,
+  hostChangeNotice,
+  isAutoTicked,
   isDirty,
   isLocalHttp,
   modelsUrlFor,
   newHeaderDraft,
+  renameHeader,
+  toggleSecret,
   withId,
   withName,
 } from '../lib/settingsForm';
@@ -99,9 +103,15 @@ export function ProviderEditor(p: ProviderEditorProps) {
   const newModelId = newModel.trim();
   const newModelTaken = draft.models.some((m) => m.id === newModelId);
   const saveBlocked = off || !pending || hasProblems(p.problems);
+  // A saved provider's key or secret headers would go to a changed host, so the editor says so. Never blocks a save.
+  const hasStoredSecrets = p.saved !== null && (p.saved.storedKey || p.saved.storedHeaders.length > 0);
+  const hostNotice = hostChangeNotice(p.saved, draft, hasStoredSecrets);
 
   const setHeader = (key: string, patch: Partial<HeaderDraft>) =>
     set({ headers: draft.headers.map((h) => (h.key === key ? { ...h, ...patch } : h)) });
+
+  const updateHeader = (key: string, change: (h: HeaderDraft) => HeaderDraft) =>
+    set({ headers: draft.headers.map((h) => (h.key === key ? change(h) : h)) });
 
   const addModel = () => {
     if (newModelId === '' || newModelTaken) {
@@ -180,6 +190,11 @@ export function ProviderEditor(p: ProviderEditorProps) {
             onChange={(e) => set({ models_url: e.target.value })}
           />
           {p.problems.models_url && <span className="settings-error">{p.problems.models_url}</span>}
+          {hostNotice !== null && (
+            <span className="settings-warn" role="status">
+              {hostNotice}
+            </span>
+          )}
         </div>
 
         <div className="settings-field">
@@ -271,7 +286,10 @@ export function ProviderEditor(p: ProviderEditorProps) {
             </thead>
             <tbody>
               {draft.headers.map((h) => {
-                const stored = draft.storedHeaders.includes(h.name.trim()) && h.name.trim() !== '';
+                // A renamed saved secret keeps its stored value under the new name (see buildSaveInput), so it still shows as stored.
+                const stored =
+                  (draft.storedHeaders.includes(h.name.trim()) && h.name.trim() !== '') ||
+                  (h.savedName !== null && draft.storedHeaders.includes(h.savedName));
                 const error = p.problems.headers[h.key];
                 return (
                   <tr key={h.key}>
@@ -283,9 +301,10 @@ export function ProviderEditor(p: ProviderEditorProps) {
                         disabled={off}
                         spellCheck={false}
                         aria-invalid={error !== undefined || undefined}
-                        onChange={(e) => setHeader(h.key, { name: e.target.value })}
+                        onChange={(e) => updateHeader(h.key, (x) => renameHeader(x, e.target.value))}
                       />
                       {error && <span className="settings-error">{error}</span>}
+                      {isAutoTicked(h) && <span className="settings-hint">Looks like a credential, so it is stored in the Keychain.</span>}
                     </td>
                     <td>
                       {h.secret ? (
@@ -325,7 +344,7 @@ export function ProviderEditor(p: ProviderEditorProps) {
                         aria-label={`Secret: ${h.name.trim() || 'new header'}`}
                         checked={h.secret}
                         disabled={off}
-                        onChange={(e) => setHeader(h.key, { secret: e.target.checked, clearStored: false })}
+                        onChange={(e) => updateHeader(h.key, (x) => toggleSecret(x, e.target.checked))}
                       />
                     </td>
                     <td>
@@ -355,7 +374,7 @@ export function ProviderEditor(p: ProviderEditorProps) {
         </div>
         <span className="settings-hint">
           A value may use {'{session_id}'}, which is replaced by the conversation id. OpenCode Go needs x-opencode-session: {'{session_id}'}.
-          Secret values are kept in the store, not in settings.json. Renaming a secret header drops its stored value.
+          Secret values are kept in the store, not in settings.json. Renaming a secret header keeps its stored value, unless a new value is typed.
         </span>
       </div>
 

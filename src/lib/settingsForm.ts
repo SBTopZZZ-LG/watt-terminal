@@ -31,6 +31,8 @@ const LOCAL_HOSTS = ['localhost', '127.0.0.1', '[::1]'];
 const ID_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/;
 /** RFC 7230 tchar: the characters a header name may use. */
 const TOKEN_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+/** Header names that look like they carry a credential. Such a row's Secret toggle is ticked until the user touches it. */
+const CREDENTIAL_NAME_RE = /key|token|secret|auth|password|cookie/i;
 /** Control characters (Rust char::is_control): C0, DEL and C1. */
 const CONTROL_RE = /[\u0000-\u001f\u007f-\u009f]/;
 const WHITESPACE_RE = /\s/;
@@ -47,6 +49,13 @@ export interface HeaderDraft {
   secret: boolean;
   /** Secret headers: the user asked to remove the stored value. */
   clearStored: boolean;
+  /** The name this header had when it was saved as a secret header. Null for a new row, a preset row or a plain header. */
+  savedName: string | null;
+  /**
+   * The user has set this row's Secret toggle by hand. Until then, a credential-looking name ticks it (see renameHeader).
+   * UI state only: it is never sent, and buildSaveInput ignores it.
+   */
+  secretTouched: boolean;
 }
 
 /** One model row. `context_limit` is the typed override, as text: blank means none. */
@@ -108,7 +117,30 @@ const nextHeaderKey = () => `h${++headerKeySeq}`;
 
 /** An empty header row, with a key no other row has. */
 export function newHeaderDraft(): HeaderDraft {
-  return { key: nextHeaderKey(), name: '', value: '', secret: false, clearStored: false };
+  return { key: nextHeaderKey(), name: '', value: '', secret: false, clearStored: false, savedName: null, secretTouched: false };
+}
+
+/** Whether a header name looks like it carries a credential (key, token, secret, auth, password or cookie). */
+export function isCredentialName(name: string): boolean {
+  return CREDENTIAL_NAME_RE.test(name);
+}
+
+/**
+ * The header row after its name is typed. An untouched Secret toggle is ticked when the name looks like a credential, and is
+ * never unticked: a name that stops matching leaves a ticked row ticked.
+ */
+export function renameHeader(h: HeaderDraft, name: string): HeaderDraft {
+  return { ...h, name, secret: h.secret || (!h.secretTouched && isCredentialName(name)) };
+}
+
+/** The row after its Secret toggle is set by hand. From then on the name no longer ticks it. */
+export function toggleSecret(h: HeaderDraft, secret: boolean): HeaderDraft {
+  return { ...h, secret, clearStored: false, secretTouched: true };
+}
+
+/** A secret header with a row showing a credential-looking name that the user has not decided about: the note under it. */
+export function isAutoTicked(h: HeaderDraft): boolean {
+  return h.secret && !h.secretTouched && isCredentialName(h.name);
 }
 
 /** Text that is a positive whole number that fits the backend's u32, or null when blank or not one. */
@@ -157,8 +189,22 @@ export function slugify(name: string, takenIds: readonly string[]): string {
   }
 }
 
+/** A row from a saved header. Saved rows count as touched, so their Secret toggle is never ticked for them. */
 function headerDraft(h: HeaderEntry): HeaderDraft {
-  return { key: nextHeaderKey(), name: h.name, value: h.value, secret: h.secret, clearStored: false };
+  return {
+    key: nextHeaderKey(),
+    name: h.name,
+    value: h.value,
+    secret: h.secret,
+    clearStored: false,
+    savedName: h.secret ? h.name : null,
+    secretTouched: true,
+  };
+}
+
+/** A row from a preset's header. Untouched, so a credential-looking name ticks its Secret toggle. */
+function presetHeaderDraft(h: HeaderEntry): HeaderDraft {
+  return { ...newHeaderDraft(), name: h.name, value: h.value, secret: h.secret || isCredentialName(h.name) };
 }
 
 /** A saved provider as an editable draft. `present` says which of its secrets are stored; the draft never holds them. */
@@ -199,7 +245,7 @@ export function draftFromPreset(preset: ProviderPreset, existingIds: readonly st
     models_url: p.models_url ?? '',
     stream: p.stream,
     max_tokens: p.max_tokens === null ? '' : String(p.max_tokens),
-    headers: p.headers.map(headerDraft),
+    headers: p.headers.map(presetHeaderDraft),
     models: [],
     apiKey: '',
     clearKey: false,
@@ -258,11 +304,14 @@ function apiKeyField(draft: ProviderDraft): string | null {
  * `provider.headers` always has value "". The models list is sent whole, since the backend replaces it.
  */
 export function buildSaveInput(draft: ProviderDraft): SaveProviderInput {
-  const headers: HeaderEntry[] = draft.headers.map((h) => ({
-    name: h.name.trim(),
-    value: h.secret ? '' : h.value.trim(),
-    secret: h.secret,
-  }));
+  const headers: HeaderEntry[] = draft.headers.map((h) => {
+    const entry: HeaderEntry = { name: h.name.trim(), value: h.secret ? '' : h.value.trim(), secret: h.secret };
+    // A saved secret header renamed with no new value keeps its stored value: the backend moves it from the old name.
+    if (h.secret && !h.clearStored && h.value.trim() === '' && h.savedName !== null && h.name.trim().toLowerCase() !== h.savedName.toLowerCase()) {
+      entry.previous_name = h.savedName;
+    }
+    return entry;
+  });
   const header_secrets: Record<string, string> = {};
   for (const h of draft.headers) {
     if (!h.secret) {
@@ -370,6 +419,44 @@ export function chatHost(url: string): string {
   } catch {
     return url;
   }
+}
+
+/** The host and port of a URL, or null when it is missing, empty, does not parse or has no host. Never throws. */
+export function hostOf(url: string | null): string | null {
+  if (url === null || url.trim() === '') {
+    return null;
+  }
+  try {
+    const host = new URL(url.trim()).host;
+    return host === '' ? null : host;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The warning shown while a saved provider's URL is edited to another host. The saved key and secret headers would then be
+ * sent there, so the notice asks the user to re-enter them. Only for a saved provider that has a stored key or secret header
+ * (hasStoredSecrets). Null for a new provider, and when no host changed. It never blocks a save.
+ */
+export function hostChangeNotice(saved: ProviderDraft | null, draft: ProviderDraft, hasStoredSecrets: boolean): string | null {
+  if (saved === null || draft.isNew || !hasStoredSecrets) {
+    return null;
+  }
+  const changed: string[] = [];
+  const chatNow = hostOf(draft.chat_url);
+  if (chatNow !== null && hostOf(saved.chat_url) !== null && chatNow !== hostOf(saved.chat_url)) {
+    changed.push(chatNow);
+  }
+  // The model list URL in use: the explicit one, or the one taken from the chat URL.
+  const modelsNow = hostOf(modelsUrlFor(draft));
+  if (modelsNow !== null && hostOf(modelsUrlFor(saved)) !== null && modelsNow !== hostOf(modelsUrlFor(saved)) && !changed.includes(modelsNow)) {
+    changed.push(modelsNow);
+  }
+  if (changed.length === 0) {
+    return null;
+  }
+  return `The saved API key and secret headers will be sent to ${changed.join(' and ')}. Re-enter them if that host is not the one you trust.`;
 }
 
 /** Field problems for a draft. `takenIds` are the ids of the other providers. Mirrors the rules in Rust settings validate(). */

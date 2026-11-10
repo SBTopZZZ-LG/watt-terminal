@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { ProviderEditor } from './ProviderEditor';
 import type { ProviderEditorProps, TestState } from './ProviderEditor';
-import { draftFromPreset, draftFromProvider, draftNew } from '../lib/settingsForm';
+import { draftFromPreset, draftFromProvider, draftNew, newHeaderDraft, renameHeader, toggleSecret } from '../lib/settingsForm';
 import type { DraftProblems } from '../lib/settingsForm';
 import type { Provider } from '../lib/types';
 
@@ -223,7 +223,7 @@ describe('ProviderEditor: validation and save', () => {
   it('each problem is shown next to its field, and Save stays disabled', () => {
     const d = {
       ...SAVED,
-      headers: [...SAVED.headers, { key: 'bad', name: 'Authorization', value: 'x', secret: false, clearStored: false }],
+      headers: [...SAVED.headers, { key: 'bad', name: 'Authorization', value: 'x', secret: false, clearStored: false, savedName: null, secretTouched: false }],
     };
     const problems: DraftProblems = {
       headers: { bad: 'Authorization must be a secret header, so its value stays out of settings.json.' },
@@ -365,5 +365,62 @@ describe('ProviderEditor: names are text', () => {
     const out = html({ draft: d, saved: d });
     expect(out).not.toContain('<img src=x>');
     expect(out).toContain('&lt;img src=x&gt;');
+  });
+});
+
+describe('ProviderEditor: host change notice', () => {
+  const EVIL = 'The saved API key and secret headers will be sent to evil.test. Re-enter them if that host is not the one you trust.';
+
+  it('a changed chat host on a saved provider with a stored key shows the notice, as a status line', () => {
+    const d = { ...SAVED, chat_url: 'https://evil.test/v1/chat/completions' };
+    const out = html({ draft: d, saved: SAVED });
+    expect(out).toContain('role="status"');
+    expect(out).toContain(EVIL);
+  });
+
+  it('a path-only edit shows no notice, and neither does a saved provider with nothing stored', () => {
+    expect(html({ draft: { ...SAVED, chat_url: 'https://api.acme.test/v2/chat/completions' }, saved: SAVED })).not.toContain('will be sent to');
+    const bare = draftFromProvider(PROVIDER, { api_key: false, headers: [] });
+    expect(html({ draft: { ...bare, chat_url: 'https://evil.test/v1/chat/completions' }, saved: bare })).not.toContain('will be sent to');
+  });
+
+  it('a new provider shows no notice', () => {
+    const d = { ...draftNew(), chat_url: 'https://evil.test/v1/chat/completions' };
+    expect(html({ draft: d, saved: null })).not.toContain('will be sent to');
+  });
+});
+
+describe('ProviderEditor: a credential-looking header name ticks Secret', () => {
+  const NOTE = 'Looks like a credential, so it is stored in the Keychain.';
+  const typed = (name: string) => ({ ...draftNew(), headers: [renameHeader({ ...newHeaderDraft() }, name)] });
+
+  it('a row typed as X-Api-Key is ticked and shows the note', () => {
+    const out = html({ draft: typed('X-Api-Key'), saved: null });
+    expect(out).toContain(NOTE);
+    expect(out).toMatch(/<input[^>]*type="checkbox"[^>]*aria-label="Secret: X-Api-Key"[^>]*checked=""/);
+  });
+
+  it('a row whose name is not a credential has no note and stays unticked', () => {
+    const out = html({ draft: typed('X-Team'), saved: null });
+    expect(out).not.toContain(NOTE);
+    const toggle = out.match(/<input[^>]*aria-label="Secret: X-Team"[^>]*>/)?.[0] ?? '';
+    expect(toggle).toContain('type="checkbox"');
+    expect(toggle).not.toContain('checked');
+  });
+
+  it('once the user has set the toggle, the note is gone', () => {
+    const row = toggleSecret(renameHeader({ ...newHeaderDraft() }, 'X-Api-Key'), false);
+    expect(html({ draft: { ...draftNew(), headers: [row] }, saved: null })).not.toContain(NOTE);
+  });
+
+  it('a saved provider never shows the note for its secret headers', () => {
+    expect(html()).not.toContain(NOTE);
+  });
+});
+
+describe('ProviderEditor: saving', () => {
+  it('the save button is disabled while a save is in flight, and says so', () => {
+    const out = html({ saving: true, draft: { ...SAVED, name: 'Acme Prod' } });
+    expect(out).toMatch(/<button[^>]*disabled=""[^>]*>Saving\.\.\.<\/button>/);
   });
 });

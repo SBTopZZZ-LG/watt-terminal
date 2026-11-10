@@ -7,6 +7,10 @@ import {
   draftNew,
   fetchSummaryText,
   hasProblems,
+  hostChangeNotice,
+  hostOf,
+  isAutoTicked,
+  isCredentialName,
   isDirty,
   isLocalHttp,
   modelOptions,
@@ -15,7 +19,9 @@ import {
   modelsUrlFor,
   newHeaderDraft,
   parsePositiveInt,
+  renameHeader,
   slugify,
+  toggleSecret,
   urlProblem,
   validateDraft,
   withId,
@@ -378,9 +384,9 @@ describe('validateDraft', () => {
 
   it('header names are required, valid tokens and listed once, ignoring case', () => {
     const d = saved();
-    d.headers.push({ key: 'n1', name: '', value: '', secret: false, clearStored: false });
-    d.headers.push({ key: 'n2', name: 'Bad Name', value: '', secret: false, clearStored: false });
-    d.headers.push({ key: 'n3', name: 'x-team', value: 'dup', secret: false, clearStored: false });
+    d.headers.push({ key: 'n1', name: '', value: '', secret: false, clearStored: false, savedName: null, secretTouched: false });
+    d.headers.push({ key: 'n2', name: 'Bad Name', value: '', secret: false, clearStored: false, savedName: null, secretTouched: false });
+    d.headers.push({ key: 'n3', name: 'x-team', value: 'dup', secret: false, clearStored: false, savedName: null, secretTouched: false });
     const p = validateDraft(d, []);
     expect(p.headers.n1).toBe('Header name is required.');
     expect(p.headers.n2).toMatch(/not a valid HTTP header name/);
@@ -389,7 +395,7 @@ describe('validateDraft', () => {
 
   it('Authorization must be a secret header', () => {
     const d = saved();
-    d.headers.push({ key: 'auth', name: 'Authorization', value: 'Bearer x', secret: false, clearStored: false });
+    d.headers.push({ key: 'auth', name: 'Authorization', value: 'Bearer x', secret: false, clearStored: false, savedName: null, secretTouched: false });
     expect(validateDraft(d, []).headers.auth).toMatch(/must be a secret header/);
     d.headers[2].secret = true;
     expect(validateDraft(d, []).headers.auth).toBeUndefined();
@@ -481,5 +487,190 @@ describe('modelOptions and modelRefKey', () => {
     const keys = modelOptions(settings).map((o) => o.key);
     expect(new Set(keys).size).toBe(keys.length);
     expect(modelRefKey({ provider_id: 'acme', model_id: 'big/one' })).not.toBe(modelRefKey({ provider_id: 'acme/big', model_id: 'one' }));
+  });
+});
+
+describe('isCredentialName', () => {
+  it('matches the credential words, in any case and anywhere in the name', () => {
+    for (const name of ['X-Api-Key', 'Authorization', 'X-Auth-Token', 'client_secret', 'Password', 'Cookie', 'x-session-key']) {
+      expect(isCredentialName(name)).toBe(true);
+    }
+  });
+
+  it('leaves ordinary header names alone', () => {
+    for (const name of ['X-Team', 'Content-Type', 'X-Session', 'Accept', '']) {
+      expect(isCredentialName(name)).toBe(false);
+    }
+  });
+});
+
+describe('renameHeader and toggleSecret: the Secret toggle', () => {
+  it('ticks an untouched row whose name becomes a credential name, as it is typed', () => {
+    const row = { ...newHeaderDraft(), name: 'X-Team' };
+    expect(renameHeader(row, 'X-Api-Key')).toMatchObject({ name: 'X-Api-Key', secret: true });
+    expect(renameHeader(row, 'X-Api')).toMatchObject({ name: 'X-Api', secret: false });
+  });
+
+  it('never unticks: a ticked row whose name stops matching stays ticked', () => {
+    const ticked = renameHeader({ ...newHeaderDraft(), name: 'X-Api-Key' }, 'X-Api-Key');
+    expect(renameHeader(ticked, 'X-Team')).toMatchObject({ name: 'X-Team', secret: true });
+  });
+
+  it('a row whose toggle the user set by hand is not ticked by its name', () => {
+    const untouched = toggleSecret({ ...newHeaderDraft(), name: 'X-Team' }, false);
+    expect(untouched.secretTouched).toBe(true);
+    expect(renameHeader(untouched, 'X-Api-Key').secret).toBe(false);
+  });
+
+  it('a manual untick sticks, and a manual tick sets the touched flag too', () => {
+    const row = renameHeader({ ...newHeaderDraft(), name: '' }, 'X-Api-Key');
+    const unticked = toggleSecret(row, false);
+    expect(unticked).toMatchObject({ secret: false, secretTouched: true });
+    expect(toggleSecret({ ...newHeaderDraft(), name: 'Accept' }, true)).toMatchObject({ secret: true, secretTouched: true });
+  });
+
+  it('the note shows only while the row is ticked, credential-named and untouched', () => {
+    const typed = renameHeader({ ...newHeaderDraft() }, 'X-Api-Key');
+    expect(isAutoTicked(typed)).toBe(true);
+    expect(isAutoTicked(toggleSecret(typed, true))).toBe(false);
+    expect(isAutoTicked({ ...newHeaderDraft(), name: 'X-Team' })).toBe(false);
+  });
+});
+
+describe('draftFromPreset and draftFromProvider: the Secret toggle at the start', () => {
+  const preset: ProviderPreset = {
+    key: 'x',
+    label: 'X',
+    provider: { ...SAVED, id: 'x', name: 'X', headers: [{ name: 'X-Api-Key', value: '', secret: false }, { name: 'X-Team', value: 'b', secret: false }] },
+    needs_key: true,
+    note: '',
+  };
+
+  it('a preset row with a credential name starts ticked and untouched, and the note shows', () => {
+    const [keyRow, teamRow] = draftFromPreset(preset, []).headers;
+    expect(keyRow).toMatchObject({ name: 'X-Api-Key', secret: true, secretTouched: false });
+    expect(isAutoTicked(keyRow)).toBe(true);
+    expect(teamRow).toMatchObject({ secret: false, secretTouched: false });
+  });
+
+  it('a saved row starts touched, so it is never auto-ticked and never shows the note', () => {
+    const [team, key] = saved().headers;
+    expect(team).toMatchObject({ secret: false, secretTouched: true });
+    expect(key).toMatchObject({ secret: true, secretTouched: true, savedName: 'X-Key' });
+    expect(isAutoTicked(key)).toBe(false);
+  });
+
+  it('a saved plain header has no saved name, so a later secret toggle renames nothing', () => {
+    expect(saved().headers[0].savedName).toBeNull();
+  });
+});
+
+describe('buildSaveInput: previous_name and the UI-only flag', () => {
+  it('a saved secret header renamed with no new value carries previous_name', () => {
+    const d = saved();
+    d.headers = d.headers.map((h) => (h.secret ? { ...h, name: 'X-Other-Key' } : h));
+    const input = buildSaveInput(d);
+    expect(input.provider.headers.find((h) => h.secret)).toEqual({ name: 'X-Other-Key', value: '', secret: true, previous_name: 'X-Key' });
+    expect(input.header_secrets).toEqual({});
+  });
+
+  it('a case-only rename does not carry previous_name (the backend treats it as the same header)', () => {
+    const d = saved();
+    d.headers = d.headers.map((h) => (h.secret ? { ...h, name: 'x-key' } : h));
+    expect(buildSaveInput(d).provider.headers.find((h) => h.secret)).not.toHaveProperty('previous_name');
+  });
+
+  it('a typed value wins: the new name gets it and no previous_name is sent', () => {
+    const d = saved();
+    d.headers = d.headers.map((h) => (h.secret ? { ...h, name: 'X-Other-Key', value: ' fresh ' } : h));
+    const input = buildSaveInput(d);
+    expect(input.provider.headers.find((h) => h.secret)).not.toHaveProperty('previous_name');
+    expect(input.header_secrets).toEqual({ 'X-Other-Key': 'fresh' });
+  });
+
+  it('a removal asked for does not carry previous_name', () => {
+    const d = saved();
+    d.headers = d.headers.map((h) => (h.secret ? { ...h, name: 'X-Other-Key', clearStored: true } : h));
+    expect(buildSaveInput(d).provider.headers.find((h) => h.secret)).not.toHaveProperty('previous_name');
+  });
+
+  it('an unchanged name, a plain header and a new row carry no previous_name', () => {
+    expect(buildSaveInput(saved()).provider.headers.some((h) => 'previous_name' in h)).toBe(false);
+    const d = saved();
+    d.headers = d.headers.map((h) => (h.secret ? h : { ...h, name: 'X-Renamed' }));
+    expect(buildSaveInput(d).provider.headers.some((h) => 'previous_name' in h)).toBe(false);
+    const fresh = { ...saved(), headers: [{ ...newHeaderDraft(), name: 'X-New', secret: true }] };
+    expect(buildSaveInput(fresh).provider.headers[0]).not.toHaveProperty('previous_name');
+  });
+
+  it('the UI-only flags never reach the save input, and do not make a draft dirty', () => {
+    const d = saved();
+    const touchedOnly = { ...d, headers: d.headers.map((h) => ({ ...h, secretTouched: false, savedName: null })) };
+    expect(JSON.stringify(buildSaveInput(touchedOnly))).not.toMatch(/secretTouched|savedName/);
+    expect(isDirty(touchedOnly, d)).toBe(false);
+  });
+});
+
+describe('hostOf', () => {
+  it('returns the host with its port, and null for anything without one', () => {
+    expect(hostOf('https://api.acme.test/v1/chat/completions')).toBe('api.acme.test');
+    expect(hostOf('http://localhost:8080/v1')).toBe('localhost:8080');
+    expect(hostOf('  https://API.Acme.test/x  ')).toBe('api.acme.test');
+    expect(hostOf('')).toBeNull();
+    expect(hostOf('   ')).toBeNull();
+    expect(hostOf(null)).toBeNull();
+    expect(hostOf('not a url')).toBeNull();
+    expect(hostOf('mailto:someone')).toBeNull();
+  });
+});
+
+describe('hostChangeNotice', () => {
+  const MSG = (host: string) =>
+    `The saved API key and secret headers will be sent to ${host}. Re-enter them if that host is not the one you trust.`;
+
+  it('names the new host when the chat URL changes host, for a saved provider with a stored key', () => {
+    const d = saved();
+    d.chat_url = 'https://evil.test/v1/chat/completions';
+    expect(hostChangeNotice(saved(), d, true)).toBe(MSG('evil.test'));
+  });
+
+  it('a path-only edit does not warn', () => {
+    const d = saved();
+    d.chat_url = 'https://api.acme.test/v2/chat/completions';
+    expect(hostChangeNotice(saved(), d, true)).toBeNull();
+  });
+
+  it('a port change is a host change', () => {
+    const d = saved();
+    d.chat_url = 'https://api.acme.test:8443/v1/chat/completions';
+    expect(hostChangeNotice(saved(), d, true)).toBe(MSG('api.acme.test:8443'));
+  });
+
+  it('a model list URL on another host warns, and a changed chat URL is not repeated', () => {
+    const d = saved();
+    d.models_url = 'https://models.other.test/v1/models';
+    expect(hostChangeNotice(saved(), d, true)).toBe(MSG('models.other.test'));
+    const both = { ...saved(), chat_url: 'https://evil.test/c', models_url: 'https://evil.test/m' };
+    expect(hostChangeNotice(saved(), both, true)).toBe(MSG('evil.test'));
+  });
+
+  it('a chat URL change moves the derived model list host too, without a second name', () => {
+    const d = { ...saved(), models_url: '', chat_url: 'https://evil.test/v1/chat/completions' };
+    const base = { ...saved(), models_url: '' };
+    expect(hostChangeNotice(base, d, true)).toBe(MSG('evil.test'));
+  });
+
+  it('no notice without a stored key or secret header, for a new provider, or with no saved baseline', () => {
+    const d = saved();
+    d.chat_url = 'https://evil.test/v1/chat/completions';
+    expect(hostChangeNotice(saved(), d, false)).toBeNull();
+    expect(hostChangeNotice(null, d, true)).toBeNull();
+    expect(hostChangeNotice(saved(), { ...d, isNew: true }, true)).toBeNull();
+  });
+
+  it('an invalid edited URL gives no notice (validation shows it instead)', () => {
+    const d = saved();
+    d.chat_url = 'not a url';
+    expect(hostChangeNotice(saved(), d, true)).toBeNull();
   });
 });

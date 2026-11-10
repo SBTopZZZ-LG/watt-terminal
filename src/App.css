@@ -657,6 +657,52 @@ input {
   cursor: default;
 }
 
+/* The settings notice above the chat body. Wraps at any width, and shrinks with the panel, so nothing overflows sideways. */
+.agent-notice {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  align-items: center;
+  min-width: 0;
+  margin: 6px 12px 0;
+  padding: 6px 8px;
+  border: 1px dashed var(--warn);
+  border-radius: 2px;
+  background: var(--warn-tint);
+  color: var(--ink);
+  font-size: 11px;
+}
+
+.agent-notice-text {
+  flex: 1 1 180px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.agent-notice button {
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  border: 1px dashed var(--rule);
+  border-radius: 2px;
+  background: var(--bg);
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.agent-notice button:not(:disabled):hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.agent-notice button:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
 /* The dock buttons: four icons, the current dock's pressed and accented. Same size and edge as the copy button. */
 .dock-buttons {
   display: flex;
@@ -1967,6 +2013,28 @@ input {
   border-radius: 2px;
   color: var(--fail);
   overflow-wrap: anywhere;
+}
+
+/* The recovery panel: the broken file's reason, its path, and the actions. It sits where the banner was. */
+.settings-recovery {
+  margin: 10px 0 0;
+  padding: 8px 10px;
+  border: 1px dashed var(--warn);
+  border-radius: 2px;
+}
+
+.settings-recovery .settings-section-title {
+  color: var(--warn);
+}
+
+/* The path is plain text the user can select, so it can be copied into another tool. */
+.settings-path {
+  margin: 4px 0;
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+  user-select: text;
 }
 
 .settings-section {
