@@ -6,8 +6,10 @@ import { History, messageFor } from '../lib/barInput';
 
 interface Props {
   mode: BarMode;
-  /** Why the bar is limited. Shown under the input. */
+  /** Why the bar is limited. Shown under the input, or as the input's placeholder when hintInline is set. */
   hint: string | null;
+  /** Show the hint as the input's placeholder instead of a row under it, so the bar's height does not change. */
+  hintInline: boolean;
   hasPendingApproval: boolean;
   /** Bumped by the parent to move focus into the input (or the restart button, when the shell exited). */
   focusToken: number;
@@ -26,7 +28,7 @@ interface Props {
 }
 
 export function InputBar(props: Props) {
-  const { mode, hint, hasPendingApproval, focusToken } = props;
+  const { mode, hint, hintInline, hasPendingApproval, focusToken } = props;
   const [text, setText] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
@@ -136,6 +138,10 @@ export function InputBar(props: Props) {
     }
   }
 
+  // The inline hint is the placeholder, so it shows only while the input is empty. An error takes the row instead,
+  // and the placeholder goes back to the normal text.
+  const inlineHint = hintInline && hint !== null && error === null ? hint : null;
+
   return (
     <div className={`bar bar-${mode}`}>
       <span className="bar-mode mode-agent">agent</span>
@@ -143,7 +149,7 @@ export function InputBar(props: Props) {
         ref={inputRef}
         className="bar-input"
         value={text}
-        placeholder="Ask the agent…  (Ctrl/Cmd+Shift+A to focus, Esc to return)"
+        placeholder={inlineHint ?? 'Ask the agent…  (Ctrl/Cmd+Shift+A to focus, Esc to return)'}
         spellCheck={false}
         autoComplete="off"
         onChange={(e) => {
@@ -155,7 +161,7 @@ export function InputBar(props: Props) {
         onBlur={() => props.onFocusChange(false)}
       />
       {error !== null && <div className="bar-error">{error}</div>}
-      {error === null && hint !== null && <div className="bar-hint">{hint}</div>}
+      {error === null && hint !== null && !hintInline && <div className="bar-hint">{hint}</div>}
     </div>
   );
 }

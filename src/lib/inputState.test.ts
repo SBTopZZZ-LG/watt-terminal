@@ -94,6 +94,13 @@ describe('routeFor: the input routing table', () => {
       expect(routeFor(s).hint === null, s).toBe(s === 'prompt');
     }
   });
+
+  it('shows the hint inline (as the placeholder) only while a command is starting or running', () => {
+    // These two flip on every command, so they must not add a row: the bar would grow and the terminal would resize.
+    for (const s of ALL_STATES) {
+      expect(routeFor(s).hintInline, s).toBe(s === 'submitted' || s === 'running');
+    }
+  });
 });
 
 describe('focusAfter', () => {

@@ -49,39 +49,64 @@ export type BarMode = 'chat' | 'collapsed' | 'exited';
 export interface Route {
   keys: KeyRoute;
   bar: BarMode;
+  /** What the bar says about the state, or null when there is nothing to say. */
   hint: string | null;
+  /**
+   * Whether the hint shows as the input's placeholder instead of its own row. The two transient states (a command
+   * starting, a command running) use it, so the bar keeps its height while a command runs and the terminal does not
+   * resize. Every other hint keeps its own row.
+   */
+  hintInline: boolean;
 }
 
 export function routeFor(state: InputState): Route {
   switch (state) {
     case 'booting':
-      return { keys: 'pty', bar: 'chat', hint: 'The shell is starting. The agent cannot run commands yet.' };
+      return {
+        keys: 'pty',
+        bar: 'chat',
+        hint: 'The shell is starting. The agent cannot run commands yet.',
+        hintInline: false,
+      };
     case 'prompt':
-      return { keys: 'pty', bar: 'chat', hint: null };
+      return { keys: 'pty', bar: 'chat', hint: null, hintInline: false };
     case 'submitted':
       return {
         keys: 'pty',
         bar: 'chat',
         hint: 'The command is starting. The agent cannot run commands until it finishes.',
+        hintInline: true,
       };
     case 'continuation':
       return {
         keys: 'pty',
         bar: 'chat',
         hint: 'The shell is waiting for the rest of a multi-line command. The agent cannot run commands now.',
+        hintInline: false,
       };
     case 'running':
-      return { keys: 'pty', bar: 'chat', hint: 'A command is running. The agent cannot run another until it finishes.' };
+      return {
+        keys: 'pty',
+        bar: 'chat',
+        hint: 'A command is running. The agent cannot run another until it finishes.',
+        hintInline: true,
+      };
     case 'alt':
-      return { keys: 'pty', bar: 'collapsed', hint: 'Full-screen app: keys go to it. Ctrl/Cmd+Shift+A messages the agent.' };
+      return {
+        keys: 'pty',
+        bar: 'collapsed',
+        hint: 'Full-screen app: keys go to it. Ctrl/Cmd+Shift+A messages the agent.',
+        hintInline: false,
+      };
     case 'raw':
       return {
         keys: 'pty',
         bar: 'chat',
         hint: 'No shell integration: the agent can read the screen but cannot run commands.',
+        hintInline: false,
       };
     case 'exited':
-      return { keys: 'drop', bar: 'exited', hint: 'Shell exited.' };
+      return { keys: 'drop', bar: 'exited', hint: 'Shell exited.', hintInline: false };
   }
 }
 

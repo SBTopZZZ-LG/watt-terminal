@@ -317,6 +317,7 @@ export default function App() {
       <InputBar
         mode={barMode}
         hint={route.hint}
+        hintInline={route.hintInline}
         hasPendingApproval={pendingApproval !== null}
         focusToken={focusToken}
         onFocusChange={setBarOpen}
