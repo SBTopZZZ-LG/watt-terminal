@@ -545,12 +545,25 @@ pub fn location_note(top: &TopLevel, r: &Redactor) -> Option<String> {
     )))
 }
 
+/// The command text in the terminal note is cut to this many characters, the ellipsis included.
+const NOTE_COMMAND_CHARS: usize = 300;
+
+/// `text` cut to `max` characters, the last one an ellipsis when it was cut.
+fn cap_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut cut: String = text.chars().take(max - 1).collect();
+    cut.push('…');
+    cut
+}
+
 /// The terminal note for one model call, while a program is in the foreground of the shell. It says what runs and that
-/// run_command waits for it to exit. None when nothing is in the foreground. The command text is redacted: it is the
-/// user's text.
+/// run_command waits for it to exit. None when nothing is in the foreground. The command text is redacted, then capped:
+/// it is the user's text, and redacting the whole text first means a secret cannot be left half-cut at the cap.
 pub fn foreground_note(fg: Option<&Foreground>, r: &Redactor) -> Option<String> {
     let fg = fg?;
-    let command = r.redact(&fg.command);
+    let command = cap_chars(&r.redact(&fg.command), NOTE_COMMAND_CHARS);
     Some(if fg.kind == ForegroundKind::Other {
         format!(
             "Terminal context: the command `{command}` is still running in this shell. You can wait for it, but run_command \
@@ -816,6 +829,39 @@ mod tests {
         let note = foreground_note(Some(&ssh), &r).expect("a note");
         assert!(note.contains("`sshpass -p [REDACTED] ssh host`"), "{note}");
         assert!(!note.contains("hunter2-secret"), "{note}");
+    }
+
+    /// A long command is cut in the note to 300 characters, the last one an ellipsis, and the rest of it is not sent.
+    #[test]
+    fn the_terminal_note_caps_a_long_command() {
+        let r = Redactor::new(Vec::new());
+        let long = hint(ForegroundKind::Ssh, &format!("ssh {}", "a".repeat(1200)));
+        let note = foreground_note(Some(&long), &r).expect("a note");
+        let shown = format!("ssh {}…", "a".repeat(295));
+        assert_eq!(shown.chars().count(), NOTE_COMMAND_CHARS);
+        assert!(note.contains(&format!("`{shown}`")), "{note}");
+        assert!(!note.contains(&"a".repeat(296)), "{note}");
+    }
+
+    /// The secret straddles the cut (it starts before character 299 and runs past it), and the text is still longer than
+    /// the cap once redacted. The secret is removed before the cut, so no part of it reaches the note. Cutting first would
+    /// leave `hunter2-s` in the note.
+    #[test]
+    fn the_terminal_note_redacts_before_it_caps() {
+        let r = Redactor::new(vec!["hunter2-secret".to_string()]);
+        let text = format!("ssh {} hunter2-secret {}", "a".repeat(285), "b".repeat(50));
+        let note = foreground_note(Some(&hint(ForegroundKind::Ssh, &text)), &r).expect("a note");
+        assert!(note.contains('…'), "the command was not capped: {note}");
+        assert!(!note.contains("hunter2"), "{note}");
+        assert!(!note.contains("secret"), "{note}");
+    }
+
+    #[test]
+    fn cap_chars_keeps_short_text_and_cuts_long_text_to_the_limit_with_an_ellipsis() {
+        assert_eq!(cap_chars("abc", 3), "abc");
+        assert_eq!(cap_chars("abcd", 3), "ab…");
+        assert_eq!(cap_chars("日本語です", 3), "日本…", "characters, not bytes");
+        assert_eq!(cap_chars(&"日".repeat(400), 300).chars().count(), 300);
     }
 
     #[test]

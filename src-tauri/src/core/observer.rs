@@ -32,7 +32,7 @@ pub const MAX_DEPTH: usize = 8;
 /// A level expected by `expect_level` must say Hello within this long. Otherwise its nonce is retired.
 pub const PENDING_TIMEOUT: Duration = Duration::from_secs(30);
 /// Longest label kept for a nested level.
-pub const LABEL_CAP: usize = 200;
+pub const LABEL_CAP: usize = 1000;
 /// The key of the local shell's level.
 pub const LOCAL_KEY: u64 = 0;
 /// The command text of a nested record whose text the shell did not report (bash does not record every command).

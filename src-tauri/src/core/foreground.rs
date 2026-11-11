@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 
 /// The stored command text is cut to this many characters.
-pub const MAX_COMMAND_CHARS: usize = 200;
+pub const MAX_COMMAND_CHARS: usize = 1000;
 
 /// What kind of program the hint says is in the foreground. The codes are the wire names (snake_case).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -364,15 +364,15 @@ mod tests {
     }
 
     #[test]
-    fn the_stored_command_is_capped_at_200_characters() {
-        let long = format!("ssh {}", "a".repeat(300));
+    fn the_stored_command_is_capped_at_1000_characters() {
+        let long = format!("ssh {}", "a".repeat(1200));
         let fg = classify(&long);
         assert_eq!(fg.kind, ForegroundKind::Ssh);
         assert_eq!(fg.command.chars().count(), MAX_COMMAND_CHARS);
         assert!(fg.command.starts_with("ssh aaa"));
 
         // Characters, not bytes: a multi-byte name is cut on a character boundary.
-        let wide = format!("ssh {}", "日".repeat(300));
+        let wide = format!("ssh {}", "日".repeat(1200));
         let fg = classify(&wide);
         assert_eq!(fg.command.chars().count(), MAX_COMMAND_CHARS);
         assert_eq!(fg.kind, ForegroundKind::Ssh);
@@ -381,7 +381,7 @@ mod tests {
     #[test]
     fn the_kind_is_read_from_the_whole_line_before_the_cap() {
         // The program is at the start, so a long line still names it.
-        let long = format!("docker run -it {} alpine", "x".repeat(400));
+        let long = format!("docker run -it {} alpine", "x".repeat(1200));
         assert_eq!(kind(&long), ForegroundKind::ContainerExec);
     }
 

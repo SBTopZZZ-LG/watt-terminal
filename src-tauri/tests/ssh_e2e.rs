@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use agent_term_lib::core::agent::{AgentCtx, AgentEvent, ApprovalGate, DENIED};
 use agent_term_lib::core::approval::RegexPolicy;
 use agent_term_lib::core::foreground::ForegroundKind;
-use agent_term_lib::core::observer::{InputState, LevelKind, LABEL_CAP};
+use agent_term_lib::core::observer::{InputState, LevelKind};
 use agent_term_lib::core::record::{Record, RecordStatus, RecordSummary, Source};
 use agent_term_lib::core::session::{IntegrateOutcome, Session, SubmitError};
 use agent_term_lib::core::settings::{ApprovalMode, ApprovalSettings};
@@ -206,15 +206,9 @@ fn last_rows(s: &Session) -> Vec<String> {
     rows.iter().rev().filter(|r| !r.trim().is_empty()).take(3).cloned().collect()
 }
 
-/// The label a nested level keeps for its command: the first LABEL_CAP characters (observer.rs). A typed ssh command with a
-/// long key path is longer than that, so the label is a prefix of it. That truncation is reported as a finding.
+/// The label a nested level keeps for its command: the whole command, since it is far below LABEL_CAP (observer.rs).
 fn expected_label(command: &str) -> String {
-    let label: String = command.chars().take(LABEL_CAP).collect();
-    if label != command {
-        let len = command.chars().count();
-        eprintln!("FINDING: the nested level label is cut to {LABEL_CAP} chars; the typed command is {len} chars");
-    }
-    label
+    command.to_string()
 }
 
 /// True when the last non-blank row ends in a prompt sign (`$`, `#` or zsh's `%`).
@@ -540,8 +534,7 @@ fn exec_into_an_unhooked_shell_is_not_reported_as_a_prompt() {
 
 /// Forged and retired prompt markers from the remote side. An unknown nonce is forged: counted, and nothing changes. The
 /// nonce of the popped remote level is stale, not forged: after the user leaves the remote shell, a late marker with it
-/// is not counted as forged and the local stack does not change. (The stale counter has no accessor on Session, so the
-/// stale side is checked through the forged counter and the state only.)
+/// is not counted as forged, is counted as stale, and the local stack does not change.
 #[test]
 #[ignore = "needs docker, network for apt on the first run, and the image in AT_TEST_IMAGE (default ubuntu:24.04)"]
 fn forged_and_retired_prompt_markers_from_the_remote_side_change_nothing() {
@@ -571,10 +564,12 @@ fn forged_and_retired_prompt_markers_from_the_remote_side_change_nothing() {
         h.levels()
     );
     let forged_after_pop = h.stats().forged_events;
+    let stale_after_pop = h.stats().stale_events;
     let late = format!(r"printf '\033]133;A;n={remote_nonce}\033\\'");
     let rec = typed_cmd(&h, &late, 0);
     assert_eq!(rec.exit_code, Some(0));
     assert_eq!(h.stats().forged_events, forged_after_pop, "a retired nonce was counted as forged");
+    assert_eq!(h.stats().stale_events, stale_after_pop + 1, "the popped level's late marker was not counted as stale");
     assert_eq!((h.levels().len(), h.top_key()), (1, 0), "a late marker changed the stack");
     assert!(at_prompt(&h, 0), "state {:?}", h.state());
 }

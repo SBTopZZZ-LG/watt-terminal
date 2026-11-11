@@ -114,6 +114,8 @@ pub enum IntegrateOutcome {
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct SessionStats {
     pub forged_events: u64,
+    /// Tagged events from popped shell levels (not forged, just late).
+    pub stale_events: u64,
     pub overflow_events: u64,
     pub dropped_bytes: u64,
 }
@@ -438,9 +440,12 @@ impl Session {
     }
 
     pub fn stats(&self) -> SessionStats {
-        let forged_events = self.shared.lock().forged_events();
+        let (forged_events, stale_events) = {
+            let core = self.shared.lock();
+            (core.forged_events(), core.stale_events())
+        };
         let (overflow_events, dropped_bytes) = self.queue.overflow_stats();
-        SessionStats { forged_events, overflow_events, dropped_bytes }
+        SessionStats { forged_events, stale_events, overflow_events, dropped_bytes }
     }
 
     pub fn records(&self) -> Vec<RecordSummary> {

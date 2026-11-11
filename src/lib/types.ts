@@ -139,6 +139,8 @@ export interface StartResult {
 
 export interface SessionStats {
   forged_events: number;
+  /** Tagged events from popped shell levels. Optional so an older status payload still type-checks. */
+  stale_events?: number;
   overflow_events: number;
   dropped_bytes: number;
 }
