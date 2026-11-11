@@ -37,6 +37,7 @@ const SETTINGS: Settings = {
   global_context_limit: 8000,
   approval: { mode: 'manual', allow: [], deny: [], nested: 'ask' },
   integration: { agent_requests: 'ask' },
+  limits: { max_model_calls: 50, model_calls_unlimited: false, max_poll_calls: 60, max_commands_per_turn: 30, max_wait_minutes: 30 },
 };
 
 function view(over: Partial<SettingsView> = {}): SettingsView {
@@ -102,10 +103,11 @@ function noticesProps(over: Partial<SettingsNoticesProps> = {}): SettingsNotices
 const notices = (over: Partial<SettingsNoticesProps> = {}) => renderToStaticMarkup(<SettingsNotices {...noticesProps(over)} />);
 
 describe('SETTINGS_TABS', () => {
-  it('Models first, then Approvals, each with its label', () => {
+  it('Models first, then Approvals, then Limits, each with its label', () => {
     expect(SETTINGS_TABS.map((t) => [t.id, t.label])).toEqual([
       ['models', 'Models'],
       ['approvals', 'Approvals'],
+      ['limits', 'Limits'],
     ]);
   });
 });

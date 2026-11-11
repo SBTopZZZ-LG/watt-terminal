@@ -3,6 +3,8 @@ import type { KeyboardEvent, ReactNode } from 'react';
 import { api, errorText } from '../lib/api';
 import { approvalInput, draftFromApproval, isApprovalDirty } from '../lib/approvalForm';
 import type { ApprovalDraft } from '../lib/approvalForm';
+import { defaultDraft, draftFromLimits, isLimitsDirty, limitsInput } from '../lib/limitsForm';
+import type { LimitsDraft } from '../lib/limitsForm';
 import {
   buildSaveInput,
   chatHost,
@@ -20,6 +22,7 @@ import type { ProviderDraft } from '../lib/settingsForm';
 import { RECOVERY_BUSY_LABEL, REVERT_CONFIRM, reasonText, recoveryExplanation, recoveryKind } from '../lib/settingsRecovery';
 import type { AgentRequests, ProviderPreset, RecoverAction, SettingsStateView, SettingsView } from '../lib/types';
 import { ApprovalSection } from './ApprovalSection';
+import { LimitsSection } from './LimitsSection';
 import { ProviderEditor } from './ProviderEditor';
 import type { TestState } from './ProviderEditor';
 import { SettingsTabs } from './SettingsTabs';
@@ -57,11 +60,13 @@ export interface EditorState {
 
 /**
  * The tabs of the AI settings, in order. Models holds the default model, the context limit, the providers and the editor;
- * Approvals holds the approval rules. A new tab is one entry here and one panel in the dialog's render.
+ * Approvals holds the approval rules; Limits holds the per-turn caps. A new tab is one entry here and one panel in the
+ * dialog's render.
  */
 export const SETTINGS_TABS: readonly TabDef[] = [
   { id: 'models', label: 'Models' },
   { id: 'approvals', label: 'Approvals' },
+  { id: 'limits', label: 'Limits' },
 ];
 
 /** The select value for "None" (default model) and "Blank provider" (add provider). Preset keys are never empty. */
@@ -435,6 +440,10 @@ export function SettingsDialog({ onClose, onChanged, onViewLoaded }: SettingsDia
   const [approvalDraft, setApprovalDraft] = useState<ApprovalDraft | null>(null);
   const [approvalSaving, setApprovalSaving] = useState(false);
   const [approvalError, setApprovalError] = useState<string | null>(null);
+  // The Limits section's edit, or null when it shows the saved limits. Its baseline is the view's limits.
+  const [limitsDraft, setLimitsDraft] = useState<LimitsDraft | null>(null);
+  const [limitsSaving, setLimitsSaving] = useState(false);
+  const [limitsError, setLimitsError] = useState<string | null>(null);
   // The agent integration setting is saved on each change (its own command), so it has its own busy and error state.
   const [integrationSave, setIntegrationSave] = useState<{ busy: boolean; error: string | null }>({ busy: false, error: null });
   // undefined while the built-in list loads; null when it could not be read.
@@ -446,6 +455,8 @@ export function SettingsDialog({ onClose, onChanged, onViewLoaded }: SettingsDia
   const dirty = editor !== null && isDirty(editor.draft, editor.saved);
   const approvalDirty = view !== null && approvalDraft !== null && isApprovalDirty(approvalDraft, view.settings.approval);
   const approvalShown = view === null ? null : (approvalDraft ?? draftFromApproval(view.settings.approval));
+  const limitsDirtyNow = view !== null && limitsDraft !== null && isLimitsDirty(limitsDraft, view.settings.limits);
+  const limitsShown = view === null ? null : (limitsDraft ?? draftFromLimits(view.settings.limits));
 
   // Load the settings each time the dialog opens or Retry is pressed. The presets are static, so a failure only hides them.
   useEffect(() => {
@@ -539,26 +550,29 @@ export function SettingsDialog({ onClose, onChanged, onViewLoaded }: SettingsDia
 
   // A save in flight: closing now would offer to discard a change that is being saved, and would drop its result. Esc, the
   // backdrop and Close are ignored until it settles.
-  const saving = editor?.saving === true || approvalSaving;
+  const saving = editor?.saving === true || approvalSaving || limitsSaving;
 
   const requestClose = () => {
     if (saving) {
       return;
     }
-    if (dirty || approvalDirty) {
+    if (dirty || approvalDirty || limitsDirtyNow) {
       setAskClose(true);
       return;
     }
     onClose();
   };
 
-  // The question the close guard asks, naming what is unsaved.
+  // The question the close guard asks, naming what is unsaved. Two or more unsaved areas share one question.
+  const unsavedCount = [dirty, approvalDirty, limitsDirtyNow].filter(Boolean).length;
   const discardQuestion =
-    dirty && approvalDirty
+    unsavedCount > 1
       ? 'Discard unsaved changes?'
       : dirty
         ? 'Discard unsaved provider changes?'
-        : 'Discard unsaved approval changes?';
+        : approvalDirty
+          ? 'Discard unsaved approval changes?'
+          : 'Discard unsaved limits changes?';
 
   const discardAndClose = () => {
     setEditor(null);
@@ -822,6 +836,8 @@ export function SettingsDialog({ onClose, onChanged, onViewLoaded }: SettingsDia
         setLimit({ text: limitText(v), error: null, busy: false });
         setApprovalDraft(null);
         setApprovalError(null);
+        setLimitsDraft(null);
+        setLimitsError(null);
         setRecovery(NO_RECOVERY);
         onChanged();
       },
@@ -865,9 +881,34 @@ export function SettingsDialog({ onClose, onChanged, onViewLoaded }: SettingsDia
     );
   };
 
+  /** Saves the Limits draft. The backend checks the ranges; a refused save shows its message and keeps the draft. */
+  const saveLimits = () => {
+    if (view === null || limitsDraft === null || limitsSaving) {
+      return;
+    }
+    const input = limitsInput(limitsDraft);
+    if (input === null) {
+      return;
+    }
+    setLimitsSaving(true);
+    setLimitsError(null);
+    api.setLimitsSettings(input).then(
+      (v) => {
+        applyView(v);
+        setLimitsDraft(null);
+        setLimitsSaving(false);
+      },
+      (e: unknown) => {
+        setLimitsSaving(false);
+        setLimitsError(errorText(e));
+      },
+    );
+  };
+
   const locked = view !== null && view.load_error !== null;
-  // The Approvals section is read-only while settings.json is not in use (broken, last good, or a load error).
+  // The Approvals and Limits sections are read-only while settings.json is not in use (broken, last good, or a load error).
   const approvalLocked = locked || (view !== null && recoveryKind(view.settings_state) !== 'ok');
+  const limitsLocked = approvalLocked;
   const takenIds = view === null ? [] : view.settings.providers.filter((p) => p.id !== editor?.forId).map((p) => p.id);
 
   let editorSlot: { forId: string | null; node: ReactNode } | null = null;
@@ -912,6 +953,9 @@ export function SettingsDialog({ onClose, onChanged, onViewLoaded }: SettingsDia
   }
   if (approvalDirty) {
     dirtyTabs.push('approvals');
+  }
+  if (limitsDirtyNow) {
+    dirtyTabs.push('limits');
   }
 
   const modelsPanel = (
@@ -964,6 +1008,26 @@ export function SettingsDialog({ onClose, onChanged, onViewLoaded }: SettingsDia
       />
     ) : null;
 
+  const limitsPanel =
+    view !== null && limitsShown !== null ? (
+      <LimitsSection
+        draft={limitsShown}
+        dirty={limitsDirtyNow}
+        locked={limitsLocked}
+        saving={limitsSaving}
+        saveError={limitsError}
+        onChange={(draft) => {
+          setLimitsDraft(draft);
+          setLimitsError(null);
+        }}
+        onSave={saveLimits}
+        onReset={() => {
+          setLimitsDraft(defaultDraft());
+          setLimitsError(null);
+        }}
+      />
+    ) : null;
+
   return (
     <div
       className="modal-backdrop"
@@ -1008,7 +1072,7 @@ export function SettingsDialog({ onClose, onChanged, onViewLoaded }: SettingsDia
           selected={tab}
           dirty={dirtyTabs}
           onSelect={setTab}
-          panel={(id) => (id === 'approvals' ? approvalsPanel : modelsPanel)}
+          panel={(id) => (id === 'approvals' ? approvalsPanel : id === 'limits' ? limitsPanel : modelsPanel)}
         />
         <footer className="settings-foot">
           {askClose ? (

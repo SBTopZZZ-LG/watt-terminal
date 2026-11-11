@@ -2647,6 +2647,44 @@ input {
   flex: 1 1 160px;
 }
 
+/* The Limits tab: the four caps in a grid that wraps (two columns at the usual width, one on a narrow window). */
+.settings-dialog .limits-fields {
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+}
+
+.settings-dialog .limits-fields .settings-check {
+  color: var(--ink);
+  font-size: 12px;
+}
+
+/* The unlimited confirm: a card over the dialog, on the same scrim as the other modals. Its buttons take the dialog's style. */
+.settings-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: min(420px, 100vw - 32px);
+  max-height: calc(100vh - 32px);
+  padding: 12px 14px;
+  border: 1px solid var(--rule-strong);
+  border-radius: 2px;
+  background: var(--panel);
+  box-shadow: 0 8px 24px var(--shadow);
+}
+
+.settings-confirm:focus {
+  outline: none;
+}
+
+.settings-confirm p {
+  margin: 0;
+  line-height: 1.45;
+}
+
+.settings-confirm-foot {
+  justify-content: flex-end;
+  margin: 4px 0 0;
+}
+
 /* The chip buttons (auto-approve and the settings gear) take the same focus ring. */
 .chip-button:focus-visible {
   outline: 1px solid var(--accent);

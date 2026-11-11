@@ -340,6 +340,19 @@ export interface IntegrationSettings {
   agent_requests: AgentRequests;
 }
 
+/**
+ * The per-turn caps of the agent (core/settings LimitsSettings). Saved by set_limits_settings. `max_model_calls` is a u32 with
+ * no upper bound in the UI; `model_calls_unlimited` turns the cap off and keeps the number. The polling cap counts only the
+ * polling replies (wait, get_screen, send_keys while a command the agent started is running).
+ */
+export interface LimitsSettings {
+  max_model_calls: number;
+  model_calls_unlimited: boolean;
+  max_poll_calls: number;
+  max_commands_per_turn: number;
+  max_wait_minutes: number;
+}
+
 /** What the saved approval settings would decide for one command, without running it (test_approval). */
 export interface ApprovalPreview {
   verdict: 'auto' | 'ask';
@@ -354,6 +367,7 @@ export interface Settings {
   global_context_limit: number | null;
   approval: ApprovalSettings;
   integration: IntegrationSettings;
+  limits: LimitsSettings;
 }
 
 /** Which secrets a provider has stored. Never their values. */

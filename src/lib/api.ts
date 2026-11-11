@@ -11,6 +11,7 @@ import type {
   FetchOutcome,
   IntegrateOutcome,
   IntegrationSettings,
+  LimitsSettings,
   LoadedConversation,
   ModelRef,
   ProviderPreset,
@@ -159,6 +160,10 @@ export const api = {
   /** Saves whether the agent's integration requests ask the user or run at once. Refused while settings.json is broken. */
   setIntegrationSettings(input: IntegrationSettings) {
     return invoke<SettingsView>('set_integration_settings', { input });
+  },
+  /** Saves the per-turn caps. Refused while settings.json is broken. A value out of range fails with its name in the message. */
+  setLimitsSettings(input: LimitsSettings) {
+    return invoke<SettingsView>('set_limits_settings', { input });
   },
   /** What the saved approval settings would decide for a command, without running it. Approve-all is not part of it. */
   testApproval(command: string) {
