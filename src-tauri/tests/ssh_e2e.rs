@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use agent_term_lib::core::agent::{AgentCtx, AgentEvent, ApprovalGate, DENIED};
+use agent_term_lib::core::agent::{AgentCtx, AgentEvent, ApprovalGate, DENIED, TurnRules};
 use agent_term_lib::core::approval::RegexPolicy;
 use agent_term_lib::core::foreground::ForegroundKind;
 use agent_term_lib::core::observer::{InputState, LevelKind};
@@ -335,6 +335,7 @@ fn rules(allow: &[&str]) -> RegexPolicy {
         mode: ApprovalMode::Regex,
         allow: allow.iter().map(|s| s.to_string()).collect(),
         deny: Vec::new(),
+        ..Default::default()
     };
     RegexPolicy::new(&approval).expect("the rules compile")
 }
@@ -451,6 +452,79 @@ fn ssh_into_bash_integrates_and_the_agent_works_there() {
     assert_eq!(run_decision(&again_log), Some(("auto", true)), "approve-all resumes on the local shell");
     let local = run(&h, "echo local-again-typed");
     assert_eq!((local.output.as_str(), local.level), ("local-again-typed", 0));
+}
+
+/// The phases of the integration events in `log`, in order.
+fn integration_phases(log: &Log) -> Vec<&'static str> {
+    log.lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Integration { phase, .. } => Some(*phase),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The agent asks for the integration over a real sshd. First the user is asked and accepts in the dialog. Then the ssh
+/// session is left and reopened, the setting is auto, and the shell is integrated with no dialog. A command runs in each.
+#[test]
+#[ignore = "needs docker, network for apt on the first run, and the image in AT_TEST_IMAGE (default ubuntu:24.04)"]
+fn the_agent_requests_integration_over_ssh_asks_then_runs_without_asking() {
+    let _g = serial();
+    let remote = Remote::start();
+    let h = start();
+
+    connect(&h, &remote, "tester");
+    let asked: Log = Arc::default();
+    let gate = ApprovalGate::with_timeout(WAIT);
+    let emit = |ev: AgentEvent| {
+        if let AgentEvent::Integration { call_id, phase: "asking", .. } = &ev {
+            assert!(gate.integrations().decide(call_id, true), "the dialog's answer is waiting");
+        }
+        asked.lock().unwrap().push(ev);
+    };
+    let tools = SessionTools::new(&h);
+    let ctx = AgentCtx::new(&tools, &gate, &emit);
+    let text = ctx.call_tool("request_integration", json!({})).expect("integrated after the dialog");
+    let text = text.as_str().unwrap_or_default().to_string();
+    assert!(text.starts_with("Integrated ssh ") && text.contains("(bash as tester@"), "{text}");
+    assert_eq!(integration_phases(&asked), ["asking", "running", "done"]);
+    let key = h.top_key();
+    assert_eq!(h.levels().len(), 2, "{:?}", h.levels());
+    wait_at_prompt(&h, key);
+    let hi = agent_cmd(&h, "b5r-hi", "echo asked", key);
+    assert_eq!((hi.exit_code, hi.output.as_str()), (Some(0), "asked"));
+
+    h.write_user(b"exit\r").expect("type exit");
+    assert!(
+        wait_until(WAIT, || (h.levels().len() == 1 && at_prompt(&h, 0)).then_some(())).is_some(),
+        "exit did not return to the local prompt: state {:?}, levels {:?}",
+        h.state(),
+        h.levels()
+    );
+
+    connect(&h, &remote, "tester");
+    let auto: Log = Arc::default();
+    let emit_auto = |ev: AgentEvent| auto.lock().unwrap().push(ev);
+    let gate_auto = ApprovalGate::with_timeout(WAIT);
+    let tools = SessionTools::new(&h);
+    let rules = TurnRules { integrate_without_asking: true, ..TurnRules::default() };
+    let ctx = AgentCtx::new(&tools, &gate_auto, &emit_auto).with_rules(rules);
+    let text = ctx.call_tool("request_integration", json!({})).expect("integrated without asking");
+    let text = text.as_str().unwrap_or_default().to_string();
+    assert!(text.starts_with("Integrated ssh ") && text.contains("(bash as tester@"), "{text}");
+    assert_eq!(integration_phases(&auto), ["running", "done"], "no dialog under auto");
+    let key = h.top_key();
+    wait_at_prompt(&h, key);
+    let pwd = agent_cmd(&h, "b5r-pwd", "pwd", key);
+    assert_eq!((pwd.exit_code, pwd.output.as_str()), (Some(0), "/home/tester"));
+
+    h.write_user(b"exit\r").expect("type exit");
+    assert!(
+        wait_until(WAIT, || (h.levels().len() == 1 && at_prompt(&h, 0)).then_some(())).is_some(),
+        "the second exit did not return to the local prompt"
+    );
 }
 
 /// The remote sshd session is killed while the remote shell is integrated. Its bash goes with it, ssh exits, and the local

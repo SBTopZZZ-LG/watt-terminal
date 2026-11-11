@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use crate::core::chat::redact::Redactor;
 use crate::core::chat::todo;
 use crate::core::foreground::{Foreground, ForegroundKind};
+use crate::core::tools::INTEGRATE_HINT;
 
 /// `run_command` output longer than this is cut to a head and tail. Output at or under it is sent whole.
 const RUN_OUTPUT_LIMIT: usize = 4500;
@@ -42,6 +43,7 @@ pub fn project(name: &str, ok: bool, result: &Value, redactor: &Redactor) -> Str
             "get_screen" => get_screen_text(result, redactor),
             "wait" => wait_text(result, redactor),
             todo::TOOL_NAME => todo_write_text(result),
+            "request_integration" => result.as_str().unwrap_or_default().to_string(),
             "list_commands" => list_commands_text(result, redactor),
             "get_cwd" => cwd_text(Some(result)),
             _ => compact_json(result),
@@ -241,7 +243,7 @@ fn foreground_line(v: &Value, r: &Redactor) -> Option<String> {
         format!("foreground: {command} (a command running in this shell; wait for it to finish)")
     } else {
         format!(
-            "foreground: {command} ({}, without shell integration; you can read the screen but cannot run commands here)",
+            "foreground: {command} ({}, without shell integration; you can read the screen but cannot run commands here). {INTEGRATE_HINT}",
             fg.kind.describe()
         )
     })
@@ -852,7 +854,7 @@ mod tests {
         let out = project("get_screen", true, &v, &none());
         assert_eq!(
             out.lines().nth(1),
-            Some("foreground: ssh ubuntu@lidia (a shell on another machine, without shell integration; you can read the screen but cannot run commands here)"),
+            Some("foreground: ssh ubuntu@lidia (a shell on another machine, without shell integration; you can read the screen but cannot run commands here). Call request_integration to ask for it."),
             "{out}"
         );
         assert!(out.ends_with("ubuntu@lidia:~$"), "the rows follow the header: {out}");

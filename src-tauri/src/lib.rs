@@ -20,7 +20,7 @@ use tauri_plugin_window_state::StateFlags;
 // Core logic (PTY, shell integration, observer, agent) has no Tauri dependency, so `cargo test` runs it headless.
 pub mod core;
 
-use crate::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate, AutoState, MockAgent, OnDrop};
+use crate::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate, AutoState, MockAgent, OnDrop, TurnRules};
 use crate::core::approval::{self, ApprovalPolicy, ManualPolicy};
 use crate::core::chat::agent_loop::{self, Conversation, LlmAgent, LlmSettings, USER_AGENT};
 use crate::core::chat::history::History;
@@ -44,7 +44,7 @@ use crate::core::settings::service::{
     FetchOutcome, RecoverAction, SaveProviderInput, SettingsService, SettingsStateView, SettingsView, TestResult,
     test_model,
 };
-use crate::core::settings::{ApprovalSettings, ModelRef};
+use crate::core::settings::{AgentRequests, ApprovalSettings, IntegrationSettings, ModelRef, Nested};
 use crate::core::tools::SessionTools;
 
 type Reg = Registry<Attached>;
@@ -391,6 +391,22 @@ fn approval_policy(service: Option<&SettingsService>) -> Box<dyn ApprovalPolicy>
         .unwrap_or_else(|| -> Box<dyn ApprovalPolicy> { Box::new(ManualPolicy) })
 }
 
+/// Whether nested shells follow the local approval rules (approval nested = same as local), in the settings in use. False
+/// when the settings cannot be used.
+fn follows_local(service: Option<&SettingsService>) -> bool {
+    service.and_then(|s| s.approval_settings().ok()).is_some_and(|approval| approval.nested == Nested::SameAsLocal)
+}
+
+/// The rules one turn decides by, from the settings in use (see `TurnRules`). Both are off when the settings cannot be used.
+fn turn_rules(service: Option<&SettingsService>) -> TurnRules {
+    TurnRules {
+        follow_local_in_nested: follows_local(service),
+        integrate_without_asking: service
+            .and_then(|s| s.integration_settings().ok())
+            .is_some_and(|integration| integration.agent_requests == AgentRequests::Auto),
+    }
+}
+
 /// Starts one agent turn on its own thread. Events arrive on the events channel. The model is chosen by `choose_llm`,
 /// and the approval policy by `approval_policy`. Both are read from the settings before the turn starts, so an error
 /// leaves the agent idle.
@@ -405,9 +421,10 @@ async fn agent_message(
     let att = session(&reg, &session_id)?;
     // Reading a saved model touches the Keychain, so it runs on the blocking pool.
     let service = settings.0.clone();
-    let (chosen, policy) = blocking(move || {
+    let (chosen, policy, rules) = blocking(move || {
         let policy = approval_policy(service.as_deref());
-        Ok((choose_llm(service.as_deref())?, policy))
+        let rules = turn_rules(service.as_deref());
+        Ok((choose_llm(service.as_deref())?, policy, rules))
     })
     .await?;
     let cancel = Arc::new(TurnCancel::new());
@@ -450,7 +467,7 @@ async fn agent_message(
             }
             channels.send_json(&ev);
         };
-        let ctx = AgentCtx::new(&tools, &worker.approvals, &emit).with_policy(policy.as_ref());
+        let ctx = AgentCtx::new(&tools, &worker.approvals, &emit).with_policy(policy.as_ref()).with_rules(rules);
         match llm.as_mut() {
             Some(agent) => agent::run_turn(agent, &text, &ctx),
             None => agent::run_turn(&mut MockAgent, &text, &ctx),
@@ -505,6 +522,16 @@ fn approve_tool(session_id: String, call_id: String, approve: bool, reg: State<'
     }
 }
 
+/// Answers the dialog for a `request_integration` call: `accept` integrates the shell, anything else declines it.
+#[tauri::command]
+fn answer_integration(session_id: String, call_id: String, accept: bool, reg: State<'_, Reg>) -> Result<(), String> {
+    if session(&reg, &session_id)?.approvals.integrations().decide(&call_id, accept) {
+        Ok(())
+    } else {
+        Err(format!("no pending integration request {call_id}"))
+    }
+}
+
 #[tauri::command]
 fn set_auto_approve(session_id: String, on: bool, reg: State<'_, Reg>) -> Result<(), String> {
     // The shell on top is the level approve-all is tied to. The session supplies it, not the frontend.
@@ -522,9 +549,13 @@ struct AutoApproveState {
 }
 
 #[tauri::command]
-fn auto_approve_state(session_id: String, reg: State<'_, Reg>) -> Result<AutoApproveState, String> {
+fn auto_approve_state(
+    session_id: String,
+    reg: State<'_, Reg>,
+    settings: State<'_, SettingsState>,
+) -> Result<AutoApproveState, String> {
     let att = session(&reg, &session_id)?;
-    let state = att.approvals.auto_state(att.session.top_key());
+    let state = att.approvals.auto_state_across(att.session.top_key(), follows_local(settings.0.as_deref()));
     Ok(AutoApproveState { auto: state != AutoState::Off, suspended: state == AutoState::Suspended })
 }
 
@@ -601,7 +632,8 @@ fn get_status(session_id: String, reg: State<'_, Reg>, settings: State<'_, Setti
         cwd: att.session.cwd(),
         stats: att.session.stats(),
         auto_approve: att.approvals.auto_approve(),
-        auto_approve_suspended: att.approvals.auto_state(att.session.top_key()) == AutoState::Suspended,
+        auto_approve_suspended: att.approvals.auto_state_across(att.session.top_key(), follows_local(settings.0.as_deref()))
+            == AutoState::Suspended,
         nonces: att.session.nonces(),
         agent_busy: att.agent_busy.load(Ordering::SeqCst),
         agent_control: att.agent_control.load(Ordering::SeqCst),
@@ -862,6 +894,17 @@ async fn set_approval_settings(
 
 /// What the saved approval settings would decide for `command`, without running it. Approve-all is not included: it is
 /// session-only and is not saved.
+/// Saves the shell integration settings: whether the agent's integration requests ask the user. Refused while settings.json
+/// is broken or in last-good mode.
+#[tauri::command]
+async fn set_integration_settings(
+    input: IntegrationSettings,
+    settings: State<'_, SettingsState>,
+) -> Result<SettingsView, String> {
+    let service = settings.get()?;
+    blocking(move || service.set_integration(input)).await
+}
+
 #[tauri::command]
 async fn test_approval(command: String, settings: State<'_, SettingsState>) -> Result<approval::Preview, String> {
     let service = settings.get()?;
@@ -977,6 +1020,8 @@ pub fn run() {
             set_default_model,
             set_global_context_limit,
             set_approval_settings,
+            set_integration_settings,
+            answer_integration,
             test_approval,
             approval_builtin_deny,
             provider_presets,

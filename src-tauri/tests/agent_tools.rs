@@ -266,7 +266,10 @@ fn send_keys_is_disabled_and_schemas_list_every_tool() {
     let err = tools.call("send_keys", &json!({"bytes": [108, 115, 13]}), None).expect_err("send_keys via JSON");
     assert!(err.contains("disabled in slice 1"), "error: {err}");
     let names: Vec<&str> = schemas().iter().map(|t| t.name).collect();
-    assert_eq!(names, ["list_commands", "get_command", "get_screen", "get_cwd", "wait", "run_command", "send_keys"]);
+    assert_eq!(
+        names,
+        ["list_commands", "get_command", "get_screen", "get_cwd", "wait", "run_command", "request_integration", "send_keys"]
+    );
 }
 
 /// Submits `cmd` as the user and waits until the shell reports it running.
@@ -1087,7 +1090,7 @@ fn a_regex_rule_runs_an_allowed_command_without_a_card_and_a_gated_one_still_ask
     let _g = serial();
     let s = start();
     wait_prompt(&s);
-    let approval = ApprovalSettings { mode: ApprovalMode::Regex, allow: vec![".*".into()], deny: Vec::new() };
+    let approval = ApprovalSettings { mode: ApprovalMode::Regex, allow: vec![".*".into()], ..Default::default() };
     let policy = RegexPolicy::new(&approval).expect("the rules compile");
     let approvals = ApprovalGate::with_timeout(Duration::from_millis(200));
     let log: Log = Arc::default();

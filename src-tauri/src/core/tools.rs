@@ -16,9 +16,9 @@ use serde_json::{json, Value};
 
 use crate::core::foreground::{Foreground, ForegroundKind};
 use crate::core::llm::TurnCancel;
-use crate::core::observer::{CallStatus, InputState, IntegrationStatus, LevelKind, ObserverStatus};
+use crate::core::observer::{CallStatus, InjectRefusal, InputState, IntegrationStatus, LevelKind, ObserverStatus};
 use crate::core::record::{Cwd, Record, RecordSummary, Source};
-use crate::core::session::{user_text_refusal, Session};
+use crate::core::session::{user_text_refusal, IntegrateOutcome, Session};
 
 /// How long `run_command` waits for the command to finish before it returns `TimedOut`.
 pub const DEFAULT_RUN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -43,6 +43,10 @@ const PROMPT_SETTLE: Duration = Duration::from_secs(3);
 pub const UNRESPONSIVE_REFUSAL: &str = "cannot run a command now: the shell is not answering (it may be busy, or the connection dropped); use get_screen, or ask the user";
 /// Added to a nested `run_command` result that may be waiting for a password or other input. The agent must not type it.
 pub const INPUT_WAIT_NOTE: &str = "The shell appears to be waiting for a password or other input. Do not type it. Ask the user to handle it, then use get_screen.";
+/// The next step, when the foreground is a shell or program without integration. Used by the refusal, the screen and the note.
+pub const INTEGRATE_HINT: &str = "Call request_integration to ask for it.";
+/// The refusal for `request_integration` while the shell waits for a password or passphrase: the loader must not be typed there.
+pub const INTEGRATE_PASSWORD_REFUSAL: &str = "cannot integrate the shell now: it appears to be waiting for a password or other input. Do not type it. Ask the user to handle it, then call request_integration again.";
 const DEFAULT_LIST: usize = 10;
 const DEFAULT_LIMIT: usize = 4096;
 const MAX_LIMIT: usize = 64 << 10;
@@ -188,6 +192,15 @@ pub trait AgentTools {
     /// card, so the user is not asked to approve a command that will be refused. Writes nothing.
     fn run_command_precheck(&self) -> Result<(), String> {
         Ok(())
+    }
+    /// Checks that `request_integration` may start now, and returns the label of the shell it would integrate (the command
+    /// that holds the foreground). The error is the text the model reads. Writes nothing. A fake without a shell refuses.
+    fn integration_precheck(&self) -> Result<String, String> {
+        Err("shell integration is not available here".into())
+    }
+    /// Integrates the shell in the foreground (see `Session::integrate_shell`). Blocking. A fake without a shell fails.
+    fn integrate_shell(&self) -> IntegrateOutcome {
+        IntegrateOutcome::Failed { hint: "shell integration is not available here".into() }
     }
     fn send_keys(&self, bytes: &[u8]) -> Result<(), String>;
 
@@ -416,6 +429,20 @@ impl AgentTools for SessionTools<'_> {
         }
     }
 
+    fn integration_precheck(&self) -> Result<String, String> {
+        if let Some(reason) = self.session.integration_refusal() {
+            return Err(integration_refusal_text(&reason));
+        }
+        if screen_waits_for_input(&self.session.screen_snapshot().rows) {
+            return Err(INTEGRATE_PASSWORD_REFUSAL.to_string());
+        }
+        Ok(self.session.foreground().map(|fg| fg.command).unwrap_or_default())
+    }
+
+    fn integrate_shell(&self) -> IntegrateOutcome {
+        self.session.integrate_shell()
+    }
+
     fn send_keys(&self, _bytes: &[u8]) -> Result<(), String> {
         Err("send_keys is disabled in slice 1".into())
     }
@@ -526,10 +553,53 @@ pub fn not_at_prompt_text(state: InputState, foreground: Option<&Foreground>) ->
         ),
         kind => format!(
             "{base}. The foreground program is `{}`: {}, without shell integration, so commands cannot run in it. \
-             Read it with get_screen and wait for it to end. Ask the user to leave it, so commands can run again.",
+             Read it with get_screen and wait for it to end. Ask the user to leave it, so commands can run again. {INTEGRATE_HINT}",
             fg.command,
             kind.describe()
         ),
+    }
+}
+
+/// The text for a refused `request_integration`: the refusal and what the agent should do next.
+pub fn integration_refusal_text(reason: &InjectRefusal) -> String {
+    let next = match reason {
+        InjectRefusal::NotRunning => {
+            "Nothing is running in the shell: ask the user to open the remote shell (for example with ssh), then call request_integration again."
+        }
+        InjectRefusal::AltScreen => "Ask the user to close the full-screen program, then call request_integration again.",
+        InjectRefusal::NoShellProgram => {
+            "Only a shell, ssh, su or a container exec can be integrated. Work from get_screen and ask the user."
+        }
+        InjectRefusal::TooDeep => "Ask the user to leave the nested shell first.",
+        InjectRefusal::Busy => "Another integration is in progress: wait a moment, then call request_integration again.",
+    };
+    format!("cannot integrate the shell now: {reason}. {next}")
+}
+
+/// What the model reads for a `request_integration` outcome. An integrated shell gives its text. Every other outcome is an
+/// error that says what to do next.
+pub fn integration_result(outcome: &IntegrateOutcome) -> Result<Value, String> {
+    match outcome {
+        IntegrateOutcome::Integrated { label, sh, user, host, .. } => {
+            let who = match (user, host) {
+                (Some(user), Some(host)) => format!(" as {user}@{host}"),
+                _ => String::new(),
+            };
+            Ok(Value::String(format!("Integrated {label} ({sh}{who}). You can now use run_command in this shell.")))
+        }
+        IntegrateOutcome::UnsupportedShell => Err(
+            "This shell is not supported (needs zsh or bash 4.4+); stay read-only: use get_screen and ask the user.".into(),
+        ),
+        IntegrateOutcome::Timeout => Err(
+            "integration timed out: the shell did not answer the handshake. Ask the user to check that the shell is at its \
+             prompt (not at a password or other prompt), then call request_integration again."
+                .into(),
+        ),
+        IntegrateOutcome::Failed { hint } => Err(format!(
+            "integration did not complete: {hint}. Ask the user to check that the shell is at its prompt, then call \
+             request_integration again."
+        )),
+        IntegrateOutcome::Refused { reason } => Err(integration_refusal_text(reason)),
     }
 }
 
@@ -586,6 +656,11 @@ pub fn schemas() -> Vec<ToolSchema> {
                 "properties": {"command": {"type": "string", "minLength": 1}},
                 "required": ["command"],
             }),
+        },
+        ToolSchema {
+            name: "request_integration",
+            description: "Ask the user to integrate the shell in the foreground (ssh, a nested shell, su, or a container exec) so that run_command works there. Use it when get_screen shows such a shell without shell integration. The user confirms it in a dialog, unless the user chose to let the app do it. It is refused while the shell waits for a password. After it succeeds, run_command runs commands in that shell, under the approval rules of that shell.",
+            parameters: json!({"type": "object", "properties": {}}),
         },
         ToolSchema {
             name: "send_keys",
@@ -776,5 +851,60 @@ mod tests {
         assert!(!TopLevel::default().is_nested());
         let remote = TopLevel { key: 1, location: Some("ssh h".into()), ..TopLevel::default() };
         assert!(remote.is_nested());
+    }
+
+    #[test]
+    fn the_refusal_for_integration_names_the_reason_and_the_next_step() {
+        let text = integration_refusal_text(&InjectRefusal::NotRunning);
+        assert!(text.starts_with("cannot integrate the shell now: no command is running in this shell"), "{text}");
+        assert!(text.contains("call request_integration again"), "{text}");
+        for reason in [InjectRefusal::AltScreen, InjectRefusal::NoShellProgram, InjectRefusal::TooDeep, InjectRefusal::Busy] {
+            let text = integration_refusal_text(&reason);
+            assert!(text.starts_with("cannot integrate the shell now: "), "{text}");
+            assert!(text.len() > 60, "a next step is given: {text}");
+        }
+    }
+
+    #[test]
+    fn integration_results_say_what_to_do_next() {
+        let ok = integration_result(&IntegrateOutcome::Integrated {
+            key: 1,
+            label: "ssh ubuntu@lidia".into(),
+            sh: "zsh".into(),
+            user: None,
+            host: None,
+        });
+        assert_eq!(ok, Ok(json!("Integrated ssh ubuntu@lidia (zsh). You can now use run_command in this shell.")));
+        let unsupported = integration_result(&IntegrateOutcome::UnsupportedShell).unwrap_err();
+        assert!(unsupported.contains("not supported") && unsupported.contains("stay read-only"), "{unsupported}");
+        let timeout = integration_result(&IntegrateOutcome::Timeout).unwrap_err();
+        assert!(timeout.contains("timed out") && timeout.contains("at its prompt"), "{timeout}");
+        let failed = integration_result(&IntegrateOutcome::Failed { hint: "agentterm: Unsupported shell (promptvars off)".into() })
+            .unwrap_err();
+        assert!(failed.starts_with("integration did not complete: agentterm: Unsupported shell (promptvars off)."), "{failed}");
+        let refused = integration_result(&IntegrateOutcome::Refused { reason: InjectRefusal::Busy }).unwrap_err();
+        assert!(refused.starts_with("cannot integrate the shell now: another shell integration"), "{refused}");
+    }
+
+    #[test]
+    fn request_integration_is_offered_with_no_arguments() {
+        let schema = schemas().into_iter().find(|s| s.name == "request_integration").expect("offered");
+        assert_eq!(schema.parameters["properties"], json!({}));
+        assert!(schema.description.contains("dialog"), "{}", schema.description);
+    }
+
+    /// A shell or program without integration in the foreground ends the refusal with the next step. Other programs do not.
+    #[test]
+    fn the_refusal_offers_request_integration_only_for_a_shell_that_can_be_integrated() {
+        let ssh = hint(ForegroundKind::Ssh, "ssh ubuntu@lidia");
+        assert!(not_at_prompt_text(InputState::Running, Some(&ssh)).ends_with(INTEGRATE_HINT));
+        let sleep = hint(ForegroundKind::Other, "sleep 30");
+        assert!(!not_at_prompt_text(InputState::Running, Some(&sleep)).contains("request_integration"));
+    }
+
+    #[test]
+    fn the_password_refusal_tells_the_agent_not_to_type() {
+        assert!(INTEGRATE_PASSWORD_REFUSAL.contains("Do not type it"), "{INTEGRATE_PASSWORD_REFUSAL}");
+        assert!(INTEGRATE_PASSWORD_REFUSAL.contains("call request_integration again"), "{INTEGRATE_PASSWORD_REFUSAL}");
     }
 }

@@ -51,6 +51,9 @@ pub struct Settings {
     /// How `run_command` is approved (core/approval). Missing in older files: manual.
     #[serde(default)]
     pub approval: ApprovalSettings,
+    /// How the agent's shell integration requests are answered (`request_integration`). Missing in older files: ask.
+    #[serde(default)]
+    pub integration: IntegrationSettings,
 }
 
 fn current_version() -> u32 {
@@ -65,6 +68,7 @@ impl Default for Settings {
             default_model: None,
             global_context_limit: None,
             approval: ApprovalSettings::default(),
+            integration: IntegrationSettings::default(),
         }
     }
 }
@@ -90,6 +94,39 @@ pub struct ApprovalSettings {
     /// Regular expressions, matched the same way. A deny match wins over an allow match.
     #[serde(default)]
     pub deny: Vec<String>,
+    /// How a nested shell (ssh, a shell the app integrated) is approved. `ask`: its commands always need a card, and approve-all
+    /// applies only in the shell it was switched on in. `same_as_local`: the rules and approve-all apply there as they do locally.
+    /// The hard gate and the deny rules apply everywhere.
+    #[serde(default)]
+    pub nested: Nested,
+}
+
+/// How commands in a nested shell are approved. See `ApprovalSettings::nested`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Nested {
+    /// Allow rules ask in a nested shell, and approve-all is tied to the shell it was switched on in.
+    #[default]
+    Ask,
+    /// Allow rules and approve-all apply in a nested shell as they do locally.
+    SameAsLocal,
+}
+
+/// The shell integration settings (core/inject, `request_integration`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct IntegrationSettings {
+    #[serde(default)]
+    pub agent_requests: AgentRequests,
+}
+
+/// What the agent's `request_integration` call does. `ask`: the user confirms each one. `auto`: the shell is integrated
+/// without a dialog. Approve-all never implies it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRequests {
+    #[default]
+    Ask,
+    Auto,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -534,6 +571,7 @@ mod tests {
             default_model: Some(ModelRef { provider_id: "example".into(), model_id: "big-1".into() }),
             global_context_limit: Some(32_000),
             approval: ApprovalSettings::default(),
+            integration: IntegrationSettings::default(),
         }
     }
 
@@ -884,6 +922,7 @@ mod tests {
             mode: ApprovalMode::Regex,
             allow: vec!["git status".into(), "cargo (test|check)( .*)?".into()],
             deny: vec!["cargo publish.*".into()],
+            ..Default::default()
         };
         save(dir.path(), &settings).unwrap();
         let text = fs::read_to_string(settings_path(dir.path())).unwrap();
@@ -900,6 +939,47 @@ mod tests {
         assert_eq!(loaded.approval, ApprovalSettings::default());
         assert_eq!(loaded.approval.mode, ApprovalMode::Manual);
         assert!(loaded.approval.allow.is_empty() && loaded.approval.deny.is_empty());
+    }
+
+    #[test]
+    fn nested_and_integration_settings_round_trip_and_default_to_ask() {
+        let dir = TempDir::new();
+        let mut settings = valid();
+        settings.approval.nested = Nested::SameAsLocal;
+        settings.integration.agent_requests = AgentRequests::Auto;
+        save(dir.path(), &settings).unwrap();
+        let text = fs::read_to_string(settings_path(dir.path())).unwrap();
+        assert!(text.contains(r#""nested": "same_as_local""#), "{text}");
+        assert!(text.contains(r#""agent_requests": "auto""#), "{text}");
+        assert_eq!(load(dir.path()).unwrap(), settings);
+
+        assert_eq!(Settings::default().approval.nested, Nested::Ask);
+        assert_eq!(Settings::default().integration.agent_requests, AgentRequests::Ask);
+    }
+
+    #[test]
+    fn an_older_file_loads_with_nested_and_integration_at_their_defaults() {
+        let dir = TempDir::new();
+        fs::create_dir_all(dir.path()).unwrap();
+        let json = br#"{"version":1,"approval":{"mode":"regex","allow":["git status"]}}"#;
+        fs::write(settings_path(dir.path()), json).unwrap();
+        let loaded = load(dir.path()).unwrap();
+        assert_eq!(loaded.approval.nested, Nested::Ask);
+        assert_eq!(loaded.integration, IntegrationSettings::default());
+        assert_eq!(loaded.integration.agent_requests, AgentRequests::Ask);
+    }
+
+    #[test]
+    fn an_unknown_nested_or_integration_value_makes_the_file_invalid() {
+        let dir = TempDir::new();
+        fs::create_dir_all(dir.path()).unwrap();
+        for json in [
+            &br#"{"version":1,"approval":{"nested":"always"}}"#[..],
+            &br#"{"version":1,"integration":{"agent_requests":"yes"}}"#[..],
+        ] {
+            fs::write(settings_path(dir.path()), json).unwrap();
+            assert!(matches!(load(dir.path()), Err(SettingsError::Invalid(_))));
+        }
     }
 
     #[test]

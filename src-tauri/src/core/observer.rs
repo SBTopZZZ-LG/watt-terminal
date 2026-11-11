@@ -762,25 +762,34 @@ impl Core {
     /// Starts an injection with `token`: the loader is about to be typed. Only while the top level is Running a program that
     /// holds a shell (ssh, a shell, su, a container exec), with no level pending, no injection in flight and depth to spare.
     pub fn begin_injection(&mut self, token: &str) -> Result<(), InjectRefusal> {
+        if let Some(refusal) = self.injection_refusal() {
+            return Err(refusal);
+        }
+        self.injection = Some(Injection { token: token.to_string(), sh: None });
+        Ok(())
+    }
+
+    /// Why `begin_injection` would refuse now, or None. The same checks, changing nothing: the agent asks this before it
+    /// asks the user.
+    pub fn injection_refusal(&self) -> Option<InjectRefusal> {
         if self.injection.is_some() || self.pending_level.is_some() {
-            return Err(InjectRefusal::Busy);
+            return Some(InjectRefusal::Busy);
         }
         if self.depth() >= MAX_DEPTH {
-            return Err(InjectRefusal::TooDeep);
+            return Some(InjectRefusal::TooDeep);
         }
         match self.lifecycle_view() {
             InputState::Running => {}
-            InputState::Alt => return Err(InjectRefusal::AltScreen),
-            _ => return Err(InjectRefusal::NotRunning),
+            InputState::Alt => return Some(InjectRefusal::AltScreen),
+            _ => return Some(InjectRefusal::NotRunning),
         }
         let holds_a_shell = self.foreground().is_some_and(|fg| {
             matches!(fg.kind, ForegroundKind::Ssh | ForegroundKind::Shell | ForegroundKind::Su | ForegroundKind::ContainerExec)
         });
         if !holds_a_shell {
-            return Err(InjectRefusal::NoShellProgram);
+            return Some(InjectRefusal::NoShellProgram);
         }
-        self.injection = Some(Injection { token: token.to_string(), sh: None });
-        Ok(())
+        None
     }
 
     /// The shell name (`zsh` or `bash`) once the loader's Ready arrived for the injection in flight.

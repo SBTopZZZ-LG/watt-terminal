@@ -35,8 +35,8 @@ use super::models::{FetchedModel, merge_fetched, models_url_for};
 use super::resolve::{self, api_key_for, headers_for};
 use super::secrets::{SecretMap, Secrets, api_key_name, header_secret_name, provider_prefix};
 use super::{
-    ApprovalSettings, ModelRef, ModelSource, Provider, SETTINGS_FILE, Settings, SettingsError, last_good_path,
-    read_checked, save, settings_path, write_private_atomic,
+    ApprovalSettings, IntegrationSettings, ModelRef, ModelSource, Provider, SETTINGS_FILE, Settings, SettingsError,
+    last_good_path, read_checked, save, settings_path, write_private_atomic,
 };
 use crate::core::chat::agent_loop::{LlmSettings, USER_AGENT, new_conversation_id};
 use crate::core::chat::redact::Redactor;
@@ -551,6 +551,17 @@ impl SettingsService {
         Ok(self.usable()?.approval)
     }
 
+    /// Saves the shell integration settings. Refused while settings.json is broken or in last-good mode, like every change.
+    pub fn set_integration(&self, integration: IntegrationSettings) -> Result<SettingsView, String> {
+        self.change_settings(|settings| settings.integration = integration)
+    }
+
+    /// The integration settings in use (the saved ones, or the last working copy's in last-good mode). Fails while
+    /// settings.json is broken, so the caller falls back to asking.
+    pub fn integration_settings(&self) -> Result<IntegrationSettings, String> {
+        Ok(self.usable()?.integration)
+    }
+
     /// What a model-list request for `id` needs: the list URL, the key and the resolved headers.
     pub fn provider_for_fetch(&self, id: &str) -> Result<FetchPlan, String> {
         let settings = self.usable()?;
@@ -745,7 +756,10 @@ mod tests {
 
     use super::super::secrets::MemoryStore;
     use super::super::test_support::TempDir;
-    use super::super::{ApprovalMode, ApprovalSettings, HeaderEntry, Model, last_good_path, load, save as save_file};
+    use super::super::{
+        AgentRequests, ApprovalMode, ApprovalSettings, HeaderEntry, IntegrationSettings, Model, Nested, last_good_path, load,
+        save as save_file,
+    };
     use super::*;
 
     const KEY: &str = "DUMMY-key-0123456789abcdef";
@@ -1009,12 +1023,12 @@ mod tests {
         let f = fixture();
         assert_eq!(f.service.approval_settings(), Ok(ApprovalSettings::default()), "no file: manual, no rules");
 
-        let bad = ApprovalSettings { mode: ApprovalMode::Regex, allow: vec!["a(".into()], deny: Vec::new() };
+        let bad = ApprovalSettings { mode: ApprovalMode::Regex, allow: vec!["a(".into()], ..ApprovalSettings::default() };
         let err = f.service.set_approval(bad).unwrap_err();
         assert!(err.contains("approval allow rule 1"), "{err}");
         assert_eq!(f.service.approval_settings(), Ok(ApprovalSettings::default()), "a refused change saved nothing");
 
-        let regex = ApprovalSettings { mode: ApprovalMode::Regex, allow: vec!["git status".into()], deny: Vec::new() };
+        let regex = ApprovalSettings { mode: ApprovalMode::Regex, allow: vec!["git status".into()], ..ApprovalSettings::default() };
         let view = f.service.set_approval(regex.clone()).unwrap();
         assert_eq!(view.settings.approval, regex);
         assert_eq!(f.service.approval_settings(), Ok(regex.clone()));
@@ -1022,11 +1036,25 @@ mod tests {
     }
 
     #[test]
+    fn integration_and_nested_settings_are_saved_and_read_back() {
+        let f = fixture();
+        assert_eq!(f.service.integration_settings(), Ok(IntegrationSettings::default()), "no file: ask");
+        let auto = IntegrationSettings { agent_requests: AgentRequests::Auto };
+        let view = f.service.set_integration(auto).unwrap();
+        assert_eq!(view.settings.integration, auto);
+        assert_eq!(service_on(&f.dir, &f.store).integration_settings(), Ok(auto), "a new service reads it back");
+
+        let nested = ApprovalSettings { nested: Nested::SameAsLocal, ..ApprovalSettings::default() };
+        f.service.set_approval(nested.clone()).unwrap();
+        assert_eq!(f.service.approval_settings(), Ok(nested));
+    }
+
+    #[test]
     fn last_good_mode_runs_the_saved_approval_rules_and_refuses_changes() {
         let f = fixture();
         f.service.save_provider(with_key(provider("acme"), KEY)).unwrap();
         f.service.set_default_model(Some(model_ref("acme", "big"))).unwrap();
-        let regex = ApprovalSettings { mode: ApprovalMode::Regex, allow: vec!["echo .*".into()], deny: Vec::new() };
+        let regex = ApprovalSettings { mode: ApprovalMode::Regex, allow: vec!["echo .*".into()], ..ApprovalSettings::default() };
         f.service.set_approval(regex.clone()).unwrap();
         let _launch = service_on(&f.dir, &f.store);
         break_settings(&f);

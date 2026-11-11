@@ -21,7 +21,7 @@ use crate::core::chat::todo::Todo;
 use crate::core::foreground::Foreground;
 use crate::core::llm::TurnCancel;
 use crate::core::session::{Session, USER_TEXT_CODE};
-use crate::core::tools::{AgentTools, TopLevel};
+use crate::core::tools::{AgentTools, TopLevel, integration_result};
 
 pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -40,13 +40,54 @@ pub enum AutoState {
     Suspended,
 }
 
-/// Pending approvals, keyed by call id. A request that is not answered in time counts as a denial.
+/// Calls waiting for an answer, keyed by call id. A call that is not answered in time counts as a denial.
+struct Pending {
+    requests: Mutex<HashMap<String, Sender<bool>>>,
+    timeout: Duration,
+}
+
+impl Pending {
+    fn new(timeout: Duration) -> Self {
+        Pending { requests: Mutex::new(HashMap::new()), timeout }
+    }
+
+    /// Registers `call_id`, runs `announce` so the UI can show the request, then waits. Only an explicit answer of true
+    /// returns true. Denial, cancel and timeout return false.
+    fn ask(&self, call_id: &str, announce: impl FnOnce()) -> bool {
+        let (tx, rx) = mpsc::channel();
+        self.lock().insert(call_id.to_string(), tx);
+        announce();
+        let answer = rx.recv_timeout(self.timeout).unwrap_or(false);
+        self.lock().remove(call_id);
+        answer
+    }
+
+    /// Answers a pending request. Returns false if `call_id` is not pending (already answered or timed out).
+    fn decide(&self, call_id: &str, answer: bool) -> bool {
+        let tx = self.lock().remove(call_id);
+        tx.is_some_and(|tx| tx.send(answer).is_ok())
+    }
+
+    /// Answers every pending request with false.
+    fn cancel_all(&self) {
+        for (_, tx) in self.lock().drain() {
+            let _ = tx.send(false);
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, HashMap<String, Sender<bool>>> {
+        self.requests.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Pending approvals for `run_command` and `send_keys`, keyed by call id. Also holds the `request_integration` asks.
 pub struct ApprovalGate {
-    pending: Mutex<HashMap<String, Sender<bool>>>,
+    pending: Pending,
+    /// The `request_integration` asks. Cancelled together with the approvals (Ctrl-C, cancel).
+    integrations: IntegrationGate,
     /// Approve-all: None when off. When on, the key of the shell level it was switched on in. It applies only while that
     /// level is on top (see `auto_state`), so it never carries into a nested shell or back out of one unseen.
     auto: Mutex<Option<u64>>,
-    timeout: Duration,
 }
 
 impl Default for ApprovalGate {
@@ -61,7 +102,11 @@ impl ApprovalGate {
     }
 
     pub fn with_timeout(timeout: Duration) -> Self {
-        ApprovalGate { pending: Mutex::new(HashMap::new()), auto: Mutex::new(None), timeout }
+        ApprovalGate {
+            pending: Pending::new(timeout),
+            integrations: IntegrationGate::with_timeout(timeout),
+            auto: Mutex::new(None),
+        }
     }
 
     /// Switches approve-all on or off. `level` is the key of the shell on top when it is switched on. The caller takes it
@@ -84,36 +129,62 @@ impl ApprovalGate {
         }
     }
 
+    /// Approve-all as it applies to the shell `level`, when nested shells follow the local rules (`across_levels`): then it
+    /// is on whenever it is switched on, in whichever shell that was. Otherwise the same as `auto_state`.
+    pub fn auto_state_across(&self, level: u64, across_levels: bool) -> AutoState {
+        if across_levels && self.auto_approve() { AutoState::On } else { self.auto_state(level) }
+    }
+
     fn auto_lock(&self) -> MutexGuard<'_, Option<u64>> {
         self.auto.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Registers `call_id`, runs `announce` so the UI can show the request, then waits. Only an explicit
-    /// approval returns true. Denial, cancel and timeout return false.
+    /// Registers `call_id`, runs `announce` so the UI can show the request, then waits. Only an explicit approval returns
+    /// true. Denial, cancel and timeout return false.
     pub fn ask(&self, call_id: &str, announce: impl FnOnce()) -> bool {
-        let (tx, rx) = mpsc::channel();
-        self.lock().insert(call_id.to_string(), tx);
-        announce();
-        let answer = rx.recv_timeout(self.timeout).unwrap_or(false);
-        self.lock().remove(call_id);
-        answer
+        self.pending.ask(call_id, announce)
     }
 
-    /// Answers a pending request. Returns false if `call_id` is not pending (already answered or timed out).
+    /// Answers a pending approval. Returns false if `call_id` is not pending (already answered or timed out).
     pub fn decide(&self, call_id: &str, approve: bool) -> bool {
-        let tx = self.lock().remove(call_id);
-        tx.is_some_and(|tx| tx.send(approve).is_ok())
+        self.pending.decide(call_id, approve)
     }
 
-    /// Denies every pending request. Called when the user presses Ctrl-C.
+    /// The gate for `request_integration` asks.
+    pub fn integrations(&self) -> &IntegrationGate {
+        &self.integrations
+    }
+
+    /// Denies every pending request, approvals and integration asks alike. Called when the user presses Ctrl-C.
     pub fn cancel_all(&self) {
-        for (_, tx) in self.lock().drain() {
-            let _ = tx.send(false);
-        }
+        self.pending.cancel_all();
+        self.integrations.cancel_all();
+    }
+}
+
+/// Pending `request_integration` asks, keyed by call id. Answered by `answer_integration`. A timed-out or cancelled ask is
+/// declined, as an approval would be.
+pub struct IntegrationGate {
+    pending: Pending,
+}
+
+impl IntegrationGate {
+    pub fn with_timeout(timeout: Duration) -> Self {
+        IntegrationGate { pending: Pending::new(timeout) }
     }
 
-    fn lock(&self) -> MutexGuard<'_, HashMap<String, Sender<bool>>> {
-        self.pending.lock().unwrap_or_else(|e| e.into_inner())
+    /// Registers `call_id`, runs `announce` (the dialog), then waits. Only an explicit accept returns true.
+    pub fn ask(&self, call_id: &str, announce: impl FnOnce()) -> bool {
+        self.pending.ask(call_id, announce)
+    }
+
+    /// Answers a pending ask. Returns false if `call_id` is not pending.
+    pub fn decide(&self, call_id: &str, accept: bool) -> bool {
+        self.pending.decide(call_id, accept)
+    }
+
+    pub fn cancel_all(&self) {
+        self.pending.cancel_all();
     }
 }
 
@@ -185,6 +256,19 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         location: Option<String>,
     },
+    /// A `request_integration` call. `phase` is `asking` (the user's answer is awaited, see `answer_integration`), `running`
+    /// (the handshake is typing into the shell) or `done` (`outcome` is what the handshake gave, or `declined`). `label` is the
+    /// command that holds the shell, on `asking` and `running`. The wire type is `integration_request`: `integration` is the
+    /// session's shell-integration status event.
+    #[serde(rename = "integration_request")]
+    Integration {
+        call_id: String,
+        phase: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        outcome: Option<Value>,
+    },
     /// Streamed assistant text. `Text` is still used for whole messages.
     TextDelta { text: String },
     /// The model is working on a reply (true) or has produced its first output (false).
@@ -207,12 +291,23 @@ fn new_call_id() -> String {
 /// Tools that never change the shell. `read_tool` accepts only these. Must match `READ_NAMES` in core/chat/agent_loop.rs.
 const READ_TOOLS: [&str; 5] = ["list_commands", "get_command", "get_screen", "get_cwd", "wait"];
 
-/// What an agent may use during one turn: the approval gate, the approval policy, and a way to report events. The tools
-/// are private: the only route to them is `call_tool` (approval-gated) or `read_tool` (read-only names).
+/// What a turn reads from the saved settings when it decides. lib.rs builds one per user message. The defaults are the
+/// cautious ones: a nested shell is approved as before (its allow rules ask), and `request_integration` asks the user.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TurnRules {
+    /// Approval nested = same as local: allow rules and approve-all apply in nested shells too.
+    pub follow_local_in_nested: bool,
+    /// Integration requests = auto: `request_integration` integrates the shell without a dialog.
+    pub integrate_without_asking: bool,
+}
+
+/// What an agent may use during one turn: the approval gate, the approval policy, the turn's rules, and a way to report
+/// events. The tools are private: the only route to them is `call_tool` (approval-gated) or `read_tool` (read-only names).
 pub struct AgentCtx<'a> {
     tools: &'a dyn AgentTools,
     approvals: &'a ApprovalGate,
     policy: &'a dyn ApprovalPolicy,
+    rules: TurnRules,
     emit: &'a dyn Fn(AgentEvent),
 }
 
@@ -221,12 +316,18 @@ static MANUAL: ManualPolicy = ManualPolicy;
 
 impl<'a> AgentCtx<'a> {
     pub fn new(tools: &'a dyn AgentTools, approvals: &'a ApprovalGate, emit: &'a dyn Fn(AgentEvent)) -> Self {
-        AgentCtx { tools, approvals, policy: &MANUAL, emit }
+        AgentCtx { tools, approvals, policy: &MANUAL, rules: TurnRules::default(), emit }
     }
 
     /// Uses `policy` for the calls that are not approve-all (core/approval). lib.rs builds one per user message.
     pub fn with_policy(mut self, policy: &'a dyn ApprovalPolicy) -> Self {
         self.policy = policy;
+        self
+    }
+
+    /// Uses `rules` for the nested-shell and integration decisions of this turn (see `TurnRules`).
+    pub fn with_rules(mut self, rules: TurnRules) -> Self {
+        self.rules = rules;
         self
     }
 
@@ -313,6 +414,9 @@ impl<'a> AgentCtx<'a> {
         if !gated || READ_TOOLS.contains(&name) {
             return ("read", None, self.execute(name, args, false, None));
         }
+        if name == "request_integration" {
+            return self.gate_integration(call_id);
+        }
         // A run_command the user's typed text would block is refused before the approval card: the user is not asked to
         // approve it. The tool checks again when it injects, in case the user types while the card waits.
         if name == "run_command"
@@ -325,7 +429,7 @@ impl<'a> AgentCtx<'a> {
         // Approve-all skips the policy for run_command. send_keys always goes to the policy, which always asks.
         let verdict = match name {
             "run_command" => self.run_command_verdict(&top, args),
-            "send_keys" => self.policy.decide(name, args, top.is_nested()),
+            "send_keys" => self.policy.decide(name, args, self.policy_nested(&top)),
             // Nothing else is gated: it runs as it always did, without a card.
             _ => return self.run_ungated(name, args),
         };
@@ -361,11 +465,72 @@ impl<'a> AgentCtx<'a> {
     /// The verdict for a run_command. Approve-all decides it while it applies to the shell on top, and asks (suspended)
     /// while it was switched on in another shell. Otherwise the policy decides, and a nested shell is told so.
     fn run_command_verdict(&self, top: &TopLevel, args: &Value) -> Verdict {
-        match self.approvals.auto_state(top.key) {
+        match self.approvals.auto_state_across(top.key, self.rules.follow_local_in_nested) {
             AutoState::On => Verdict::Auto(Reason::ApproveAll),
             AutoState::Suspended => Verdict::Ask(Reason::ApproveAllSuspended),
-            AutoState::Off => self.policy.decide("run_command", args, top.is_nested()),
+            AutoState::Off => self.policy.decide("run_command", args, self.policy_nested(top)),
         }
+    }
+
+    /// Whether the policy treats the shell on top as nested: a nested level, unless nested shells follow the local rules.
+    fn policy_nested(&self, top: &TopLevel) -> bool {
+        top.is_nested() && !self.rules.follow_local_in_nested
+    }
+
+    /// `request_integration`: integrates the shell in the foreground as a new level. It never uses the command card, and
+    /// approve-all does not apply to it. With `integration.agent_requests` = auto it runs at once. Otherwise the user is asked
+    /// (`asking`) and the call waits for `answer_integration`. A decline, a cancel or a timeout ends the call with an error
+    /// that is not a denial (no DENIED prefix), so the turn goes on: the user is away, and the agent can still work.
+    fn gate_integration(&self, call_id: &str) -> (&'static str, Option<&'static str>, Result<Value, String>) {
+        let label = match self.tools.integration_precheck() {
+            Ok(label) => label,
+            Err(refusal) => return ("refused", None, Err(refusal)),
+        };
+        if self.rules.integrate_without_asking {
+            let result = self.run_integration(call_id, &label);
+            return (if result.is_ok() { "auto" } else { "refused" }, None, result);
+        }
+        let accepted = self.approvals.integrations().ask(call_id, || {
+            self.emit(AgentEvent::Integration {
+                call_id: call_id.to_string(),
+                phase: "asking",
+                label: Some(label.clone()),
+                outcome: None,
+            })
+        });
+        if !accepted {
+            self.emit(AgentEvent::Integration {
+                call_id: call_id.to_string(),
+                phase: "done",
+                label: None,
+                outcome: Some(json!({"outcome": "declined"})),
+            });
+            let err = "declined: the user did not integrate this shell (declined or no answer within 2 minutes). Do not ask \
+                       again in this turn. You can still read it with get_screen, or ask the user in your reply."
+                .to_string();
+            return ("denied", None, Err(err));
+        }
+        // The user accepted, so the decision stays "manual" even if the handshake then fails.
+        ("manual", None, self.run_integration(call_id, &label))
+    }
+
+    /// The handshake for `request_integration`, bracketed by its `running` and `done` events. The result is what the model
+    /// reads: the text of an integrated shell, or the error that says what to do next.
+    fn run_integration(&self, call_id: &str, label: &str) -> Result<Value, String> {
+        self.emit(AgentEvent::Integration {
+            call_id: call_id.to_string(),
+            phase: "running",
+            label: Some(label.to_string()),
+            outcome: None,
+        });
+        let outcome = self.tools.integrate_shell();
+        self.emit(AgentEvent::Integration {
+            call_id: call_id.to_string(),
+            phase: "done",
+            label: None,
+            outcome: serde_json::to_value(&outcome).ok(),
+        });
+        integration_result(&outcome)
     }
 
     /// A gated name the gate does not know: no card and no policy. Runs as it did before the policy existed.
@@ -563,6 +728,7 @@ mod tests {
     use crate::core::foreground::ForegroundKind;
     use crate::core::observer::{InputState, IntegrationStatus, ObserverStatus};
     use crate::core::record::{Cwd, RecordSummary};
+    use crate::core::session::IntegrateOutcome;
     use crate::core::settings::{ApprovalMode, ApprovalSettings};
     use crate::core::tools::{CommandView, RunOutcome, ScreenView, TopLevel, WaitView};
 
@@ -580,6 +746,12 @@ mod tests {
         top: Mutex<TopLevel>,
         /// When set, every `call` fails with this error after it is recorded.
         call_error: Option<String>,
+        /// What `integration_precheck` refuses with. None means it passes (the shell is `ssh h`).
+        integration_refusal: Option<String>,
+        /// What `integrate_shell` returns. None means an integrated shell.
+        integrate_outcome: Mutex<Option<IntegrateOutcome>>,
+        /// How many times the handshake was run.
+        integrate_calls: Mutex<usize>,
     }
 
     impl Recorder {
@@ -637,6 +809,13 @@ mod tests {
         }
         fn top_level(&self) -> TopLevel {
             self.top.lock().unwrap().clone()
+        }
+        fn integration_precheck(&self) -> Result<String, String> {
+            self.integration_refusal.clone().map_or(Ok("ssh h".to_string()), Err)
+        }
+        fn integrate_shell(&self) -> IntegrateOutcome {
+            *self.integrate_calls.lock().unwrap() += 1;
+            self.integrate_outcome.lock().unwrap().clone().unwrap_or_else(integrated)
         }
         fn call(&self, name: &str, _args: &Value, expected_level: Option<u64>) -> Result<Value, String> {
             self.reached.lock().unwrap().push(name.to_string());
@@ -970,6 +1149,7 @@ mod tests {
             mode: ApprovalMode::Regex,
             allow: allow.iter().map(|s| s.to_string()).collect(),
             deny: Vec::new(),
+            ..Default::default()
         };
         RegexPolicy::new(&approval).expect("the rules compile")
     }
@@ -1267,6 +1447,7 @@ mod tests {
             mode: ApprovalMode::Regex,
             allow: vec![".*".into()],
             deny: vec!["cargo .*".into()],
+            ..Default::default()
         };
         let policy = RegexPolicy::new(&approval).expect("the rules compile");
         let log = Mutex::new(Vec::new());
@@ -1274,5 +1455,287 @@ mod tests {
         let ctx = AgentCtx::new(&tools, &gate, &emit).with_policy(&policy);
         assert!(ctx.call_tool("run_command", json!({"command": "cargo test"})).is_err());
         assert_eq!(reasons(&log), [("run_command".to_string(), "denied", Some("deny_rule"))]);
+    }
+
+    // ---------- request_integration and the turn rules ----------
+
+    fn integrated() -> IntegrateOutcome {
+        IntegrateOutcome::Integrated {
+            key: 1,
+            label: "ssh h".into(),
+            sh: "bash".into(),
+            user: Some("tester".into()),
+            host: Some("127.0.0.1".into()),
+        }
+    }
+
+    /// The phases of the integration events, in order, with whether each carries a label and its outcome.
+    fn integration_events(log: &Mutex<Vec<AgentEvent>>) -> Vec<(&'static str, bool, Option<Value>)> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Integration { phase, label, outcome, .. } => Some((*phase, label.is_some(), outcome.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn phases(log: &Mutex<Vec<AgentEvent>>) -> Vec<&'static str> {
+        integration_events(log).into_iter().map(|e| e.0).collect()
+    }
+
+    /// With auto, the shell is integrated at once: no card, no question, and the result is the integrated text.
+    #[test]
+    fn request_integration_with_auto_runs_without_asking() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+        let rules = TurnRules { integrate_without_asking: true, ..TurnRules::default() };
+        let ctx = AgentCtx::new(&tools, &gate, &emit).with_rules(rules);
+        let result = ctx.call_tool("request_integration", json!({})).expect("integrated");
+        assert_eq!(result, json!("Integrated ssh h (bash as tester@127.0.0.1). You can now use run_command in this shell."));
+        assert_eq!(*tools.integrate_calls.lock().unwrap(), 1);
+        assert_eq!(phases(&log), ["running", "done"], "no asking event");
+        assert!(!log.lock().unwrap().iter().any(|e| matches!(e, AgentEvent::ApprovalRequest { .. })));
+        assert_eq!(decisions(&log), [named("request_integration", "auto", true)]);
+    }
+
+    /// Without auto the user is asked first. The answer is given in the emit callback: the ask is registered before its event
+    /// goes out, so an answer given there is already waiting.
+    #[test]
+    fn request_integration_asks_first_and_runs_when_accepted() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| {
+            if let AgentEvent::Integration { call_id, phase: "asking", label, .. } = &ev {
+                assert_eq!(label.as_deref(), Some("ssh h"));
+                assert!(gate.integrations().decide(call_id, true));
+            }
+            log.lock().unwrap().push(ev);
+        };
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        assert!(ctx.call_tool("request_integration", json!({})).is_ok());
+        assert_eq!(phases(&log), ["asking", "running", "done"]);
+        assert_eq!(*tools.integrate_calls.lock().unwrap(), 1);
+        assert_eq!(decisions(&log), [named("request_integration", "manual", true)]);
+    }
+
+    /// A declined ask is refused: the handshake never runs, the decision is "denied", and the error says what the agent can
+    /// do instead. It is not a DENIED error, so the turn does not stop (see the agent loop's tests).
+    #[test]
+    fn a_declined_integration_never_integrates_and_is_not_a_denial_error() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| {
+            if let AgentEvent::Integration { call_id, phase: "asking", .. } = &ev {
+                assert!(gate.integrations().decide(call_id, false));
+            }
+            log.lock().unwrap().push(ev);
+        };
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        let err = ctx.call_tool("request_integration", json!({})).expect_err("declined");
+        assert!(!err.starts_with(DENIED), "a declined integration must not stop the turn: {err}");
+        assert!(err.starts_with("declined: the user did not integrate this shell"), "{err}");
+        assert!(err.contains("Do not ask again in this turn") && err.contains("get_screen"), "{err}");
+        assert_eq!(*tools.integrate_calls.lock().unwrap(), 0);
+        assert_eq!(phases(&log), ["asking", "done"]);
+        assert_eq!(integration_events(&log)[1].2, Some(json!({"outcome": "declined"})));
+        assert_eq!(decisions(&log), [named("request_integration", "denied", false)]);
+    }
+
+    /// A cancel while the dialog is open declines it, and so does an ask nobody answers in time. Neither stops the turn.
+    #[test]
+    fn a_cancelled_or_unanswered_integration_ask_is_declined() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| {
+            if matches!(ev, AgentEvent::Integration { phase: "asking", .. }) {
+                gate.cancel_all();
+            }
+            log.lock().unwrap().push(ev);
+        };
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        let err = ctx.call_tool("request_integration", json!({})).expect_err("cancelled");
+        assert!(err.starts_with("declined: "), "{err}");
+        assert!(!err.starts_with(DENIED), "{err}");
+        assert_eq!(phases(&log), ["asking", "done"]);
+
+        let quiet = ApprovalGate::with_timeout(Duration::from_millis(30));
+        let silent = |_: AgentEvent| {};
+        let ctx = AgentCtx::new(&tools, &quiet, &silent);
+        let err = ctx.call_tool("request_integration", json!({})).expect_err("timed out");
+        assert!(err.starts_with("declined: "), "{err}");
+        assert!(!err.starts_with(DENIED), "{err}");
+        assert_eq!(*tools.integrate_calls.lock().unwrap(), 0);
+    }
+
+    /// Approve-all is for commands: it does not answer an integration ask.
+    #[test]
+    fn approve_all_does_not_integrate_a_shell() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        gate.set_auto_approve(true, 0);
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| {
+            if let AgentEvent::Integration { call_id, phase: "asking", .. } = &ev {
+                assert!(gate.integrations().decide(call_id, false));
+            }
+            log.lock().unwrap().push(ev);
+        };
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        assert!(ctx.call_tool("request_integration", json!({})).is_err());
+        assert_eq!(phases(&log), ["asking", "done"], "approve-all still asks");
+        assert_eq!(*tools.integrate_calls.lock().unwrap(), 0);
+    }
+
+    /// A refused precheck is an error with no card and no question, and the handshake does not run.
+    #[test]
+    fn a_refused_integration_never_asks_and_says_why() {
+        let tools = Recorder { integration_refusal: Some("cannot integrate the shell now: nothing".into()), ..Recorder::default() };
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        let err = ctx.call_tool("request_integration", json!({})).expect_err("refused");
+        assert_eq!(err, "cannot integrate the shell now: nothing");
+        assert!(phases(&log).is_empty());
+        assert_eq!(*tools.integrate_calls.lock().unwrap(), 0);
+        assert_eq!(decisions(&log), [named("request_integration", "refused", false)]);
+    }
+
+    /// Accepted, then the handshake fails: the user did approve, so the decision stays manual, and the result is an error that
+    /// is not a denial.
+    #[test]
+    fn a_failed_handshake_after_acceptance_stays_manual_and_is_an_error() {
+        let tools = Recorder { integrate_outcome: Mutex::new(Some(IntegrateOutcome::Timeout)), ..Recorder::default() };
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| {
+            if let AgentEvent::Integration { call_id, phase: "asking", .. } = &ev {
+                assert!(gate.integrations().decide(call_id, true));
+            }
+            log.lock().unwrap().push(ev);
+        };
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        let err = ctx.call_tool("request_integration", json!({})).expect_err("timed out");
+        assert!(!err.starts_with(DENIED), "{err}");
+        assert!(err.contains("timed out") && err.contains("request_integration again"), "{err}");
+        assert_eq!(decisions(&log), [named("request_integration", "manual", false)]);
+    }
+
+    /// The result of an integration the user accepted: the outcome and the events carry the label on the asking and running
+    /// phases only.
+    #[test]
+    fn the_integration_events_carry_the_label_and_the_outcome() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| {
+            if let AgentEvent::Integration { call_id, phase: "asking", .. } = &ev {
+                assert!(gate.integrations().decide(call_id, true));
+            }
+            log.lock().unwrap().push(ev);
+        };
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        assert!(ctx.call_tool("request_integration", json!({})).is_ok());
+        let events = integration_events(&log);
+        assert_eq!(events[0], ("asking", true, None));
+        assert_eq!(events[1], ("running", true, None));
+        assert_eq!(events[2].0, "done");
+        assert!(!events[2].1, "done carries no label");
+        assert_eq!(events[2].2.as_ref().and_then(|o| o.get("outcome")), Some(&json!("integrated")));
+    }
+
+    /// The wire form: the type is `integration_request` (not the session's `integration` status event), and the optional
+    /// fields are left out when absent.
+    #[test]
+    fn the_integration_event_serializes_with_its_phase_and_optional_fields() {
+        let asking = AgentEvent::Integration {
+            call_id: "call-9".into(),
+            phase: "asking",
+            label: Some("ssh h".into()),
+            outcome: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&asking).unwrap(),
+            json!({"type": "integration_request", "call_id": "call-9", "phase": "asking", "label": "ssh h"})
+        );
+        let done = AgentEvent::Integration { call_id: "call-9".into(), phase: "done", label: None, outcome: Some(json!({"outcome": "declined"})) };
+        assert_eq!(
+            serde_json::to_value(&done).unwrap(),
+            json!({"type": "integration_request", "call_id": "call-9", "phase": "done", "outcome": {"outcome": "declined"}})
+        );
+    }
+
+    /// With approval nested = same as local, an allow rule runs a command in a nested shell without a card, as it does on the
+    /// local shell. The reason is the rule.
+    #[test]
+    fn an_allow_rule_runs_in_a_nested_shell_when_nested_follows_local() {
+        let tools = Recorder::default();
+        tools.set_top(nested(1, "ssh h"));
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let policy = regex_policy(&["echo .*"]);
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+        let rules = TurnRules { follow_local_in_nested: true, ..TurnRules::default() };
+        let ctx = AgentCtx::new(&tools, &gate, &emit).with_policy(&policy).with_rules(rules);
+        assert!(ctx.call_tool("run_command", json!({"command": "echo remote"})).is_ok());
+        assert_eq!(reasons(&log), [("run_command".to_string(), "auto", Some("rule"))]);
+        assert_eq!(tools.reached(), ["run_command"]);
+    }
+
+    /// Following the local rules does not loosen the floor: the hard gate and the deny rules still refuse in a nested shell.
+    #[test]
+    fn the_hard_gate_and_deny_rules_still_apply_when_nested_follows_local() {
+        let tools = Recorder::default();
+        tools.set_top(nested(1, "ssh h"));
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let policy = RegexPolicy::new(&ApprovalSettings {
+            mode: ApprovalMode::Regex,
+            allow: vec![".*".into()],
+            deny: vec!["cargo .*".into()],
+            ..ApprovalSettings::default()
+        })
+        .expect("rules compile");
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+        let rules = TurnRules { follow_local_in_nested: true, ..TurnRules::default() };
+        let ctx = AgentCtx::new(&tools, &gate, &emit).with_policy(&policy).with_rules(rules);
+        assert!(ctx.call_tool("run_command", json!({"command": "sudo ls"})).is_err());
+        assert!(ctx.call_tool("run_command", json!({"command": "cargo test"})).is_err());
+        assert_eq!(
+            reasons(&log),
+            [
+                ("run_command".to_string(), "denied", Some("gate_denylist")),
+                ("run_command".to_string(), "denied", Some("deny_rule")),
+            ]
+        );
+        assert!(tools.reached().is_empty(), "nothing reached the tools");
+    }
+
+    /// Approve-all switched on in the local shell applies in a nested shell when nested follows local. Without that setting it
+    /// is suspended there, as before.
+    #[test]
+    fn approve_all_carries_into_a_nested_shell_when_nested_follows_local() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        gate.set_auto_approve(true, 0);
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+        tools.set_top(nested(1, "ssh h"));
+
+        let follow = AgentCtx::new(&tools, &gate, &emit).with_rules(TurnRules { follow_local_in_nested: true, ..TurnRules::default() });
+        assert!(follow.call_tool("run_command", json!({"command": "pwd"})).is_ok());
+        assert_eq!(reasons(&log), [("run_command".to_string(), "auto", Some("approve_all"))]);
+
+        let asking = AgentCtx::new(&tools, &gate, &emit);
+        assert!(asking.call_tool("run_command", json!({"command": "pwd"})).is_err());
+        assert_eq!(reasons(&log)[1], ("run_command".to_string(), "denied", Some("approve_all_suspended")));
+        assert_eq!(tools.reached(), ["run_command"]);
     }
 }

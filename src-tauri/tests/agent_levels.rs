@@ -93,6 +93,7 @@ fn rules(allow: &[&str]) -> RegexPolicy {
         mode: ApprovalMode::Regex,
         allow: allow.iter().map(|s| s.to_string()).collect(),
         deny: Vec::new(),
+        ..Default::default()
     };
     RegexPolicy::new(&approval).expect("the rules compile")
 }

@@ -15,6 +15,7 @@ use agent_term_lib::core::chat::prompt;
 use agent_term_lib::core::chat::todo;
 use agent_term_lib::core::llm::{TurnCancel, http_client};
 use agent_term_lib::core::record::{Cwd, RecordSummary};
+use agent_term_lib::core::session::IntegrateOutcome;
 use agent_term_lib::core::tools::{AgentTools, CommandView, RunOutcome, ScreenView, WaitView};
 use serde_json::{Value, json};
 
@@ -184,6 +185,8 @@ struct FakeTools {
     cancel_on_cwd: Option<Arc<TurnCancel>>,
     /// The output a `run_command` returns. Defaults to "hello".
     command_output: Option<String>,
+    /// How many times the handshake was run (`integrate_shell`). It never is in these tests: the user declines or does not answer.
+    integrations: Mutex<usize>,
 }
 
 impl FakeTools {
@@ -214,6 +217,13 @@ impl AgentTools for FakeTools {
     }
     fn send_keys(&self, _bytes: &[u8]) -> Result<(), String> {
         panic!("the loop calls tools by name through `call`")
+    }
+    fn integration_precheck(&self) -> Result<String, String> {
+        Ok("ssh h".to_string())
+    }
+    fn integrate_shell(&self) -> IntegrateOutcome {
+        *self.integrations.lock().unwrap() += 1;
+        IntegrateOutcome::Timeout
     }
 
     fn call(&self, name: &str, args: &Value, _expected_level: Option<u64>) -> Result<Value, String> {
@@ -482,6 +492,61 @@ fn denied_run_command_ends_the_turn_and_closes_the_rest() {
     assert_eq!(msgs.len(), 4, "user, assistant, and one tool result per call");
     assert!(tool_content(&msgs, "call_a").starts_with("error: not_approved"), "{msgs:?}");
     assert_eq!(tool_content(&msgs, "call_b"), "denied by the user");
+    assert_paired(&msgs);
+}
+
+/// The user declines `request_integration`: the handshake does not run, the error goes back to the model, and the turn
+/// goes on. The next call of the same reply runs, and the model is called again.
+#[test]
+fn a_declined_integration_does_not_end_the_turn() {
+    let provider = serve(vec![
+        Script::json(tool_reply(&[("call_a", "request_integration", "{}"), ("call_b", "get_cwd", "{}")])),
+        Script::json(text_reply("I will read the screen instead.")),
+    ]);
+    let conv = Conversation::new().unwrap();
+    let tools = FakeTools::default();
+    let gate = no_gate();
+    let log: Mutex<Vec<AgentEvent>> = Mutex::new(Vec::new());
+    let emit = |ev: AgentEvent| {
+        if let AgentEvent::Integration { call_id, phase: "asking", .. } = &ev {
+            assert!(gate.integrations().decide(call_id, false), "the ask is waiting");
+        }
+        log.lock().unwrap().push(ev);
+    };
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
+    let ctx = AgentCtx::new(&tools, &gate, &emit);
+    agent::run_turn(&mut agent, "integrate the ssh shell", &ctx);
+    let events = log.into_inner().unwrap();
+
+    assert_eq!(*tools.integrations.lock().unwrap(), 0, "a declined shell is not integrated");
+    assert_eq!(tools.reached(), ["get_cwd"], "the call after the decline ran");
+    assert_eq!(provider.requests().len(), 2, "the model is called again after a decline");
+    assert_eq!(decisions(&events), [("request_integration".to_string(), "denied", false), ("get_cwd".to_string(), "read", true)]);
+    assert_eq!(texts(&events), ["I will read the screen instead."], "no 'stopped' notice");
+    let msgs = stored(&conv.history());
+    assert!(tool_content(&msgs, "call_a").starts_with("error: declined: the user did not integrate this shell"), "{msgs:?}");
+    assert_eq!(tool_content(&msgs, "call_b"), "box:/home/u");
+    assert_paired(&msgs);
+}
+
+/// Nobody answers `request_integration`: it times out as a decline, and the turn goes on as it does after a decline.
+#[test]
+fn an_unanswered_integration_does_not_end_the_turn() {
+    let provider = serve(vec![
+        Script::json(tool_reply(&[("call_a", "request_integration", "{}"), ("call_b", "get_cwd", "{}")])),
+        Script::json(text_reply("Nobody answered, so I will work from the screen.")),
+    ]);
+    let conv = Conversation::new().unwrap();
+    let tools = FakeTools::default();
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
+    let events = turn(&mut agent, &tools, &no_gate(), "integrate the ssh shell");
+
+    assert_eq!(*tools.integrations.lock().unwrap(), 0);
+    assert_eq!(tools.reached(), ["get_cwd"]);
+    assert_eq!(provider.requests().len(), 2);
+    assert_eq!(texts(&events), ["Nobody answered, so I will work from the screen."]);
+    let msgs = stored(&conv.history());
+    assert!(tool_content(&msgs, "call_a").starts_with("error: declined: "), "{msgs:?}");
     assert_paired(&msgs);
 }
 

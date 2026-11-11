@@ -286,6 +286,7 @@ mod tests {
             mode,
             allow: allow.iter().map(|s| s.to_string()).collect(),
             deny: deny.iter().map(|s| s.to_string()).collect(),
+            nested: crate::core::settings::Nested::Ask,
         }
     }
 
@@ -601,13 +602,13 @@ mod tests {
     #[test]
     fn too_many_rules_are_refused() {
         let many: Vec<String> = (0..=MAX_RULES).map(|n| format!("cmd{n}")).collect();
-        let approval = ApprovalSettings { mode: ApprovalMode::Regex, allow: many, deny: Vec::new() };
+        let approval = ApprovalSettings { mode: ApprovalMode::Regex, allow: many, ..ApprovalSettings::default() };
         let problems = validate_settings(&approval);
         assert!(problems.iter().any(|p| p.contains("at most 50 rules")), "{problems:?}");
         let at_limit = ApprovalSettings {
             mode: ApprovalMode::Regex,
             allow: (0..MAX_RULES).map(|n| format!("cmd{n}")).collect(),
-            deny: Vec::new(),
+            ..ApprovalSettings::default()
         };
         assert!(validate_settings(&at_limit).is_empty());
     }
