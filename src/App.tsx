@@ -150,6 +150,52 @@ export default function App() {
     api.getStatus().then((s) => setConversationId(s.conversation_id)).catch(reportError);
   };
 
+  // The settings refresh's guards: a response is ignored after unmount, and when a newer refresh has started since.
+  const settingsAlive = useRef(true);
+  const settingsRequest = useRef(0);
+  useEffect(() => {
+    settingsAlive.current = true;
+    return () => {
+      settingsAlive.current = false;
+    };
+  }, []);
+
+  /**
+   * Reads the settings state again from the status, so a settings.json fixed by hand shows in the chip and the banner without
+   * a restart or Reload. It sets only the settings fields (the state, the banner's visibility as applyStatus does, and the model
+   * the chip shows). It never touches the busy state, the conversation or the input, so it is safe while a send is in transit.
+   * Errors are ignored: the next refresh tries again.
+   */
+  const refreshSettingsState = useCallback(() => {
+    settingsRequest.current += 1;
+    const request = settingsRequest.current;
+    api.getStatus().then(
+      (s) => {
+        if (!settingsAlive.current || request !== settingsRequest.current) {
+          return;
+        }
+        setLlm(s.llm);
+        setSettingsState(s.settings_state ?? null);
+        if (recoveryKind(s.settings_state) !== 'ok') {
+          setSettingsBannerHidden(false);
+        }
+      },
+      () => undefined,
+    );
+  }, []);
+
+  /** Opens the AI settings, and reads the settings state again on the way in, so the chip and the banner match the file. */
+  const openSettings = () => {
+    setSettingsOpen(true);
+    refreshSettingsState();
+  };
+
+  /** Closes the AI settings, and reads the settings state again: the dialog may have changed the file. */
+  const closeSettings = () => {
+    setSettingsOpen(false);
+    refreshSettingsState();
+  };
+
   // The UI state file: read once, reconciled with the localStorage values, and kept in step after that. The file wins when it
   // has a valid value; a missing value is filled in from localStorage (see uiState.ts). With no file (no store), nothing changes.
   useEffect(() => {
@@ -360,13 +406,34 @@ export default function App() {
           zoomFont('reset');
           return;
         case 'settings':
-          setSettingsOpen(true);
+          openSettings();
           return;
       }
     };
     window.addEventListener('keydown', onKey, true);
     return () => window.removeEventListener('keydown', onKey, true);
   }, []);
+
+  // While settings.json cannot be used, returning to the window reads it again, so a file fixed by hand is picked up. Not
+  // while it is ok, and not for last good: the backend leaves that only by a Reload.
+  const settingsKind = recoveryKind(settingsState);
+  useEffect(() => {
+    if (settingsKind === 'ok') {
+      return;
+    }
+    const onFocus = () => refreshSettingsState();
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        refreshSettingsState();
+      }
+    };
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [settingsKind, refreshSettingsState]);
 
   const handleTerminalInput = useCallback((data: string) => {
     if (routeRef.current.keys === 'pty') {
@@ -555,7 +622,7 @@ export default function App() {
         onToggleAutoApprove={toggleAutoApprove}
         llm={llm}
         settingsState={settingsState}
-        onOpenSettings={() => setSettingsOpen(true)}
+        onOpenSettings={openSettings}
       />
       {/* The terminal is always the first child and the panel the last (see Workspace). The dock only changes the CSS. */}
       <Workspace
@@ -604,7 +671,7 @@ export default function App() {
                 settingsState !== null && recoveryKind(settingsState) !== 'ok' && !settingsBannerHidden ? (
                   <SettingsBanner
                     state={settingsState}
-                    onOpenSettings={() => setSettingsOpen(true)}
+                    onOpenSettings={openSettings}
                     onDismiss={() => {
                       setSettingsBannerHidden(true);
                       // The button unmounts with the banner. Focus goes to the panel's header button, which stays put.
@@ -649,7 +716,7 @@ export default function App() {
           </AgentPanel>
         }
       />
-      {settingsOpen && <SettingsDialog onClose={() => setSettingsOpen(false)} onChanged={refreshStatus} />}
+      {settingsOpen && <SettingsDialog onClose={closeSettings} onChanged={refreshStatus} onViewLoaded={refreshSettingsState} />}
     </div>
   );
 }

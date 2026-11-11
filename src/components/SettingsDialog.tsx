@@ -376,6 +376,8 @@ export interface SettingsDialogProps {
   onClose(): void;
   /** A change was saved: the caller refreshes the status (the chip shows the default model). */
   onChanged(): void;
+  /** The settings were loaded (on open, Retry or Check again): the caller reads the settings state again. */
+  onViewLoaded?(): void;
 }
 
 /**
@@ -383,7 +385,7 @@ export interface SettingsDialogProps {
  * context limit and the provider editor. Focus moves in on open, stays in while open, and goes back to where it was on
  * close. Esc closes; a click on the backdrop closes. Unsaved provider changes are asked about before they are dropped.
  */
-export function SettingsDialog({ onClose, onChanged }: SettingsDialogProps) {
+export function SettingsDialog({ onClose, onChanged, onViewLoaded }: SettingsDialogProps) {
   const titleId = useId();
   const dialogRef = useRef<HTMLDivElement>(null);
   const backdropPressed = useRef(false);
@@ -409,6 +411,7 @@ export function SettingsDialog({ onClose, onChanged }: SettingsDialogProps) {
         if (live) {
           setLoad({ kind: 'ready', view: v });
           setLimit((l) => ({ ...l, text: limitText(v) }));
+          onViewLoaded?.();
         }
       },
       (e: unknown) => {
