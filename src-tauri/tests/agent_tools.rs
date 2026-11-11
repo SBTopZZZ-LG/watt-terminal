@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 use agent_term_lib::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate, DENIED, MockAgent, user_input};
 use agent_term_lib::core::approval::RegexPolicy;
 use agent_term_lib::core::llm::TurnCancel;
-use agent_term_lib::core::observer::{InputState, IntegrationStatus, ObserverStatus};
+use agent_term_lib::core::foreground::ForegroundKind;
+use agent_term_lib::core::observer::{EventSink, InputState, IntegrationStatus, ObserverStatus, SessionEvent};
 use agent_term_lib::core::record::Source;
 use agent_term_lib::core::session::{Session, USER_TEXT_CODE};
 use agent_term_lib::core::settings::{ApprovalMode, ApprovalSettings};
@@ -1088,3 +1089,146 @@ fn a_regex_rule_runs_an_allowed_command_without_a_card_and_a_gated_one_still_ask
     drop(events);
     assert!(!s.records().iter().any(|r| r.command.contains("gated")), "the gated command ran");
 }
+
+/// Every session event, in order, for the state-event checks.
+#[derive(Default)]
+struct Events(Mutex<Vec<SessionEvent>>);
+
+impl EventSink for Events {
+    fn event(&self, ev: SessionEvent) {
+        self.0.lock().unwrap().push(ev);
+    }
+}
+
+/// A nested interactive zsh with no integration is the foreground program. The hint says so on the screen and on the state
+/// event, `run_command` is refused before any approval card, and when the nested shell exits the hint goes away and the
+/// agent can run commands again.
+#[test]
+fn a_nested_shell_is_the_foreground_hint_and_refuses_run_command_without_a_card() {
+    let _g = serial();
+    let s = start();
+    let events = Arc::new(Events::default());
+    s.set_event_sink(events.clone());
+    wait_prompt(&s);
+
+    let cmd = "zsh -f -i";
+    s.submit(Source::User, cmd).expect("submit");
+    assert!(wait_state(&s, InputState::Running, Duration::from_secs(5)), "state={:?}", s.state());
+
+    let tools = SessionTools::new(&s);
+    let screen = tools.get_screen();
+    assert_eq!(screen.state, InputState::Running);
+    let fg = screen.foreground.clone().expect("the nested shell is the foreground hint");
+    assert_eq!(fg.kind, ForegroundKind::Shell, "{fg:?}");
+    assert_eq!(fg.command, cmd);
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            events.0.lock().unwrap().iter().any(|e| {
+                matches!(e, SessionEvent::State { state: InputState::Running, foreground: Some(f) } if f.kind == ForegroundKind::Shell)
+            })
+            .then_some(())
+        })
+        .is_some(),
+        "no running state event carried the hint: {:?}",
+        events.0.lock().unwrap()
+    );
+
+    // The precheck refuses first, with the explanation, and no card is shown.
+    let err = tools.run_command_precheck().expect_err("refused while a nested shell runs");
+    assert!(err.starts_with("cannot run a command now: the session is Running, not at an idle prompt"), "{err}");
+    assert!(err.contains("`zsh -f -i`") && err.contains("without shell integration"), "{err}");
+    let err = tools.run_command("echo nested-refused", DEFAULT_RUN_TIMEOUT).expect_err("refused in the nested shell");
+    assert!(err.starts_with("cannot run a command now"), "{err}");
+
+    let approvals = ApprovalGate::with_timeout(Duration::from_millis(300));
+    let turn_events = turn(&s, &approvals, "please run `echo nested-card-check`");
+    assert!(!has_approval(&turn_events), "an approval card was raised for a refused command");
+    assert!(!turn_events.iter().any(|e| matches!(e, AgentEvent::AgentControl { .. })), "the agent took control");
+    assert_eq!(run_ok(&turn_events), Some(false));
+    let said = text_of(&turn_events);
+    assert!(said.contains("cannot run a command now") && said.contains("`zsh -f -i`"), "{said}");
+    assert!(!s.records().iter().any(|r| r.command.contains("nested-card-check")), "the refused command ran");
+
+    // The nested shell exits (typed at the nested prompt). The hint goes away, and the state event says so.
+    s.write_user(b"exit\r").expect("exit the nested shell");
+    wait_prompt(&s);
+    assert!(tools.get_screen().foreground.is_none(), "the hint outlived the nested shell");
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            let evs = events.0.lock().unwrap();
+            let with = evs.iter().rposition(|e| matches!(e, SessionEvent::State { foreground: Some(_), .. }));
+            let without = evs.iter().rposition(|e| matches!(e, SessionEvent::State { state: InputState::Prompt, foreground: None }));
+            matches!((with, without), (Some(w), Some(p)) if p > w).then_some(())
+        })
+        .is_some(),
+        "no prompt state event without the hint after it: {:?}",
+        events.0.lock().unwrap()
+    );
+
+    // The text typed into the nested shell still counts as typed text at the outer prompt (see Core::note_user_bytes), so
+    // Ctrl-C at the prompt clears it, and then the agent's command runs.
+    s.write_user(&[0x03]).expect("ctrl-c at the prompt");
+    wait_prompt(&s);
+    let RunOutcome::Finished { record } =
+        tools.run_command("echo after-nested", DEFAULT_RUN_TIMEOUT).expect("runs after the nested shell exits")
+    else {
+        panic!("expected a finished record");
+    };
+    assert_eq!(record.output, "after-nested");
+}
+
+/// An ordinary command still running is also the hint (kind other): run_command is refused without a card, and the
+/// refusal says the command is still running. When it finishes on its own the hint is gone and the agent can run.
+#[test]
+fn an_ordinary_running_command_is_the_hint_and_refuses_without_a_card() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    s.submit(Source::User, "sleep 2").expect("submit");
+    assert!(wait_state(&s, InputState::Running, Duration::from_secs(3)), "state={:?}", s.state());
+
+    let tools = SessionTools::new(&s);
+    let fg = tools.get_screen().foreground.expect("the running command is the hint");
+    assert_eq!(fg.kind, ForegroundKind::Other);
+    assert_eq!(fg.command, "sleep 2");
+    let err = tools.run_command("echo during-sleep", DEFAULT_RUN_TIMEOUT).expect_err("refused while sleep runs");
+    assert!(err.contains("`sleep 2` is still running"), "{err}");
+    assert!(!err.contains("without shell integration"), "{err}");
+
+    let approvals = ApprovalGate::with_timeout(Duration::from_millis(300));
+    let turn_events = turn(&s, &approvals, "please run `echo during-sleep-card`");
+    assert!(!has_approval(&turn_events), "a card was raised for a refused command");
+
+    run_finish(&s, "sleep 2");
+    wait_prompt(&s);
+    assert!(tools.get_screen().foreground.is_none(), "the hint outlived the command");
+    let RunOutcome::Finished { record } =
+        tools.run_command("echo after-sleep", DEFAULT_RUN_TIMEOUT).expect("runs after the command finished")
+    else {
+        panic!("expected a finished record");
+    };
+    assert_eq!(record.output, "after-sleep");
+}
+
+/// In the alternate screen the shell is not at a prompt, so the precheck refuses before the card, with the plain refusal (no
+/// hint: a full-screen program has no foreground hint).
+#[test]
+fn run_command_in_the_alt_screen_is_refused_before_the_card() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let cmd = r"printf '\033[?1049h'; sleep 2; printf '\033[?1049l'";
+    s.submit(Source::User, cmd).expect("submit");
+    assert!(wait_state(&s, InputState::Alt, Duration::from_secs(5)), "state={:?}", s.state());
+    let tools = SessionTools::new(&s);
+    assert_eq!(tools.get_screen().foreground, None, "no hint in the alt screen");
+    let err = tools.run_command_precheck().expect_err("the precheck refuses in the alt screen");
+    assert_eq!(err, "cannot run a command now: the session is Alt, not at an idle prompt");
+
+    let approvals = ApprovalGate::with_timeout(Duration::from_millis(300));
+    let events = turn(&s, &approvals, "please run `echo alt-card-check`");
+    assert!(!has_approval(&events), "an approval card was raised in the alt screen");
+    assert_eq!(run_ok(&events), Some(false));
+    run_finish(&s, cmd);
+}
+

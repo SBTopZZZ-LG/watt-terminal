@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 
 use crate::core::chat::redact::Redactor;
 use crate::core::chat::todo;
+use crate::core::foreground::{Foreground, ForegroundKind};
 
 /// `run_command` output longer than this is cut to a head and tail. Output at or under it is sent whole.
 const RUN_OUTPUT_LIMIT: usize = 4500;
@@ -120,7 +121,7 @@ fn get_command_text(v: &Value, r: &Redactor) -> String {
 }
 
 fn get_screen_text(v: &Value, r: &Redactor) -> String {
-    format!("{}\n{}", screen_header(v), screen_body(v, r, SCREEN_LIMIT))
+    format!("{}\n{}", screen_header(v, r), screen_body(v, r, SCREEN_LIMIT))
 }
 
 /// The rows of a screen, trailing blank rows dropped, redacted, keeping the most recent `limit` bytes.
@@ -153,7 +154,7 @@ fn wait_text(v: &Value, r: &Redactor) -> String {
     });
     let output_len = output.as_ref().map_or(0, String::len);
     let body = screen_body(screen, r, SCREEN_LIMIT.saturating_sub(output_len));
-    lines.push(format!("{}\n{body}", screen_header(screen)));
+    lines.push(format!("{}\n{body}", screen_header(screen, r)));
     if let (Some(rec), Some(output)) = (record, output) {
         lines.push(command_header(rec, r));
         let screen_rows: Vec<&str> = body.lines().map(str::trim_end).collect();
@@ -200,7 +201,7 @@ fn command_header(rec: &Value, r: &Redactor) -> String {
     )
 }
 
-fn screen_header(v: &Value) -> String {
+fn screen_header(v: &Value, r: &Redactor) -> String {
     let mut header = format!(
         "screen size={} cursor={} alternate_screen={} state={}",
         pair(v.get("size"), 'x'),
@@ -217,7 +218,25 @@ fn screen_header(v: &Value) -> String {
     if integration != "live" && integration != "?" {
         header.push_str(&format!(" integration={integration}"));
     }
+    if let Some(line) = foreground_line(v, r) {
+        header.push('\n');
+        header.push_str(&line);
+    }
     header
+}
+
+/// The one line that names the foreground program, when the screen has a hint. Absent otherwise.
+fn foreground_line(v: &Value, r: &Redactor) -> Option<String> {
+    let fg: Foreground = serde_json::from_value(v.get("foreground")?.clone()).ok()?;
+    let command = escape_controls(&r.redact(&fg.command));
+    Some(if fg.kind == ForegroundKind::Other {
+        format!("foreground: {command} (a command running in this shell; wait for it to finish)")
+    } else {
+        format!(
+            "foreground: {command} ({}, without shell integration; you can read the screen but cannot run commands here)",
+            fg.kind.describe()
+        )
+    })
 }
 
 fn list_commands_text(v: &Value, r: &Redactor) -> String {
@@ -807,6 +826,67 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn with_foreground(mut v: Value, kind: &str, command: &str) -> Value {
+        v["foreground"] = json!({"kind": kind, "command": command});
+        v
+    }
+
+    /// The screen names the foreground program in one line, only when there is a hint, with the same words the agent is
+    /// told elsewhere.
+    #[test]
+    fn get_screen_shows_the_foreground_line_only_when_there_is_one() {
+        let plain = project("get_screen", true, &screen(&["ubuntu@lidia:~$"]), &none());
+        assert!(!plain.contains("foreground:"), "{plain}");
+
+        let v = with_foreground(screen(&["ubuntu@lidia:~$"]), "ssh", "ssh ubuntu@lidia");
+        let out = project("get_screen", true, &v, &none());
+        assert_eq!(
+            out.lines().nth(1),
+            Some("foreground: ssh ubuntu@lidia (a shell on another machine, without shell integration; you can read the screen but cannot run commands here)"),
+            "{out}"
+        );
+        assert!(out.ends_with("ubuntu@lidia:~$"), "the rows follow the header: {out}");
+    }
+
+    #[test]
+    fn a_plain_running_command_is_named_as_still_running_not_as_unintegrated() {
+        let v = with_foreground(screen(&["x"]), "other", "sleep 30");
+        let out = project("get_screen", true, &v, &none());
+        assert!(out.contains("foreground: sleep 30 (a command running in this shell; wait for it to finish)"), "{out}");
+        assert!(!out.contains("without shell integration"), "{out}");
+    }
+
+    /// The command text of the hint is the user's, so the redactor sees it like any other output.
+    #[test]
+    fn the_foreground_command_is_redacted() {
+        let r = Redactor::new(vec!["hunter2-secret".to_string()]);
+        let v = with_foreground(screen(&["x"]), "ssh", "sshpass -p hunter2-secret ssh host");
+        let out = project("get_screen", true, &v, &r);
+        assert!(out.contains("foreground: sshpass -p [REDACTED] ssh host ("), "{out}");
+        assert!(!out.contains("hunter2-secret"), "{out}");
+    }
+
+    /// `wait` shows the screen as get_screen does, so the hint reaches the model there too.
+    #[test]
+    fn wait_carries_the_foreground_line_in_its_screen() {
+        let v = json!({
+            "reason": "timeout", "waited_ms": 10000, "state": "running",
+            "screen": with_foreground(screen(&["x"]), "ssh", "ssh h"),
+        });
+        let out = project("wait", true, &v, &none());
+        assert!(out.contains("foreground: ssh h (a shell on another machine, without shell integration"), "{out}");
+    }
+
+    /// An odd hint (wrong kind, not an object) is left out rather than shown wrongly.
+    #[test]
+    fn a_malformed_foreground_is_left_out() {
+        let mut v = screen(&["x"]);
+        v["foreground"] = json!({"kind": "unknown_kind", "command": "x"});
+        assert!(!project("get_screen", true, &v, &none()).contains("foreground:"));
+        v["foreground"] = json!("ssh");
+        assert!(!project("get_screen", true, &v, &none()).contains("foreground:"));
     }
 
     #[test]

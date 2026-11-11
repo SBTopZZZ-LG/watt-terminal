@@ -16,6 +16,7 @@ use std::time::Duration;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
 
+use crate::core::foreground::Foreground;
 use crate::core::observer::{
     run_observer, Activity, CallStatus, Core, EventSink, InputState, IntegrationStatus, ObsMsg, ObsQueue,
     ObserverStatus, ScreenSnapshot, Shared,
@@ -210,6 +211,12 @@ impl Session {
 
     pub fn integration_status(&self) -> IntegrationStatus {
         self.shared.lock().integration_status()
+    }
+
+    /// The foreground program hint while a command runs: what it is, and that it has no shell integration when it is a
+    /// remote login or a nested shell. See core/foreground.rs. None at a prompt and in the other states.
+    pub fn foreground(&self) -> Option<Foreground> {
+        self.shared.lock().foreground()
     }
 
     pub fn observer_status(&self) -> ObserverStatus {

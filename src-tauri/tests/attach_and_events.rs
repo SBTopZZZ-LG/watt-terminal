@@ -121,7 +121,7 @@ fn listeners_get_state_integration_and_record_events() {
     let events = wait_until(Duration::from_secs(10), || {
         let evs = sink.0.lock().unwrap().clone();
         let done = evs.iter().any(|e| matches!(e, SessionEvent::RecordFinished { record } if record.command == "echo ev"));
-        let prompt = evs.iter().any(|e| matches!(e, SessionEvent::State { state: InputState::Prompt }));
+        let prompt = evs.iter().any(|e| matches!(e, SessionEvent::State { state: InputState::Prompt, .. }));
         (done && prompt).then_some(evs)
     })
     .expect("finished record and prompt state were delivered");

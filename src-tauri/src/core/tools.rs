@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use serde_json::{json, Value};
 
+use crate::core::foreground::{Foreground, ForegroundKind};
 use crate::core::llm::TurnCancel;
 use crate::core::observer::{CallStatus, InputState, IntegrationStatus, ObserverStatus};
 use crate::core::record::{Cwd, Record, RecordSummary, Source};
@@ -49,6 +50,9 @@ pub struct ScreenView {
     pub state: InputState,
     pub observer_status: ObserverStatus,
     pub integration_status: IntegrationStatus,
+    /// The foreground program hint, while a command runs (core/foreground.rs). Left out when there is none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub foreground: Option<Foreground>,
 }
 
 /// One page of a command's rendered output. `offset` and `limit` are byte counts, moved to character boundaries.
@@ -134,6 +138,11 @@ pub trait AgentTools {
     fn get_command(&self, id: u64, offset: usize, limit: usize) -> Result<CommandView, String>;
     fn get_screen(&self) -> ScreenView;
     fn get_cwd(&self) -> Option<Cwd>;
+    /// The foreground program hint, while a command runs (core/foreground.rs). A hint only, never a safety decision.
+    /// Defaults to None, so a fake without a shell needs no change.
+    fn foreground(&self) -> Option<Foreground> {
+        None
+    }
     fn run_command(&self, command: &str, timeout: Duration) -> Result<RunOutcome, String>;
     /// Waits up to `seconds` (already clamped to 1..=MAX_WAIT_SECONDS) for the shell to do something worth reporting. See
     /// `WaitReason`. Counts against the turn's wait budget, not the command limit.
@@ -264,11 +273,16 @@ impl AgentTools for SessionTools<'_> {
             state: self.session.state(),
             observer_status: self.session.observer_status(),
             integration_status: self.session.integration_status(),
+            foreground: self.session.foreground(),
         }
     }
 
     fn get_cwd(&self) -> Option<Cwd> {
         self.session.cwd()
+    }
+
+    fn foreground(&self) -> Option<Foreground> {
+        self.session.foreground()
     }
 
     fn run_command(&self, command: &str, timeout: Duration) -> Result<RunOutcome, String> {
@@ -279,12 +293,8 @@ impl AgentTools for SessionTools<'_> {
         if let Some(c) = command.chars().find(|c| c.is_control() && *c != '\n' && *c != '\t') {
             return Err(format!("command contains the control character {c:?}, which cannot be sent"));
         }
-        if self.session.integration_status() != IntegrationStatus::Live {
-            return Err("shell integration is not live, so commands cannot be run".into());
-        }
-        let state = self.session.state();
-        if state != InputState::Prompt {
-            return Err(format!("cannot run a command now: the session is {state:?}, not at an idle prompt"));
+        if let Some(refusal) = self.not_at_prompt() {
+            return Err(refusal);
         }
         if self.cancelled() {
             return Ok(RunOutcome::NotRun { reason: NotRunReason::Cancelled });
@@ -331,6 +341,10 @@ impl AgentTools for SessionTools<'_> {
     }
 
     fn run_command_precheck(&self) -> Result<(), String> {
+        // The same refusals run_command makes before it writes, first: a call that is doomed gets no approval card.
+        if let Some(refusal) = self.not_at_prompt() {
+            return Err(refusal);
+        }
         if self.session.user_typed_since_prompt() {
             Err(user_text_refusal())
         } else {
@@ -344,6 +358,16 @@ impl AgentTools for SessionTools<'_> {
 }
 
 impl SessionTools<'_> {
+    /// Why `run_command` cannot run now, when the shell is not live or not at an idle prompt. None when it may run.
+    /// `run_command` and `run_command_precheck` both use it, so the refusals match.
+    fn not_at_prompt(&self) -> Option<String> {
+        if self.session.integration_status() != IntegrationStatus::Live {
+            return Some("shell integration is not live, so commands cannot be run".into());
+        }
+        let state = self.session.state();
+        (state != InputState::Prompt).then(|| not_at_prompt_text(state, self.session.foreground().as_ref()))
+    }
+
     /// The wait itself. An idle prompt or an exited session returns at once. Otherwise the first of these ends it:
     /// the turn is cancelled, the session exits, a command finishes (the shell back at its prompt with a newer record),
     /// the screen changes (unless `ignore_updates`, and then after its quiet period), or the time runs out.
@@ -403,6 +427,28 @@ impl SessionTools<'_> {
             screen,
             record: finished.and_then(|id| self.session.get_record(id)),
         }
+    }
+}
+
+/// The refusal for a `run_command` when the shell is not at an idle prompt. The text starts with the plain refusal
+/// either way. While a command runs and the hint names a program, the text says what runs and what the agent can do:
+/// read the screen, wait, and ask the user to leave a program without shell integration.
+pub fn not_at_prompt_text(state: InputState, foreground: Option<&Foreground>) -> String {
+    let base = format!("cannot run a command now: the session is {state:?}, not at an idle prompt");
+    let Some(fg) = foreground.filter(|_| state == InputState::Running) else {
+        return base;
+    };
+    match fg.kind {
+        ForegroundKind::Other => format!(
+            "{base}. The command `{}` is still running in the shell. Wait for it to finish (wait), then run the command again.",
+            fg.command
+        ),
+        kind => format!(
+            "{base}. The foreground program is `{}`: {}, without shell integration, so commands cannot run in it. \
+             Read it with get_screen and wait for it to end. Ask the user to leave it, so commands can run again.",
+            fg.command,
+            kind.describe()
+        ),
     }
 }
 
@@ -542,6 +588,65 @@ mod tests {
         assert!(note.is_some());
         let (negative, _) = wait_seconds_arg(&json!({"seconds": -4}));
         assert_eq!(negative, 1);
+    }
+
+    fn hint(kind: ForegroundKind, command: &str) -> Foreground {
+        Foreground { kind, command: command.to_string() }
+    }
+
+    /// Without a hint, or outside Running, the refusal is the plain one, as it was before the hint existed.
+    #[test]
+    fn the_refusal_is_the_plain_text_without_a_running_hint() {
+        let plain = "cannot run a command now: the session is Running, not at an idle prompt";
+        assert_eq!(not_at_prompt_text(InputState::Running, None), plain);
+        let ssh = hint(ForegroundKind::Ssh, "ssh ubuntu@lidia");
+        assert_eq!(not_at_prompt_text(InputState::Alt, Some(&ssh)), "cannot run a command now: the session is Alt, not at an idle prompt");
+        assert_eq!(not_at_prompt_text(InputState::Submitted, Some(&ssh)), "cannot run a command now: the session is Submitted, not at an idle prompt");
+    }
+
+    /// A program without integration: the text names it, says why commands cannot run, and says what the agent can do.
+    /// The original wording is the prefix.
+    #[test]
+    fn the_refusal_names_a_program_without_integration_and_what_to_do() {
+        let ssh = hint(ForegroundKind::Ssh, "ssh ubuntu@lidia");
+        let text = not_at_prompt_text(InputState::Running, Some(&ssh));
+        assert!(
+            text.starts_with("cannot run a command now: the session is Running, not at an idle prompt"),
+            "the original prefix is kept: {text}"
+        );
+        assert!(text.contains("`ssh ubuntu@lidia`"), "{text}");
+        assert!(text.contains("a shell on another machine, without shell integration"), "{text}");
+        assert!(text.contains("get_screen") && text.contains("wait"), "{text}");
+        assert!(text.contains("Ask the user to leave it"), "{text}");
+    }
+
+    /// Any other command: it is still running, and the agent should wait for it.
+    #[test]
+    fn the_refusal_for_an_ordinary_running_command_says_it_is_still_running() {
+        let sleep = hint(ForegroundKind::Other, "sleep 30");
+        let text = not_at_prompt_text(InputState::Running, Some(&sleep));
+        assert!(text.starts_with("cannot run a command now: the session is Running, not at an idle prompt"), "{text}");
+        assert!(text.contains("`sleep 30` is still running"), "{text}");
+        assert!(!text.contains("without shell integration"), "{text}");
+    }
+
+    /// The screen carries the hint only when there is one: the key is left out otherwise.
+    #[test]
+    fn the_screen_wire_has_the_foreground_only_when_present() {
+        let screen = |foreground: Option<Foreground>| ScreenView {
+            rows: vec!["ubuntu@lidia:~$".into()],
+            cursor: (0, 0),
+            alternate_screen: false,
+            size: (24, 80),
+            state: InputState::Running,
+            observer_status: ObserverStatus::Ok,
+            integration_status: IntegrationStatus::Live,
+            foreground,
+        };
+        let without = serde_json::to_value(screen(None)).unwrap();
+        assert!(without.get("foreground").is_none(), "{without}");
+        let with = serde_json::to_value(screen(Some(hint(ForegroundKind::Ssh, "ssh ubuntu@lidia")))).unwrap();
+        assert_eq!(with["foreground"], json!({"kind": "ssh", "command": "ssh ubuntu@lidia"}));
     }
 
     #[test]

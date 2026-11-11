@@ -16,6 +16,7 @@ use serde::Serialize;
 use vt100::capture::{basic_formatted_to_plain, BasicFormattedCaptureState, RowContents};
 use vt100::{Callbacks, Parser};
 
+use crate::core::foreground::{self, Foreground};
 use crate::core::record::{Cwd, OutputBuilder, RawCapture, Record, RecordStatus, RecordSummary, Source};
 use crate::core::scanner::{Event, Found, Scanner};
 
@@ -192,7 +193,12 @@ pub struct Activity {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionEvent {
-    State { state: InputState },
+    State {
+        state: InputState,
+        /// The foreground program hint, while a command runs (see core/foreground.rs). Left out otherwise.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        foreground: Option<Foreground>,
+    },
     Integration { status: IntegrationStatus },
     Observer { status: ObserverStatus },
     Cwd { cwd: Option<Cwd> },
@@ -208,6 +214,7 @@ pub trait EventSink: Send + Sync {
 #[derive(Default)]
 struct Reported {
     state: Option<InputState>,
+    foreground: Option<Foreground>,
     integration: Option<IntegrationStatus>,
     observer: Option<ObserverStatus>,
     cwd: Option<Cwd>,
@@ -384,10 +391,13 @@ impl Core {
             return Vec::new();
         }
         let mut out = std::mem::take(&mut self.events);
+        // A change of the foreground hint is reported as a state event too: it is the same moment in the same event.
         let state = self.lifecycle_view();
-        if self.reported.state != Some(state) {
+        let foreground = self.foreground();
+        if self.reported.state != Some(state) || self.reported.foreground != foreground {
             self.reported.state = Some(state);
-            out.push(SessionEvent::State { state });
+            self.reported.foreground = foreground.clone();
+            out.push(SessionEvent::State { state, foreground });
         }
         let integration = self.integration_status();
         if self.reported.integration != Some(integration) {
@@ -673,6 +683,17 @@ impl Core {
 
     // TODO: `exec zsh` and nested shells are undetected. They have no AGENTTERM_NONCE, so they emit no events:
     // this stays Live and the lifecycle stays Running until the session exits. Needs an "integration lost" status.
+    /// The foreground program hint: only while the shell is Running (not Alt, not Raw) with a command open, and the
+    /// command text is not blank. Derived from the open record each time, so it cannot go stale.
+    pub fn foreground(&self) -> Option<Foreground> {
+        if self.lifecycle_view() != InputState::Running {
+            return None;
+        }
+        let open = self.parser.callbacks().open.as_ref()?;
+        let fg = foreground::classify(&open.record.command);
+        (!fg.command.is_empty()).then_some(fg)
+    }
+
     pub fn integration_status(&self) -> IntegrationStatus {
         if self.lifecycle != Lifecycle::Booting {
             IntegrationStatus::Live
@@ -863,6 +884,7 @@ pub fn run_observer(queue: Arc<ObsQueue>, shared: Arc<Shared>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::foreground::ForegroundKind;
 
     struct Probe(Vec<(String, bool)>);
 
@@ -1112,5 +1134,83 @@ mod tests {
         c.resize(10, 40);
         c.note_screen();
         assert_eq!(c.activity().screen_gen, text + 3, "a resize did not bump the generation");
+    }
+
+    /// Opens a record for `command` the way the shell does: E, then C, in the Running lifecycle.
+    fn running(command: &str) -> Core {
+        let mut c = core();
+        c.lifecycle = Lifecycle::Prompt;
+        c.handle(Event::CommandLine(command.to_string()));
+        c.handle(Event::CommandStart);
+        c
+    }
+
+    /// The foreground hint comes from the open record while the shell is Running, and from nothing else.
+    #[test]
+    fn foreground_is_the_open_records_command_only_while_running() {
+        let c = running("ssh ubuntu@lidia");
+        assert_eq!(c.lifecycle_view(), InputState::Running);
+        let fg = c.foreground().expect("a hint while the ssh record is open");
+        assert_eq!(fg.kind, ForegroundKind::Ssh);
+        assert_eq!(fg.command, "ssh ubuntu@lidia");
+
+        let mut prompt = core();
+        prompt.lifecycle = Lifecycle::Prompt;
+        assert_eq!(prompt.foreground(), None, "no hint at the prompt");
+
+        let mut ended = running("ssh ubuntu@lidia");
+        ended.handle(Event::CommandEnd { exit: 0, pipestatus: vec![0] });
+        assert_eq!(ended.foreground(), None, "no hint once D closed the record, even before the next prompt");
+
+        let mut submitted = core();
+        submitted.lifecycle = Lifecycle::Submitted { since: Instant::now() };
+        assert_eq!(submitted.foreground(), None, "no hint while the line is only submitted");
+    }
+
+    /// The hint is left out in the alternate screen (a full-screen program has its own state) and when the command
+    /// text is blank (nothing says what runs).
+    #[test]
+    fn no_hint_in_the_alternate_screen_or_for_a_blank_command() {
+        let mut alt = running("ssh ubuntu@lidia");
+        alt.parser.process(b"\x1b[?1049h");
+        assert_eq!(alt.lifecycle_view(), InputState::Alt);
+        assert_eq!(alt.foreground(), None);
+
+        let blank = running("   ");
+        assert_eq!(blank.lifecycle_view(), InputState::Running);
+        assert_eq!(blank.foreground(), None);
+    }
+
+    /// The hint is on the wire as an optional `foreground` field of the state event: present while a command runs, and
+    /// left out at a prompt. A change of the hint alone is reported as a state event.
+    #[test]
+    fn the_state_event_carries_the_foreground_hint_only_when_there_is_one() {
+        let mut c = core();
+        c.lifecycle = Lifecycle::Prompt;
+        let first = c.take_events(true);
+        let wire = |evs: &[SessionEvent]| -> Vec<serde_json::Value> {
+            evs.iter().filter(|e| matches!(e, SessionEvent::State { .. })).map(|e| serde_json::to_value(e).unwrap()).collect()
+        };
+        assert_eq!(wire(&first), vec![serde_json::json!({"type": "state", "state": "prompt"})]);
+
+        c.handle(Event::CommandLine("ssh ubuntu@lidia".into()));
+        c.handle(Event::CommandStart);
+        let running = c.take_events(true);
+        assert_eq!(
+            wire(&running),
+            vec![serde_json::json!({
+                "type": "state",
+                "state": "running",
+                "foreground": {"kind": "ssh", "command": "ssh ubuntu@lidia"},
+            })]
+        );
+
+        // Same lifecycle, same hint: nothing new is reported.
+        assert!(wire(&c.take_events(true)).is_empty());
+
+        // Back at the prompt: the state changes and the hint goes away from the wire.
+        c.handle(Event::CommandEnd { exit: 0, pipestatus: vec![0] });
+        c.handle(Event::PromptStart);
+        assert_eq!(wire(&c.take_events(true)), vec![serde_json::json!({"type": "state", "state": "prompt"})]);
     }
 }

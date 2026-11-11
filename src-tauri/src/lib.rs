@@ -26,6 +26,7 @@ use crate::core::chat::agent_loop::{self, Conversation, LlmAgent, LlmSettings, U
 use crate::core::chat::history::History;
 use crate::core::chat::redact::Redactor;
 use crate::core::chat::todo::{Todo, TodoList};
+use crate::core::foreground::Foreground;
 use crate::core::llm::TurnCancel;
 use crate::core::observer::{EventSink, InputState, IntegrationStatus, ObserverStatus, SessionEvent};
 use crate::core::persist::conversations::ConversationMeta;
@@ -522,6 +523,9 @@ struct LlmStatus {
 #[derive(Serialize)]
 struct Status {
     state: InputState,
+    /// The foreground program hint while a command runs (core/foreground.rs). Left out when there is none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    foreground: Option<Foreground>,
     integration: IntegrationStatus,
     observer: ObserverStatus,
     cwd: Option<Cwd>,
@@ -562,6 +566,7 @@ fn get_status(session_id: String, reg: State<'_, Reg>, settings: State<'_, Setti
     };
     Ok(Status {
         state: att.session.state(),
+        foreground: att.session.foreground(),
         integration: att.session.integration_status(),
         observer: att.session.observer_status(),
         cwd: att.session.cwd(),

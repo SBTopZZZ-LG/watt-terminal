@@ -267,8 +267,8 @@ fn empty_enter_goes_submitted_then_back_to_prompt_without_a_record() {
     s.write_user(b"\r").expect("enter");
     let seen = wait_until(Duration::from_secs(5), || {
         let evs = events.0.lock().unwrap();
-        let sub = evs.iter().position(|e| matches!(e, SessionEvent::State { state: InputState::Submitted }))?;
-        evs[sub..].iter().any(|e| matches!(e, SessionEvent::State { state: InputState::Prompt })).then_some(())
+        let sub = evs.iter().position(|e| matches!(e, SessionEvent::State { state: InputState::Submitted, .. }))?;
+        evs[sub..].iter().any(|e| matches!(e, SessionEvent::State { state: InputState::Prompt, .. })).then_some(())
     });
     assert!(seen.is_some(), "no Submitted followed by Prompt: {:?}", events.0.lock().unwrap());
     assert_eq!(s.state(), InputState::Prompt);

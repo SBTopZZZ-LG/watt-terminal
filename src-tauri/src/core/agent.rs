@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 
 use crate::core::approval::{ApprovalPolicy, ManualPolicy, Reason, Verdict};
 use crate::core::chat::todo::Todo;
+use crate::core::foreground::Foreground;
 use crate::core::llm::TurnCancel;
 use crate::core::session::{Session, USER_TEXT_CODE};
 use crate::core::tools::AgentTools;
@@ -202,6 +203,11 @@ impl<'a> AgentCtx<'a> {
 
     pub fn say(&self, text: impl Into<String>) {
         self.emit(AgentEvent::Text { text: text.into() });
+    }
+
+    /// The foreground program hint at this moment (see `AgentTools::foreground`). The agent loop reads it per model call.
+    pub fn foreground(&self) -> Option<Foreground> {
+        self.tools.foreground()
     }
 
     /// Calls a read-only tool (`list_commands`, `get_command`, `get_screen`, `get_cwd`, `wait`) and reports the call
@@ -500,6 +506,7 @@ mod tests {
 
     use super::*;
     use crate::core::approval::{MAX_AUTO_PER_TURN, RegexPolicy};
+    use crate::core::foreground::ForegroundKind;
     use crate::core::observer::{InputState, IntegrationStatus, ObserverStatus};
     use crate::core::record::{Cwd, RecordSummary};
     use crate::core::settings::{ApprovalMode, ApprovalSettings};
@@ -511,6 +518,8 @@ mod tests {
         reached: Mutex<Vec<String>>,
         /// What `run_command_precheck` returns as an error. None means the precheck passes.
         precheck: Option<String>,
+        /// What `foreground` reports. None means nothing runs in the foreground.
+        foreground: Option<Foreground>,
         /// When set, every `call` fails with this error after it is recorded.
         call_error: Option<String>,
     }
@@ -537,6 +546,7 @@ mod tests {
                 state: InputState::Prompt,
                 observer_status: ObserverStatus::Ok,
                 integration_status: IntegrationStatus::Live,
+                foreground: None,
             }
         }
         fn get_cwd(&self) -> Option<Cwd> {
@@ -553,6 +563,9 @@ mod tests {
         }
         fn run_command_precheck(&self) -> Result<(), String> {
             self.precheck.clone().map_or(Ok(()), Err)
+        }
+        fn foreground(&self) -> Option<Foreground> {
+            self.foreground.clone()
         }
         fn call(&self, name: &str, _args: &Value) -> Result<Value, String> {
             self.reached.lock().unwrap().push(name.to_string());
@@ -992,6 +1005,22 @@ mod tests {
         let cancelled = text(json!({"outcome": "not_run", "reason": "cancelled"}));
         assert!(cancelled.contains("you cancelled it") && cancelled.contains("keeps running"), "{cancelled}");
         assert!(!cancelled.contains("waiting for the rest"), "{cancelled}");
+    }
+
+    /// The context reads the hint from its tools each time it is asked: the agent loop asks once per model call.
+    #[test]
+    fn the_context_reports_the_tools_foreground_hint() {
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let emit = |_: AgentEvent| {};
+        let plain = Recorder::default();
+        assert_eq!(AgentCtx::new(&plain, &gate, &emit).foreground(), None);
+        let ssh = Recorder {
+            foreground: Some(Foreground { kind: ForegroundKind::Ssh, command: "ssh h".into() }),
+            ..Default::default()
+        };
+        let ctx = AgentCtx::new(&ssh, &gate, &emit);
+        assert_eq!(ctx.foreground().map(|f| f.command), Some("ssh h".to_string()));
+        assert_eq!(ctx.foreground().map(|f| f.kind), Some(ForegroundKind::Ssh));
     }
 
     #[test]
