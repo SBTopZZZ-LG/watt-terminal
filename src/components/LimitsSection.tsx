@@ -1,7 +1,7 @@
 import { useEffect, useId, useRef, useState } from 'react';
 import type { KeyboardEvent } from 'react';
 import { AUTO_PER_TURN } from '../lib/approvalReasons';
-import { DEFAULT_LIMITS, HIGH_LIMIT_WARNING, isHighModelCalls, limitProblems, limitsInput } from '../lib/limitsForm';
+import { DEFAULT_LIMITS, HIGH_LIMIT_WARNING, isHighModelCalls, limitProblems, limitsInput, withUnlimitedOn } from '../lib/limitsForm';
 import type { LimitsDraft } from '../lib/limitsForm';
 
 export interface LimitsSectionProps {
@@ -63,7 +63,7 @@ export function LimitsSection(p: LimitsSectionProps) {
   };
 
   const confirmUnlimited = () => {
-    p.onChange({ ...draft, unlimited: true });
+    p.onChange(withUnlimitedOn(draft));
     closeConfirm();
   };
 

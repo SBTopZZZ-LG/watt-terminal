@@ -12,6 +12,7 @@ import {
   limitProblems,
   limitsInput,
   parseWhole,
+  withUnlimitedOn,
 } from './limitsForm';
 import type { LimitsDraft } from './limitsForm';
 import type { LimitsSettings } from './types';
@@ -125,6 +126,35 @@ describe('isLimitsDirty', () => {
 
   it('a field that is not a number is a change, and so is a draft that cannot be saved', () => {
     expect(isLimitsDirty({ ...draftFromLimits(SAVED), pollCalls: '' }, SAVED)).toBe(true);
+  });
+});
+
+describe('withUnlimitedOn', () => {
+  it('turns unlimited on and keeps a valid model-call number', () => {
+    const draft: LimitsDraft = { modelCalls: '250', unlimited: false, pollCalls: '120', commands: '31', waitMinutes: '29' };
+    expect(withUnlimitedOn(draft)).toEqual({ modelCalls: '250', unlimited: true, pollCalls: '120', commands: '31', waitMinutes: '29' });
+  });
+
+  it('puts the default back in place of a model-call number that is not valid, so the save is not blocked', () => {
+    for (const modelCalls of ['9', '2.5', '', 'abc', '4294967296']) {
+      const draft: LimitsDraft = { modelCalls, unlimited: false, pollCalls: '60', commands: '30', waitMinutes: '30' };
+      const next = withUnlimitedOn(draft);
+      expect(next.modelCalls, modelCalls).toBe('50');
+      expect(next.unlimited, modelCalls).toBe(true);
+      expect(limitsInput(next), modelCalls).toEqual({ ...DEFAULT_LIMITS, max_model_calls: 50, model_calls_unlimited: true });
+    }
+  });
+
+  it('leaves the other fields as they were, even when they are not valid', () => {
+    const draft: LimitsDraft = { modelCalls: '', unlimited: false, pollCalls: '501', commands: '', waitMinutes: '0' };
+    expect(withUnlimitedOn(draft)).toEqual({ modelCalls: '50', unlimited: true, pollCalls: '501', commands: '', waitMinutes: '0' });
+  });
+
+  it('does not change the draft it is given', () => {
+    const draft: LimitsDraft = { modelCalls: '9', unlimited: false, pollCalls: '60', commands: '30', waitMinutes: '30' };
+    withUnlimitedOn(draft);
+    expect(draft.modelCalls).toBe('9');
+    expect(draft.unlimited).toBe(false);
   });
 });
 

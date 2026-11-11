@@ -119,3 +119,9 @@ export function isHighModelCalls(text: string): boolean {
   const n = parseWhole(text);
   return n !== null && n > HIGH_MODEL_CALLS;
 }
+
+/** The draft once unlimited is confirmed on. The model-call field is disabled while unlimited is on, so a number that is not valid is put back to the default there (it could not be fixed otherwise). A valid number is kept. */
+export function withUnlimitedOn(draft: LimitsDraft): LimitsDraft {
+  const modelCalls = fieldProblem('modelCalls', draft.modelCalls) === null ? draft.modelCalls : String(DEFAULT_LIMITS.max_model_calls);
+  return { ...draft, modelCalls, unlimited: true };
+}
