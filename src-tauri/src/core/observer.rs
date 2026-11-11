@@ -725,6 +725,8 @@ impl Core {
         match event {
             // Hello and 633;Cwd are handled in `route`, which knows the level they came from.
             Event::Hello { .. } | Event::LevelCwd { .. } => {}
+            // Ready is for the injection state machine (B2b). Nothing consumes it yet.
+            Event::Ready { .. } => {}
             Event::PromptStart => {
                 self.desynced = false;
                 self.close_open(RecordStatus::Incomplete);

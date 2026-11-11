@@ -14,5 +14,5 @@ if [[ -n ${AGENTTERM_HISTFILE-} ]]; then HISTFILE=$AGENTTERM_HISTFILE; fi
 unset AGENTTERM_HISTFILE
 # Hello must stay last: the observer treats it as "this shell is observable".
 if [[ -n ${_AGENTTERM_NONCE-} ]]; then
-  printf '\033]633;Hello;n=%s;v=1;zsh=%s;pid=%d\033\\' "$_AGENTTERM_NONCE" "$ZSH_VERSION" $$
+  _agentterm_hello
 fi

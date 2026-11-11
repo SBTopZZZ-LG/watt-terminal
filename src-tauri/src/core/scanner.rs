@@ -22,6 +22,8 @@ pub const OSC_CAP: usize = 4096;
 pub const RETIRED_CAP: usize = 16;
 /// Longest value kept from a 633;Hello text field (sh, ver, user, host). Longer values are cut.
 pub const HELLO_FIELD_CAP: usize = 255;
+/// Longest token or shell name taken from a 633;Ready. A longer value, or any byte outside [A-Za-z0-9], drops the Ready.
+pub const READY_FIELD_CAP: usize = 64;
 
 const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
@@ -36,6 +38,8 @@ pub enum Event {
         user: Option<String>,
         host: Option<String>,
     },
+    /// 633;Ready (untagged): the loader has checked the shell and is waiting for its blob. `sh` is `zsh` or `bash`.
+    Ready { token: String, sh: String },
     /// 133;A: prompt start.
     PromptStart,
     /// 133;P: continuation prompt (PS2), zsh is waiting for more input.
@@ -240,6 +244,10 @@ impl Scanner {
     /// accepted gives its key, retired counts as stale, anything else is forged.
     fn parse_integration(&mut self, payload: &[u8]) -> Option<(Event, Option<u64>)> {
         let fields: Vec<&[u8]> = payload.split(|&c| c == b';').collect();
+        // Ready is untagged: the loader speaks before the shell has any nonce. It is checked by charset, never counted forged.
+        if fields.len() >= 2 && fields[0] == b"633" && fields[1] == b"Ready" {
+            return parse_ready(&fields[2..]).map(|e| (e, None));
+        }
         let Some(nonce) = fields.get(2).and_then(|f| f.strip_prefix(b"n=")) else {
             self.forged += 1;
             return None;
@@ -306,6 +314,19 @@ fn parse_hello(fields: &[&[u8]]) -> Option<Event> {
         user: text_field(fields, b"user="),
         host: text_field(fields, b"host="),
     })
+}
+
+/// `633;Ready;t=<token>;sh=<name>`. Both fields are required and must pass `ready_word`.
+fn parse_ready(fields: &[&[u8]]) -> Option<Event> {
+    let token = ready_word(field_value(fields, b"t=")?)?;
+    let sh = ready_word(field_value(fields, b"sh=")?)?;
+    Some(Event::Ready { token, sh })
+}
+
+/// A Ready field: 1 to `READY_FIELD_CAP` bytes, each [A-Za-z0-9]. Anything else is not a Ready.
+fn ready_word(v: &[u8]) -> Option<String> {
+    let ok = !v.is_empty() && v.len() <= READY_FIELD_CAP && v.iter().all(|c| c.is_ascii_alphanumeric());
+    ok.then(|| String::from_utf8_lossy(v).into_owned())
 }
 
 /// An optional text field of a Hello, cut to `HELLO_FIELD_CAP` bytes.
@@ -432,6 +453,43 @@ mod tests {
         assert_eq!(found[0].event, Event::LevelCwd { path: "/srv/a;b".into() });
         assert_eq!(found[0].level, Some(0));
         assert_eq!(sc.forged_events(), 0);
+    }
+
+    /// Ready carries no nonce: it is found with no level, and it is never counted as forged or stale.
+    #[test]
+    fn ready_is_untagged_and_not_counted() {
+        let mut sc = Scanner::new(NONCE);
+        let found = sc.feed(&osc("633;Ready;t=Ab12;sh=bash"));
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].event, Event::Ready { token: "Ab12".into(), sh: "bash".into() });
+        assert_eq!(found[0].level, None);
+        assert_eq!((sc.forged_events(), sc.stale_events()), (0, 0));
+    }
+
+    /// A Ready whose token or shell name is not [A-Za-z0-9], empty, missing, or over the cap is ignored. Not counted either.
+    #[test]
+    fn bad_ready_fields_are_ignored() {
+        let long = "a".repeat(READY_FIELD_CAP + 1);
+        let bodies = [
+            "633;Ready;t=a%20b;sh=zsh".to_string(),
+            "633;Ready;t=abc;sh=zsh-5".to_string(),
+            "633;Ready;t=;sh=zsh".to_string(),
+            "633;Ready;sh=zsh".to_string(),
+            "633;Ready;t=abc".to_string(),
+            format!("633;Ready;t={long};sh=zsh"),
+            format!("633;Ready;t=abc;sh={long}"),
+        ];
+        for body in bodies {
+            let mut sc = Scanner::new(NONCE);
+            assert!(sc.feed(&osc(&body)).is_empty(), "{body}");
+            assert_eq!((sc.forged_events(), sc.stale_events()), (0, 0), "{body}");
+        }
+        let at_cap = "b".repeat(READY_FIELD_CAP);
+        assert_eq!(
+            events(&osc(&format!("633;Ready;t={at_cap};sh=zsh"))),
+            vec![Event::Ready { token: at_cap, sh: "zsh".into() }],
+            "the cap itself is allowed"
+        );
     }
 
     #[test]

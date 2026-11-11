@@ -1,22 +1,7 @@
-# AgentTerm shell integration. Sourced by the shim .zshrc after the user's config.
+# AgentTerm shell integration. Sourced by the shim .zshrc after the user's config, or evaluated from an injected blob
+# (core/inject.rs). It has no top-level return, so eval is safe.
 # Every OSC 133/633 event carries n=<nonce>; the Rust scanner (core/scanner.rs) ignores any event without it.
-# Event order per prompt: E, C (command) / D (exit) and OSC 7 (cwd), then titles, then A and B (prompt).
-if [[ -z ${AGENTTERM_NONCE-} ]]; then
-  return 0
-fi
-typeset -g _AGENTTERM_NONCE=$AGENTTERM_NONCE
-unset AGENTTERM_NONCE
-
-typeset -g _agentterm_ran=0
-typeset -g _agentterm_pA _agentterm_pB _agentterm_pP
-printf -v _agentterm_pA '%%{\033]133;A;n=%s\033\\%%}' "$_AGENTTERM_NONCE"
-printf -v _agentterm_pB '%%{\033]133;B;n=%s\033\\%%}' "$_AGENTTERM_NONCE"
-printf -v _agentterm_pP '%%{\033]133;P;n=%s;k=s\033\\%%}' "$_AGENTTERM_NONCE"
-
-# A blank row before each prompt that follows a command. It is a literal newline right after pA, so A is emitted on
-# the settled cursor row and that row stays blank. The separator line sits in it. AGENT_TERM_PROMPT_GAP=0 turns it off.
-typeset -g _agentterm_gap=$'\n'
-typeset -g _agentterm_gap_on=${AGENT_TERM_PROMPT_GAP-1}
+# Event order per prompt: E, C (command) / D (exit), Cwd and OSC 7 (cwd), then titles, then A and B (prompt).
 
 # E payload escaping: backslash, ';' and every C0 byte (including ESC and BEL) become \\ or \xHH,
 # so the payload has no raw ';' or terminator bytes.
@@ -81,6 +66,8 @@ _agentterm_precmd() {
   fi
   _agentterm_urlencode "$PWD"
   printf '\033]7;file://%s%s\033\\' "${HOST:-localhost}" "$REPLY"
+  _agentterm_escape_e "$PWD"
+  printf '\033]633;Cwd;n=%s;%s\033\\' "$_AGENTTERM_NONCE" "$REPLY"
   return $ret
 }
 
@@ -91,7 +78,44 @@ _agentterm_preexec() {
   printf '\033]133;C;n=%s\033\\' "$_AGENTTERM_NONCE"
 }
 
-precmd_functions=(_agentterm_precmd ${precmd_functions:#_agentterm_precmd})
-preexec_functions+=(_agentterm_preexec)
-PROMPT=$_agentterm_pA$PROMPT$_agentterm_pB
-PS2=$_agentterm_pP$PS2
+# Hello: the observer treats a shell that has said Hello as observable. The shim prints it last (.zshrc); an injected
+# shell prints it from the install branch at the bottom of this file. Values lose ';' and control bytes.
+_agentterm_hello() {
+  local user=${USER-} host=${HOST-} ver=${ZSH_VERSION-}
+  user=${user//[[:cntrl:];]/}
+  host=${host//[[:cntrl:];]/}
+  ver=${ver//[[:cntrl:];]/}
+  printf '\033]633;Hello;n=%s;v=1;sh=zsh;ver=%s;user=%s;host=%s;pid=%d\033\\' "$_AGENTTERM_NONCE" "$ver" "$user" "$host" $$
+}
+
+# Installs the hooks for the nonce in $1. Called once per shell.
+_agentterm_start() {
+  typeset -g _AGENTTERM_NONCE=$1
+  typeset -g _agentterm_ran=0
+  typeset -g _agentterm_pA _agentterm_pB _agentterm_pP
+  printf -v _agentterm_pA '%%{\033]133;A;n=%s\033\\%%}' "$_AGENTTERM_NONCE"
+  printf -v _agentterm_pB '%%{\033]133;B;n=%s\033\\%%}' "$_AGENTTERM_NONCE"
+  printf -v _agentterm_pP '%%{\033]133;P;n=%s;k=s\033\\%%}' "$_AGENTTERM_NONCE"
+
+  # A blank row before each prompt that follows a command. It is a literal newline right after pA, so A is emitted on
+  # the settled cursor row and that row stays blank. The separator line sits in it. AGENT_TERM_PROMPT_GAP=0 turns it off.
+  typeset -g _agentterm_gap=$'\n'
+  typeset -g _agentterm_gap_on=${AGENT_TERM_PROMPT_GAP-1}
+
+  precmd_functions=(_agentterm_precmd ${precmd_functions:#_agentterm_precmd})
+  preexec_functions+=(_agentterm_preexec)
+  PROMPT=$_agentterm_pA$PROMPT$_agentterm_pB
+  PS2=$_agentterm_pP$PS2
+}
+
+# Already installed: say so and leave the nonce and the hooks alone. Otherwise the nonce comes from the injected blob
+# (plain variable, never exported) or from the environment, as the shim has always done.
+if (( ${precmd_functions[(Ie)_agentterm_precmd]} )); then
+  print -r -- 'agentterm: already integrated'
+elif [[ -n ${_agentterm_inject_nonce-} ]]; then
+  _agentterm_start "$_agentterm_inject_nonce"
+  _agentterm_hello
+elif [[ -n ${AGENTTERM_NONCE-} ]]; then
+  _agentterm_start "$AGENTTERM_NONCE"
+  unset AGENTTERM_NONCE
+fi

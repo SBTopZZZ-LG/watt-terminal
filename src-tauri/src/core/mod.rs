@@ -7,6 +7,7 @@ pub mod agent;
 pub mod approval;
 pub mod chat;
 pub mod foreground;
+pub mod inject;
 pub mod llm;
 pub mod observer;
 pub mod persist;
