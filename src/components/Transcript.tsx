@@ -6,9 +6,11 @@ import { isAtBottom, shouldFollowAfterSend } from '../lib/stickScroll';
 import { approvalTitle } from '../lib/transcript';
 import type { TranscriptItem } from '../lib/transcript';
 import { askedBecause, decisionLabel, decisionTooltip } from '../lib/approvalReasons';
+import { capDisplay, displayText, sendKeysDisplay } from '../lib/keysDisplay';
+import { interactiveHeader } from '../lib/interactive';
 import { isDeclinedIntegration } from '../lib/integrate';
 import { groupTranscript, toolGroupSummary } from '../lib/toolGroups';
-import type { GroupItem } from '../lib/toolGroups';
+import type { GroupItem, InteractiveGroup, TranscriptEntry } from '../lib/toolGroups';
 import type { TodoItem } from '../lib/types';
 import { visibleEscapes } from '../lib/visibleEscapes';
 import { Markdown } from './Markdown';
@@ -188,13 +190,7 @@ export function Transcript({
       {bodyShown && (
         <div className="transcript-body" ref={bodyRef} tabIndex={-1} onScroll={onScroll} onWheel={onWheel}>
           {items.length === 0 && <div className="empty">Ask the agent something, for example "what was the last command".</div>}
-          {entries.map((entry) =>
-            entry.kind === 'item' ? (
-              <Entry key={entry.item.id} item={entry.item} onApprove={onApprove} />
-            ) : (
-              <ToolGroup key={entry.key} items={entry.items} onApprove={onApprove} />
-            ),
-          )}
+          {renderEntries(entries, onApprove)}
         </div>
       )}
       {bodyShown && showJump && <JumpToLatest busy={busy} onClick={jumpToLatest} />}
@@ -230,6 +226,61 @@ function ToolGroup({ items, onApprove }: { items: GroupItem[]; onApprove: Props[
   );
 }
 
+/** The transcript's entries as elements. Used for the body and, inside an interactive group, for the group's contents. */
+function renderEntries(entries: TranscriptEntry[], onApprove: Props['onApprove']) {
+  return entries.map((entry) => {
+    switch (entry.kind) {
+      case 'item':
+        return <Entry key={entry.item.id} item={entry.item} onApprove={onApprove} />;
+      case 'tools':
+        return <ToolGroup key={entry.key} items={entry.items} onApprove={onApprove} />;
+      case 'interactive':
+        return <InteractiveGroupView key={entry.key} group={entry.group} onApprove={onApprove} />;
+    }
+  });
+}
+
+/**
+ * A command the agent started and left running, and what the agent did for it. The wrapper has an accent rail while the
+ * command runs; once it ends the rail goes and the header says how it ended. The header ticks once a second while running.
+ */
+function InteractiveGroupView({ group, onApprove }: { group: InteractiveGroup; onApprove: Props['onApprove'] }) {
+  const running = group.ended === null;
+  const now = useNow(running);
+  return (
+    <section className={`interactive ${running ? 'interactive-running' : 'interactive-ended'}`}>
+      <div className="interactive-header">{interactiveHeader(group, now)}</div>
+      <div className="interactive-items">{renderEntries(group.entries, onApprove)}</div>
+    </section>
+  );
+}
+
+/** The current time, refreshed every second while `ticking`. Only the component that asks re-renders. */
+function useNow(ticking: boolean): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!ticking) {
+      return;
+    }
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [ticking]);
+  return now;
+}
+
+/** The send_keys rows' typed text is cut to this many characters in the summary. The full text is in the row's details. */
+const SEND_KEYS_ROW_CHARS = 40;
+
+/** A tool row's name. A send_keys row shows what it typed (decoded, capped) in place of the bare name. */
+function toolName(item: Extract<TranscriptItem, { kind: 'tool' }>): string {
+  if (item.name !== 'send_keys') {
+    return item.name;
+  }
+  const typed = sendKeysDisplay(item.args);
+  return typed === '' ? item.name : `send_keys "${capDisplay(typed, SEND_KEYS_ROW_CHARS)}"`;
+}
+
 function Entry({ item, onApprove }: { item: TranscriptItem; onApprove: Props['onApprove'] }) {
   switch (item.kind) {
     case 'user':
@@ -248,6 +299,9 @@ function Entry({ item, onApprove }: { item: TranscriptItem; onApprove: Props['on
       );
     case 'notice':
       return <div className="notice">{item.text}</div>;
+    // Closes an interactive group (see renderEntries); with no group open there is nothing to show.
+    case 'record_end':
+      return null;
     case 'tool': {
       // A declined integration request is its own status, not a failure: the user chose it.
       const declined = isDeclinedIntegration(item.name, item.decision);
@@ -255,7 +309,7 @@ function Entry({ item, onApprove }: { item: TranscriptItem; onApprove: Props['on
       return (
         <details className={`tool tool-${status}`}>
           <summary>
-            {item.name}
+            {toolName(item)}
             {item.decision !== null && !declined && (
               <span
                 className={`decision decision-${item.decision}`}
@@ -276,7 +330,12 @@ function Entry({ item, onApprove }: { item: TranscriptItem; onApprove: Props['on
         <div className={`approval approval-${item.state}`}>
           <div className="approval-title">{approvalTitle(item.name)}</div>
           {item.location !== null && <div className="approval-location">on {item.location}</div>}
-          <code className="approval-text">{visibleEscapes(item.text)}</code>
+          {/* A send_keys card shows the decoded input (the text and the keys), escaped; the other cards show the command. */}
+          {item.name === 'send_keys' ? (
+            <code className="approval-text approval-keys">{displayText(item.display ?? item.text)}</code>
+          ) : (
+            <code className="approval-text">{visibleEscapes(item.text)}</code>
+          )}
           {why !== null && <div className="approval-reason">{why}</div>}
           {item.state === 'pending' && (
             <div className="approval-actions">

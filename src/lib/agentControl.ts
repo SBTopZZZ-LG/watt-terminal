@@ -6,16 +6,22 @@ import type { WireEvent } from './types';
 export interface AgentControl {
   /** An approved run_command or send_keys is executing. Rust sends agent_control true before the call, false after. */
   call: boolean;
-  /** A command the agent started has not finished yet. Outlives the call when the call timed out and the command kept running. */
-  command: boolean;
+  /**
+   * The ids of the commands the agent started that have not finished. Several can be open at once: a command run inside a
+   * remote shell keeps the parked ssh command open. Outlives the call when the call timed out and the command kept running.
+   */
+  commands: ReadonlySet<number>;
 }
 
-export const NO_CONTROL: AgentControl = { call: false, command: false };
+const NO_COMMANDS: ReadonlySet<number> = new Set<number>();
+
+export const NO_CONTROL: AgentControl = { call: false, commands: NO_COMMANDS };
 
 /**
- * The hold after `ev`. The call flag: set by agent_control, cleared by its false. The command flag: set when a record the
- * agent started begins, cleared when that record finishes. Both clear when the shell exits, and the call flag also clears
- * when the agent's turn ends (`done`), so a missed event cannot leave the border on. Other events leave it as it is.
+ * The hold after `ev`. The call flag: set by agent_control, cleared by its false. The commands: a record the agent started is
+ * added when it begins and removed when that record finishes, so one command finishing leaves the others open. Everything
+ * clears when the shell exits, and the call flag also clears when the agent's turn ends (`done`), so a missed event cannot
+ * leave the border on. Other events leave it as it is.
  */
 export function agentControlAfter(c: AgentControl, ev: WireEvent): AgentControl {
   switch (ev.type) {
@@ -23,10 +29,20 @@ export function agentControlAfter(c: AgentControl, ev: WireEvent): AgentControl 
       return c.call === ev.active ? c : { ...c, call: ev.active };
     case 'done':
       return c.call ? { ...c, call: false } : c;
-    case 'record_started':
-      return ev.source.kind === 'agent' && !c.command ? { ...c, command: true } : c;
-    case 'record_finished':
-      return ev.record.source.kind === 'agent' && c.command ? { ...c, command: false } : c;
+    case 'record_started': {
+      if (ev.source.kind !== 'agent' || c.commands.has(ev.id)) {
+        return c;
+      }
+      return { ...c, commands: new Set([...c.commands, ev.id]) };
+    }
+    case 'record_finished': {
+      if (!c.commands.has(ev.record.id)) {
+        return c;
+      }
+      const commands = new Set(c.commands);
+      commands.delete(ev.record.id);
+      return { ...c, commands };
+    }
     case 'state':
       return ev.state === 'exited' ? NO_CONTROL : c;
     default:
@@ -36,7 +52,7 @@ export function agentControlAfter(c: AgentControl, ev: WireEvent): AgentControl 
 
 /** The agent holds the shell: the border is on while either hold is. */
 export function borderActive(c: AgentControl): boolean {
-  return c.call || c.command;
+  return c.call || c.commands.size > 0;
 }
 
 /**

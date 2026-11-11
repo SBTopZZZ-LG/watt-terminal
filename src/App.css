@@ -1505,6 +1505,61 @@ input {
   word-break: break-all;
 }
 
+/* The decoded keys of a send_keys card: a block of its own, on the code background, so what is typed reads clearly. */
+.approval-keys {
+  margin-top: 4px;
+  padding: 6px 8px;
+  background: var(--code-bg);
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  color: var(--ink-strong);
+  font-size: 12px;
+}
+
+/*
+ * A command the agent started and left running, and the agent's steps for it. The rail and the tinted background mark it
+ * while the command runs; when it ends the rail and the tint go, and the header says how it ended.
+ */
+.interactive {
+  margin: 8px 0;
+  padding: 4px 0 4px 10px;
+  position: relative;
+}
+
+.interactive-running {
+  padding-left: 12px;
+  background: var(--tint);
+  border-radius: 2px;
+}
+
+.interactive-running::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 3px;
+  background: var(--accent);
+}
+
+.interactive-header {
+  margin-bottom: 4px;
+  overflow: hidden;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.interactive-running .interactive-header {
+  color: var(--accent);
+}
+
+.interactive-ended {
+  border-left: 1px dotted var(--line);
+}
+
 /* Why the card asks. One muted line, under the command. */
 .approval-reason {
   margin-top: 4px;

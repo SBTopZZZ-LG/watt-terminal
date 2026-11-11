@@ -5,7 +5,7 @@
 import type { ApprovalPreview, ApprovalReasonCode, ToolDecision } from './types';
 
 /** The reasons a call asks. The approval card and the tool row say these. */
-export type AskReasonCode = Exclude<ApprovalReasonCode, 'approve_all' | 'rule'>;
+export type AskReasonCode = Exclude<ApprovalReasonCode, 'approve_all' | 'rule' | 'interrupt' | 'latched'>;
 
 /** Automatic approvals one turn may use before the rules stop running commands by themselves (MAX_AUTO_PER_TURN). */
 export const AUTO_PER_TURN = 8;
@@ -13,7 +13,7 @@ export const AUTO_PER_TURN = 8;
 /**
  * Why a call asks, as a clause: the card says "Asked because <clause>", and the try-a-command line says "Would ask: <clause>".
  */
-const ASK_CLAUSE: Record<AskReasonCode, string> = {
+const ASK_CLAUSE: Record<Exclude<AskReasonCode, 'unintegrated_shell'>, string> = {
   manual_mode: 'manual approval is on, so every command waits for you.',
   send_keys: 'sending keystrokes always needs your approval.',
   gate_chars: 'the command has a character outside letters, digits, spaces and _-./:=@+, so your rules do not apply to it.',
@@ -26,10 +26,17 @@ const ASK_CLAUSE: Record<AskReasonCode, string> = {
   approve_all_suspended: 'approve-all is off in this shell, because it was turned on in another shell.',
 };
 
+/** Reasons that are a whole sentence on their own, so the card shows them as they are (no "Asked because"). */
+const ASK_SENTENCE: Record<'unintegrated_shell', string> = {
+  unintegrated_shell: 'Typed into a shell without integration: your rules cannot check this.',
+};
+
 /** Why a call ran without asking, as a sentence. */
-const RAN_TEXT: Record<'approve_all' | 'rule', string> = {
+const RAN_TEXT: Record<'approve_all' | 'rule' | 'interrupt' | 'latched', string> = {
   approve_all: 'Ran without asking: approve-all is on for this session.',
   rule: 'Ran without asking: an allow rule matches this command.',
+  interrupt: 'Ran without asking: Ctrl-C, Ctrl-D or Esc into the command the agent started.',
+  latched: "Ran without asking: you approved this command's first keystrokes, so its later ones run too until you type.",
 };
 
 const GENERIC_ASK = 'Asked for your approval.';
@@ -43,6 +50,10 @@ function own<T>(table: Record<string, T>, key: string): T | undefined {
 export function askedBecause(code: ApprovalReasonCode | null | undefined): string | null {
   if (code === null || code === undefined) {
     return null;
+  }
+  const sentence = own(ASK_SENTENCE, code);
+  if (sentence !== undefined) {
+    return sentence;
   }
   const clause = own(ASK_CLAUSE, code);
   return clause === undefined ? GENERIC_ASK : `Asked because ${clause}`;

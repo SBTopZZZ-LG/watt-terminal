@@ -2,6 +2,8 @@
 // as they are and renders what comes back.
 
 import { isDeclinedIntegration } from './integrate';
+import { buildFrames } from './interactive';
+import type { FrameNode } from './interactive';
 import type { TranscriptItem } from './transcript';
 import { visibleEscapes } from './visibleEscapes';
 
@@ -11,7 +13,21 @@ type ApprovalItem = Extract<TranscriptItem, { kind: 'approval' }>;
 /** What a group may hold: a tool call, or an approval that has been answered. */
 export type GroupItem = ToolItem | ApprovalItem;
 
-export type TranscriptEntry = { kind: 'item'; item: TranscriptItem } | { kind: 'tools'; key: number; items: GroupItem[] };
+/** An interactive group as the view shows it: its header's facts, and its contents in order (see interactive.ts). */
+export interface InteractiveGroup {
+  recordId: number;
+  command: string;
+  startedAt: number | null;
+  /** Null while the command runs. */
+  ended: { exit: number | null } | null;
+  entries: TranscriptEntry[];
+}
+
+export type TranscriptEntry =
+  | { kind: 'item'; item: TranscriptItem }
+  | { kind: 'tools'; key: number; items: GroupItem[] }
+  /** `key` is the id of the tool row that opened the group. */
+  | { kind: 'interactive'; key: number; group: InteractiveGroup };
 
 /**
  * A run of consecutive tool and resolved approval items. A pending or answering approval is never inside a run: it is
@@ -22,39 +38,63 @@ function groupable(item: TranscriptItem): item is GroupItem {
 }
 
 /**
+ * The transcript's entries. Items are collapsed into runs (see collapseRun), and each interactive group (interactive.ts) is an
+ * entry holding its own entries, so the runs inside a group collapse the same way.
+ */
+export function groupTranscript(items: TranscriptItem[]): TranscriptEntry[] {
+  return entriesOf(buildFrames(items).children);
+}
+
+function entriesOf(nodes: FrameNode[]): TranscriptEntry[] {
+  const entries: TranscriptEntry[] = [];
+  let run: TranscriptItem[] = [];
+  const flush = () => {
+    entries.push(...collapseRun(run));
+    run = [];
+  };
+  for (const node of nodes) {
+    if (node.kind === 'frame') {
+      flush();
+      const { frame } = node;
+      entries.push({
+        kind: 'interactive',
+        key: frame.id,
+        group: {
+          recordId: frame.recordId,
+          command: frame.command,
+          startedAt: frame.startedAt,
+          ended: frame.ended,
+          entries: entriesOf(frame.children),
+        },
+      });
+    } else if (groupable(node.item)) {
+      run.push(node.item);
+    } else {
+      flush();
+      entries.push({ kind: 'item', item: node.item });
+    }
+  }
+  flush();
+  return entries;
+}
+
+/**
  * Collapses a run into one entry when it has two or more tool calls, or one tool call and at least one resolved
  * approval (the approval is the reason for the call, so it is folded in with it). A run with a single tool call and
  * no approval, or with approvals and no tool call, is returned item by item. The key is the id of the run's first
  * item, so it stays the same while the run grows and a group the user opened stays open.
  */
-export function groupTranscript(items: TranscriptItem[]): TranscriptEntry[] {
-  const entries: TranscriptEntry[] = [];
-  let run: GroupItem[] = [];
-  const flush = () => {
-    if (run.length === 0) {
-      return;
-    }
-    const toolCount = run.filter((i) => i.kind === 'tool').length;
-    const approvalCount = run.length - toolCount;
-    if (toolCount >= 2 || (toolCount >= 1 && approvalCount >= 1)) {
-      entries.push({ kind: 'tools', key: run[0].id, items: run });
-    } else {
-      for (const item of run) {
-        entries.push({ kind: 'item', item });
-      }
-    }
-    run = [];
-  };
-  for (const item of items) {
-    if (groupable(item)) {
-      run.push(item);
-    } else {
-      flush();
-      entries.push({ kind: 'item', item });
-    }
+function collapseRun(run: TranscriptItem[]): TranscriptEntry[] {
+  if (run.length === 0) {
+    return [];
   }
-  flush();
-  return entries;
+  const items = run.filter(groupable);
+  const toolCount = items.filter((i) => i.kind === 'tool').length;
+  const approvalCount = items.length - toolCount;
+  if (toolCount >= 2 || (toolCount >= 1 && approvalCount >= 1)) {
+    return [{ kind: 'tools', key: items[0].id, items }];
+  }
+  return run.map((item): TranscriptEntry => ({ kind: 'item', item }));
 }
 
 /**

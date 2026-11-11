@@ -215,3 +215,74 @@ describe('Transcript: a request_integration row', () => {
     expect(html).toContain('auto');
   });
 });
+
+describe('Transcript: interactive command groups', () => {
+  const started = (at: number): TranscriptAction[] => [
+    { type: 'agent_event', event: { type: 'tool_call', call_id: 'rc', name: 'run_command', args: { command: 'ssh ubuntu@lidia' } }, at },
+    {
+      type: 'agent_event',
+      event: { type: 'tool_result', call_id: 'rc', name: 'run_command', ok: true, decision: 'auto', result: { outcome: 'running', record_id: 7 } },
+    },
+  ];
+  const wait: TranscriptAction[] = [
+    { type: 'agent_event', event: { type: 'tool_call', call_id: 'w1', name: 'wait', args: {} } },
+    { type: 'agent_event', event: { type: 'tool_result', call_id: 'w1', name: 'wait', ok: true, decision: 'read', result: {} } },
+  ];
+  const endOf7: TranscriptAction = {
+    type: 'record_finished',
+    record: { id: 7, command: 'ssh ubuntu@lidia', source: { kind: 'agent', call_id: 'rc' }, exit_code: 0, status: 'complete', used_alt_screen: false, output_bytes: 0 },
+  };
+
+  it('a running command is a wrapper with the accent rail and a header that says running', () => {
+    const html = render([...started(Date.now()), ...wait]);
+    expect(html).toContain('class="interactive interactive-running"');
+    expect(html).toMatch(/Interactive · ssh ubuntu@lidia · running \d+s/);
+    expect(html).toContain('class="interactive-items"');
+    // The run_command row is the header, not a row inside the group.
+    expect(html).not.toContain('>run_command');
+  });
+
+  it('a finished command has no rail and its header says finished with the exit code', () => {
+    const html = render([...started(Date.now()), ...wait, endOf7]);
+    expect(html).toContain('class="interactive interactive-ended"');
+    expect(html).not.toContain('interactive-running');
+    expect(html).toContain('Interactive · ssh ubuntu@lidia · finished · exit 0');
+  });
+
+  it('an item after the end is outside the wrapper', () => {
+    const html = render([...started(Date.now()), endOf7, { type: 'agent_event', event: { type: 'text', text: 'after the end' } }]);
+    const wrapperEnd = html.indexOf('interactive-items');
+    expect(wrapperEnd).toBeGreaterThan(-1);
+    expect(html.indexOf('after the end')).toBeGreaterThan(html.indexOf('interactive-ended'));
+    expect(html.slice(wrapperEnd).indexOf('after the end')).toBeGreaterThan(-1);
+  });
+
+  it('a record_end with no group shows nothing', () => {
+    const html = render([endOf7]);
+    expect(html).not.toContain('interactive');
+    expect(html).not.toContain('record');
+  });
+
+  it('a send_keys row shows what it typed, and its approval card the decoded keys in a block', () => {
+    const html = render([
+      { type: 'agent_event', event: { type: 'approval_request', call_id: 'k1', name: 'send_keys', text: 'echo hi⏎', display: 'echo hi⏎', reason: 'unintegrated_shell' } },
+      { type: 'agent_event', event: { type: 'tool_call', call_id: 'k1', name: 'send_keys', args: { text: 'echo hi', keys: ['Enter'] } } },
+      { type: 'agent_event', event: { type: 'tool_result', call_id: 'k1', name: 'send_keys', ok: true, decision: 'manual', reason: 'unintegrated_shell', result: {} } },
+    ]);
+    expect(html).toContain('The agent wants to type into a running command');
+    expect(html).toContain('<code class="approval-text approval-keys">echo hi⏎</code>');
+    expect(html).toContain('Typed into a shell without integration: your rules cannot check this.');
+    expect(html).toContain('echo hi⏎');
+    expect(html).toContain('send_keys');
+  });
+
+  it('a long typed text is cut in the row summary', () => {
+    const long = 'x'.repeat(80);
+    const html = render([{ type: 'agent_event', event: { type: 'tool_call', call_id: 'k2', name: 'send_keys', args: { text: long } } }]);
+    // The summary is cut; the full text stays in the row's details (its <pre>).
+    const summary = /<summary>([^]*?)<\/summary>/.exec(html)?.[1] ?? '';
+    expect(summary).toContain(`${'x'.repeat(39)}…`);
+    expect(summary).not.toContain('x'.repeat(40));
+    expect(html).toContain('x'.repeat(80));
+  });
+});

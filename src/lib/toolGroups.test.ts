@@ -35,11 +35,15 @@ const text = (t: string): TranscriptAction => ({ type: 'agent_event', event: { t
 
 /** The shape of a grouped list: an item's kind, or a group as the ids of its members. */
 function shape(entries: ReturnType<typeof groupTranscript>): unknown[] {
-  return entries.map((e) =>
-    e.kind === 'item'
-      ? e.item.kind
-      : e.items.map((i) => (i.kind === 'tool' ? i.callId : `${i.kind}:${i.callId}`)),
-  );
+  return entries.map((e) => {
+    if (e.kind === 'item') {
+      return e.item.kind;
+    }
+    if (e.kind === 'interactive') {
+      return `interactive:${e.group.recordId}`;
+    }
+    return e.items.map((i) => (i.kind === 'tool' ? i.callId : `${i.kind}:${i.callId}`));
+  });
 }
 
 describe('groupTranscript', () => {
@@ -225,5 +229,60 @@ describe('toolGroupSummary: declined integration requests', () => {
       result('c2', 'run_command', false, 'denied'),
     ]);
     expect(toolGroupSummary(g)).toBe('2 tool calls: request_integration, run_command · 1 failed · denied · declined');
+  });
+});
+
+describe('groupTranscript: interactive groups', () => {
+  const runningCommand = (callId: string, recordId: number, command = 'ssh ubuntu@lidia'): TranscriptAction[] => [
+    { type: 'agent_event', event: { type: 'tool_call', call_id: callId, name: 'run_command', args: { command } } },
+    {
+      type: 'agent_event',
+      event: { type: 'tool_result', call_id: callId, name: 'run_command', ok: true, decision: 'auto', result: { outcome: 'running', record_id: recordId } },
+    },
+  ];
+  const waitRow = (callId: string): TranscriptAction[] => [
+    { type: 'agent_event', event: { type: 'tool_call', call_id: callId, name: 'wait', args: {} } },
+    { type: 'agent_event', event: { type: 'tool_result', call_id: callId, name: 'wait', ok: true, decision: 'read', result: { reason: 'screen_changed' } } },
+  ];
+  const recordEnd = (id: number, exit: number): TranscriptAction => ({
+    type: 'record_finished',
+    record: { id, command: 'x', source: { kind: 'agent', call_id: 'run' }, exit_code: exit, status: 'complete', used_alt_screen: false, output_bytes: 0 },
+  });
+
+  it('the run_command row becomes the group header, not a row inside it; its later rows are nested', () => {
+    const entries = groupTranscript(items([...runningCommand('c1', 7), ...waitRow('w1'), ...waitRow('w2')]));
+    expect(entries).toHaveLength(1);
+    const [entry] = entries;
+    expect(entry.kind).toBe('interactive');
+    if (entry.kind !== 'interactive') {
+      return;
+    }
+    expect(entry.group).toMatchObject({ recordId: 7, command: 'ssh ubuntu@lidia', ended: null });
+    // Two wait rows in a row collapse into one group inside the wrapper, as they do in the transcript.
+    expect(entry.group.entries.map((e) => e.kind)).toEqual(['tools']);
+  });
+
+  it('consecutive rows inside the group collapse the same way the transcript collapses them', () => {
+    const entries = groupTranscript(items([...runningCommand('c1', 7), ...waitRow('w1'), ...waitRow('w2'), recordEnd(7, 0)]));
+    const [entry] = entries;
+    expect(entry.kind === 'interactive' && entry.group.ended).toEqual({ exit: 0 });
+    expect(entry.kind === 'interactive' && entry.group.entries.map((e) => e.kind)).toEqual(['tools']);
+  });
+
+  it('the items after the end are outside the group', () => {
+    const entries = groupTranscript(items([...runningCommand('c1', 7), recordEnd(7, 0), { type: 'agent_event', event: { type: 'text', text: 'done' } }]));
+    expect(entries.map((e) => e.kind)).toEqual(['interactive', 'item']);
+    expect(entries[1].kind === 'item' && entries[1].item.kind).toBe('agent');
+  });
+
+  it('the group key is the id of the opening row, and it stays the same as the group grows', () => {
+    const before = groupTranscript(items(runningCommand('c1', 7)));
+    const after = groupTranscript(items([...runningCommand('c1', 7), ...waitRow('w1')]));
+    expect(before[0].kind === 'interactive' && before[0].key).toBe(after[0].kind === 'interactive' && after[0].key);
+  });
+
+  it('a group with nothing in it still shows its header', () => {
+    const [entry] = groupTranscript(items(runningCommand('c1', 7)));
+    expect(entry.kind === 'interactive' && entry.group.entries).toEqual([]);
   });
 });

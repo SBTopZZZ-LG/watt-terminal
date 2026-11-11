@@ -115,4 +115,28 @@ describe('previewText', () => {
       expect(askedBecause(code)).toBe(`Asked because ${previewText({ verdict: 'ask', reason: code }).replace('Would ask: ', '')}`);
     }
   });
+
+  it('an unintegrated shell is a sentence of its own, without "Asked because"', () => {
+    expect(askedBecause('unintegrated_shell')).toBe('Typed into a shell without integration: your rules cannot check this.');
+  });
+});
+
+describe('send_keys reasons that run without asking', () => {
+  it('an interrupt and a latched keystroke say they ran without asking, with the reason in the tooltip', () => {
+    expect(ranBecause('interrupt')).toBe('Ran without asking: Ctrl-C, Ctrl-D or Esc into the command the agent started.');
+    expect(ranBecause('latched')).toBe(
+      "Ran without asking: you approved this command's first keystrokes, so its later ones run too until you type.",
+    );
+    expect(decisionTooltip('auto', 'latched')).toBe(ranBecause('latched'));
+    expect(decisionTooltip('auto', 'interrupt')).toBe(ranBecause('interrupt'));
+  });
+
+  it('the row label names them: auto · interrupt, auto · latched', () => {
+    expect(decisionLabel('auto', 'interrupt')).toBe('auto · interrupt');
+    expect(decisionLabel('auto', 'latched')).toBe('auto · latched');
+  });
+
+  it('an unintegrated shell asks, so its tooltip is the card sentence', () => {
+    expect(decisionTooltip('manual', 'unintegrated_shell')).toBe('Typed into a shell without integration: your rules cannot check this.');
+  });
 });

@@ -96,14 +96,17 @@ export type SessionEvent =
 export type ToolDecision = 'read' | 'manual' | 'auto' | 'denied' | 'refused';
 
 /**
- * Why a call asked or ran without asking (core/approval). Wire codes, as sent in `reason`. "approve_all" and "rule" are
- * the reasons a call ran without asking; the others say why it asked.
+ * Why a call asked or ran without asking (core/approval). Wire codes, as sent in `reason`. "approve_all", "rule", "interrupt"
+ * and "latched" are the reasons a call ran without asking; the others say why it asked.
  */
 export type ApprovalReasonCode =
   | 'approve_all'
   | 'rule'
+  | 'interrupt'
+  | 'latched'
   | 'manual_mode'
   | 'send_keys'
+  | 'unintegrated_shell'
   | 'gate_chars'
   | 'gate_path'
   | 'gate_denylist'
@@ -122,8 +125,11 @@ export type AgentEvent =
   | { type: 'tool_call'; call_id: string; name: string; args: unknown }
   /** `reason` is absent for read tools, `todo_write` and calls refused before the policy. */
   | { type: 'tool_result'; call_id: string; name: string; ok: boolean; decision: ToolDecision; reason?: ApprovalReasonCode; result: unknown }
-  /** `reason` is why the call asks. `level` (0 is the local shell) and `location` (a nested shell's label) are always sent by the backend, optional here for existing fixtures. */
-  | { type: 'approval_request'; call_id: string; name: string; text: string; reason?: ApprovalReasonCode; level?: number; location?: string }
+  /**
+   * `reason` is why the call asks. `level` (0 is the local shell) and `location` (a nested shell's label) are always sent by the
+   * backend, optional here for existing fixtures. `display` is the decoded input of a send_keys card (`echo hi⏎`), sent only for that.
+   */
+  | { type: 'approval_request'; call_id: string; name: string; text: string; display?: string; reason?: ApprovalReasonCode; level?: number; location?: string }
   /** The agent is executing an approved shell call (true) and has finished it (false). */
   | { type: 'agent_control'; active: boolean }
   /**

@@ -33,6 +33,17 @@ function finished(source: Source): WireEvent {
   };
 }
 
+function startedId(id: number, source: Source): WireEvent {
+  return { type: 'record_started', id, command: 'cmd', source };
+}
+
+function finishedId(id: number, source: Source): WireEvent {
+  return {
+    type: 'record_finished',
+    record: { id, command: 'cmd', source, exit_code: 0, status: 'complete', used_alt_screen: false, output_bytes: 0 },
+  };
+}
+
 /** Feeds the events through the derive function in order and returns the border after each one. */
 function trace(events: WireEvent[], start: AgentControl = NO_CONTROL): boolean[] {
   const out: boolean[] = [];
@@ -46,8 +57,8 @@ function trace(events: WireEvent[], start: AgentControl = NO_CONTROL): boolean[]
 
 describe('agentControlAfter', () => {
   it('is set by agent_control and cleared by its false', () => {
-    expect(agentControlAfter(NO_CONTROL, controlOn)).toEqual({ call: true, command: false });
-    expect(agentControlAfter({ call: true, command: false }, controlOff)).toEqual(NO_CONTROL);
+    expect(agentControlAfter(NO_CONTROL, controlOn)).toEqual({ call: true, commands: new Set() });
+    expect(agentControlAfter({ call: true, commands: new Set() }, controlOff)).toEqual(NO_CONTROL);
   });
 
   it('waiting for an approval is not control: the request and the call do not set it', () => {
@@ -90,6 +101,31 @@ describe('agentControlAfter', () => {
     expect(trace([started(userSource), finished(userSource)])).toEqual([false, false]);
   });
 
+  it('a nested agent command finishing does not clear the border while the parked ssh command is open', () => {
+    // The ssh command (7) stays open after request_integration; the agent runs a command inside it (9) that ends first.
+    const events: WireEvent[] = [
+      startedId(7, agentSource),
+      startedId(9, agentSource),
+      finishedId(9, agentSource),
+      finishedId(7, agentSource),
+    ];
+    expect(trace(events)).toEqual([true, true, true, false]);
+  });
+
+  it('the set holds each open id once, and only a finish of an id in it removes it', () => {
+    let c = agentControlAfter(NO_CONTROL, startedId(7, agentSource));
+    c = agentControlAfter(c, startedId(7, agentSource));
+    expect(c.commands).toEqual(new Set([7]));
+    c = agentControlAfter(c, finishedId(8, agentSource));
+    expect(c.commands).toEqual(new Set([7]));
+    c = agentControlAfter(c, finishedId(7, agentSource));
+    expect(c.commands.size).toBe(0);
+  });
+
+  it('a shell exit clears every open command', () => {
+    expect(trace([startedId(7, agentSource), startedId(9, agentSource), { type: 'state', state: 'exited' }])).toEqual([true, true, false]);
+  });
+
   it('clears when the agent turn ends, even if the control off event was lost', () => {
     expect(trace([controlOn, done])).toEqual([true, false]);
   });
@@ -100,7 +136,7 @@ describe('agentControlAfter', () => {
   });
 
   it('keeps the flag through unrelated events', () => {
-    expect(trace([{ type: 'text', text: 'hi' }, toolResult], { call: true, command: false })).toEqual([true, true]);
+    expect(trace([{ type: 'text', text: 'hi' }, toolResult], { call: true, commands: new Set() })).toEqual([true, true]);
   });
 });
 
@@ -115,9 +151,9 @@ describe('borderLevel', () => {
 
   it('is control while a call or an agent command holds the shell, busy or not', () => {
     const holds: AgentControl[] = [
-      { call: true, command: false },
-      { call: false, command: true },
-      { call: true, command: true },
+      { call: true, commands: new Set() },
+      { call: false, commands: new Set([1]) },
+      { call: true, commands: new Set([1, 2]) },
     ];
     for (const c of holds) {
       expect(borderLevel(c, true)).toBe('control');

@@ -341,6 +341,8 @@ export default function App() {
           marks.recordStarted(ev.source.kind === 'agent');
           return;
         case 'record_finished':
+          // Closes the interactive group the command opened on, if there is one (see transcript.ts).
+          dispatchTranscript({ type: 'record_finished', record: ev.record });
           return;
         case 'levels':
           // Rust pushed, popped or pending-ed a level. The nonces are taken first, so the bytes after this event are checked
@@ -350,7 +352,7 @@ export default function App() {
           refreshAutoState();
           return;
         default:
-          dispatchTranscript({ type: 'agent_event', event: ev });
+          dispatchTranscript({ type: 'agent_event', event: ev, at: Date.now() });
       }
     };
 

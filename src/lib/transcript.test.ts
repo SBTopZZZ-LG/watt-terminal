@@ -355,7 +355,7 @@ describe('transcriptReducer: conversation_reset', () => {
 describe('approvalTitle', () => {
   it('names run_command and send_keys', () => {
     expect(approvalTitle('run_command')).toBe('The agent wants to run a command');
-    expect(approvalTitle('send_keys')).toBe('The agent wants to send keystrokes');
+    expect(approvalTitle('send_keys')).toBe('The agent wants to type into a running command');
   });
 
   it('names any other tool, escaping the name', () => {
@@ -505,5 +505,32 @@ describe('transcriptReducer: integration requests', () => {
     );
     expect(after.items).toEqual(before.items);
     expect(after.inFlight).toBe(before.inFlight);
+  });
+});
+
+describe('transcriptReducer: send_keys cards and tool start times', () => {
+  it('an approval card keeps the decoded display of a send_keys request', () => {
+    const t = run([
+      { type: 'agent_event', event: { type: 'approval_request', call_id: 'k1', name: 'send_keys', text: 'echo hi⏎', display: 'echo hi⏎', reason: 'unintegrated_shell' } },
+    ]);
+    expect(t.items[0]).toMatchObject({ kind: 'approval', display: 'echo hi⏎', reason: 'unintegrated_shell' });
+  });
+
+  it('an approval card without a display (other tools) has null', () => {
+    const t = run([{ type: 'agent_event', event: { type: 'approval_request', call_id: 'a1', name: 'run_command', text: 'ls' } }]);
+    expect(t.items[0]).toMatchObject({ kind: 'approval', display: null });
+  });
+
+  it('a tool call records when it started, from the arrival time of the event', () => {
+    const t = run([{ type: 'agent_event', event: { type: 'tool_call', call_id: 'c1', name: 'wait', args: {} }, at: 5000 }]);
+    expect(t.items[0]).toMatchObject({ kind: 'tool', startedAt: 5000 });
+  });
+
+  it('a session reset clears the finished-command memory', () => {
+    const t = run([
+      { type: 'record_finished', record: { id: 4, command: 'x', source: { kind: 'agent', call_id: 'r' }, exit_code: 0, status: 'complete', used_alt_screen: false, output_bytes: 0 } },
+      { type: 'session_reset' },
+    ]);
+    expect(t.finished).toEqual([]);
   });
 });

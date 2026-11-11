@@ -1,9 +1,10 @@
 // The agent transcript: what the user said, what the agent said, its tool calls, and approval requests.
 // Pure reducer over AgentEvents (from Rust) and local actions (sent messages, clicks, errors).
 
-import type { AgentEvent, ApprovalReasonCode, TodoItem, ToolDecision } from './types';
+import type { AgentEvent, ApprovalReasonCode, RecordSummary, TodoItem, ToolDecision } from './types';
 import { visibleEscapes } from './visibleEscapes';
 import { TODO_TOOL } from './todoView';
+import { openRecordIds, openedBy } from './interactive';
 
 export type ToolStatus = 'running' | 'ok' | 'failed';
 export type ApprovalState = 'pending' | 'answering' | 'resolved';
@@ -12,10 +13,18 @@ export type TranscriptItem =
   | { id: number; kind: 'user'; clientId: number; text: string }
   /** `streaming` is true while text_delta events are still extending this message. */
   | { id: number; kind: 'agent'; text: string; streaming: boolean }
-  /** `reason` is why the call asked or ran without asking. Null for read tools and calls refused before the policy. */
-  | { id: number; kind: 'tool'; callId: string; name: string; args: unknown; status: ToolStatus; result: unknown; decision: ToolDecision | null; reason: ApprovalReasonCode | null }
-  /** `reason` is why the card asks. `location` is the nested shell the command is for (its label), or null on the local shell. */
-  | { id: number; kind: 'approval'; callId: string; name: string; text: string; state: ApprovalState; approve: boolean | null; reason: ApprovalReasonCode | null; location: string | null }
+  /**
+   * `reason` is why the call asked or ran without asking. Null for read tools and calls refused before the policy.
+   * `startedAt` is when the call started (Unix ms), set for the calls of this session; absent for a reopened conversation.
+   */
+  | { id: number; kind: 'tool'; callId: string; name: string; args: unknown; status: ToolStatus; result: unknown; decision: ToolDecision | null; reason: ApprovalReasonCode | null; startedAt?: number }
+  /**
+   * `reason` is why the card asks. `location` is the nested shell the command is for (its label), or null on the local shell.
+   * `display` is the decoded input of a send_keys card (null for the others, and for a card from an older backend).
+   */
+  | { id: number; kind: 'approval'; callId: string; name: string; text: string; display: string | null; state: ApprovalState; approve: boolean | null; reason: ApprovalReasonCode | null; location: string | null }
+  /** The command an interactive group opened on has ended (see interactive.ts). Not shown: it closes the group. */
+  | { id: number; kind: 'record_end'; recordId: number; exit: number | null }
   | { id: number; kind: 'notice'; text: string };
 
 /** A transcript item before the reducer gives it an id. `Omit` over the union would lose the variants, so it is distributed. */
@@ -30,15 +39,31 @@ export interface Transcript {
   thinking: boolean;
   /** The conversation's todo list, shown by the todo panel. Replaced as a whole. */
   todos: TodoItem[];
+  /**
+   * Agent commands that finished while no interactive group was open for them, newest last. The run_command result that
+   * opens a group can arrive after the command has finished, so the group is closed at once when it does (see transcript.ts).
+   */
+  finished: FinishedRecord[];
 }
 
-export const EMPTY_TRANSCRIPT: Transcript = { items: [], inFlight: 0, nextId: 1, thinking: false, todos: [] };
+export interface FinishedRecord {
+  recordId: number;
+  exit: number | null;
+}
+
+export const EMPTY_TRANSCRIPT: Transcript = { items: [], inFlight: 0, nextId: 1, thinking: false, todos: [], finished: [] };
 
 /** Keeps the transcript bounded; the oldest items go first. */
 export const MAX_ITEMS = 500;
 
+/** How many finished agent commands are remembered for a group that opens late. */
+const MAX_FINISHED = 16;
+
 export type TranscriptAction =
-  | { type: 'agent_event'; event: AgentEvent }
+  /** `at` is when the event arrived (Unix ms). Only a tool call's start time uses it, so it may be left out in tests. */
+  | { type: 'agent_event'; event: AgentEvent; at?: number }
+  /** A command the shell ran has finished. Closes the interactive group it opened on, if one is open (see interactive.ts). */
+  | { type: 'record_finished'; record: RecordSummary }
   /** A message was handed to the agent. Counts as in flight until its `done`. */
   | { type: 'user_sent'; clientId: number; text: string }
   /** The agent refused the message (Rust error). Drops the user item and the in-flight count. */
@@ -61,7 +86,19 @@ export type TranscriptAction =
 export function transcriptReducer(t: Transcript, action: TranscriptAction): Transcript {
   switch (action.type) {
     case 'agent_event':
-      return applyAgentEvent(t, action.event);
+      return applyAgentEvent(t, action.event, action.at);
+    case 'record_finished': {
+      const { id, exit_code, source } = action.record;
+      if (openRecordIds(t.items).has(id)) {
+        return add(t, (nid) => ({ id: nid, kind: 'record_end', recordId: id, exit: exit_code }));
+      }
+      // No group to close yet. An agent command is remembered, in case its run_command result (which opens the group) comes later.
+      if (source.kind !== 'agent') {
+        return t;
+      }
+      const finished = [...t.finished.filter((f) => f.recordId !== id), { recordId: id, exit: exit_code }];
+      return { ...t, finished: finished.slice(Math.max(0, finished.length - MAX_FINISHED)) };
+    }
     case 'user_sent':
       return add({ ...t, inFlight: t.inFlight + 1 }, (id) => ({
         id,
@@ -108,7 +145,12 @@ export function transcriptReducer(t: Transcript, action: TranscriptAction): Tran
         }
         return i;
       });
-      return add({ ...t, items, inFlight: 0, thinking: false }, (id) => ({ id, kind: 'notice', text: 'New shell session started.' }));
+      // The commands the old shell was running can never finish: their interactive groups end here, with no exit code.
+      let next: Transcript = { ...t, items, inFlight: 0, thinking: false, finished: [] };
+      for (const recordId of openRecordIds(items)) {
+        next = add(next, (id) => ({ id, kind: 'record_end', recordId, exit: null }));
+      }
+      return add(next, (id) => ({ id, kind: 'notice', text: 'New shell session started.' }));
     }
     case 'conversation_reset':
       // Keeps nextId, so ids stay unique for the React keys of the items that come after.
@@ -127,7 +169,7 @@ function keyed(item: NewItem, id: number): TranscriptItem {
   return (item.kind === 'agent' ? { ...item, id, streaming: false } : { ...item, id }) as TranscriptItem;
 }
 
-function applyAgentEvent(t: Transcript, ev: AgentEvent): Transcript {
+function applyAgentEvent(t: Transcript, ev: AgentEvent, at: number | undefined): Transcript {
   switch (ev.type) {
     case 'text':
       return add(t, (id) => ({ id, kind: 'agent', text: ev.text, streaming: false }));
@@ -150,6 +192,7 @@ function applyAgentEvent(t: Transcript, ev: AgentEvent): Transcript {
         result: null,
         decision: null,
         reason: null,
+        startedAt: at,
       }));
     case 'tool_result': {
       if (ev.name === TODO_TOOL) {
@@ -168,9 +211,10 @@ function applyAgentEvent(t: Transcript, ev: AgentEvent): Transcript {
       });
       const next = { ...t, items };
       // A result without its call should not happen, but show it rather than drop it.
-      return hasTool
-        ? next
-        : add(next, (id) => ({
+      if (hasTool) {
+        return closeIfFinished(next, ev.call_id);
+      }
+      return add(next, (id) => ({
             id,
             kind: 'tool',
             callId: ev.call_id,
@@ -189,6 +233,7 @@ function applyAgentEvent(t: Transcript, ev: AgentEvent): Transcript {
         callId: ev.call_id,
         name: ev.name,
         text: ev.text,
+        display: ev.display ?? null,
         state: 'pending',
         approve: null,
         reason: ev.reason ?? null,
@@ -238,6 +283,25 @@ function add(t: Transcript, make: (id: number) => TranscriptItem): Transcript {
   return { ...t, items: items.length > MAX_ITEMS ? items.slice(items.length - MAX_ITEMS) : items, nextId: t.nextId + 1 };
 }
 
+/**
+ * The result of a run_command call that opened an interactive group, for a command that had already finished (see
+ * `finished`). Its end goes right after the row, so the group opens and closes at once, with the command's exit code.
+ */
+function closeIfFinished(t: Transcript, callId: string): Transcript {
+  const at = t.items.findIndex((i) => i.kind === 'tool' && i.callId === callId);
+  if (at < 0) {
+    return t;
+  }
+  const opener = openedBy(t.items[at]);
+  const done = opener === null ? undefined : t.finished.find((f) => f.recordId === opener.recordId);
+  if (done === undefined) {
+    return t;
+  }
+  const marker: TranscriptItem = { id: t.nextId, kind: 'record_end', recordId: done.recordId, exit: done.exit };
+  const items = [...t.items.slice(0, at + 1), marker, ...t.items.slice(at + 1)];
+  return { ...t, items: items.length > MAX_ITEMS ? items.slice(items.length - MAX_ITEMS) : items, nextId: t.nextId + 1 };
+}
+
 /** The call id of the oldest approval still waiting for an answer, or null. */
 export function firstPendingApproval(t: Transcript): string | null {
   const found = t.items.find((i) => i.kind === 'approval' && i.state === 'pending');
@@ -254,7 +318,7 @@ export function approvalTitle(name: string): string {
     case 'run_command':
       return 'The agent wants to run a command';
     case 'send_keys':
-      return 'The agent wants to send keystrokes';
+      return 'The agent wants to type into a running command';
     default:
       return `The agent wants to use ${visibleEscapes(name)}`;
   }
