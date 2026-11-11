@@ -554,6 +554,14 @@ input {
 }
 
 
+/* The robot mark beside "Agent" in the transcript header and above it on the rail. The height is fixed and the width follows
+   the image's proportions (its width attribute), so nothing moves when it loads. */
+.brand-mark {
+  flex: 0 0 auto;
+  height: 16px;
+  width: auto;
+}
+
 /* Collapsed side panel: a 32px rail with one button. The children stay mounted, hidden. */
 .agent-rail {
   display: none;
@@ -579,6 +587,8 @@ input {
 .agent-panel.is-rail > .agent-rail {
   display: flex;
   flex: 1 1 auto;
+  flex-direction: column;
+  gap: 8px;
   align-items: center;
   justify-content: center;
   padding: 8px 0;
@@ -2294,13 +2304,17 @@ input {
   padding: 0 14px 6px;
 }
 
-/* The tab strip: one row. The selected tab has accent text and a solid rule under it; the others are muted. Labels shrink
-   with an ellipsis, so the row fits a narrow window. */
+/* The tab strip: one row. The selected tab has accent text and a solid rule under it; the others are muted. The tabs share the
+   row when every label fits; when they do not (a narrow window), the row scrolls sideways and no label is cut short. The
+   labels need about 194px together, more than a 240px window leaves inside the padding, so the narrow case scrolls. */
 .tab-strip {
   display: flex;
   flex: 0 0 auto;
   gap: 2px;
   min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
   padding: 0 14px;
   border-bottom: 1px dashed var(--rule);
 }
@@ -2312,7 +2326,7 @@ input {
   gap: 5px;
   align-items: center;
   justify-content: center;
-  min-width: 0;
+  min-width: max-content;
   margin: 0 0 -1px;
   padding: 6px 8px 5px;
   border: 0;
@@ -2376,6 +2390,42 @@ input {
 .settings-note {
   margin: 10px 0 0;
   color: var(--muted);
+  font-size: 11px;
+}
+
+/* Settings > About: the mark and wordmark centred in a column, then the name and the version in the muted style. */
+.about {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 24px 0 8px;
+  text-align: center;
+}
+
+.about-mark {
+  height: 112px;
+  width: auto;
+}
+
+.about-wordmark {
+  width: 200px;
+  height: auto;
+}
+
+.about-name,
+.about-version {
+  margin: 0;
+  color: var(--muted);
+}
+
+.about-name {
+  font-size: 12px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.about-version {
   font-size: 11px;
 }
 

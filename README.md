@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/brand/watt-logo-full.png" width="220" alt="Watt logo">
+</p>
+
 # Watt Terminal
 
 Whatever Agentic Terminal Thing
@@ -79,3 +83,7 @@ The Rust integration tests spawn real `zsh -l` sessions through the user's own s
 - No "integration lost" detection. An `exec zsh` or nested shell silently loses shell integration.
 - TUIs (alternate-screen apps such as `vim` or `less`) are rendered, but the agent can only read the screen. It cannot type into them, because `send_keys` is a stub.
 - Conversation is not persisted across app restarts.
+
+## Notes
+
+The bundle identifier (`dev.agentterm.app`, in `src-tauri/tauri.conf.json`) and the Keychain service name keep the app's old name on purpose. They decide where settings, window state and stored API keys live, so changing them would orphan existing user data. `tauri.conf.json` is strict JSON, so the note cannot sit there; the Keychain constant has its own comment in `src-tauri/src/core/settings/secrets.rs`.

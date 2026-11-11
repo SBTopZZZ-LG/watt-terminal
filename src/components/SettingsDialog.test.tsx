@@ -103,11 +103,12 @@ function noticesProps(over: Partial<SettingsNoticesProps> = {}): SettingsNotices
 const notices = (over: Partial<SettingsNoticesProps> = {}) => renderToStaticMarkup(<SettingsNotices {...noticesProps(over)} />);
 
 describe('SETTINGS_TABS', () => {
-  it('Models first, then Approvals, then Limits, each with its label', () => {
+  it('Models first, then Approvals, then Limits, then About, each with its label', () => {
     expect(SETTINGS_TABS.map((t) => [t.id, t.label])).toEqual([
       ['models', 'Models'],
       ['approvals', 'Approvals'],
       ['limits', 'Limits'],
+      ['about', 'About'],
     ]);
   });
 });
@@ -360,8 +361,24 @@ describe('SettingsDialog: backdrop', () => {
     vi.stubGlobal('document', { activeElement: null });
     try {
       const out = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} />);
-      expect(out).toMatch(/^<div class="modal-backdrop"><div class="settings-dialog" role="dialog"/);
+      // Not anchored at the start: React's server renderer puts <link rel="preload"> tags before the markup for the About images.
+      expect(out).toMatch(/<div class="modal-backdrop"><div class="settings-dialog" role="dialog"/);
       expect(out).not.toContain('settings-backdrop');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+describe('SettingsDialog: About tab', () => {
+  it('has an About tab whose panel holds the about section, and the footer Close button is still there', () => {
+    vi.stubGlobal('document', { activeElement: null });
+    try {
+      const out = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} />);
+      expect(out).toMatch(/<button[^>]*role="tab"[^>]*>(?:(?!<\/button>).)*About/);
+      expect(out).toContain('class="about"');
+      expect(out).toContain('Watt Terminal');
+      expect(out).toContain('>Close<');
     } finally {
       vi.unstubAllGlobals();
     }

@@ -16,6 +16,7 @@ import { visibleEscapes } from '../lib/visibleEscapes';
 import { Markdown } from './Markdown';
 import { TodoPanel } from './TodoPanel';
 import type { Dock } from '../lib/panelLayout';
+import wattMark from '../assets/watt-mark.png';
 
 /** The default for `todos`, so the prop can be left out. A constant, so it is not a new array on every render. */
 const NO_TODOS: TodoItem[] = [];
@@ -165,6 +166,7 @@ export function Transcript({
     <section className={`transcript${open ? ' open' : ''}`}>
       <div className="transcript-header">
         <button type="button" className="transcript-head" onClick={onToggle}>
+          <img className="brand-mark" src={wattMark} width={212} height={256} alt="" aria-hidden="true" />
           <span>Agent</span>
           {busy && <span className="busy">working...</span>}
           {thinking && <span className="thinking">thinking...</span>}

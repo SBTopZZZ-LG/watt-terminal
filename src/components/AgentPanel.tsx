@@ -1,5 +1,6 @@
 import type { ReactNode, Ref } from 'react';
 import type { Dock, PanelView } from '../lib/panelLayout';
+import wattMark from '../assets/watt-mark.png';
 
 interface WorkspaceProps {
   ref?: Ref<HTMLDivElement>;
@@ -49,6 +50,7 @@ export function AgentPanel({ ref, view, onExpand, children }: AgentPanelProps) {
           title="Show the agent (Ctrl/Cmd+Shift+A)"
           aria-label="Show the agent panel"
         >
+          <img className="brand-mark" src={wattMark} width={212} height={256} alt="" aria-hidden="true" />
           <span className="agent-rail-label">Agent</span>
         </button>
       ) : null}

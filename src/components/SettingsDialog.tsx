@@ -21,6 +21,7 @@ import {
 import type { ProviderDraft } from '../lib/settingsForm';
 import { RECOVERY_BUSY_LABEL, REVERT_CONFIRM, reasonText, recoveryExplanation, recoveryKind } from '../lib/settingsRecovery';
 import type { AgentRequests, ProviderPreset, RecoverAction, SettingsStateView, SettingsView } from '../lib/types';
+import { AboutSection } from './AboutSection';
 import { ApprovalSection } from './ApprovalSection';
 import { LimitsSection } from './LimitsSection';
 import { ProviderEditor } from './ProviderEditor';
@@ -60,13 +61,14 @@ export interface EditorState {
 
 /**
  * The tabs of the AI settings, in order. Models holds the default model, the context limit, the providers and the editor;
- * Approvals holds the approval rules; Limits holds the per-turn caps. A new tab is one entry here and one panel in the
- * dialog's render.
+ * Approvals holds the approval rules; Limits holds the per-turn caps; About shows the app's name and version. A new tab is one
+ * entry here and one panel in the dialog's render.
  */
 export const SETTINGS_TABS: readonly TabDef[] = [
   { id: 'models', label: 'Models' },
   { id: 'approvals', label: 'Approvals' },
   { id: 'limits', label: 'Limits' },
+  { id: 'about', label: 'About' },
 ];
 
 /** The select value for "None" (default model) and "Blank provider" (add provider). Preset keys are never empty. */
@@ -1028,6 +1030,8 @@ export function SettingsDialog({ onClose, onChanged, onViewLoaded }: SettingsDia
       />
     ) : null;
 
+  const aboutPanel = <AboutSection />;
+
   return (
     <div
       className="modal-backdrop"
@@ -1072,7 +1076,9 @@ export function SettingsDialog({ onClose, onChanged, onViewLoaded }: SettingsDia
           selected={tab}
           dirty={dirtyTabs}
           onSelect={setTab}
-          panel={(id) => (id === 'approvals' ? approvalsPanel : id === 'limits' ? limitsPanel : modelsPanel)}
+          panel={(id) =>
+            id === 'approvals' ? approvalsPanel : id === 'limits' ? limitsPanel : id === 'about' ? aboutPanel : modelsPanel
+          }
         />
         <footer className="settings-foot">
           {askClose ? (
