@@ -16,6 +16,7 @@ use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -54,6 +55,9 @@ pub struct Settings {
     /// How the agent's shell integration requests are answered (`request_integration`). Missing in older files: ask.
     #[serde(default)]
     pub integration: IntegrationSettings,
+    /// The per-turn caps of the agent (`LimitsSettings`). Missing in older files: the defaults.
+    #[serde(default)]
+    pub limits: LimitsSettings,
 }
 
 fn current_version() -> u32 {
@@ -69,7 +73,69 @@ impl Default for Settings {
             global_context_limit: None,
             approval: ApprovalSettings::default(),
             integration: IntegrationSettings::default(),
+            limits: LimitsSettings::default(),
         }
+    }
+}
+
+/// The per-turn caps of the agent (core/chat/agent_loop, core/tools). Missing fields take their defaults. A saved number out
+/// of range makes the whole file invalid, like any other bad setting (see `validate`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LimitsSettings {
+    /// Model calls in one turn that are not polling (see `max_poll_calls`). At least 10, no upper bound. Still checked while
+    /// `model_calls_unlimited` is on.
+    pub max_model_calls: u32,
+    /// No cap on the model calls above. Its own switch, so the number is kept while it is on.
+    pub model_calls_unlimited: bool,
+    /// Polling model calls in one turn: a reply whose calls are all wait, get_screen or send_keys while a command the agent
+    /// started is still running. 10 to 500.
+    pub max_poll_calls: u32,
+    /// `run_command` calls in one turn. 1 to 500.
+    pub max_commands_per_turn: u32,
+    /// Minutes `wait` may spend in one turn. 1 to 720.
+    pub max_wait_minutes: u32,
+}
+
+impl Default for LimitsSettings {
+    fn default() -> Self {
+        Self {
+            max_model_calls: 50,
+            model_calls_unlimited: false,
+            max_poll_calls: 60,
+            max_commands_per_turn: 30,
+            max_wait_minutes: 30,
+        }
+    }
+}
+
+impl LimitsSettings {
+    /// The model-call cap of one turn, or `None` when it is unlimited.
+    pub fn model_call_cap(&self) -> Option<u32> {
+        (!self.model_calls_unlimited).then_some(self.max_model_calls)
+    }
+
+    /// The longest `wait` may spend in one turn.
+    pub fn max_wait(&self) -> Duration {
+        Duration::from_secs(u64::from(self.max_wait_minutes) * 60)
+    }
+
+    /// Every problem found, one human-readable string each.
+    pub fn validate(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        if self.max_model_calls < 10 {
+            problems.push("limits: model calls per turn must be at least 10".into());
+        }
+        if !(10..=500).contains(&self.max_poll_calls) {
+            problems.push("limits: polling calls per turn must be 10 to 500".into());
+        }
+        if !(1..=500).contains(&self.max_commands_per_turn) {
+            problems.push("limits: commands per turn must be 1 to 500".into());
+        }
+        if !(1..=720).contains(&self.max_wait_minutes) {
+            problems.push("limits: wait minutes per turn must be 1 to 720".into());
+        }
+        problems
     }
 }
 
@@ -236,6 +302,7 @@ impl Settings {
         }
 
         problems.extend(approval::validate_settings(&self.approval));
+        problems.extend(self.limits.validate());
 
         if problems.is_empty() { Ok(()) } else { Err(problems) }
     }
@@ -572,6 +639,7 @@ mod tests {
             global_context_limit: Some(32_000),
             approval: ApprovalSettings::default(),
             integration: IntegrationSettings::default(),
+            limits: LimitsSettings::default(),
         }
     }
 
@@ -999,5 +1067,128 @@ mod tests {
         fs::write(settings_path(dir.path()), json).unwrap();
         assert!(matches!(load(dir.path()), Err(SettingsError::Invalid(msg)) if msg.contains("approval allow rule 1")));
         assert_eq!(fs::read(settings_path(dir.path())).unwrap(), json);
+    }
+
+    #[test]
+    fn limits_default_to_the_documented_values() {
+        let expected = LimitsSettings {
+            max_model_calls: 50,
+            model_calls_unlimited: false,
+            max_poll_calls: 60,
+            max_commands_per_turn: 30,
+            max_wait_minutes: 30,
+        };
+        assert_eq!(LimitsSettings::default(), expected);
+        assert_eq!(Settings::default().limits, expected);
+        assert_eq!(expected.model_call_cap(), Some(50));
+        assert_eq!(expected.max_wait(), Duration::from_secs(30 * 60));
+    }
+
+    #[test]
+    fn limits_round_trip_through_the_file() {
+        let dir = TempDir::new();
+        let mut settings = valid();
+        settings.limits = LimitsSettings {
+            max_model_calls: u32::MAX,
+            model_calls_unlimited: true,
+            max_poll_calls: 500,
+            max_commands_per_turn: 1,
+            max_wait_minutes: 720,
+        };
+        save(dir.path(), &settings).unwrap();
+        let text = fs::read_to_string(settings_path(dir.path())).unwrap();
+        assert!(text.contains(r#""model_calls_unlimited": true"#), "{text}");
+        assert!(text.contains(r#""max_model_calls": 4294967295"#), "{text}");
+        assert_eq!(load(dir.path()).unwrap(), settings);
+    }
+
+    #[test]
+    fn an_older_file_loads_with_the_default_limits_and_a_partial_limits_section_keeps_the_rest() {
+        let dir = TempDir::new();
+        fs::create_dir_all(dir.path()).unwrap();
+        fs::write(settings_path(dir.path()), br#"{"version":1,"providers":[],"global_context_limit":4000}"#).unwrap();
+        assert_eq!(load(dir.path()).unwrap().limits, LimitsSettings::default());
+
+        fs::write(settings_path(dir.path()), br#"{"version":1,"limits":{"max_poll_calls":200}}"#).unwrap();
+        let loaded = load(dir.path()).unwrap().limits;
+        assert_eq!(loaded, LimitsSettings { max_poll_calls: 200, ..LimitsSettings::default() });
+    }
+
+    #[test]
+    fn model_call_cap_is_none_only_when_unlimited() {
+        let limited = LimitsSettings { max_model_calls: 10, ..LimitsSettings::default() };
+        assert_eq!(limited.model_call_cap(), Some(10));
+        let unlimited = LimitsSettings { model_calls_unlimited: true, ..limited };
+        assert_eq!(unlimited.model_call_cap(), None);
+        assert_eq!(LimitsSettings { max_wait_minutes: 2, ..LimitsSettings::default() }.max_wait(), Duration::from_secs(120));
+    }
+
+    /// The limits edges: each case is (label, limits, whether the file is valid).
+    #[test]
+    fn limits_edges_are_checked_on_their_ranges() {
+        let base = LimitsSettings::default();
+        let cases = [
+            ("model calls 10", LimitsSettings { max_model_calls: 10, ..base }, true),
+            ("model calls 9", LimitsSettings { max_model_calls: 9, ..base }, false),
+            ("model calls 0", LimitsSettings { max_model_calls: 0, ..base }, false),
+            ("model calls u32::MAX, no upper bound", LimitsSettings { max_model_calls: u32::MAX, ..base }, true),
+            ("model calls 200 (a warning in the UI, not an error)", LimitsSettings { max_model_calls: 200, ..base }, true),
+            ("model calls 9 while unlimited is still checked", LimitsSettings { max_model_calls: 9, model_calls_unlimited: true, ..base }, false),
+            ("unlimited with a valid number", LimitsSettings { model_calls_unlimited: true, ..base }, true),
+            ("polling 10", LimitsSettings { max_poll_calls: 10, ..base }, true),
+            ("polling 9", LimitsSettings { max_poll_calls: 9, ..base }, false),
+            ("polling 500", LimitsSettings { max_poll_calls: 500, ..base }, true),
+            ("polling 501", LimitsSettings { max_poll_calls: 501, ..base }, false),
+            ("commands 1", LimitsSettings { max_commands_per_turn: 1, ..base }, true),
+            ("commands 0", LimitsSettings { max_commands_per_turn: 0, ..base }, false),
+            ("commands 500", LimitsSettings { max_commands_per_turn: 500, ..base }, true),
+            ("commands 501", LimitsSettings { max_commands_per_turn: 501, ..base }, false),
+            ("wait 1", LimitsSettings { max_wait_minutes: 1, ..base }, true),
+            ("wait 0", LimitsSettings { max_wait_minutes: 0, ..base }, false),
+            ("wait 720", LimitsSettings { max_wait_minutes: 720, ..base }, true),
+            ("wait 721", LimitsSettings { max_wait_minutes: 721, ..base }, false),
+        ];
+        for (label, limits, expect_valid) in cases {
+            let mut settings = valid();
+            settings.limits = limits;
+            let problems = settings.validate().err().unwrap_or_default();
+            assert_eq!(problems.is_empty(), expect_valid, "{label}: {problems:?}");
+            assert!(problems.iter().all(|p| p.starts_with("limits:")) || problems.is_empty(), "{label}: {problems:?}");
+        }
+    }
+
+    #[test]
+    fn a_limit_out_of_range_is_refused_on_save_and_the_file_is_left_alone() {
+        let dir = TempDir::new();
+        save(dir.path(), &valid()).unwrap();
+        let before = fs::read(settings_path(dir.path())).unwrap();
+
+        let mut bad = valid();
+        bad.limits.max_poll_calls = 9;
+        let err = save(dir.path(), &bad).unwrap_err();
+        assert!(matches!(&err, SettingsError::Invalid(msg) if msg.contains("polling calls per turn must be 10 to 500")), "{err}");
+        assert_eq!(fs::read(settings_path(dir.path())).unwrap(), before);
+    }
+
+    #[test]
+    fn an_out_of_range_limit_in_a_file_makes_the_file_invalid_and_is_left_alone() {
+        let dir = TempDir::new();
+        fs::create_dir_all(dir.path()).unwrap();
+        let below = br#"{"version":1,"limits":{"max_model_calls":9}}"#;
+        fs::write(settings_path(dir.path()), below).unwrap();
+        assert!(matches!(load(dir.path()), Err(SettingsError::Invalid(msg)) if msg.contains("model calls per turn must be at least 10")));
+        assert_eq!(fs::read(settings_path(dir.path())).unwrap(), below);
+
+        // Values the number type cannot hold, or that are not whole numbers, make the file unreadable: same result.
+        for json in [
+            &br#"{"version":1,"limits":{"max_model_calls":4294967296}}"#[..],
+            &br#"{"version":1,"limits":{"max_wait_minutes":12.5}}"#[..],
+            &br#"{"version":1,"limits":{"max_commands_per_turn":0}}"#[..],
+            &br#"{"version":1,"limits":{"max_poll_calls":5000}}"#[..],
+        ] {
+            fs::write(settings_path(dir.path()), json).unwrap();
+            assert!(matches!(load(dir.path()), Err(SettingsError::Invalid(_))), "{}", String::from_utf8_lossy(json));
+            assert_eq!(fs::read(settings_path(dir.path())).unwrap(), json);
+        }
     }
 }

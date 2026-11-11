@@ -34,12 +34,8 @@ use crate::core::chat::redact::Redactor;
 use crate::core::chat::todo::{self, Todo, TodoList};
 use crate::core::llm::{self, AssistantReply, ChatRequest, Delta, LlmError, ProviderConfig, ToolCall, TurnCancel};
 use crate::core::observer::OpenAgentRecord;
+use crate::core::settings::LimitsSettings;
 use crate::core::tools::{age_text, INTEGRATE_HINT, TopLevel};
-
-/// Model calls allowed in one turn. The tool calls of the last one are not run.
-pub const MAX_MODEL_CALLS: usize = 50;
-/// `run_command` calls allowed in one turn. A call past the cap gets an error result and does not run.
-pub const MAX_COMMANDS_PER_TURN: usize = 30;
 
 const SESSION_PLACEHOLDER: &str = "{session_id}";
 pub const USER_AGENT: &str = concat!("agent-term/", env!("CARGO_PKG_VERSION"));
@@ -56,7 +52,10 @@ const READ_NAMES: [&str; 5] = ["list_commands", "get_command", "get_screen", "ge
 /// Longest tool name echoed back in an error, so a model cannot make the history carry a huge name.
 const NAME_LIMIT: usize = 80;
 
+/// Tool names that count a reply as polling when they are all it asks for, while a command the agent started is running.
+const POLL_NAMES: [&str; 3] = ["wait", "get_screen", "send_keys"];
 const LIMIT_REASON: &str = "not run: the turn stopped after the model call limit";
+const POLL_LIMIT_REASON: &str = "not run: the turn stopped after the polling call limit";
 const DENIED_NOTICE: &str = "Stopped: the command was not approved. Tell me what you want to do next.";
 
 /// The provider settings read from the environment. Holds the key, so `Debug` hides it.
@@ -276,6 +275,8 @@ pub struct LlmAgent {
     resume_note: Option<String>,
     /// Saves the conversation at each checkpoint (see `with_checkpoint`).
     checkpoint: Option<Checkpoint>,
+    /// The caps this turn runs under (see `with_limits`).
+    limits: LimitsSettings,
 }
 
 impl LlmAgent {
@@ -310,7 +311,14 @@ impl LlmAgent {
             tools: prompt::tool_definitions(),
             resume_note: None,
             checkpoint: None,
+            limits: LimitsSettings::default(),
         }
+    }
+
+    /// The caps this turn runs under: the saved limits, read per user message. The default is the saved default.
+    pub fn with_limits(mut self, limits: LimitsSettings) -> Self {
+        self.limits = limits;
+        self
     }
 
     /// The note about a resumed conversation (from `Conversation::take_resume_note`). It goes into the system message
@@ -409,7 +417,7 @@ impl LlmAgent {
 
     /// Runs the tool calls of one reply in order and records each result. Returns why the turn must stop, if it must.
     /// The calls after a stop are not run; the caller closes them in the history.
-    fn run_calls(&self, calls: &[ToolCall], ctx: &AgentCtx<'_>, commands: &mut usize) -> Option<Stop> {
+    fn run_calls(&self, calls: &[ToolCall], ctx: &AgentCtx<'_>, commands: &mut u32) -> Option<Stop> {
         for call in calls {
             if self.cancel.is_cancelled() {
                 return Some(Stop::Cancelled);
@@ -427,7 +435,7 @@ impl LlmAgent {
     }
 
     /// Runs one call. Returns the model-facing text of its result and whether the user denied it.
-    fn run_call(&self, call: &ToolCall, ctx: &AgentCtx<'_>, commands: &mut usize) -> (String, bool) {
+    fn run_call(&self, call: &ToolCall, ctx: &AgentCtx<'_>, commands: &mut u32) -> (String, bool) {
         let name = call.name.as_str();
         let failed = |message: &str| (project(name, false, &Value::String(message.to_string()), &self.redactor), false);
         let Ok(args) = serde_json::from_str::<Value>(&call.arguments) else {
@@ -435,7 +443,7 @@ impl LlmAgent {
         };
         let result = match name {
             "run_command" => {
-                if *commands >= MAX_COMMANDS_PER_TURN {
+                if *commands >= self.limits.max_commands_per_turn {
                     return failed("per-turn command limit reached; ask the user to continue");
                 }
                 *commands += 1;
@@ -475,7 +483,8 @@ impl Agent for LlmAgent {
         // The finished note is for this turn's first model call only: it says what finished since the last turn.
         let mut finished = finished_since_last_turn(&lock(&self.history).snapshot(), ctx);
         let mut commands = 0;
-        for call_no in 1..=MAX_MODEL_CALLS {
+        let (mut general, mut polls) = (0, 0);
+        loop {
             if self.cancel.is_cancelled() {
                 return;
             }
@@ -486,10 +495,11 @@ impl Agent for LlmAgent {
             if reply.tool_calls.is_empty() {
                 return;
             }
-            if call_no == MAX_MODEL_CALLS {
-                // The calls of the last allowed reply are not run, so nothing happens after the limit.
-                lock(&self.history).close_pending(LIMIT_REASON);
-                ctx.say(format!("I stopped after {MAX_MODEL_CALLS} model calls in one turn."));
+            let polling = is_polling(&ctx.open_agent_records(), &reply.tool_calls);
+            if let Some(cap) = self.charge(polling, &mut general, &mut polls) {
+                // The calls of the reply that reached the cap are not run, so nothing happens after the limit.
+                lock(&self.history).close_pending(cap.reason());
+                ctx.say(cap.notice());
                 return;
             }
             if let Some(stop) = self.run_calls(&reply.tool_calls, ctx, &mut commands) {
@@ -500,6 +510,55 @@ impl Agent for LlmAgent {
                 return;
             }
             self.save_checkpoint();
+        }
+    }
+}
+
+impl LlmAgent {
+    /// Counts one reply that asks for tool calls, against the cap it belongs to: a polling reply against the polling cap
+    /// only, any other reply against the model-call cap only. Returns the cap the count reached, if it reached one. A
+    /// reply that reaches a cap is not run.
+    fn charge(&self, polling: bool, general: &mut u32, polls: &mut u32) -> Option<Cap> {
+        if polling {
+            *polls += 1;
+            return (*polls >= self.limits.max_poll_calls).then_some(Cap::Polls(self.limits.max_poll_calls));
+        }
+        *general += 1;
+        self.limits.model_call_cap().filter(|&cap| *general >= cap).map(Cap::Model)
+    }
+}
+
+/// True when a reply counts as polling: an agent-started command is still running, and every call in the reply is one that
+/// only looks at it or types into it (wait, get_screen, send_keys).
+fn is_polling(open: &[OpenAgentRecord], calls: &[ToolCall]) -> bool {
+    !open.is_empty() && !calls.is_empty() && calls.iter().all(|call| POLL_NAMES.contains(&call.name.as_str()))
+}
+
+/// A cap that a reply reached. The turn ends there, and the reply's calls are not run.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cap {
+    /// The model-call cap, with its value.
+    Model(u32),
+    /// The polling cap, with its value.
+    Polls(u32),
+}
+
+impl Cap {
+    fn reason(self) -> &'static str {
+        match self {
+            Cap::Model(_) => LIMIT_REASON,
+            Cap::Polls(_) => POLL_LIMIT_REASON,
+        }
+    }
+
+    /// What the user is told. It names the cap and its value, and where to change it.
+    fn notice(self) -> String {
+        match self {
+            Cap::Model(n) => format!("I stopped after {n} model calls in one turn. The limit can be changed in Settings > Limits."),
+            Cap::Polls(n) => format!(
+                "I stopped after {n} polling calls in one turn (wait, get_screen or send_keys while a command you started is \
+                 running). The limit can be changed in Settings > Limits."
+            ),
         }
     }
 }

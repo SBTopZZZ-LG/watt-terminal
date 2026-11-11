@@ -44,7 +44,7 @@ use crate::core::settings::service::{
     FetchOutcome, RecoverAction, SaveProviderInput, SettingsService, SettingsStateView, SettingsView, TestResult,
     test_model,
 };
-use crate::core::settings::{AgentRequests, ApprovalSettings, IntegrationSettings, ModelRef, Nested};
+use crate::core::settings::{AgentRequests, ApprovalSettings, IntegrationSettings, LimitsSettings, ModelRef, Nested};
 use crate::core::tools::SessionTools;
 
 type Reg = Registry<Attached>;
@@ -407,6 +407,12 @@ fn turn_rules(service: Option<&SettingsService>) -> TurnRules {
     }
 }
 
+/// The per-turn caps (model calls, polling calls, commands, wait minutes) from the settings in use. The defaults when the
+/// settings cannot be used.
+fn turn_limits(service: Option<&SettingsService>) -> LimitsSettings {
+    service.and_then(|s| s.limits_settings().ok()).unwrap_or_default()
+}
+
 /// Starts one agent turn on its own thread. Events arrive on the events channel. The model is chosen by `choose_llm`,
 /// and the approval policy by `approval_policy`. Both are read from the settings before the turn starts, so an error
 /// leaves the agent idle.
@@ -421,10 +427,11 @@ async fn agent_message(
     let att = session(&reg, &session_id)?;
     // Reading a saved model touches the Keychain, so it runs on the blocking pool.
     let service = settings.0.clone();
-    let (chosen, policy, rules) = blocking(move || {
+    let (chosen, policy, rules, limits) = blocking(move || {
         let policy = approval_policy(service.as_deref());
         let rules = turn_rules(service.as_deref());
-        Ok((choose_llm(service.as_deref())?, policy, rules))
+        let limits = turn_limits(service.as_deref());
+        Ok((choose_llm(service.as_deref())?, policy, rules, limits))
     })
     .await?;
     let cancel = Arc::new(TurnCancel::new());
@@ -445,7 +452,8 @@ async fn agent_message(
                 let agent = LlmAgent::new(client, llm_settings, &conversation_id, history, todos, cancel.clone())
                     // The note is taken only by a turn that calls the model: a turn that fails to start keeps it.
                     .with_resume_note(att.conversation.take_resume_note())
-                    .with_checkpoint(checkpoint);
+                    .with_checkpoint(checkpoint)
+                    .with_limits(limits);
                 (Some(agent), Some(state))
             }
             Err(e) => {
@@ -458,7 +466,7 @@ async fn agent_message(
     let spawned = thread::Builder::new().name("agent".into()).spawn(move || {
         // Runs on panic too, so a crashed turn cannot leave the agent busy or in control of the shell.
         let _end = OnDrop::new(|| worker.end_turn());
-        let tools = SessionTools::new(&worker.session).with_cancel(cancel);
+        let tools = SessionTools::new(&worker.session).with_cancel(cancel).with_wait_budget(limits.max_wait());
         let channels = worker.channels.clone();
         let owner = worker.clone();
         let emit = move |ev: AgentEvent| {
@@ -903,6 +911,14 @@ async fn set_integration_settings(
     blocking(move || service.set_integration(input)).await
 }
 
+/// Saves the per-turn limits: the model-call cap (or unlimited), the polling cap, the commands cap and the wait minutes. Refused
+/// while settings.json is broken or in last-good mode.
+#[tauri::command]
+async fn set_limits_settings(input: LimitsSettings, settings: State<'_, SettingsState>) -> Result<SettingsView, String> {
+    let service = settings.get()?;
+    blocking(move || service.set_limits(input)).await
+}
+
 /// What the saved approval settings would decide for `command`, without running it. Approve-all is not included: it is
 /// session-only and is not saved.
 #[tauri::command]
@@ -1021,6 +1037,7 @@ pub fn run() {
             set_global_context_limit,
             set_approval_settings,
             set_integration_settings,
+            set_limits_settings,
             answer_integration,
             test_approval,
             approval_builtin_deny,

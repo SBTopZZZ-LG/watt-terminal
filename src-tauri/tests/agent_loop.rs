@@ -9,7 +9,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use agent_term_lib::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate};
-use agent_term_lib::core::chat::agent_loop::{agent_record_note, Conversation, LlmAgent, LlmSettings, MAX_COMMANDS_PER_TURN, MAX_MODEL_CALLS};
+use agent_term_lib::core::chat::agent_loop::{agent_record_note, Conversation, LlmAgent, LlmSettings};
+use agent_term_lib::core::settings::LimitsSettings;
 use agent_term_lib::core::chat::history::History;
 use agent_term_lib::core::chat::prompt;
 use agent_term_lib::core::chat::redact::Redactor;
@@ -24,6 +25,9 @@ use serde_json::{Value, json};
 
 const KEY: &str = "sk-or-test-SECRETVALUE-0123456789";
 const MODEL: &str = "deepseek/deepseek-v4.1-flash";
+/// The saved defaults (core/settings), which an agent without `with_limits` runs under.
+const MAX_MODEL_CALLS: usize = 50;
+const MAX_COMMANDS_PER_TURN: usize = 30;
 
 /// One scripted provider answer.
 struct Script {
@@ -736,11 +740,188 @@ fn the_model_call_cap_stops_the_turn_and_runs_nothing_after_it() {
 
     assert_eq!(provider.requests().len(), MAX_MODEL_CALLS);
     assert_eq!(tools.reached().len(), MAX_MODEL_CALLS - 1, "the last reply's calls are not run");
-    assert_eq!(texts(&events), [format!("I stopped after {MAX_MODEL_CALLS} model calls in one turn.")]);
+    assert_eq!(
+        texts(&events),
+        [format!("I stopped after {MAX_MODEL_CALLS} model calls in one turn. The limit can be changed in Settings > Limits.")]
+    );
     let msgs = stored(&conv.history());
     let last = msgs.last().unwrap();
     assert_eq!(last["role"], "tool");
     assert!(last["content"].as_str().unwrap().contains("model call limit"), "{last}");
+    assert_paired(&msgs);
+}
+
+/// One of the agent's own commands, open and on top, as the observer reports it while it runs.
+fn open_on_top(id: u64) -> OpenAgentRecord {
+    OpenAgentRecord { id, call_id: "run-1".into(), command: "sleep 30".into(), age: Duration::from_secs(20), on_top: true }
+}
+
+/// Model calls per turn: a lowered cap stops the turn at that many replies, and the notice names the cap and its value.
+#[test]
+fn a_lowered_model_call_cap_stops_at_that_many_replies() {
+    let provider = serve(vec![
+        Script::json(tool_reply(&[("call_1", "get_cwd", "{}")])),
+        Script::json(tool_reply(&[("call_2", "get_cwd", "{}")])),
+        Script::json(tool_reply(&[("call_3", "get_cwd", "{}")])),
+        Script::json(text_reply("never asked for")),
+    ]);
+    let conv = Conversation::new().unwrap();
+    let tools = FakeTools::default();
+    let limits = LimitsSettings { max_model_calls: 3, ..LimitsSettings::default() };
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new())).with_limits(limits);
+    let events = turn(&mut agent, &tools, &no_gate(), "keep looking");
+
+    assert_eq!(provider.requests().len(), 3, "the third reply reached the cap");
+    assert_eq!(tools.reached(), ["get_cwd", "get_cwd"], "the third reply's call is not run");
+    assert_eq!(
+        texts(&events),
+        ["I stopped after 3 model calls in one turn. The limit can be changed in Settings > Limits."]
+    );
+    assert!(tool_content(&stored(&conv.history()), "call_3").contains("model call limit"));
+    assert_paired(&stored(&conv.history()));
+}
+
+/// An unlimited model-call cap does not stop at 50, nor at any other number: the turn ends when the model answers.
+#[test]
+fn an_unlimited_model_call_cap_does_not_stop_at_fifty() {
+    let mut scripts: Vec<Script> = (1..=54).map(|n| Script::json(tool_reply(&[(&format!("call_{n}"), "get_cwd", "{}")]))).collect();
+    scripts.push(Script::json(text_reply("done")));
+    let provider = serve(scripts);
+    let conv = Conversation::new().unwrap();
+    let tools = FakeTools::default();
+    let limits = LimitsSettings { model_calls_unlimited: true, ..LimitsSettings::default() };
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new())).with_limits(limits);
+    let events = turn(&mut agent, &tools, &no_gate(), "keep looking");
+
+    assert_eq!(provider.requests().len(), 55, "more than the default cap of 50 model calls ran");
+    assert_eq!(tools.reached().len(), 54, "every reply's calls ran");
+    assert_eq!(texts(&events), ["done"], "no limit notice");
+    assert_paired(&stored(&conv.history()));
+}
+
+/// While the agent's command runs, a reply whose calls are all wait, get_screen or send_keys is a polling reply. Those do not
+/// count toward the model-call cap, which is set low here: the turn runs five of them under a cap of three.
+#[test]
+fn polling_replies_do_not_count_toward_the_model_call_cap() {
+    let provider = serve(vec![
+        Script::json(tool_reply(&[("call_1", "wait", "{\"seconds\":1}")])),
+        Script::json(tool_reply(&[("call_2", "get_screen", "{}")])),
+        Script::json(tool_reply(&[("call_3", "wait", "{\"seconds\":1}"), ("call_4", "send_keys", "{\"bytes\":[13]}")])),
+        Script::json(tool_reply(&[("call_5", "wait", "{\"seconds\":1}")])),
+        Script::json(tool_reply(&[("call_6", "get_screen", "{}")])),
+        Script::json(text_reply("done")),
+    ]);
+    let conv = Conversation::new().unwrap();
+    let tools = FakeTools::default();
+    tools.open.lock().unwrap().push(open_on_top(7));
+    let limits = LimitsSettings { max_model_calls: 3, ..LimitsSettings::default() };
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new())).with_limits(limits);
+    let events = turn(&mut agent, &tools, &no_gate(), "watch it");
+
+    assert_eq!(provider.requests().len(), 6, "five polling replies and the answer");
+    assert_eq!(tools.reached(), ["wait", "get_screen", "wait", "wait", "get_screen"]);
+    assert_eq!(texts(&events), ["done"], "no limit notice");
+    assert_paired(&stored(&conv.history()));
+}
+
+/// The polling cap stops the turn at its own value, and the notice says it is the polling cap. The model-call cap is left at
+/// 10 here, so a reply that counted there would not stop the turn: the stop is the polling one.
+#[test]
+fn polling_replies_stop_at_the_polling_cap() {
+    let provider = serve(vec![
+        Script::json(tool_reply(&[("call_1", "wait", "{\"seconds\":1}")])),
+        Script::json(tool_reply(&[("call_2", "get_screen", "{}")])),
+        Script::json(tool_reply(&[("call_3", "wait", "{\"seconds\":1}")])),
+        Script::json(text_reply("never asked for")),
+    ]);
+    let conv = Conversation::new().unwrap();
+    let tools = FakeTools::default();
+    tools.open.lock().unwrap().push(open_on_top(7));
+    let limits = LimitsSettings { max_model_calls: 10, max_poll_calls: 3, ..LimitsSettings::default() };
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new())).with_limits(limits);
+    let events = turn(&mut agent, &tools, &no_gate(), "watch it");
+
+    assert_eq!(provider.requests().len(), 3, "the third polling reply reached the polling cap");
+    assert_eq!(tools.reached(), ["wait", "get_screen"], "the third reply's call is not run");
+    assert_eq!(
+        texts(&events),
+        [
+            "I stopped after 3 polling calls in one turn (wait, get_screen or send_keys while a command you started is running). \
+             The limit can be changed in Settings > Limits."
+        ]
+    );
+    let msgs = stored(&conv.history());
+    assert!(tool_content(&msgs, "call_3").contains("polling call limit"), "{msgs:?}");
+    assert_paired(&msgs);
+}
+
+/// A reply with any call that is not a polling call counts toward the model-call cap, not the polling cap. Here the middle reply
+/// mixes a wait with get_cwd, so the cap of two model calls stops the turn at the third reply.
+#[test]
+fn a_mixed_reply_counts_as_a_model_call() {
+    let provider = serve(vec![
+        Script::json(tool_reply(&[("call_1", "wait", "{\"seconds\":1}")])),
+        Script::json(tool_reply(&[("call_2", "wait", "{\"seconds\":1}"), ("call_3", "get_cwd", "{}")])),
+        Script::json(tool_reply(&[("call_4", "get_cwd", "{}")])),
+        Script::json(text_reply("never asked for")),
+    ]);
+    let conv = Conversation::new().unwrap();
+    let tools = FakeTools::default();
+    tools.open.lock().unwrap().push(open_on_top(7));
+    let limits = LimitsSettings { max_model_calls: 2, max_poll_calls: 10, ..LimitsSettings::default() };
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new())).with_limits(limits);
+    let events = turn(&mut agent, &tools, &no_gate(), "watch it");
+
+    assert_eq!(provider.requests().len(), 3);
+    assert_eq!(tools.reached(), ["wait", "wait", "get_cwd"], "the third reply's call is not run");
+    assert_eq!(
+        texts(&events),
+        ["I stopped after 2 model calls in one turn. The limit can be changed in Settings > Limits."]
+    );
+    assert_paired(&stored(&conv.history()));
+}
+
+/// Without a command of the agent's running, a wait is an ordinary model call: it counts toward the model-call cap.
+#[test]
+fn a_wait_with_no_agent_command_running_is_a_model_call() {
+    let provider = serve(vec![
+        Script::json(tool_reply(&[("call_1", "wait", "{\"seconds\":1}")])),
+        Script::json(tool_reply(&[("call_2", "wait", "{\"seconds\":1}")])),
+        Script::json(text_reply("never asked for")),
+    ]);
+    let conv = Conversation::new().unwrap();
+    let tools = FakeTools::default();
+    let limits = LimitsSettings { max_model_calls: 2, max_poll_calls: 10, ..LimitsSettings::default() };
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new())).with_limits(limits);
+    let events = turn(&mut agent, &tools, &no_gate(), "wait a bit");
+
+    assert_eq!(provider.requests().len(), 2, "the second reply reached the model-call cap");
+    assert_eq!(tools.reached(), ["wait"]);
+    assert_eq!(
+        texts(&events),
+        ["I stopped after 2 model calls in one turn. The limit can be changed in Settings > Limits."]
+    );
+}
+
+/// The saved commands cap is the one that applies: a cap of 4 lets four run_command calls through, not the default 30.
+#[test]
+fn the_saved_commands_cap_is_used() {
+    let calls: Vec<(String, &str, String)> =
+        (1..=6).map(|n| (format!("call_{n}"), "run_command", format!("{{\"command\":\"echo {n}\"}}"))).collect();
+    let call_refs: Vec<(&str, &str, &str)> = calls.iter().map(|(id, name, args)| (id.as_str(), *name, args.as_str())).collect();
+    let provider = serve(vec![Script::json(tool_reply(&call_refs)), Script::json(text_reply("ok"))]);
+    let conv = Conversation::new().unwrap();
+    let tools = FakeTools::default();
+    let gate = no_gate();
+    gate.set_auto_approve(true, 0);
+    let limits = LimitsSettings { max_commands_per_turn: 4, ..LimitsSettings::default() };
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new())).with_limits(limits);
+    turn(&mut agent, &tools, &gate, "run six things");
+
+    assert_eq!(tools.reached().iter().filter(|n| *n == "run_command").count(), 4);
+    let msgs = stored(&conv.history());
+    assert!(tool_content(&msgs, "call_4").starts_with('{'), "the fourth ran");
+    assert_eq!(tool_content(&msgs, "call_5"), "error: per-turn command limit reached; ask the user to continue");
     assert_paired(&msgs);
 }
 

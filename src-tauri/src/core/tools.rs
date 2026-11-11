@@ -19,6 +19,7 @@ use crate::core::llm::TurnCancel;
 use crate::core::observer::{CallStatus, InjectRefusal, InputState, IntegrationStatus, LevelKind, ObserverStatus, OpenAgentRecord};
 use crate::core::record::{Cwd, Record, RecordSummary, Source};
 use crate::core::session::{user_text_refusal, IntegrateOutcome, Session};
+use crate::core::settings::LimitsSettings;
 
 /// The wait `run_command` gives a command when the model gives no `wait_seconds`. A command still running at its end is
 /// returned as `RunOutcome::Running`, and the shell keeps it.
@@ -38,8 +39,6 @@ pub const WAITING_FOR_INPUT_AFTER: Duration = Duration::from_secs(2);
 /// The longest one `wait` call may last, and the length when the model gives no `seconds`.
 pub const MAX_WAIT_SECONDS: u64 = 120;
 pub const DEFAULT_WAIT_SECONDS: u64 = 10;
-/// The waiting one turn may do in total. Past it, `wait` returns an error without waiting.
-pub const MAX_WAIT_PER_TURN: Duration = Duration::from_secs(30 * 60);
 /// After a screen change, `wait` returns once the screen has been quiet for `WAIT_QUIET`, or `WAIT_BURST` after the
 /// first change, whichever comes first. So the snapshot is not a frame that is still being drawn.
 const WAIT_QUIET: Duration = Duration::from_millis(300);
@@ -331,7 +330,8 @@ pub struct SessionTools<'a> {
     input_wait: Duration,
     /// When set, `run_command` checks it while it waits and before it sends anything.
     cancel: Option<Arc<TurnCancel>>,
-    /// The most `wait` may spend through this value. `MAX_WAIT_PER_TURN` unless a test overrides it.
+    /// The most `wait` may spend through this value, the waiting one turn may do in total. Past it, `wait` returns an error
+    /// without waiting. The app sets the saved `limits.max_wait_minutes` (`with_wait_budget`); `new` uses the default.
     wait_budget: Duration,
     /// Time spent in `wait` through this value so far.
     wait_used: Cell<Duration>,
@@ -348,12 +348,12 @@ impl<'a> SessionTools<'a> {
             session,
             input_wait,
             cancel: None,
-            wait_budget: MAX_WAIT_PER_TURN,
+            wait_budget: LimitsSettings::default().max_wait(),
             wait_used: Cell::new(Duration::ZERO),
         }
     }
 
-    /// Like `new`, with a different per-turn wait budget. For tests.
+    /// Like `new`, with the per-turn wait budget of the saved limits (the app) or a shorter one (tests).
     pub fn with_wait_budget(self, budget: Duration) -> Self {
         SessionTools { wait_budget: budget, ..self }
     }

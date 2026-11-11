@@ -35,8 +35,8 @@ use super::models::{FetchedModel, merge_fetched, models_url_for};
 use super::resolve::{self, api_key_for, headers_for};
 use super::secrets::{SecretMap, Secrets, api_key_name, header_secret_name, provider_prefix};
 use super::{
-    ApprovalSettings, IntegrationSettings, ModelRef, ModelSource, Provider, SETTINGS_FILE, Settings, SettingsError,
-    last_good_path, read_checked, save, settings_path, write_private_atomic,
+    ApprovalSettings, IntegrationSettings, LimitsSettings, ModelRef, ModelSource, Provider, SETTINGS_FILE, Settings,
+    SettingsError, last_good_path, read_checked, save, settings_path, write_private_atomic,
 };
 use crate::core::chat::agent_loop::{LlmSettings, USER_AGENT, new_conversation_id};
 use crate::core::chat::redact::Redactor;
@@ -562,6 +562,17 @@ impl SettingsService {
         Ok(self.usable()?.integration)
     }
 
+    /// Saves the per-turn limits. Refused while settings.json is broken or in last-good mode, like every change.
+    pub fn set_limits(&self, limits: LimitsSettings) -> Result<SettingsView, String> {
+        self.change_settings(|settings| settings.limits = limits)
+    }
+
+    /// The limits in use: the saved ones, or the last working copy's in last-good mode. Fails while settings.json is
+    /// broken, so the caller falls back to the defaults.
+    pub fn limits_settings(&self) -> Result<LimitsSettings, String> {
+        Ok(self.usable()?.limits)
+    }
+
     /// What a model-list request for `id` needs: the list URL, the key and the resolved headers.
     pub fn provider_for_fetch(&self, id: &str) -> Result<FetchPlan, String> {
         let settings = self.usable()?;
@@ -1047,6 +1058,38 @@ mod tests {
         let nested = ApprovalSettings { nested: Nested::SameAsLocal, ..ApprovalSettings::default() };
         f.service.set_approval(nested.clone()).unwrap();
         assert_eq!(f.service.approval_settings(), Ok(nested));
+    }
+
+    #[test]
+    fn limits_are_saved_read_back_and_refused_when_out_of_range() {
+        let f = fixture();
+        assert_eq!(f.service.limits_settings(), Ok(LimitsSettings::default()), "no file: the defaults");
+        let saved = LimitsSettings { max_model_calls: 75, model_calls_unlimited: false, max_poll_calls: 120, max_commands_per_turn: 40, max_wait_minutes: 45 };
+        let view = f.service.set_limits(saved).unwrap();
+        assert_eq!(view.settings.limits, saved);
+        assert_eq!(service_on(&f.dir, &f.store).limits_settings(), Ok(saved), "a new service reads it back");
+
+        let bad = LimitsSettings { max_poll_calls: 9, ..saved };
+        let err = f.service.set_limits(bad).unwrap_err();
+        assert!(err.contains("polling calls per turn must be 10 to 500"), "{err}");
+        assert_eq!(f.service.limits_settings(), Ok(saved), "a refused change saved nothing");
+    }
+
+    #[test]
+    fn last_good_mode_runs_the_saved_limits_and_refuses_changes() {
+        let f = fixture();
+        f.service.save_provider(with_key(provider("acme"), KEY)).unwrap();
+        f.service.set_default_model(Some(model_ref("acme", "big"))).unwrap();
+        let saved = LimitsSettings { model_calls_unlimited: true, ..LimitsSettings::default() };
+        f.service.set_limits(saved).unwrap();
+        let _launch = service_on(&f.dir, &f.store);
+        break_settings(&f);
+
+        let service = service_on(&f.dir, &f.store);
+        assert!(service.limits_settings().is_err(), "a broken file runs no limits of its own");
+        service.use_last_good().unwrap();
+        assert_eq!(service.limits_settings(), Ok(saved), "last-good mode runs the last working limits");
+        assert!(service.set_limits(LimitsSettings::default()).unwrap_err().contains("broken"));
     }
 
     #[test]
