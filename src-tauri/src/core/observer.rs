@@ -569,9 +569,10 @@ impl Core {
             self.reported.observer = Some(observer);
             out.push(SessionEvent::Observer { status: observer });
         }
-        if self.reported.cwd != self.cwd {
-            self.reported.cwd = self.cwd.clone();
-            out.push(SessionEvent::Cwd { cwd: self.cwd.clone() });
+        let cwd = self.cwd();
+        if self.reported.cwd != cwd {
+            self.reported.cwd = cwd.clone();
+            out.push(SessionEvent::Cwd { cwd });
         }
         out
     }
@@ -1259,8 +1260,15 @@ impl Core {
         self.scanner.forged_events()
     }
 
+    /// The shell's directory: the top level's, from its 633;Cwd when a nested shell is on top, else the local shell's (OSC 7).
+    /// None on a nested level that has not reported a directory yet.
     pub fn cwd(&self) -> Option<Cwd> {
-        self.cwd.clone()
+        match self.stack.last() {
+            Some(top) if top.key != LOCAL_KEY => {
+                top.cwd.as_ref().map(|path| Cwd { host: top.host.clone().unwrap_or_default(), path: path.clone() })
+            }
+            _ => self.cwd.clone(),
+        }
     }
 
     pub fn shell_pid(&self) -> Option<u32> {
@@ -2075,9 +2083,12 @@ mod tests {
     #[test]
     fn a_nested_level_reports_its_own_cwd_and_the_local_osc7_is_ignored_on_top() {
         let mut c = nested_at_prompt();
+        // Before the level's own 633;Cwd there is no directory for it: the local OSC 7 is not used for it.
+        c.feed(&osc("7;file://mac.local/tmp/local"));
+        assert_eq!(c.cwd(), None, "a nested level with no directory yet does not show the local one");
         c.feed(&tagged("633;Cwd", CHILD, ";/srv/app"));
         c.feed(&osc("7;file://lidia/tmp/elsewhere"));
-        assert_eq!(c.cwd(), None, "untagged OSC 7 is the local shell's only");
+        assert_eq!(c.cwd(), Some(Cwd { host: "lidia".into(), path: "/srv/app".into() }), "the top level's cwd, not OSC 7");
         remote_running(&mut c, "ls");
         c.feed(&tagged("133;D", CHILD, ";exit=0;ps=0"));
         let rec = c.get_record(2).expect("the remote record");

@@ -70,6 +70,9 @@ pub enum SubmitError {
     /// The top level is bash, and the text has a newline. bash's multi-line history is joined or split, so the
     /// observer cannot attribute it safely. Nothing was written.
     MultiLineAtBash,
+    /// The shell on top is not the one the command was approved for (it exited, or another shell started). Nothing was
+    /// written.
+    LocationChanged,
 }
 
 impl std::fmt::Display for SubmitError {
@@ -82,6 +85,10 @@ impl std::fmt::Display for SubmitError {
             SubmitError::MultiLineAtBash => write!(
                 f,
                 "this shell is bash and cannot take multi-line commands safely; send one line, or join with ;"
+            ),
+            SubmitError::LocationChanged => write!(
+                f,
+                "the shell you were working in has changed (it exited or another shell started); the command was not run, check the screen and decide again"
             ),
         }
     }
@@ -116,7 +123,8 @@ enum WriteCmd {
     /// Raw keystrokes or bytes from the user. A CR at the prompt starts a submitted line, so the gate closes until C
     /// (or the submit timeout, for an empty line).
     User(Vec<u8>),
-    Submit { source: Source, text: String, reply: Sender<Result<(), SubmitError>> },
+    /// `expected_level` is the level key the command was approved for. None means the top level whatever it is.
+    Submit { source: Source, text: String, expected_level: Option<u64>, reply: Sender<Result<(), SubmitError>> },
     /// Bytes for the injection (Ctrl-C, the loader, the blob lines). Written as they are: no submit gate, no typed-text
     /// bookkeeping. Only `integrate_shell` sends these.
     Inject(Vec<u8>),
@@ -202,9 +210,16 @@ impl Session {
     /// Writes `text` plus CR at an idle prompt, atomically: the prompt check and the Submitted transition
     /// happen in the writer thread, under the same lock, right before the bytes go out.
     pub fn submit(&self, source: Source, text: &str) -> Result<(), SubmitError> {
+        self.submit_bound(source, text, None)
+    }
+
+    /// Like `submit`, but refused with `LocationChanged` unless the top level is `expected_level` when the writer takes the
+    /// line. The agent binds an approved command to the shell it was carded for, so a shell that changed in between
+    /// gets nothing.
+    pub fn submit_bound(&self, source: Source, text: &str, expected_level: Option<u64>) -> Result<(), SubmitError> {
         let (reply, got) = mpsc::channel();
         self.wtx
-            .send(WriteCmd::Submit { source, text: text.to_string(), reply })
+            .send(WriteCmd::Submit { source, text: text.to_string(), expected_level, reply })
             .map_err(|_| SubmitError::Closed)?;
         got.recv().map_err(|_| SubmitError::Closed)?
     }
@@ -517,11 +532,13 @@ fn run_writer(rx: Receiver<WriteCmd>, mut writer: Box<dyn Write + Send>, shared:
                 }
                 let _ = write_all(&mut writer, &bytes);
             }
-            WriteCmd::Submit { source, text, reply } => {
+            WriteCmd::Submit { source, text, expected_level, reply } => {
                 let prepared = {
                     let mut core = shared.lock();
                     if core.desynced() {
                         Err(SubmitError::ObserverDesynced)
+                    } else if expected_level.is_some_and(|key| key != core.top_key()) {
+                        Err(SubmitError::LocationChanged)
                     } else {
                         match core.lifecycle_view() {
                             // The user's text is on the line: refuse, and write nothing.

@@ -32,6 +32,7 @@ use crate::core::chat::prompt;
 use crate::core::chat::redact::Redactor;
 use crate::core::chat::todo::{self, Todo, TodoList};
 use crate::core::llm::{self, AssistantReply, ChatRequest, Delta, LlmError, ProviderConfig, ToolCall, TurnCancel};
+use crate::core::tools::TopLevel;
 
 /// Model calls allowed in one turn. The tool calls of the last one are not run.
 pub const MAX_MODEL_CALLS: usize = 50;
@@ -345,6 +346,9 @@ impl LlmAgent {
         if let Some(note) = &self.resume_note {
             system = format!("{system}\n\n{note}");
         }
+        if let Some(note) = location_note(&ctx.top_level(), &self.redactor) {
+            system = format!("{system}\n\n{note}");
+        }
         if let Some(note) = foreground_note(ctx.foreground().as_ref(), &self.redactor) {
             system = format!("{system}\n\n{note}");
         }
@@ -524,6 +528,23 @@ fn error_text(e: &LlmError) -> String {
     }
 }
 
+/// The note for one model call while the shell on top is a nested one (not the local machine). It names the shell, the user
+/// and host its Hello gave, and says what the agent must not do there. None on the local shell. The label is the user's
+/// command text, so the redactor removes what it knows first.
+pub fn location_note(top: &TopLevel, r: &Redactor) -> Option<String> {
+    let label = top.location.as_deref()?;
+    let who = match (&top.user, &top.host) {
+        (Some(user), Some(host)) => format!(", as {user}@{host}"),
+        _ => String::new(),
+    };
+    let shell = top.sh.as_deref().map(|sh| format!(", shell {sh}")).unwrap_or_default();
+    Some(r.redact(&format!(
+        "You are in a nested/remote shell: {label}{who}{shell}. It is not the local machine: paths, tools and users may \
+         differ. Never type passwords or answer sudo or other password prompts: stop and ask the user. Each approved \
+         command runs in this shell only."
+    )))
+}
+
 /// The terminal note for one model call, while a program is in the foreground of the shell. It says what runs and that
 /// run_command waits for it to exit. None when nothing is in the foreground. The command text is redacted: it is the
 /// user's text.
@@ -565,6 +586,32 @@ fn lock_note(m: &Mutex<Option<String>>) -> MutexGuard<'_, Option<String>> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// The nested-shell note is present only on a nested level, and names its label, user, host and shell.
+    #[test]
+    fn the_location_note_is_only_for_a_nested_shell() {
+        let r = Redactor::new(vec!["hunter2-secret".to_string()]);
+        assert_eq!(location_note(&TopLevel::default(), &r), None, "the local shell has no note");
+        let remote = TopLevel {
+            key: 1,
+            location: Some("sshpass -p hunter2-secret ssh ubuntu@lidia".into()),
+            user: Some("ubuntu".into()),
+            host: Some("lidia".into()),
+            sh: Some("zsh".into()),
+        };
+        let note = location_note(&remote, &r).expect("a note on a nested level");
+        assert!(
+            note.starts_with("You are in a nested/remote shell: sshpass -p [REDACTED] ssh ubuntu@lidia, as ubuntu@lidia, shell zsh. It is not the local machine"),
+            "{note}"
+        );
+        assert!(note.contains("Never type passwords"), "{note}");
+        assert!(note.contains("Each approved command runs in this shell only."), "{note}");
+        assert!(!note.contains("hunter2-secret"), "{note}");
+        // Without the Hello, the note still names the shell's label and says what it is.
+        let bare = TopLevel { key: 2, location: Some("ssh h".into()), ..TopLevel::default() };
+        let note = location_note(&bare, &r).expect("a note");
+        assert!(note.starts_with("You are in a nested/remote shell: ssh h. It is not the local machine"), "{note}");
+    }
 
     /// A lookup over the given pairs.
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {

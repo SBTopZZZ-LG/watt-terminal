@@ -206,7 +206,7 @@ impl AgentTools for FakeTools {
     fn get_cwd(&self) -> Option<Cwd> {
         panic!("the loop calls tools by name through `call`")
     }
-    fn run_command(&self, _command: &str, _timeout: Duration) -> Result<RunOutcome, String> {
+    fn run_command(&self, _command: &str, _timeout: Duration, _expected: Option<u64>) -> Result<RunOutcome, String> {
         panic!("the loop calls tools by name through `call`")
     }
     fn wait(&self, _seconds: u64, _ignore_updates: bool) -> Result<WaitView, String> {
@@ -216,7 +216,7 @@ impl AgentTools for FakeTools {
         panic!("the loop calls tools by name through `call`")
     }
 
-    fn call(&self, name: &str, args: &Value) -> Result<Value, String> {
+    fn call(&self, name: &str, args: &Value, _expected_level: Option<u64>) -> Result<Value, String> {
         self.reached.lock().unwrap().push(name.to_string());
         match name {
             "get_cwd" => {
@@ -433,7 +433,7 @@ fn waits_do_not_count_against_the_command_limit() {
     let conv = Conversation::new().unwrap();
     let tools = FakeTools::default();
     let gate = no_gate();
-    gate.set_auto_approve(true);
+    gate.set_auto_approve(true, 0);
     let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
     turn(&mut agent, &tools, &gate, "run and wait");
 
@@ -602,7 +602,7 @@ fn the_command_past_the_per_turn_cap_gets_the_limit_error() {
     let conv = Conversation::new().unwrap();
     let tools = FakeTools::default();
     let gate = no_gate();
-    gate.set_auto_approve(true);
+    gate.set_auto_approve(true, 0);
     let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
     turn(&mut agent, &tools, &gate, "run too many things");
 
@@ -680,7 +680,7 @@ fn the_key_never_reaches_events_or_history() {
     // The command's output contains the key, as if a program printed it.
     let tools = FakeTools { command_output: Some(format!("token is {KEY} end\n")), ..Default::default() };
     let gate = no_gate();
-    gate.set_auto_approve(true);
+    gate.set_auto_approve(true, 0);
     let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
 
     let mut all_events = Vec::new();

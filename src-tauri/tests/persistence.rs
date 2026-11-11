@@ -155,7 +155,7 @@ impl AgentTools for NoTools {
     fn get_cwd(&self) -> Option<Cwd> {
         unreachable!("no tool is called in these tests")
     }
-    fn run_command(&self, _command: &str, _timeout: Duration) -> Result<RunOutcome, String> {
+    fn run_command(&self, _command: &str, _timeout: Duration, _expected: Option<u64>) -> Result<RunOutcome, String> {
         unreachable!("no tool is called in these tests")
     }
     fn wait(&self, _seconds: u64, _ignore_updates: bool) -> Result<WaitView, String> {

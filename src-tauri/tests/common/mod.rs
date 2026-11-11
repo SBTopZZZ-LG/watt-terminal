@@ -94,8 +94,23 @@ pub fn start_with_histfile(histfile: &Path) -> Harness {
     start_inner(None, Some(histfile.to_path_buf()))
 }
 
+/// Like `start`, with `extra` appended to the user's .zshrc in the temporary home, before the shell reads it.
+pub fn start_with_zshrc(extra: &str) -> Harness {
+    start_inner_rc(None, None, extra)
+}
+
 fn start_inner(hook: Option<Hook>, histfile: Option<PathBuf>) -> Harness {
+    start_inner_rc(hook, histfile, "")
+}
+
+fn start_inner_rc(hook: Option<Hook>, histfile: Option<PathBuf>, extra_rc: &str) -> Harness {
     let home = make_real_home();
+    if !extra_rc.is_empty() {
+        let rc = home.join(".zshrc");
+        let mut text = fs::read_to_string(&rc).expect("read the temporary .zshrc");
+        text.push_str(extra_rc);
+        fs::write(&rc, text).expect("write the temporary .zshrc");
+    }
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     let id = format!("t{}", NEXT_ID.fetch_add(1, Ordering::SeqCst));
     let cfg = SpawnConfig { rows: 30, cols: 120, real_zdotdir: Some(home.clone()), histfile };

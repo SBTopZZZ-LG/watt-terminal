@@ -51,11 +51,16 @@ pub fn project(name: &str, ok: bool, result: &Value, redactor: &Redactor) -> Str
 }
 
 fn run_command_text(v: &Value, r: &Redactor) -> String {
-    match v.get("outcome").and_then(Value::as_str) {
+    let text = match v.get("outcome").and_then(Value::as_str) {
         Some("finished") => finished_text(v.get("record"), r),
         Some("timed_out") => timed_out_text(v),
         Some("not_run") => not_run_text(v),
         _ => compact_json(v),
+    };
+    // The note (see core/tools `INPUT_WAIT_NOTE`) follows the outcome, on its own line.
+    match v.get("note").and_then(Value::as_str) {
+        Some(note) => format!("{text}\n{note}"),
+        None => text,
     }
 }
 
@@ -217,6 +222,9 @@ fn screen_header(v: &Value, r: &Redactor) -> String {
     let integration = scalar(v.get("integration_status"));
     if integration != "live" && integration != "?" {
         header.push_str(&format!(" integration={integration}"));
+    }
+    if let Some(location) = v.get("location").and_then(Value::as_str) {
+        header.push_str(&format!("\nlocation: {} (a nested shell, not the local machine)", escape_controls(&r.redact(location))));
     }
     if let Some(line) = foreground_line(v, r) {
         header.push('\n');
@@ -893,5 +901,27 @@ mod tests {
     fn error_text_from_a_non_string_is_still_text() {
         assert_eq!(project("run_command", false, &Value::Null, &none()), "error: unknown error");
         assert_eq!(project("run_command", false, &json!(42), &none()), "error: 42");
+    }
+
+    /// A nested shell's screen names its location in the header; the local screen does not.
+    #[test]
+    fn the_screen_header_names_a_nested_location_only() {
+        let mut nested = screen(&["ubuntu@lidia:~$"]);
+        nested["location"] = json!("ssh ubuntu@lidia");
+        let text = project("get_screen", true, &nested, &none());
+        assert!(text.contains("\nlocation: ssh ubuntu@lidia (a nested shell, not the local machine)"), "{text}");
+        let local = project("get_screen", true, &screen(&["$ ls"]), &none());
+        assert!(!local.contains("location:"), "{local}");
+    }
+
+    /// A run result that carries the input-wait note says so after the outcome. Without the note nothing is added.
+    #[test]
+    fn a_run_note_follows_the_outcome() {
+        let timed = json!({"outcome": "timed_out", "state": "running", "note": "The shell appears to be waiting for a password or other input. Do not type it. Ask the user to handle it, then use get_screen."});
+        let text = project("run_command", true, &timed, &none());
+        assert!(text.starts_with("timed out after the wait; shell state: running;"), "{text}");
+        assert!(text.ends_with("\nThe shell appears to be waiting for a password or other input. Do not type it. Ask the user to handle it, then use get_screen."), "{text}");
+        let plain = project("run_command", true, &json!({"outcome": "timed_out", "state": "running"}), &none());
+        assert!(!plain.contains("password"), "{plain}");
     }
 }

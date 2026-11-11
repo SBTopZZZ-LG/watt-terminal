@@ -20,7 +20,7 @@ use tauri_plugin_window_state::StateFlags;
 // Core logic (PTY, shell integration, observer, agent) has no Tauri dependency, so `cargo test` runs it headless.
 pub mod core;
 
-use crate::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate, MockAgent, OnDrop};
+use crate::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate, AutoState, MockAgent, OnDrop};
 use crate::core::approval::{self, ApprovalPolicy, ManualPolicy};
 use crate::core::chat::agent_loop::{self, Conversation, LlmAgent, LlmSettings, USER_AGENT};
 use crate::core::chat::history::History;
@@ -507,7 +507,9 @@ fn approve_tool(session_id: String, call_id: String, approve: bool, reg: State<'
 
 #[tauri::command]
 fn set_auto_approve(session_id: String, on: bool, reg: State<'_, Reg>) -> Result<(), String> {
-    session(&reg, &session_id)?.approvals.set_auto_approve(on);
+    // The shell on top is the level approve-all is tied to. The session supplies it, not the frontend.
+    let att = session(&reg, &session_id)?;
+    att.approvals.set_auto_approve(on, att.session.top_key());
     Ok(())
 }
 
@@ -535,6 +537,8 @@ struct Status {
     cwd: Option<Cwd>,
     stats: SessionStats,
     auto_approve: bool,
+    /// Approve-all is on but was switched on in another shell level, so it does not apply to the shell on top.
+    auto_approve_suspended: bool,
     agent_busy: bool,
     agent_control: bool,
     llm: LlmStatus,
@@ -580,6 +584,7 @@ fn get_status(session_id: String, reg: State<'_, Reg>, settings: State<'_, Setti
         cwd: att.session.cwd(),
         stats: att.session.stats(),
         auto_approve: att.approvals.auto_approve(),
+        auto_approve_suspended: att.approvals.auto_state(att.session.top_key()) == AutoState::Suspended,
         agent_busy: att.agent_busy.load(Ordering::SeqCst),
         agent_control: att.agent_control.load(Ordering::SeqCst),
         llm,

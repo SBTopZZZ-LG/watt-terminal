@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -21,7 +21,7 @@ use crate::core::chat::todo::Todo;
 use crate::core::foreground::Foreground;
 use crate::core::llm::TurnCancel;
 use crate::core::session::{Session, USER_TEXT_CODE};
-use crate::core::tools::AgentTools;
+use crate::core::tools::{AgentTools, TopLevel};
 
 pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -29,10 +29,23 @@ pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
 /// a denial from a tool error. The text after it is for people.
 pub const DENIED: &str = "not_approved";
 
+/// Whether approve-all applies to the shell on top right now (see `ApprovalGate::auto_state`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoState {
+    /// Approve-all is off.
+    Off,
+    /// On, and switched on in the shell that is on top now.
+    On,
+    /// On, but switched on in another shell level. The calls here ask.
+    Suspended,
+}
+
 /// Pending approvals, keyed by call id. A request that is not answered in time counts as a denial.
 pub struct ApprovalGate {
     pending: Mutex<HashMap<String, Sender<bool>>>,
-    auto: AtomicBool,
+    /// Approve-all: None when off. When on, the key of the shell level it was switched on in. It applies only while that
+    /// level is on top (see `auto_state`), so it never carries into a nested shell or back out of one unseen.
+    auto: Mutex<Option<u64>>,
     timeout: Duration,
 }
 
@@ -48,15 +61,31 @@ impl ApprovalGate {
     }
 
     pub fn with_timeout(timeout: Duration) -> Self {
-        ApprovalGate { pending: Mutex::new(HashMap::new()), auto: AtomicBool::new(false), timeout }
+        ApprovalGate { pending: Mutex::new(HashMap::new()), auto: Mutex::new(None), timeout }
     }
 
-    pub fn set_auto_approve(&self, on: bool) {
-        self.auto.store(on, Ordering::SeqCst);
+    /// Switches approve-all on or off. `level` is the key of the shell on top when it is switched on. The caller takes it
+    /// from the session. Ignored when `on` is false.
+    pub fn set_auto_approve(&self, on: bool, level: u64) {
+        *self.auto_lock() = on.then_some(level);
     }
 
+    /// True while approve-all is on, in whatever shell level it was switched on.
     pub fn auto_approve(&self) -> bool {
-        self.auto.load(Ordering::SeqCst)
+        self.auto_lock().is_some()
+    }
+
+    /// Approve-all as it applies to the shell `level` (the one on top now).
+    pub fn auto_state(&self, level: u64) -> AutoState {
+        match *self.auto_lock() {
+            None => AutoState::Off,
+            Some(on_level) if on_level == level => AutoState::On,
+            Some(_) => AutoState::Suspended,
+        }
+    }
+
+    fn auto_lock(&self) -> MutexGuard<'_, Option<u64>> {
+        self.auto.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Registers `call_id`, runs `announce` so the UI can show the request, then waits. Only an explicit
@@ -144,13 +173,17 @@ pub enum AgentEvent {
         result: Value,
     },
     /// A call waits for the user. `name` is the tool name, so the card can say what is being asked. `reason` is why it
-    /// asks (a core/approval code).
+    /// asks (a core/approval code). `level` is the key of the shell the card is for (0 is the local shell), and `location`
+    /// is that shell's label when it is a nested one. A command approved here runs only while that shell is on top.
     ApprovalRequest {
         call_id: String,
         name: String,
         text: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         reason: Option<&'static str>,
+        level: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        location: Option<String>,
     },
     /// Streamed assistant text. `Text` is still used for whole messages.
     TextDelta { text: String },
@@ -208,6 +241,11 @@ impl<'a> AgentCtx<'a> {
     /// The foreground program hint at this moment (see `AgentTools::foreground`). The agent loop reads it per model call.
     pub fn foreground(&self) -> Option<Foreground> {
         self.tools.foreground()
+    }
+
+    /// The shell the agent acts in at this moment (see `AgentTools::top_level`). The agent loop reads it per model call.
+    pub fn top_level(&self) -> TopLevel {
+        self.tools.top_level()
     }
 
     /// Calls a read-only tool (`list_commands`, `get_command`, `get_screen`, `get_cwd`, `wait`) and reports the call
@@ -273,7 +311,7 @@ impl<'a> AgentCtx<'a> {
         gated: bool,
     ) -> (&'static str, Option<&'static str>, Result<Value, String>) {
         if !gated || READ_TOOLS.contains(&name) {
-            return ("read", None, self.execute(name, args, false));
+            return ("read", None, self.execute(name, args, false, None));
         }
         // A run_command the user's typed text would block is refused before the approval card: the user is not asked to
         // approve it. The tool checks again when it injects, in case the user types while the card waits.
@@ -282,17 +320,20 @@ impl<'a> AgentCtx<'a> {
         {
             return ("refused", None, Err(e));
         }
+        // The shell on top now. The card and the submit are both bound to its key.
+        let top = self.tools.top_level();
         // Approve-all skips the policy for run_command. send_keys always goes to the policy, which always asks.
         let verdict = match name {
-            "run_command" if self.approvals.auto_approve() => Verdict::Auto(Reason::ApproveAll),
-            "run_command" | "send_keys" => self.policy.decide(name, args),
+            "run_command" => self.run_command_verdict(&top, args),
+            "send_keys" => self.policy.decide(name, args, top.is_nested()),
             // Nothing else is gated: it runs as it always did, without a card.
             _ => return self.run_ungated(name, args),
         };
+        let level = (name == "run_command").then_some(top.key);
         match verdict {
             Verdict::Auto(reason) => {
                 // The gate skipped the card. A tool that refuses here did not run and the user was never asked.
-                let result = self.execute(name, args, true);
+                let result = self.execute(name, args, true, level);
                 (if result.is_ok() { "auto" } else { "refused" }, Some(reason.code()), result)
             }
             Verdict::Ask(reason) => {
@@ -303,6 +344,8 @@ impl<'a> AgentCtx<'a> {
                         name: name.to_string(),
                         text: text.clone(),
                         reason: Some(reason.code()),
+                        level: top.key,
+                        location: top.location.clone(),
                     })
                 });
                 if !approved {
@@ -310,24 +353,35 @@ impl<'a> AgentCtx<'a> {
                     return ("denied", Some(reason.code()), Err(err));
                 }
                 // The user approved, so the decision stays "manual" even if the tool then refuses.
-                ("manual", Some(reason.code()), self.execute(name, args, true))
+                ("manual", Some(reason.code()), self.execute(name, args, true, level))
             }
+        }
+    }
+
+    /// The verdict for a run_command. Approve-all decides it while it applies to the shell on top, and asks (suspended)
+    /// while it was switched on in another shell. Otherwise the policy decides, and a nested shell is told so.
+    fn run_command_verdict(&self, top: &TopLevel, args: &Value) -> Verdict {
+        match self.approvals.auto_state(top.key) {
+            AutoState::On => Verdict::Auto(Reason::ApproveAll),
+            AutoState::Suspended => Verdict::Ask(Reason::ApproveAllSuspended),
+            AutoState::Off => self.policy.decide("run_command", args, top.is_nested()),
         }
     }
 
     /// A gated name the gate does not know: no card and no policy. Runs as it did before the policy existed.
     fn run_ungated(&self, name: &str, args: &Value) -> (&'static str, Option<&'static str>, Result<Value, String>) {
-        let result = self.execute(name, args, true);
+        let result = self.execute(name, args, true, None);
         (if result.is_ok() { "auto" } else { "refused" }, None, result)
     }
 
     /// Calls the tool. For the calls that act on the shell, the agent is in control from before the call until after it.
-    fn execute(&self, name: &str, args: &Value, gated: bool) -> Result<Value, String> {
+    /// `level` is the shell the call was approved for (see `AgentTools::run_command`).
+    fn execute(&self, name: &str, args: &Value, gated: bool, level: Option<u64>) -> Result<Value, String> {
         let controls_shell = gated && matches!(name, "run_command" | "send_keys");
         if controls_shell {
             self.emit(AgentEvent::AgentControl { active: true });
         }
-        let result = self.tools.call(name, args);
+        let result = self.tools.call(name, args, level);
         if controls_shell {
             self.emit(AgentEvent::AgentControl { active: false });
         }
@@ -510,16 +564,20 @@ mod tests {
     use crate::core::observer::{InputState, IntegrationStatus, ObserverStatus};
     use crate::core::record::{Cwd, RecordSummary};
     use crate::core::settings::{ApprovalMode, ApprovalSettings};
-    use crate::core::tools::{CommandView, RunOutcome, ScreenView, WaitView};
+    use crate::core::tools::{CommandView, RunOutcome, ScreenView, TopLevel, WaitView};
 
     /// Records every tool call the agent manages to reach. Nothing here touches a shell.
     #[derive(Default)]
     struct Recorder {
         reached: Mutex<Vec<String>>,
+        /// The `expected_level` each `run_command` call reached the tools with.
+        bound_levels: Mutex<Vec<Option<u64>>>,
         /// What `run_command_precheck` returns as an error. None means the precheck passes.
         precheck: Option<String>,
         /// What `foreground` reports. None means nothing runs in the foreground.
         foreground: Option<Foreground>,
+        /// The shell on top. The default is the local shell; a test can change it between calls.
+        top: Mutex<TopLevel>,
         /// When set, every `call` fails with this error after it is recorded.
         call_error: Option<String>,
     }
@@ -528,6 +586,15 @@ mod tests {
         fn reached(&self) -> Vec<String> {
             self.reached.lock().unwrap().clone()
         }
+
+        fn set_top(&self, top: TopLevel) {
+            *self.top.lock().unwrap() = top;
+        }
+    }
+
+    /// A nested shell on top, as the session reports it: its key and the command that started it.
+    fn nested(key: u64, label: &str) -> TopLevel {
+        TopLevel { key, location: Some(label.to_string()), ..TopLevel::default() }
     }
 
     impl AgentTools for Recorder {
@@ -547,12 +614,13 @@ mod tests {
                 observer_status: ObserverStatus::Ok,
                 integration_status: IntegrationStatus::Live,
                 foreground: None,
+                location: None,
             }
         }
         fn get_cwd(&self) -> Option<Cwd> {
             None
         }
-        fn run_command(&self, _command: &str, _timeout: Duration) -> Result<RunOutcome, String> {
+        fn run_command(&self, _command: &str, _timeout: Duration, _expected: Option<u64>) -> Result<RunOutcome, String> {
             Err("not used".into())
         }
         fn wait(&self, _seconds: u64, _ignore_updates: bool) -> Result<WaitView, String> {
@@ -567,8 +635,14 @@ mod tests {
         fn foreground(&self) -> Option<Foreground> {
             self.foreground.clone()
         }
-        fn call(&self, name: &str, _args: &Value) -> Result<Value, String> {
+        fn top_level(&self) -> TopLevel {
+            self.top.lock().unwrap().clone()
+        }
+        fn call(&self, name: &str, _args: &Value, expected_level: Option<u64>) -> Result<Value, String> {
             self.reached.lock().unwrap().push(name.to_string());
+            if name == "run_command" {
+                self.bound_levels.lock().unwrap().push(expected_level);
+            }
             match &self.call_error {
                 Some(e) => Err(e.clone()),
                 None => Ok(json!({"ok": true})),
@@ -601,8 +675,22 @@ mod tests {
                 name: "run_command".into(),
                 text: "pwd".into(),
                 reason: None,
+                level: 0,
+                location: None,
             }),
-            json!({"type": "approval_request", "call_id": "c1", "name": "run_command", "text": "pwd"})
+            json!({"type": "approval_request", "call_id": "c1", "name": "run_command", "text": "pwd", "level": 0})
+        );
+        // A nested card names its shell's label.
+        assert_eq!(
+            wire(AgentEvent::ApprovalRequest {
+                call_id: "c1".into(),
+                name: "run_command".into(),
+                text: "pwd".into(),
+                reason: Some("nested_level"),
+                level: 2,
+                location: Some("ssh ubuntu@lidia".into()),
+            }),
+            json!({"type": "approval_request", "call_id": "c1", "name": "run_command", "text": "pwd", "reason": "nested_level", "level": 2, "location": "ssh ubuntu@lidia"})
         );
         assert_eq!(
             wire(AgentEvent::ToolResult {
@@ -622,8 +710,10 @@ mod tests {
                 name: "run_command".into(),
                 text: "ls | wc".into(),
                 reason: Some("gate_chars"),
+                level: 0,
+                location: None,
             }),
-            json!({"type": "approval_request", "call_id": "c1", "name": "run_command", "text": "ls | wc", "reason": "gate_chars"})
+            json!({"type": "approval_request", "call_id": "c1", "name": "run_command", "text": "ls | wc", "reason": "gate_chars", "level": 0})
         );
         assert_eq!(
             wire(AgentEvent::ToolResult {
@@ -696,7 +786,7 @@ mod tests {
     fn decision_is_auto_when_auto_approve_skips_the_card() {
         let tools = Recorder::default();
         let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
-        gate.set_auto_approve(true);
+        gate.set_auto_approve(true, 0);
         let log = Mutex::new(Vec::new());
         let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
         let ctx = AgentCtx::new(&tools, &gate, &emit);
@@ -739,7 +829,7 @@ mod tests {
         // Auto-approve skipped the card, then the tool refused: the user never saw it, so it is "refused".
         let tools = Recorder { call_error: Some("shell is busy".into()), ..Default::default() };
         let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
-        gate.set_auto_approve(true);
+        gate.set_auto_approve(true, 0);
         let ctx = AgentCtx::new(&tools, &gate, &emit);
         let err = ctx.call_tool("run_command", json!({"command": "pwd"})).expect_err("tool error");
         assert!(!err.starts_with(DENIED), "{err}");
@@ -840,7 +930,7 @@ mod tests {
     fn agent_control_sits_between_an_approved_shell_call_and_its_result() {
         let tools = Recorder::default();
         let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
-        gate.set_auto_approve(true);
+        gate.set_auto_approve(true, 0);
         let log = Mutex::new(Vec::new());
         let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
         let ctx = AgentCtx::new(&tools, &gate, &emit);
@@ -940,7 +1030,7 @@ mod tests {
     fn approve_all_skips_the_policy_and_says_approve_all_but_send_keys_still_asks() {
         let tools = Recorder::default();
         let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
-        gate.set_auto_approve(true);
+        gate.set_auto_approve(true, 0);
         // No rules: the policy would ask for everything, and the gate would refuse the pipe.
         let policy = regex_policy(&[]);
         let log = Mutex::new(Vec::new());
@@ -1032,5 +1122,157 @@ mod tests {
         }));
         assert!(result.is_err());
         assert!(ran.get(), "the guard did not run while the panic unwound");
+    }
+
+    /// The card is for the shell on top: its key, and its label when it is a nested shell. The approved command carries the
+    /// same key to the tools, so the submit can be bound to it.
+    #[test]
+    fn the_card_and_the_approved_call_carry_the_level_they_were_made_for() {
+        let tools = Recorder::default();
+        tools.set_top(nested(3, "ssh ubuntu@lidia"));
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let cards = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| {
+            if let AgentEvent::ApprovalRequest { call_id, level, location, .. } = &ev {
+                cards.lock().unwrap().push((*level, location.clone()));
+                assert!(gate.decide(call_id, true));
+            }
+        };
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        assert!(ctx.call_tool("run_command", json!({"command": "pwd"})).is_ok());
+        assert_eq!(*cards.lock().unwrap(), [(3, Some("ssh ubuntu@lidia".to_string()))]);
+        assert_eq!(*tools.bound_levels.lock().unwrap(), [Some(3)]);
+    }
+
+    /// The local shell's card has key 0 and no location, and the call is bound to key 0.
+    #[test]
+    fn a_local_call_is_bound_to_the_local_level() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        gate.set_auto_approve(true, 0);
+        let emit = |_: AgentEvent| {};
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        assert!(ctx.call_tool("run_command", json!({"command": "pwd"})).is_ok());
+        assert_eq!(*tools.bound_levels.lock().unwrap(), [Some(0)]);
+    }
+
+    /// Approve-all switched on at the local level does not run commands in a nested shell: they ask, with the suspended
+    /// reason. Back on the local shell it applies again.
+    #[test]
+    fn approve_all_is_suspended_in_a_nested_shell_and_resumes_after_the_pop() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        gate.set_auto_approve(true, 0);
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+
+        assert!(ctx.call_tool("run_command", json!({"command": "pwd"})).is_ok());
+        tools.set_top(nested(1, "ssh h"));
+        assert!(ctx.call_tool("run_command", json!({"command": "pwd"})).is_err(), "nobody answers the card");
+        tools.set_top(TopLevel::default());
+        assert!(ctx.call_tool("run_command", json!({"command": "pwd"})).is_ok());
+
+        assert_eq!(
+            reasons(&log),
+            [
+                ("run_command".to_string(), "auto", Some("approve_all")),
+                ("run_command".to_string(), "denied", Some("approve_all_suspended")),
+                ("run_command".to_string(), "auto", Some("approve_all")),
+            ]
+        );
+        assert_eq!(*tools.bound_levels.lock().unwrap(), [Some(0), Some(0)], "the suspended call never reached the tools");
+    }
+
+    /// Approve-all switched on inside a nested shell does not carry into a later nested shell with another key.
+    #[test]
+    fn approve_all_switched_on_in_a_nested_shell_does_not_carry_to_the_next_one() {
+        let tools = Recorder::default();
+        tools.set_top(nested(1, "ssh a"));
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        gate.set_auto_approve(true, 1);
+        assert_eq!(gate.auto_state(1), AutoState::On);
+        assert_eq!(gate.auto_state(2), AutoState::Suspended, "a new level with a new key");
+        assert_eq!(gate.auto_state(0), AutoState::Suspended);
+
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        assert!(ctx.call_tool("run_command", json!({"command": "pwd"})).is_ok());
+        tools.set_top(nested(2, "ssh b"));
+        assert!(ctx.call_tool("run_command", json!({"command": "pwd"})).is_err());
+        assert_eq!(
+            reasons(&log),
+            [
+                ("run_command".to_string(), "auto", Some("approve_all")),
+                ("run_command".to_string(), "denied", Some("approve_all_suspended")),
+            ]
+        );
+        gate.set_auto_approve(false, 0);
+        assert_eq!(gate.auto_state(1), AutoState::Off);
+    }
+
+    /// A regex allow rule runs a command on the local shell, and asks with `nested_level` in a nested one. The rule's
+    /// verdict is what the card says, and nothing runs when nobody approves.
+    #[test]
+    fn a_regex_rule_asks_in_a_nested_shell_with_the_nested_reason() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let policy = regex_policy(&["echo .*"]);
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+        let ctx = AgentCtx::new(&tools, &gate, &emit).with_policy(&policy);
+        assert!(ctx.call_tool("run_command", json!({"command": "echo local"})).is_ok());
+
+        tools.set_top(nested(1, "ssh h"));
+        let err = ctx.call_tool("run_command", json!({"command": "echo remote"})).expect_err("asks");
+        assert!(err.starts_with(DENIED), "{err}");
+        assert_eq!(
+            reasons(&log),
+            [
+                ("run_command".to_string(), "auto", Some("rule")),
+                ("run_command".to_string(), "denied", Some("nested_level")),
+            ]
+        );
+        assert_eq!(tools.reached(), ["run_command"], "the nested call never reached the tools");
+    }
+
+    /// The card names the nested reason, and approving it runs the call bound to that level.
+    #[test]
+    fn an_approved_nested_call_is_bound_to_its_level() {
+        let tools = Recorder::default();
+        tools.set_top(nested(4, "ssh h"));
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let policy = regex_policy(&["echo .*"]);
+        let reasons_shown = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| {
+            if let AgentEvent::ApprovalRequest { call_id, reason, .. } = &ev {
+                reasons_shown.lock().unwrap().push(*reason);
+                assert!(gate.decide(call_id, true));
+            }
+        };
+        let ctx = AgentCtx::new(&tools, &gate, &emit).with_policy(&policy);
+        assert!(ctx.call_tool("run_command", json!({"command": "echo hi"})).is_ok());
+        assert_eq!(*reasons_shown.lock().unwrap(), [Some("nested_level")]);
+        assert_eq!(*tools.bound_levels.lock().unwrap(), [Some(4)]);
+    }
+
+    /// A deny rule still asks first, and in a nested shell its reason is the deny rule's, not the nested one.
+    #[test]
+    fn a_deny_rule_keeps_its_reason_in_a_nested_shell() {
+        let tools = Recorder::default();
+        tools.set_top(nested(1, "ssh h"));
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let approval = ApprovalSettings {
+            mode: ApprovalMode::Regex,
+            allow: vec![".*".into()],
+            deny: vec!["cargo .*".into()],
+        };
+        let policy = RegexPolicy::new(&approval).expect("the rules compile");
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+        let ctx = AgentCtx::new(&tools, &gate, &emit).with_policy(&policy);
+        assert!(ctx.call_tool("run_command", json!({"command": "cargo test"})).is_err());
+        assert_eq!(reasons(&log), [("run_command".to_string(), "denied", Some("deny_rule"))]);
     }
 }

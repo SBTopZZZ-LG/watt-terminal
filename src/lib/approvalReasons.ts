@@ -22,6 +22,8 @@ const ASK_CLAUSE: Record<AskReasonCode, string> = {
   deny_rule: 'a deny rule matches this command.',
   no_rule: 'no allow rule matches this command.',
   auto_cap: `this turn has already used its ${AUTO_PER_TURN} automatic approvals.`,
+  nested_level: 'this is a nested shell, so every command in it needs your approval.',
+  approve_all_suspended: 'approve-all is off in this shell, because it was turned on in another shell.',
 };
 
 /** Why a call ran without asking, as a sentence. */

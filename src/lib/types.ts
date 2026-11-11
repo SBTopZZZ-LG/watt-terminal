@@ -92,7 +92,9 @@ export type ApprovalReasonCode =
   | 'gate_denylist'
   | 'deny_rule'
   | 'no_rule'
-  | 'auto_cap';
+  | 'auto_cap'
+  | 'nested_level'
+  | 'approve_all_suspended';
 
 export type AgentEvent =
   | { type: 'text'; text: string }
@@ -103,8 +105,8 @@ export type AgentEvent =
   | { type: 'tool_call'; call_id: string; name: string; args: unknown }
   /** `reason` is absent for read tools, `todo_write` and calls refused before the policy. */
   | { type: 'tool_result'; call_id: string; name: string; ok: boolean; decision: ToolDecision; reason?: ApprovalReasonCode; result: unknown }
-  /** `reason` is why the call asks. */
-  | { type: 'approval_request'; call_id: string; name: string; text: string; reason?: ApprovalReasonCode }
+  /** `reason` is why the call asks. `level` (0 is the local shell) and `location` (a nested shell's label) are always sent by the backend, optional here for existing fixtures. */
+  | { type: 'approval_request'; call_id: string; name: string; text: string; reason?: ApprovalReasonCode; level?: number; location?: string }
   /** The agent is executing an approved shell call (true) and has finished it (false). */
   | { type: 'agent_control'; active: boolean }
   /** The conversation's todo list was replaced by a successful todo_write. `items` is the whole list. */

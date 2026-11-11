@@ -11,6 +11,8 @@ const ASK_CODES: ApprovalReasonCode[] = [
   'deny_rule',
   'no_rule',
   'auto_cap',
+  'nested_level',
+  'approve_all_suspended',
 ];
 
 describe('askedBecause', () => {

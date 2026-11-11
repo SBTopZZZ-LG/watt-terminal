@@ -6,16 +6,17 @@
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use regex::Regex;
 use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::core::foreground::{Foreground, ForegroundKind};
 use crate::core::llm::TurnCancel;
-use crate::core::observer::{CallStatus, InputState, IntegrationStatus, ObserverStatus};
+use crate::core::observer::{CallStatus, InputState, IntegrationStatus, LevelKind, ObserverStatus};
 use crate::core::record::{Cwd, Record, RecordSummary, Source};
 use crate::core::session::{user_text_refusal, Session};
 
@@ -35,6 +36,13 @@ pub const MAX_WAIT_PER_TURN: Duration = Duration::from_secs(30 * 60);
 const WAIT_QUIET: Duration = Duration::from_millis(300);
 const WAIT_BURST: Duration = Duration::from_millis(1500);
 const RUN_POLL: Duration = Duration::from_millis(25);
+/// After a command's D, the shell's prompt (A) can take a while: the user's precmd hooks run first. `run_command` waits up
+/// to this long for the prompt before it returns, so a back-to-back call is not refused in that gap.
+const PROMPT_SETTLE: Duration = Duration::from_secs(3);
+/// The refusal for a `run_command` while the nested shell has not answered a submitted line (see `InputState::Unresponsive`).
+pub const UNRESPONSIVE_REFUSAL: &str = "cannot run a command now: the shell is not answering (it may be busy, or the connection dropped); use get_screen, or ask the user";
+/// Added to a nested `run_command` result that may be waiting for a password or other input. The agent must not type it.
+pub const INPUT_WAIT_NOTE: &str = "The shell appears to be waiting for a password or other input. Do not type it. Ask the user to handle it, then use get_screen.";
 const DEFAULT_LIST: usize = 10;
 const DEFAULT_LIMIT: usize = 4096;
 const MAX_LIMIT: usize = 64 << 10;
@@ -53,6 +61,29 @@ pub struct ScreenView {
     /// The foreground program hint, while a command runs (core/foreground.rs). Left out when there is none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub foreground: Option<Foreground>,
+    /// The label of the nested shell on top (the command that started it). Left out on the local shell.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+}
+
+/// The shell the agent acts in: the top level of the session. `key` is the level's key (0 is the local shell), which an
+/// approval is bound to: a command approved for one key is refused if another shell is on top when it is submitted. A
+/// nested level has a `location` (the command that started it) and the user, host and shell its Hello gave. The local
+/// shell has none of those.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TopLevel {
+    pub key: u64,
+    pub location: Option<String>,
+    pub user: Option<String>,
+    pub host: Option<String>,
+    pub sh: Option<String>,
+}
+
+impl TopLevel {
+    /// True when the top shell is a nested level, not the local machine's shell.
+    pub fn is_nested(&self) -> bool {
+        self.location.is_some()
+    }
 }
 
 /// One page of a command's rendered output. `offset` and `limit` are byte counts, moved to character boundaries.
@@ -143,7 +174,13 @@ pub trait AgentTools {
     fn foreground(&self) -> Option<Foreground> {
         None
     }
-    fn run_command(&self, command: &str, timeout: Duration) -> Result<RunOutcome, String>;
+    /// The shell on top (see `TopLevel`). Defaults to the local shell, so a fake without a shell needs no change.
+    fn top_level(&self) -> TopLevel {
+        TopLevel::default()
+    }
+    /// Runs `command` in the shell on top. `expected_level` is the key the call was approved for: when another shell is on
+    /// top by the time it is submitted, nothing is written. None means no check (tests and fakes).
+    fn run_command(&self, command: &str, timeout: Duration, expected_level: Option<u64>) -> Result<RunOutcome, String>;
     /// Waits up to `seconds` (already clamped to 1..=MAX_WAIT_SECONDS) for the shell to do something worth reporting. See
     /// `WaitReason`. Counts against the turn's wait budget, not the command limit.
     fn wait(&self, seconds: u64, ignore_updates: bool) -> Result<WaitView, String>;
@@ -154,8 +191,9 @@ pub trait AgentTools {
     }
     fn send_keys(&self, bytes: &[u8]) -> Result<(), String>;
 
-    /// Calls a tool by schema name. Optional arguments take their defaults. Does not ask for approval.
-    fn call(&self, name: &str, args: &Value) -> Result<Value, String> {
+    /// Calls a tool by schema name. Optional arguments take their defaults. Does not ask for approval. `expected_level` is
+    /// passed to `run_command` (see there).
+    fn call(&self, name: &str, args: &Value, expected_level: Option<u64>) -> Result<Value, String> {
         match name {
             "list_commands" => to_json(self.list_commands(usize_arg(args, "n", DEFAULT_LIST)?)),
             "get_command" => {
@@ -177,7 +215,14 @@ pub trait AgentTools {
             }
             "run_command" => {
                 let command = str_arg(args, "command")?;
-                to_json(self.run_command(command, DEFAULT_RUN_TIMEOUT)?)
+                let outcome = self.run_command(command, DEFAULT_RUN_TIMEOUT, expected_level)?;
+                // In a nested shell, a call that timed out or sits at a password prompt gets the do-not-type note.
+                let timed_out = matches!(outcome, RunOutcome::TimedOut { .. });
+                let mut value = to_json(outcome)?;
+                if self.top_level().is_nested() && (timed_out || screen_waits_for_input(&self.get_screen().rows)) {
+                    value["note"] = json!(INPUT_WAIT_NOTE);
+                }
+                Ok(value)
             }
             "send_keys" => {
                 let bytes: Vec<u8> = serde_json::from_value(args.get("bytes").cloned().unwrap_or(Value::Null))
@@ -274,6 +319,7 @@ impl AgentTools for SessionTools<'_> {
             observer_status: self.session.observer_status(),
             integration_status: self.session.integration_status(),
             foreground: self.session.foreground(),
+            location: self.session.location(),
         }
     }
 
@@ -285,7 +331,22 @@ impl AgentTools for SessionTools<'_> {
         self.session.foreground()
     }
 
-    fn run_command(&self, command: &str, timeout: Duration) -> Result<RunOutcome, String> {
+    fn top_level(&self) -> TopLevel {
+        let levels = self.session.levels();
+        let Some(top) = levels.last() else {
+            return TopLevel::default();
+        };
+        let nested = top.kind == LevelKind::Remote;
+        TopLevel {
+            key: top.key,
+            location: nested.then(|| top.label.clone()),
+            user: top.user.clone(),
+            host: top.host.clone(),
+            sh: top.sh.clone(),
+        }
+    }
+
+    fn run_command(&self, command: &str, timeout: Duration, expected_level: Option<u64>) -> Result<RunOutcome, String> {
         if command.trim().is_empty() {
             return Err("command is empty".into());
         }
@@ -303,14 +364,17 @@ impl AgentTools for SessionTools<'_> {
         // submit() re-checks the prompt, and the user's text, atomically, so a racing user submit or keystroke wins or
         // loses cleanly.
         self.session
-            .submit(Source::Agent { call_id: call_id.clone() }, command)
+            .submit_bound(Source::Agent { call_id: call_id.clone() }, command, expected_level)
             .map_err(|e| e.to_string())?;
 
         let deadline = Instant::now() + timeout;
         loop {
             // One lock read per poll: the outcome and the shell state come from the same moment.
             match self.session.call_status(&call_id, self.input_wait) {
-                CallStatus::Finished(record) => return Ok(RunOutcome::Finished { record: *record }),
+                CallStatus::Finished(record) => {
+                    self.settle_at_prompt();
+                    return Ok(RunOutcome::Finished { record: *record });
+                }
                 CallStatus::Abandoned => return Ok(RunOutcome::NotRun { reason: NotRunReason::Abandoned }),
                 CallStatus::WaitingForInput => return Ok(RunOutcome::NotRun { reason: NotRunReason::WaitingForInput }),
                 CallStatus::Pending(state) => {
@@ -358,6 +422,20 @@ impl AgentTools for SessionTools<'_> {
 }
 
 impl SessionTools<'_> {
+    /// Waits until the top level is back at its prompt, for at most `PROMPT_SETTLE`. A finished command's D arrives before the
+    /// prompt (A), which comes after the user's precmd hooks. Returns at once when the session exits. If the bound passes,
+    /// the result is returned anyway; the next call is then refused as before.
+    fn settle_at_prompt(&self) {
+        let end = Instant::now() + PROMPT_SETTLE;
+        loop {
+            match self.session.state() {
+                InputState::Prompt | InputState::Exited => return,
+                _ if Instant::now() >= end => return,
+                _ => thread::sleep(RUN_POLL),
+            }
+        }
+    }
+
     /// Why `run_command` cannot run now, when the shell is not live or not at an idle prompt. None when it may run.
     /// `run_command` and `run_command_precheck` both use it, so the refusals match.
     fn not_at_prompt(&self) -> Option<String> {
@@ -434,6 +512,9 @@ impl SessionTools<'_> {
 /// either way. While a command runs and the hint names a program, the text says what runs and what the agent can do:
 /// read the screen, wait, and ask the user to leave a program without shell integration.
 pub fn not_at_prompt_text(state: InputState, foreground: Option<&Foreground>) -> String {
+    if state == InputState::Unresponsive {
+        return UNRESPONSIVE_REFUSAL.to_string();
+    }
     let base = format!("cannot run a command now: the session is {state:?}, not at an idle prompt");
     let Some(fg) = foreground.filter(|_| state == InputState::Running) else {
         return base;
@@ -499,7 +580,7 @@ pub fn schemas() -> Vec<ToolSchema> {
         },
         ToolSchema {
             name: "run_command",
-            description: "Run a command in the user's own shell session. Only works at an idle prompt with shell integration live. Waits up to 30 s for the command to finish. The user must approve each call unless auto-approve is on.",
+            description: "Run a command in the shell on top: the user's own shell, or a shell the user opened inside another program (such as ssh) that the app integrated. Only works at an idle prompt with shell integration live. Waits up to 30 s for the command to finish. The user approves each call unless a saved rule or auto-approve allows it.",
             parameters: json!({
                 "type": "object",
                 "properties": {"command": {"type": "string", "minLength": 1}},
@@ -516,6 +597,15 @@ pub fn schemas() -> Vec<ToolSchema> {
             }),
         },
     ]
+}
+
+/// True when the last non-blank row of a screen looks like a password or passphrase prompt. Case-insensitive.
+pub fn screen_waits_for_input(rows: &[String]) -> bool {
+    static PROMPT: OnceLock<Regex> = OnceLock::new();
+    let prompt = PROMPT.get_or_init(|| {
+        Regex::new(r"(?i)password.*:\s*$|\[sudo\] password|passphrase").expect("the prompt pattern compiles")
+    });
+    rows.iter().rev().find(|r| !r.trim().is_empty()).is_some_and(|row| prompt.is_match(row.trim_end()))
 }
 
 fn to_json<T: Serialize>(v: T) -> Result<Value, String> {
@@ -642,6 +732,7 @@ mod tests {
             observer_status: ObserverStatus::Ok,
             integration_status: IntegrationStatus::Live,
             foreground,
+            location: None,
         };
         let without = serde_json::to_value(screen(None)).unwrap();
         assert!(without.get("foreground").is_none(), "{without}");
@@ -654,5 +745,36 @@ mod tests {
         assert_eq!(bool_arg(&json!({}), "ignore_updates", false), Ok(false));
         assert_eq!(bool_arg(&json!({"ignore_updates": true}), "ignore_updates", false), Ok(true));
         assert!(bool_arg(&json!({"ignore_updates": "yes"}), "ignore_updates", false).is_err());
+    }
+
+    /// An Unresponsive nested shell refuses with its own text, which says what the agent can do instead.
+    #[test]
+    fn the_refusal_for_an_unresponsive_shell_says_so_and_what_to_do() {
+        let text = not_at_prompt_text(InputState::Unresponsive, None);
+        assert_eq!(text, UNRESPONSIVE_REFUSAL);
+        assert!(text.starts_with("cannot run a command now: the shell is not answering"), "{text}");
+        assert!(text.contains("it may be busy, or the connection dropped") && text.contains("use get_screen, or ask the user"), "{text}");
+    }
+
+    /// Only the last non-blank row is looked at, and only password-like prompts match. Case does not matter.
+    #[test]
+    fn a_password_prompt_on_the_last_row_is_detected() {
+        let rows = |items: &[&str]| items.iter().map(|r| r.to_string()).collect::<Vec<String>>();
+        assert!(screen_waits_for_input(&rows(&["ubuntu@lidia:~$ sudo ls", "[sudo] password for ubuntu:"])));
+        assert!(screen_waits_for_input(&rows(&["Password: "])));
+        assert!(screen_waits_for_input(&rows(&["ubuntu@lidia's PASSWORD:  ", "", ""])), "blank rows after it are skipped");
+        assert!(screen_waits_for_input(&rows(&["Enter passphrase for key '/home/u/.ssh/id':"])));
+        assert!(!screen_waits_for_input(&rows(&["Password: ", "ubuntu@lidia:~$"])), "the prompt is not the last row");
+        assert!(!screen_waits_for_input(&rows(&["ubuntu@lidia:~$ echo password"])), "a shell prompt is not a password prompt");
+        assert!(!screen_waits_for_input(&rows(&["ls", "ubuntu@lidia:~$"])));
+        assert!(!screen_waits_for_input(&[]));
+    }
+
+    /// The top level of a nested shell is its label and Hello fields; the local shell has none.
+    #[test]
+    fn a_top_level_is_nested_only_with_a_location() {
+        assert!(!TopLevel::default().is_nested());
+        let remote = TopLevel { key: 1, location: Some("ssh h".into()), ..TopLevel::default() };
+        assert!(remote.is_nested());
     }
 }

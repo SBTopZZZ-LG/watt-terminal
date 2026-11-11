@@ -4,7 +4,8 @@
 //! `agent_message`), so the per-turn count of automatic approvals starts at zero for every message.
 //!
 //! Two modes are saved: manual (every call asks) and regex (the rules below). Approve-all is not part of this module:
-//! it is the session-only flag in core/agent.rs, and it skips the policy.
+//! it is the session-only flag in core/agent.rs, and it skips the policy. In a nested shell (ssh, a nested shell, one
+//! the app integrated: not the local machine) an allow rule never runs a command by itself: it asks with `nested_level`.
 //!
 //! This is a floor, not a sandbox. The hard gate refuses shell syntax, and any command whose first word is not a plain
 //! command name (a path, an assignment, `=ls`, a leading `-`), and the programs and shell builtins on a deny list,
@@ -76,6 +77,10 @@ pub enum Reason {
     NoRule,
     /// A rule would allow the call, but this turn already had its automatic approvals.
     AutoCap,
+    /// A rule would allow the call, but the shell on top is a nested one (not the local machine): every command there asks.
+    NestedLevel,
+    /// Approve-all was switched on in another shell level, so it does not apply to this one.
+    ApproveAllSuspended,
 }
 
 impl Reason {
@@ -91,6 +96,8 @@ impl Reason {
             Reason::DenyRule => "deny_rule",
             Reason::NoRule => "no_rule",
             Reason::AutoCap => "auto_cap",
+            Reason::NestedLevel => "nested_level",
+            Reason::ApproveAllSuspended => "approve_all_suspended",
         }
     }
 }
@@ -103,16 +110,17 @@ pub enum Verdict {
 }
 
 /// Decides how a gated call is approved. Called once per call, in the order the calls run. A policy may keep a count
-/// for its turn, which is why `decide` takes `&self`.
+/// for its turn, which is why `decide` takes `&self`. `nested` is true when the shell on top is a nested level (see
+/// `TopLevel` in core/tools): allow rules never run a command there without a card.
 pub trait ApprovalPolicy: Send + Sync {
-    fn decide(&self, tool: &str, args: &Value) -> Verdict;
+    fn decide(&self, tool: &str, args: &Value, nested: bool) -> Verdict;
 }
 
 /// Every call asks. The default, and the fallback when the settings cannot be used.
 pub struct ManualPolicy;
 
 impl ApprovalPolicy for ManualPolicy {
-    fn decide(&self, tool: &str, _args: &Value) -> Verdict {
+    fn decide(&self, tool: &str, _args: &Value, _nested: bool) -> Verdict {
         if tool == "run_command" { Verdict::Ask(Reason::ManualMode) } else { Verdict::Ask(Reason::SendKeys) }
     }
 }
@@ -143,8 +151,8 @@ impl RegexPolicy {
 }
 
 impl ApprovalPolicy for RegexPolicy {
-    fn decide(&self, tool: &str, args: &Value) -> Verdict {
-        match self.classify(tool, args) {
+    fn decide(&self, tool: &str, args: &Value, nested: bool) -> Verdict {
+        match self.classify(tool, args, nested) {
             Verdict::Auto(Reason::Rule) if !self.take_auto_slot() => Verdict::Ask(Reason::AutoCap),
             verdict => verdict,
         }
@@ -152,9 +160,9 @@ impl ApprovalPolicy for RegexPolicy {
 }
 
 impl RegexPolicy {
-    /// The order of evaluation, first hit wins: not `run_command`; the hard gate; a deny rule; an allow rule; else ask.
-    /// Says `Auto` only for an allow rule. The turn's allowance is applied by `decide`.
-    fn classify(&self, tool: &str, args: &Value) -> Verdict {
+    /// The order of evaluation, first hit wins: not `run_command`; the hard gate; a deny rule; an allow rule (asks in a
+    /// nested shell); else ask. Says `Auto` only for an allow rule. The turn's allowance is applied by `decide`.
+    fn classify(&self, tool: &str, args: &Value, nested: bool) -> Verdict {
         if tool != "run_command" {
             return Verdict::Ask(Reason::SendKeys);
         }
@@ -168,7 +176,7 @@ impl RegexPolicy {
             return Verdict::Ask(Reason::DenyRule);
         }
         if self.allow.iter().any(|rule| rule.is_match(command)) {
-            return Verdict::Auto(Reason::Rule);
+            return if nested { Verdict::Ask(Reason::NestedLevel) } else { Verdict::Auto(Reason::Rule) };
         }
         Verdict::Ask(Reason::NoRule)
     }
@@ -214,7 +222,7 @@ pub struct Preview {
 }
 
 pub fn preview(approval: &ApprovalSettings, command: &str) -> Result<Preview, String> {
-    let verdict = policy_for(approval)?.decide("run_command", &json!({"command": command}));
+    let verdict = policy_for(approval)?.decide("run_command", &json!({"command": command}), false);
     Ok(match verdict {
         Verdict::Auto(reason) => Preview { verdict: "auto", reason: reason.code() },
         Verdict::Ask(reason) => Preview { verdict: "ask", reason: reason.code() },
@@ -286,7 +294,12 @@ mod tests {
     }
 
     fn run(policy: &dyn ApprovalPolicy, command: &str) -> Verdict {
-        policy.decide("run_command", &json!({"command": command}))
+        policy.decide("run_command", &json!({"command": command}), false)
+    }
+
+    /// The same, in a nested shell.
+    fn run_nested(policy: &dyn ApprovalPolicy, command: &str) -> Verdict {
+        policy.decide("run_command", &json!({"command": command}), true)
     }
 
     /// The hard gate's answer for a command.
@@ -458,24 +471,40 @@ mod tests {
         assert!(RegexPolicy::new(&settings(ApprovalMode::Regex, &["a)|(b"], &[])).is_err());
     }
 
+    /// In a nested shell an allow rule asks instead, with its own reason. Nothing else changes: the gate and the deny
+    /// rules give the reasons they give anywhere, and a call that asks there does not use up the turn's allowance.
+    #[test]
+    fn an_allow_rule_asks_in_a_nested_shell_and_the_rest_is_unchanged() {
+        let policy = regex_policy(&["echo .*", "cargo test"], &["cargo .*"]);
+        assert_eq!(run(&policy, "echo hi"), Verdict::Auto(Reason::Rule));
+        assert_eq!(run_nested(&policy, "echo hi"), Verdict::Ask(Reason::NestedLevel));
+        assert_eq!(run_nested(&policy, "ls | wc"), Verdict::Ask(Reason::GateChars));
+        assert_eq!(run_nested(&policy, "cargo test"), Verdict::Ask(Reason::DenyRule), "a deny rule still wins");
+        assert_eq!(run_nested(&policy, "git status"), Verdict::Ask(Reason::NoRule));
+        for n in 0..(MAX_AUTO_PER_TURN * 2) {
+            assert_eq!(run_nested(&policy, &format!("echo {n}")), Verdict::Ask(Reason::NestedLevel));
+        }
+        assert_eq!(run(&policy, "echo local"), Verdict::Auto(Reason::Rule), "nested asks used up no allowance");
+    }
+
     #[test]
     fn manual_mode_asks_for_every_command_and_send_keys() {
         let policy = ManualPolicy;
         assert_eq!(run(&policy, "git status"), Verdict::Ask(Reason::ManualMode));
-        assert_eq!(policy.decide("send_keys", &json!({"bytes": [13]})), Verdict::Ask(Reason::SendKeys));
+        assert_eq!(policy.decide("send_keys", &json!({"bytes": [13]}), false), Verdict::Ask(Reason::SendKeys));
     }
 
     #[test]
     fn send_keys_always_asks_under_a_regex_policy() {
         let policy = regex_policy(&[".*"], &[]);
-        assert_eq!(policy.decide("send_keys", &json!({"bytes": [13]})), Verdict::Ask(Reason::SendKeys));
+        assert_eq!(policy.decide("send_keys", &json!({"bytes": [13]}), false), Verdict::Ask(Reason::SendKeys));
     }
 
     #[test]
     fn a_missing_command_is_refused_as_chars() {
         let policy = regex_policy(&[".*"], &[]);
-        assert_eq!(policy.decide("run_command", &json!({})), Verdict::Ask(Reason::GateChars));
-        assert_eq!(policy.decide("run_command", &json!({"command": 5})), Verdict::Ask(Reason::GateChars));
+        assert_eq!(policy.decide("run_command", &json!({}), false), Verdict::Ask(Reason::GateChars));
+        assert_eq!(policy.decide("run_command", &json!({"command": 5}), false), Verdict::Ask(Reason::GateChars));
     }
 
     #[test]
@@ -528,6 +557,8 @@ mod tests {
             (Reason::DenyRule, "deny_rule"),
             (Reason::NoRule, "no_rule"),
             (Reason::AutoCap, "auto_cap"),
+            (Reason::NestedLevel, "nested_level"),
+            (Reason::ApproveAllSuspended, "approve_all_suspended"),
         ];
         for (reason, code) in codes {
             assert_eq!(reason.code(), code);
