@@ -15,6 +15,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{Manager, RunEvent, State};
+use tauri_plugin_window_state::StateFlags;
 
 // Core logic (PTY, shell integration, observer, agent) has no Tauri dependency, so `cargo test` runs it headless.
 pub mod core;
@@ -841,6 +842,13 @@ pub fn run() {
                 let _ = window.set_focus();
             }
         }))
+        // Saves the window's size, position and maximized state on exit and restores them at launch.
+        // Visibility, decorations and fullscreen are not tracked: Tauri shows the window itself.
+        .plugin(
+            tauri_plugin_window_state::Builder::new()
+                .with_state_flags(StateFlags::SIZE | StateFlags::POSITION | StateFlags::MAXIMIZED)
+                .build(),
+        )
         .manage(Reg::new())
         .setup(|app| {
             let persist = resolve_persist(app.handle()).map(Arc::new);
