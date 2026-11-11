@@ -4,17 +4,18 @@ import { TodoPanel } from './TodoPanel';
 import type { TodoItem } from '../lib/types';
 
 const t = (content: string, status: TodoItem['status'] = 'pending'): TodoItem => ({ content, status });
-const html = (items: TodoItem[], defaultExpanded?: boolean) => renderToStaticMarkup(<TodoPanel items={items} defaultExpanded={defaultExpanded} />);
+const html = (items: TodoItem[]) => renderToStaticMarkup(<TodoPanel items={items} />);
 
 const LIST = [t('read the code', 'completed'), t('write the fix', 'in_progress'), t('run the tests')];
+const DONE = [t('a', 'completed'), t('b', 'completed'), t('c', 'completed'), t('d', 'completed'), t('e', 'completed')];
 
-describe('TodoPanel: collapsed (the default)', () => {
-  it('shows the summary line and a closed toggle, with the list hidden', () => {
+describe('TodoPanel: a list with unfinished items starts expanded', () => {
+  it('shows the summary line, an open toggle, and the list shown', () => {
     const out = html(LIST);
     expect(out).toContain('TODO 1/3 · write the fix');
-    expect(out).toContain('aria-expanded="false"');
-    expect(out).toMatch(/<ol id="([^"]+)" class="todo-list" hidden=""/);
-    expect(out).not.toContain('todo-panel expanded');
+    expect(out).toContain('aria-expanded="true"');
+    expect(out).toContain('todo-panel expanded');
+    expect(out).not.toMatch(/class="todo-list" hidden/);
   });
 
   it('the toggle controls the list by id', () => {
@@ -28,21 +29,22 @@ describe('TodoPanel: collapsed (the default)', () => {
     expect(html(LIST)).toMatch(/<button type="button" class="todo-toggle"/);
   });
 
+  it('the list is capped: its max height is inline, set from the agent panel (180px until it is measured)', () => {
+    expect(html(LIST)).toMatch(/class="todo-list" style="max-height:180px"/);
+  });
+
   it('the summary carries the full current task in the title, cut when it is long', () => {
     const long = 'y'.repeat(300);
     const out = html([t(long, 'in_progress')]);
-    expect(out).toContain(`title="Show the todo list. Current: ${'y'.repeat(199)}…"`);
+    expect(out).toContain(`title="Hide the todo list. Current: ${'y'.repeat(199)}…"`);
     // The text itself is not cut: the summary and the row keep all of it, and CSS ellipsises the summary line.
     expect(out).toContain(`TODO 0/1 · ${'y'.repeat(300)}`);
   });
 });
 
-describe('TodoPanel: expanded', () => {
-  it('starts expanded when told to, and the list shows every row in order', () => {
-    const out = html(LIST, true);
-    expect(out).toContain('aria-expanded="true"');
-    expect(out).toContain('todo-panel expanded');
-    expect(out).not.toMatch(/class="todo-list" hidden/);
+describe('TodoPanel: the list', () => {
+  it('shows every row in order', () => {
+    const out = html(LIST);
     // The current task also appears in the toggle's title, so the order is checked inside the list only.
     const list = out.slice(out.indexOf('<ol'));
     const order = ['read the code', 'write the fix', 'run the tests'].map((s) => list.indexOf(s));
@@ -52,7 +54,7 @@ describe('TodoPanel: expanded', () => {
   });
 
   it('marks the current item with aria-current and the current class, and no other', () => {
-    const out = html(LIST, true);
+    const out = html(LIST);
     expect(out.match(/aria-current="step"/g)).toHaveLength(1);
     expect(out).toMatch(/class="todo-item todo-in_progress todo-current" aria-current="step"/);
     expect(out).toContain('class="todo-item todo-completed"');
@@ -60,21 +62,21 @@ describe('TodoPanel: expanded', () => {
   });
 
   it('gives each row a status word for screen readers', () => {
-    const out = html(LIST, true);
+    const out = html(LIST);
     expect(out).toContain('Done: ');
     expect(out).toContain('In progress: ');
     expect(out).toContain('Pending: ');
   });
 
   it('shows the task text as plain text: markup in the content is escaped', () => {
-    const out = html([t('<img src=x onerror=alert(1)> **bold**')], true);
+    const out = html([t('<img src=x onerror=alert(1)> **bold**')]);
     expect(out).not.toContain('<img');
     expect(out).toContain('&lt;img');
     expect(out).toContain('**bold**');
   });
 
   it('removes bidi controls from what is shown', () => {
-    const out = html([t('safe‮evil', 'in_progress')], true);
+    const out = html([t('safe‮evil', 'in_progress')]);
     expect(out).not.toContain('‮');
     expect(out).toContain('safe evil');
   });
@@ -85,9 +87,11 @@ describe('TodoPanel: empty and done', () => {
     expect(html([])).toBe('');
   });
 
-  it('says done when every item is completed, with no current marker', () => {
-    const out = html([t('a', 'completed'), t('b', 'completed'), t('c', 'completed'), t('d', 'completed'), t('e', 'completed')]);
+  it('a list with every item done starts collapsed, says done, and has no current marker', () => {
+    const out = html(DONE);
     expect(out).toContain('TODO 5/5 done');
+    expect(out).toContain('aria-expanded="false"');
+    expect(out).toMatch(/<ol id="([^"]+)" class="todo-list" hidden=""/);
     expect(out).not.toContain('aria-current');
     expect(out).toContain('todo-panel all-done');
   });

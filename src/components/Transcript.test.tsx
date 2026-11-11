@@ -111,7 +111,7 @@ describe('Transcript: todo panel', () => {
 
   it('is pinned above the scrolling body, not inside it', () => {
     const html = renderToStaticMarkup(<Transcript {...base} todos={todos} open />);
-    const panel = html.indexOf('class="todo-panel"');
+    const panel = html.indexOf('class="todo-panel');
     expect(panel).toBeGreaterThan(-1);
     expect(panel).toBeLessThan(html.indexOf('class="transcript-body"'));
   });

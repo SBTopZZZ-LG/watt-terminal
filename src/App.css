@@ -976,16 +976,17 @@ input {
 }
 
 /*
- * Capped, with its own scroll, so a long list does not take the transcript. It is a shrinkable flex child: in a sized panel
- * it gives up room to the body (whose min-height keeps the messages visible), and scrolls inside what it keeps.
+ * Capped (inline, by TodoPanel: 40% of the agent panel, 180px at most), with its own scroll, so a long list does not take the
+ * transcript. It is a shrinkable flex child: in a sized panel it gives up room to the body (whose min-height keeps the messages
+ * visible), and scrolls inside what it keeps. Positioned, so its rows' offsetTop is measured from the list (the scroll origin).
  */
 .todo-list {
+  position: relative;
   flex: 0 1 auto;
   min-height: 0;
   margin: 0;
   padding: 0 0 6px;
   list-style: none;
-  max-height: 30vh;
   overflow-y: auto;
   overflow-wrap: anywhere;
 }
