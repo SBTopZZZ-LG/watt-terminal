@@ -248,6 +248,10 @@ pub struct Model {
     /// What the provider reported when the model list was fetched, in tokens.
     #[serde(default)]
     pub provider_context: Option<u32>,
+    /// Whether the provider reported image input for this model (see `FetchedModel::vision`). Left out of the file when
+    /// unknown, so a settings file without it is written as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision: Option<bool>,
     pub source: ModelSource,
 }
 
@@ -615,7 +619,7 @@ mod tests {
     use super::*;
 
     fn model(id: &str) -> Model {
-        Model { id: id.into(), context_limit: None, provider_context: None, source: ModelSource::Custom }
+        Model { id: id.into(), context_limit: None, provider_context: None, vision: None, source: ModelSource::Custom }
     }
 
     fn provider(id: &str) -> Provider {
@@ -853,6 +857,7 @@ mod tests {
             id: "m".into(),
             context_limit: None,
             provider_context: None,
+            vision: None,
             source: ModelSource::Fetched,
         }];
         assert_eq!(p.effective_context_limit("m", None), None);
@@ -1082,6 +1087,39 @@ mod tests {
         assert_eq!(Settings::default().limits, expected);
         assert_eq!(expected.model_call_cap(), Some(50));
         assert_eq!(expected.max_wait(), Duration::from_secs(30 * 60));
+    }
+
+    /// A model's modality is written when it is known, and a model without it is written without the key, as before.
+    /// A file from before the key loads with it unknown.
+    #[test]
+    fn vision_round_trips_and_an_unknown_one_is_not_written() {
+        let dir = TempDir::new();
+        let mut settings = valid();
+        // "big-1" stays: the fixture's default model refers to it.
+        settings.providers[0].models = vec![
+            Model { vision: Some(true), ..model("big-1") },
+            Model { vision: Some(false), ..model("blind") },
+            model("unknown"),
+        ];
+        save(dir.path(), &settings).unwrap();
+        let text = fs::read_to_string(settings_path(dir.path())).unwrap();
+        assert_eq!(text.matches("\"vision\"").count(), 2, "only the known values are written: {text}");
+        assert_eq!(load(dir.path()).unwrap(), settings);
+
+        fs::write(settings_path(dir.path()), text.replace("\"vision\"", "\"vision_old\"")).unwrap();
+        let loaded = load(dir.path()).unwrap();
+        assert!(loaded.providers[0].models.iter().all(|m| m.vision.is_none()), "the unknown key is ignored");
+    }
+
+    #[test]
+    fn an_older_file_without_the_vision_key_loads_with_it_unknown() {
+        let dir = TempDir::new();
+        fs::create_dir_all(dir.path()).unwrap();
+        let json = br#"{"version":1,"providers":[{"id":"acme","name":"Acme","chat_url":"https://api.example.com/v1/chat/completions","models":[{"id":"m","context_limit":4000,"provider_context":8000,"source":"fetched"}]}]}"#;
+        fs::write(settings_path(dir.path()), json).unwrap();
+        let loaded = load(dir.path()).unwrap();
+        let m = &loaded.providers[0].models[0];
+        assert_eq!((m.context_limit, m.provider_context, m.vision), (Some(4000), Some(8000), None));
     }
 
     #[test]

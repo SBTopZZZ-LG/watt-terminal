@@ -480,7 +480,8 @@ async fn agent_message(
                     // The note is taken only by a turn that calls the model: a turn that fails to start keeps it.
                     .with_resume_note(att.conversation.take_resume_note())
                     .with_checkpoint(checkpoint)
-                    .with_limits(limits);
+                    .with_limits(limits)
+                    .with_no_vision(att.conversation.no_vision());
                 if let Some(persist) = store.as_ref() {
                     agent = agent.with_attachments(persist.conversations.attachments().clone());
                 }

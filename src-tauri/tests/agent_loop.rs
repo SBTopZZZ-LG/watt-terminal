@@ -317,6 +317,7 @@ fn settings(url: &str, stream: bool) -> LlmSettings {
 
 fn agent_for(s: &LlmSettings, conv: &Conversation, cancel: Arc<TurnCancel>) -> LlmAgent {
     LlmAgent::new(&http_client().expect("client"), s.clone(), &conv.id(), conv.history(), conv.todos(), cancel)
+        .with_no_vision(conv.no_vision())
 }
 
 /// Runs one turn and returns every event it emitted, `Done` included.
@@ -1358,4 +1359,168 @@ fn images_older_than_the_last_three_image_messages_are_left_out_of_the_request()
     assert_eq!(sent[9], json!({"role": "user", "content": "and now?"}));
     // Elision is for the request only: the stored history keeps the first image.
     assert_eq!(conv.history().lock().unwrap().snapshot()[0]["content"][1]["name"], "a.png");
+}
+
+// Models that refuse images
+
+const NO_VISION: &str = "This model doesn't accept images, so they were left out of this reply. Switch to a vision model to use them.";
+const PLACEHOLDER: &str = "[image shot.png not sent: the current model does not accept images]";
+
+/// The answer of a provider that does not accept image input.
+fn refused_images() -> Script {
+    Script::error("400 Bad Request", json!({"error": {"message": "image input is not supported", "code": 400}}))
+}
+
+/// True when the request's messages carry an image part (not just the word, which the system prompt could hold).
+fn carries_image(raw: &str) -> bool {
+    body_of(raw)["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .any(|m| m["content"].as_array().is_some_and(|parts| parts.iter().any(|p| p["type"] == "image_url")))
+}
+
+/// A user message with one PNG named shot.png, stored in the conversation's attachment directory.
+fn image_message(store: &AttachmentStore, conv: &Conversation, text: &str, seed: u8) -> UserMessage {
+    UserMessage { text: text.into(), attachments: vec![image_attachment(store, &conv.id(), "shot.png", seed)] }
+}
+
+fn settings_for_model(url: &str, model: &str, stream: bool) -> LlmSettings {
+    LlmSettings { model: model.to_string(), ..settings(url, stream) }
+}
+
+#[test]
+fn a_model_that_refuses_images_gets_the_request_once_more_without_them() {
+    let provider = serve(vec![refused_images(), Script::json(text_reply("I can read the text."))]);
+    let conv = Conversation::new().unwrap();
+    let dir = StoreDir::new("retry");
+    let store = dir.store();
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new())).with_attachments(store.clone());
+    let events = turn_message(&mut agent, &FakeTools::default(), &no_gate(), &image_message(&store, &conv, "what is this?", 1));
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2, "one refused call and one retry");
+    assert!(carries_image(&requests[0]), "the first call sends the image");
+    assert!(!carries_image(&requests[1]), "the retry sends none");
+    assert_eq!(body_of(&requests[1])["messages"][1]["content"], json!(format!("what is this?\n\n{PLACEHOLDER}")));
+    assert_eq!(texts(&events), ["I can read the text.", NO_VISION], "the reply, then the one notice");
+    assert!(matches!(events.last(), Some(AgentEvent::Done)));
+    assert!(conv.no_vision().lock().unwrap().contains(MODEL), "the model is remembered");
+}
+
+#[test]
+fn a_streamed_retry_shows_its_text_and_then_the_notice() {
+    let provider = serve(vec![refused_images(), Script::sse(&sse_text(&["hel", "lo"]))]);
+    let conv = Conversation::new().unwrap();
+    let dir = StoreDir::new("retry-stream");
+    let store = dir.store();
+    let mut agent = agent_for(&settings(&provider.url, true), &conv, Arc::new(TurnCancel::new())).with_attachments(store.clone());
+    let events = turn_message(&mut agent, &FakeTools::default(), &no_gate(), &image_message(&store, &conv, "look", 2));
+
+    assert_eq!(provider.requests().len(), 2);
+    assert_eq!(deltas(&events), ["hel", "lo"]);
+    assert_eq!(texts(&events), [NO_VISION]);
+}
+
+#[test]
+fn a_model_known_to_refuse_images_gets_placeholders_at_once_in_the_next_message() {
+    let provider = serve(vec![refused_images(), Script::json(text_reply("first")), Script::json(text_reply("second"))]);
+    let conv = Conversation::new().unwrap();
+    let dir = StoreDir::new("memo");
+    let store = dir.store();
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new())).with_attachments(store.clone());
+    turn_message(&mut agent, &FakeTools::default(), &no_gate(), &image_message(&store, &conv, "one", 1));
+    let second = turn_message(&mut agent, &FakeTools::default(), &no_gate(), &image_message(&store, &conv, "two", 2));
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3, "no refused call in the second message: refused, retry, then one");
+    assert!(!carries_image(&requests[2]), "the second message sends no image");
+    assert_eq!(body_of(&requests[2])["messages"][3]["content"], json!(format!("two\n\n{PLACEHOLDER}")));
+    assert_eq!(texts(&second), ["second"], "no second notice");
+}
+
+#[test]
+fn an_authentication_error_is_not_retried_and_the_model_is_not_remembered() {
+    let provider = serve(vec![Script::error("401 Unauthorized", json!({"error": {"message": "invalid key", "code": 401}}))]);
+    let conv = Conversation::new().unwrap();
+    let dir = StoreDir::new("auth");
+    let store = dir.store();
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new())).with_attachments(store.clone());
+    let events = turn_message(&mut agent, &FakeTools::default(), &no_gate(), &image_message(&store, &conv, "look", 3));
+
+    assert_eq!(provider.requests().len(), 1, "a 401 is not retried");
+    assert_eq!(texts(&events), ["The provider returned HTTP 401: invalid key"]);
+    assert!(conv.no_vision().lock().unwrap().is_empty());
+}
+
+#[test]
+fn when_the_retry_fails_too_the_original_error_is_shown_and_nothing_is_remembered() {
+    let second_failure = Script::error("400 Bad Request", json!({"error": {"message": "bad request", "code": 400}}));
+    let provider = serve(vec![refused_images(), second_failure, refused_images(), Script::json(text_reply("ok"))]);
+    let conv = Conversation::new().unwrap();
+    let dir = StoreDir::new("both-fail");
+    let store = dir.store();
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new())).with_attachments(store.clone());
+    let first = turn_message(&mut agent, &FakeTools::default(), &no_gate(), &image_message(&store, &conv, "one", 1));
+    assert_eq!(texts(&first), ["The provider returned HTTP 400: image input is not supported"], "the original error");
+    assert!(conv.no_vision().lock().unwrap().is_empty(), "nothing is remembered");
+
+    // The next message still sends its image first, and the retry now works.
+    let second = turn_message(&mut agent, &FakeTools::default(), &no_gate(), &image_message(&store, &conv, "two", 2));
+    assert!(carries_image(&provider.requests()[2]), "the image is sent again");
+    assert_eq!(texts(&second), ["ok", NO_VISION]);
+}
+
+#[test]
+fn a_request_without_images_never_takes_the_retry_path() {
+    let provider = serve(vec![Script::error("400 Bad Request", json!({"error": {"message": "bad request", "code": 400}}))]);
+    let conv = Conversation::new().unwrap();
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
+    let events = turn(&mut agent, &FakeTools::default(), &no_gate(), "plain text");
+
+    assert_eq!(provider.requests().len(), 1);
+    assert_eq!(texts(&events), ["The provider returned HTTP 400: bad request"]);
+    assert!(conv.no_vision().lock().unwrap().is_empty());
+}
+
+#[test]
+fn the_stored_history_keeps_the_image_and_another_model_is_sent_it() {
+    let provider = serve(vec![refused_images(), Script::json(text_reply("first")), Script::json(text_reply("vision"))]);
+    let conv = Conversation::new().unwrap();
+    let dir = StoreDir::new("stored");
+    let store = dir.store();
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new())).with_attachments(store.clone());
+    turn_message(&mut agent, &FakeTools::default(), &no_gate(), &image_message(&store, &conv, "look", 4));
+
+    let stored_image = conv.history().lock().unwrap().snapshot()[0]["content"][1].clone();
+    assert_eq!(stored_image["type"], "watt_image", "the history is not rewritten");
+    assert_eq!(stored_image["name"], "shot.png");
+
+    // Another model has not refused images, so it gets the image at once.
+    let mut other = agent_for(&settings_for_model(&provider.url, "openai/gpt-vision", false), &conv, Arc::new(TurnCancel::new()))
+        .with_attachments(store.clone());
+    let events = turn(&mut other, &FakeTools::default(), &no_gate(), "again");
+    assert!(carries_image(&provider.requests()[2]), "the image goes to the other model");
+    assert_eq!(texts(&events), ["vision"], "and no notice");
+}
+
+#[test]
+fn a_retried_reply_counts_once_against_the_model_call_cap() {
+    let provider = serve(vec![refused_images(), Script::json(tool_reply(&[("call_r", "get_cwd", "{}")]))]);
+    let conv = Conversation::new().unwrap();
+    let dir = StoreDir::new("cap");
+    let store = dir.store();
+    let limits = LimitsSettings { max_model_calls: 1, model_calls_unlimited: false, ..LimitsSettings::default() };
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()))
+        .with_attachments(store.clone())
+        .with_limits(limits);
+    let events = turn_message(&mut agent, &FakeTools::default(), &no_gate(), &image_message(&store, &conv, "look", 5));
+
+    // The refused call is not charged; the retry's reply asks for a tool, which is the one charged reply, so the cap of
+    // one is reached there and its call is not run.
+    assert_eq!(provider.requests().len(), 2);
+    assert_eq!(
+        texts(&events),
+        [NO_VISION.to_string(), "I stopped after 1 model calls in one turn. The limit can be changed in Settings > Limits.".to_string()]
+    );
 }

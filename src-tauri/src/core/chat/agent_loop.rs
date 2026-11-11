@@ -16,7 +16,7 @@
 //! Nothing here logs the key or a header value.
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::File;
 use std::future::Future;
@@ -61,6 +61,12 @@ const POLL_NAMES: [&str; 3] = ["wait", "get_screen", "send_keys"];
 const LIMIT_REASON: &str = "not run: the turn stopped after the model call limit";
 const POLL_LIMIT_REASON: &str = "not run: the turn stopped after the polling call limit";
 const DENIED_NOTICE: &str = "Stopped: the command was not approved. Tell me what you want to do next.";
+/// Said once, when a model turned out to refuse images and the retry without them worked.
+const NO_VISION_NOTICE: &str =
+    "This model doesn't accept images, so they were left out of this reply. Switch to a vision model to use them.";
+
+/// The models (by id) that refused images in a conversation. Shared by the conversation's agents, so each turn sees it.
+pub type NoVisionModels = Arc<Mutex<HashSet<String>>>;
 
 /// The provider settings read from the environment. Holds the key, so `Debug` hides it.
 #[derive(Clone)]
@@ -213,6 +219,8 @@ pub struct Conversation {
     history: Arc<Mutex<History>>,
     todos: TodoList,
     resume_note: Mutex<Option<String>>,
+    /// The models that refused images here. Kept by `reset` and `restore`: it is a fact about the model, not the chat.
+    no_vision: NoVisionModels,
 }
 
 impl Conversation {
@@ -222,6 +230,7 @@ impl Conversation {
             history: Arc::new(Mutex::new(History::new())),
             todos: Arc::new(Mutex::new(Vec::new())),
             resume_note: Mutex::new(None),
+            no_vision: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -235,6 +244,11 @@ impl Conversation {
 
     pub fn todos(&self) -> TodoList {
         self.todos.clone()
+    }
+
+    /// The models that refused images in this conversation (see `LlmAgent::with_no_vision`).
+    pub fn no_vision(&self) -> NoVisionModels {
+        self.no_vision.clone()
     }
 
     /// Clears the history, the todo list and any pending resume note, and rotates the id. The caller makes sure no
@@ -293,6 +307,8 @@ pub struct LlmAgent {
     limits: LimitsSettings,
     /// Where the images of attached messages are read from (see `with_attachments`). None: they are not sent.
     attachments: Option<AttachmentStore>,
+    /// The models that refused images, by id (see `with_no_vision`).
+    no_vision: NoVisionModels,
 }
 
 impl LlmAgent {
@@ -330,6 +346,7 @@ impl LlmAgent {
             checkpoint: None,
             limits: LimitsSettings::default(),
             attachments: None,
+            no_vision: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -343,6 +360,14 @@ impl LlmAgent {
     /// those images are reported as no longer available.
     pub fn with_attachments(mut self, store: AttachmentStore) -> Self {
         self.attachments = Some(store);
+        self
+    }
+
+    /// The memo of models that refused images, shared with the conversation (see `Conversation::no_vision`). Without it,
+    /// the memo lasts for this agent only. A model in the memo is sent its images as placeholders, with no call that
+    /// would fail first.
+    pub fn with_no_vision(mut self, models: NoVisionModels) -> Self {
+        self.no_vision = models;
         self
     }
 
@@ -375,6 +400,11 @@ impl LlmAgent {
     /// One model call. Streams text as it arrives, or waits for the whole reply. Returns None when the call was
     /// cancelled or failed; a failure has already been shown to the user. `finished` is the turn's finished note (see
     /// `finished_since_last_turn`), given to the first call only.
+    ///
+    /// A request with images that the model refuses (see `rejects_images`), before any text was streamed, is sent once
+    /// more with the images replaced by notes. The stored history is not changed. The retry is part of this one call:
+    /// the caps count replies that ask for tools (see `charge`), so a failed attempt is never counted, and the reply
+    /// that comes back is counted once, as any other reply.
     fn ask_model(&self, ctx: &AgentCtx<'_>, finished: Option<&str>) -> Option<AssistantReply> {
         // The resume note, the terminal notes, the finished note and the todo block are added to this request's system
         // message only. None is stored in the history. The todo block comes last.
@@ -402,7 +432,43 @@ impl LlmAgent {
             system = format!("{system}\n\n{block}");
         }
         let mut resolver = Resolver::new(self.attachments.as_ref(), &self.conversation_id);
-        let messages = lock(&self.history).messages(&system, &mut resolver);
+        let messages = self.wire_messages(&system, &mut resolver);
+        if !has_image_part(&messages) {
+            return self.finish_call(ctx, self.send(ctx, messages).0);
+        }
+        // A model that refused images earlier in this conversation is not asked again: its images are replaced at once.
+        if lock_models(&self.no_vision).contains(&self.model) {
+            let text_only = self.wire_messages(&system, &mut Resolver::without_images());
+            return self.finish_call(ctx, self.send(ctx, text_only).0);
+        }
+        match self.send(ctx, messages) {
+            // The model refused the images before any text reached the user: the same request goes once more without them.
+            (Err(e), false) if rejects_images(&e) => {
+                let text_only = self.wire_messages(&system, &mut Resolver::without_images());
+                match self.send(ctx, text_only).0 {
+                    Ok(reply) => {
+                        lock_models(&self.no_vision).insert(self.model.clone());
+                        let reply = self.finish_call(ctx, Ok(reply));
+                        ctx.say(NO_VISION_NOTICE);
+                        reply
+                    }
+                    Err(LlmError::Cancelled) => None,
+                    // The retry failed too: the user sees the error of the request as it was first sent.
+                    Err(_) => self.finish_call(ctx, Err(e)),
+                }
+            }
+            (result, _) => self.finish_call(ctx, result),
+        }
+    }
+
+    /// The stored history as wire messages for one request, after `system`. The images go through `resolver`.
+    fn wire_messages(&self, system: &str, resolver: &mut Resolver<'_>) -> Vec<Value> {
+        lock(&self.history).messages(system, resolver)
+    }
+
+    /// One request, streamed or waited for, with the "thinking" state around it. Returns the result and whether any
+    /// text was streamed to the user during the call.
+    fn send(&self, ctx: &AgentCtx<'_>, messages: Vec<Value>) -> (Result<AssistantReply, LlmError>, bool) {
         let req = ChatRequest {
             model: self.model.clone(),
             messages,
@@ -410,6 +476,7 @@ impl LlmAgent {
             max_tokens: self.max_tokens,
         };
         let thinking = Cell::new(true);
+        let streamed = Cell::new(false);
         ctx.emit(AgentEvent::Thinking { active: true });
         let result = if self.stream {
             let mut on_delta = |delta: Delta| {
@@ -418,6 +485,7 @@ impl LlmAgent {
                     && !text.is_empty()
                 {
                     stop_thinking(ctx, &thinking);
+                    streamed.set(true);
                     ctx.emit(AgentEvent::TextDelta { text });
                 }
             };
@@ -426,6 +494,11 @@ impl LlmAgent {
             block(llm::complete(&self.client, &self.cfg, &req, &self.cancel))
         };
         stop_thinking(ctx, &thinking);
+        (result, streamed.get())
+    }
+
+    /// Ends one model call: a reply that was not streamed is said, and an error is shown. None when there is no reply.
+    fn finish_call(&self, ctx: &AgentCtx<'_>, result: Result<AssistantReply, LlmError>) -> Option<AssistantReply> {
         match result {
             Ok(reply) => {
                 if !self.stream && !reply.text.is_empty() {
@@ -617,6 +690,17 @@ fn stop_thinking(ctx: &AgentCtx<'_>, active: &Cell<bool>) {
     if active.replace(false) {
         ctx.emit(AgentEvent::Thinking { active: false });
     }
+}
+
+/// True when a request carries an image part: an image the model is sent.
+fn has_image_part(messages: &[Value]) -> bool {
+    messages.iter().any(|m| m["content"].as_array().is_some_and(|parts| parts.iter().any(|p| p["type"] == "image_url")))
+}
+
+/// True for an error that a model gives for images it does not accept: HTTP 400, 404 or 422, or a provider error. Other
+/// statuses and transport problems say nothing about the images.
+fn rejects_images(e: &LlmError) -> bool {
+    matches!(e, LlmError::Http { status: 400 | 404 | 422, .. } | LlmError::Provider { .. })
 }
 
 /// The notice for a failed model call. Provider text is already free of the key (the adapter scrubs it).
@@ -830,6 +914,10 @@ fn lock_todos(m: &TodoList) -> MutexGuard<'_, Vec<Todo>> {
 }
 
 fn lock_note(m: &Mutex<Option<String>>) -> MutexGuard<'_, Option<String>> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn lock_models(m: &Mutex<HashSet<String>>) -> MutexGuard<'_, HashSet<String>> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 

@@ -25,7 +25,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use super::PersistError;
-use super::attachments::AttachmentStore;
+use super::attachments::{AttachmentStore, SWEEP_GRACE};
 use super::workspace::{Workspace, is_hidden_or_control};
 use crate::core::chat::redact::Redactor;
 use crate::core::chat::todo::{self, Todo};
@@ -242,7 +242,8 @@ impl ConversationStore {
 
     /// Keeps the `keep` most recently updated conversations and deletes the rest, with their attachment files. `protect`
     /// is never deleted and is kept in addition to the `keep` newest. Attachment directories of conversations that are
-    /// neither listed nor skipped (see `index_locked`) are swept too. Returns the ids that were deleted.
+    /// neither listed nor skipped (see `index_locked`) are swept too, except those changed within `SWEEP_GRACE`: a turn
+    /// writes its images before its message is saved. Returns the ids that were deleted.
     pub fn prune(&self, keep: usize, protect: Option<&str>) -> Result<Vec<String>, PersistError> {
         if let Some(id) = protect {
             check_id(id)?;
@@ -266,7 +267,7 @@ impl ConversationStore {
         let index = self.index_locked()?;
         let kept: HashSet<String> =
             index.conversations.iter().map(|m| m.id.clone()).chain(index.skipped.iter().cloned()).collect();
-        self.attachments.remove_except(&kept).map_err(|e| io_error(self.attachments.root(), e))?;
+        self.attachments.sweep(&kept, SWEEP_GRACE).map_err(|e| io_error(self.attachments.root(), e))?;
         let mut removed: Vec<String> = removed.into_iter().collect();
         removed.sort();
         Ok(removed)
@@ -1571,16 +1572,27 @@ mod tests {
             let sha = put_image(&s, n, n as u8);
             save_with_image(&s, n, &sha);
         }
-        // A directory for an id that no conversation has, and a file that is not a conversation directory.
+        // A directory for an id that no conversation has, and a file that is not a conversation directory. Old
+        // directories are aged past the grace period; the one written just now (98) is a turn not yet saved.
         put_image(&s, 99, 9);
+        put_image(&s, 98, 8);
+        age_attachment_dir(&s, 90);
+        age_attachment_dir(&s, 99);
         fs::write(s.attachments().root().join("notes.txt"), b"not ours").unwrap();
 
         let removed = s.prune(2, None).unwrap();
         assert_eq!(removed, vec![id(90)], "the oldest conversation is pruned");
         assert!(!attachment_dir(&s, 90).exists(), "its files go with it");
         assert!(attachment_dir(&s, 91).exists() && attachment_dir(&s, 92).exists());
-        assert!(!attachment_dir(&s, 99).exists(), "an orphan directory is swept");
+        assert!(!attachment_dir(&s, 99).exists(), "an old orphan directory is swept");
+        assert!(attachment_dir(&s, 98).exists(), "a fresh orphan may be a turn being saved: kept");
         assert_eq!(fs::read(s.attachments().root().join("notes.txt")).unwrap(), b"not ours");
+    }
+
+    /// Makes conversation `n`'s attachment directory look older than the sweep grace period.
+    fn age_attachment_dir(s: &ConversationStore, n: u32) {
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(60 * 60);
+        fs::File::open(attachment_dir(s, n)).unwrap().set_modified(when).unwrap();
     }
 
     #[test]

@@ -795,7 +795,7 @@ mod tests {
     }
 
     fn model(id: &str, source: ModelSource) -> Model {
-        Model { id: id.into(), context_limit: None, provider_context: None, source }
+        Model { id: id.into(), context_limit: None, provider_context: None, vision: None, source }
     }
 
     fn provider(id: &str) -> Provider {
@@ -1472,8 +1472,8 @@ mod tests {
         f.service.set_default_model(Some(model_ref("acme", "gone"))).unwrap();
 
         let fetched = vec![
-            FetchedModel { id: "kept".into(), context: Some(2_000) },
-            FetchedModel { id: "fresh".into(), context: None },
+            FetchedModel { id: "kept".into(), context: Some(2_000), vision: None },
+            FetchedModel { id: "fresh".into(), context: None, vision: None },
         ];
         let (view, summary) = f.service.apply_fetched("acme", fetched.clone()).unwrap();
         assert_eq!(summary, FetchSummary { added: 1, updated: 1, removed: 0, total: 4 });

@@ -27,11 +27,14 @@ const MAX_CONTEXT_TOKENS: u64 = 100_000_000;
 /// Longest error message kept, in characters.
 const MESSAGE_LIMIT: usize = 300;
 
-/// One model from a provider's list. `context` is the size the provider reported, if it reported one.
+/// One model from a provider's list. `context` is the size the provider reported, if it reported one. `vision` says
+/// whether the provider lists image input among the model's input modalities: Some(true) with "image" in
+/// `architecture.input_modalities`, Some(false) when that list is there without it, None when the entry has no list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchedModel {
     pub id: String,
     pub context: Option<u32>,
+    pub vision: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,7 +95,7 @@ pub fn parse_model_list(body: &str) -> Result<Vec<FetchedModel>, ModelsError> {
         if !seen.insert(id.clone()) {
             continue;
         }
-        models.push(FetchedModel { context: context_of(entry), id });
+        models.push(FetchedModel { context: context_of(entry), vision: vision_of(entry), id });
     }
     Ok(models)
 }
@@ -132,6 +135,13 @@ fn context_of(entry: &Value) -> Option<u32> {
         let n = value.as_u64().filter(|n| (1..=MAX_CONTEXT_TOKENS).contains(n))?;
         u32::try_from(n).ok()
     })
+}
+
+/// Whether the entry takes images, from `architecture.input_modalities` (OpenRouter). None when the entry has no such
+/// array of strings; otherwise true only when the array has "image".
+fn vision_of(entry: &Value) -> Option<bool> {
+    let modalities = entry.get("architecture")?.get("input_modalities")?.as_array()?;
+    Some(modalities.iter().any(|m| m.as_str() == Some("image")))
 }
 
 /// Fetches and parses a model list. `url` is the full list URL. `headers` are the caller's header values with
@@ -236,9 +246,9 @@ fn from_llm(err: LlmError) -> ModelsError {
 /// here; the caller decides what to do about a removed default.
 pub fn merge_fetched(provider: &mut Provider, fetched: Vec<FetchedModel>) {
     // First occurrence wins, and sorting gives the append order.
-    let mut fresh: BTreeMap<String, Option<u32>> = BTreeMap::new();
+    let mut fresh: BTreeMap<String, (Option<u32>, Option<bool>)> = BTreeMap::new();
     for model in fetched {
-        fresh.entry(model.id).or_insert(model.context);
+        fresh.entry(model.id).or_insert((model.context, model.vision));
     }
     let existing: HashSet<String> = provider.models.iter().map(|m| m.id.clone()).collect();
 
@@ -247,15 +257,21 @@ pub fn merge_fetched(provider: &mut Provider, fetched: Vec<FetchedModel>) {
         match model.source {
             ModelSource::Custom => merged.push(model),
             ModelSource::Fetched => {
-                if let Some(context) = fresh.get(&model.id).copied() {
-                    merged.push(Model { provider_context: context, ..model });
+                if let Some((context, vision)) = fresh.get(&model.id).copied() {
+                    merged.push(Model { provider_context: context, vision, ..model });
                 }
             }
         }
     }
-    for (id, context) in fresh {
+    for (id, (context, vision)) in fresh {
         if !existing.contains(&id) {
-            merged.push(Model { id, context_limit: None, provider_context: context, source: ModelSource::Fetched });
+            merged.push(Model {
+                id,
+                context_limit: None,
+                provider_context: context,
+                vision,
+                source: ModelSource::Fetched,
+            });
         }
     }
     provider.models = merged;
@@ -279,7 +295,7 @@ mod tests {
     }
 
     fn fetched(id: &str, context: Option<u32>) -> FetchedModel {
-        FetchedModel { id: id.into(), context }
+        FetchedModel { id: id.into(), context, vision: None }
     }
 
     fn provider_with(models: Vec<Model>) -> Provider {
@@ -420,15 +436,23 @@ mod tests {
                 id: "mine".into(),
                 context_limit: Some(5000),
                 provider_context: None,
+                vision: None,
                 source: ModelSource::Custom,
             },
             Model {
                 id: "kept".into(),
                 context_limit: Some(9000),
                 provider_context: Some(1),
+                vision: None,
                 source: ModelSource::Fetched,
             },
-            Model { id: "gone".into(), context_limit: None, provider_context: Some(3), source: ModelSource::Fetched },
+            Model {
+                id: "gone".into(),
+                context_limit: None,
+                provider_context: Some(3),
+                vision: None,
+                source: ModelSource::Fetched,
+            },
         ]);
         merge_fetched(
             &mut provider,
@@ -458,11 +482,49 @@ mod tests {
         assert_eq!(provider.models[3].provider_context, None);
     }
 
+    /// The modality of each entry: from `architecture.input_modalities`, None without a usable list.
+    #[test]
+    fn vision_is_read_from_the_input_modalities() {
+        let body = r#"{"data":[
+            {"id":"a/vision","architecture":{"input_modalities":["text","image"]}},
+            {"id":"b/text","architecture":{"input_modalities":["text"]}},
+            {"id":"c/none"},
+            {"id":"d/not-a-list","architecture":{"input_modalities":"image"}},
+            {"id":"e/empty","architecture":{"input_modalities":[]}}
+        ]}"#;
+        let models = parse_model_list(body).unwrap();
+        let vision: Vec<(&str, Option<bool>)> = models.iter().map(|m| (m.id.as_str(), m.vision)).collect();
+        assert_eq!(
+            vision,
+            vec![
+                ("a/vision", Some(true)),
+                ("b/text", Some(false)),
+                ("c/none", None),
+                ("d/not-a-list", None),
+                ("e/empty", Some(false)),
+            ]
+        );
+    }
+
+    /// A refresh sets the modality of fetched models (kept and new), and never touches a custom model's.
+    #[test]
+    fn merge_carries_the_modality_and_leaves_custom_models_alone() {
+        let mut provider = provider_with(vec![
+            Model { id: "mine".into(), context_limit: None, provider_context: None, vision: None, source: ModelSource::Custom },
+            Model { id: "kept".into(), context_limit: None, provider_context: None, vision: Some(true), source: ModelSource::Fetched },
+        ]);
+        let fresh = |id: &str, vision| FetchedModel { id: id.into(), context: None, vision };
+        merge_fetched(&mut provider, vec![fresh("kept", Some(false)), fresh("new", Some(true)), fresh("mine", Some(true))]);
+
+        let vision: Vec<(&str, Option<bool>)> = provider.models.iter().map(|m| (m.id.as_str(), m.vision)).collect();
+        assert_eq!(vision, vec![("mine", None), ("kept", Some(false)), ("new", Some(true))]);
+    }
+
     #[test]
     fn merge_with_an_empty_list_removes_fetched_models_only() {
         let mut provider = provider_with(vec![
-            Model { id: "c".into(), context_limit: None, provider_context: None, source: ModelSource::Custom },
-            Model { id: "f".into(), context_limit: None, provider_context: None, source: ModelSource::Fetched },
+            Model { id: "c".into(), context_limit: None, provider_context: None, vision: None, source: ModelSource::Custom },
+            Model { id: "f".into(), context_limit: None, provider_context: None, vision: None, source: ModelSource::Fetched },
         ]);
         merge_fetched(&mut provider, Vec::new());
         assert_eq!(provider.models.len(), 1);

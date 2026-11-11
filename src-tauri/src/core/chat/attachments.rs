@@ -279,15 +279,28 @@ pub struct Resolver<'a> {
     source: Option<(&'a AttachmentStore, &'a str)>,
     /// The base64 of each file read, by `<sha256>.<ext>`. `None` for a file that is missing or does not match its name.
     cache: HashMap<String, Option<String>>,
+    /// True when the model is not to be sent images (see `without_images`).
+    refuse: bool,
 }
 
 impl<'a> Resolver<'a> {
     pub fn new(store: Option<&'a AttachmentStore>, conversation_id: &'a str) -> Self {
-        Resolver { source: store.map(|store| (store, conversation_id)), cache: HashMap::new() }
+        Resolver { source: store.map(|store| (store, conversation_id)), cache: HashMap::new(), refuse: false }
     }
 
     pub fn none() -> Self {
-        Resolver { source: None, cache: HashMap::new() }
+        Resolver { source: None, cache: HashMap::new(), refuse: false }
+    }
+
+    /// For a model that does not accept images: every image is replaced by a note that it was not sent, and no file is
+    /// read.
+    pub fn without_images() -> Self {
+        Resolver { source: None, cache: HashMap::new(), refuse: true }
+    }
+
+    /// True when images are replaced by the "not sent" note instead of being read.
+    pub fn refuses_images(&self) -> bool {
+        self.refuse
     }
 
     /// The `data:` URL of a stored image, or `None` when the file is missing, does not match its content address, or the
@@ -312,6 +325,8 @@ impl<'a> Resolver<'a> {
 /// The content of a stored user message for one request. `is_sent(part)` says whether the image at that part index is
 /// sent. The result is a single string unless an image is actually sent: some OpenAI-compatible servers reject the
 /// array form, so it is used only when it has to be. Images not sent, and images whose file is missing, become a note.
+/// When the resolver refuses images, an image that is sent becomes the "not sent" note instead; an image already left
+/// out of the request keeps its "omitted" note.
 pub fn wire_content(parts: &[Value], is_sent: impl Fn(usize) -> bool, resolver: &mut Resolver<'_>) -> Value {
     enum Piece {
         Text(String),
@@ -329,6 +344,10 @@ pub fn wire_content(parts: &[Value], is_sent: impl Fn(usize) -> bool, resolver: 
                 let name = sanitize_name(part["name"].as_str().unwrap_or_default());
                 if !is_sent(index) {
                     pieces.push(Piece::Text(format!("[image {name} omitted from context]")));
+                    continue;
+                }
+                if resolver.refuses_images() {
+                    pieces.push(Piece::Text(format!("[image {name} not sent: the current model does not accept images]")));
                     continue;
                 }
                 let url = match (part["sha256"].as_str(), part["mime"].as_str()) {
@@ -632,6 +651,24 @@ mod tests {
         assert_eq!(content[1]["thumb"], "data:image/png;base64,AKIAIOSFODNN7EXAMPLE");
         assert_eq!(content[2]["type"], "watt_file");
         assert!(!content[2]["text"].as_str().unwrap().contains("hunter2-secret"));
+    }
+
+    /// A refusing resolver turns a sent image into the "not sent" note and reads nothing. An image already left out of
+    /// the request keeps its "omitted" note.
+    #[test]
+    fn a_refusing_resolver_replaces_sent_images_with_a_not_sent_note() {
+        let parts = vec![
+            json!({"type": "text", "text": "look"}),
+            json!({"type": "watt_image", "sha256": "c".repeat(64), "mime": "image/png", "name": "a.png", "bytes": 3}),
+            json!({"type": "watt_image", "sha256": "d".repeat(64), "mime": "image/png", "name": "b.png", "bytes": 3}),
+        ];
+        let wire = wire_content(&parts, |index| index == 1, &mut Resolver::without_images());
+        assert_eq!(
+            wire,
+            json!("look\n\n[image a.png not sent: the current model does not accept images]\n\n[image b.png omitted from context]")
+        );
+        assert!(Resolver::without_images().refuses_images());
+        assert!(!Resolver::none().refuses_images());
     }
 
     #[test]

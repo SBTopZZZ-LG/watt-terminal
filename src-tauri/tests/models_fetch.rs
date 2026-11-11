@@ -73,8 +73,8 @@ async fn success_parses_the_list_and_sends_the_bearer_and_custom_header() {
     assert_eq!(
         models,
         vec![
-            FetchedModel { id: "deepseek/deepseek-v4.1-flash".into(), context: Some(1_048_576) },
-            FetchedModel { id: "other/model".into(), context: Some(8192) },
+            FetchedModel { id: "deepseek/deepseek-v4.1-flash".into(), context: Some(1_048_576), vision: None },
+            FetchedModel { id: "other/model".into(), context: Some(8192), vision: None },
         ]
     );
 
@@ -119,7 +119,7 @@ async fn a_body_over_five_mebibytes_is_refused() {
 async fn an_empty_key_sends_no_bearer_header() {
     let (url, rx) = serve("200 OK", br#"{"data":[{"id":"local-model"}]}"#.to_vec());
     let models = fetch_models(&http_client().unwrap(), &url, "", &[], USER_AGENT).await.unwrap();
-    assert_eq!(models, vec![FetchedModel { id: "local-model".into(), context: None }]);
+    assert_eq!(models, vec![FetchedModel { id: "local-model".into(), context: None, vision: None }]);
 
     let lower = rx.recv().unwrap().to_ascii_lowercase();
     assert!(!lower.contains("authorization:"), "an empty key must send no Authorization header: {lower}");

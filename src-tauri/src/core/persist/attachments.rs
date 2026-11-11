@@ -9,11 +9,16 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
 
 use super::conversations::is_valid_id;
 use crate::core::settings::write_private_atomic;
+
+/// How recently a directory must have changed to be left by a sweep. A turn writes its images before its message is
+/// saved, so a directory written this recently may belong to a conversation that is not in the index yet.
+pub const SWEEP_GRACE: Duration = Duration::from_secs(10 * 60);
 
 /// The lowercase hex SHA-256 of `bytes`: the content address of an attachment file.
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -70,6 +75,29 @@ impl AttachmentStore {
             if !keep.contains(&name) {
                 remove_dir_if_exists(&self.root.join(name))?;
             }
+        }
+        Ok(())
+    }
+
+    /// Removes every conversation directory whose id is not in `keep` and that has not changed within `grace`. A
+    /// directory that is newer than the grace may be a turn in progress, so it stays until a later sweep.
+    pub fn sweep(&self, keep: &HashSet<String>, grace: Duration) -> io::Result<()> {
+        let now = SystemTime::now();
+        for name in self.conversation_dirs()? {
+            if keep.contains(&name) {
+                continue;
+            }
+            let path = self.root.join(&name);
+            let modified = match fs::metadata(&path).and_then(|m| m.modified()) {
+                Ok(modified) => modified,
+                Err(e) if e.kind() == ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            // A time in the future counts as just changed.
+            if now.duration_since(modified).unwrap_or_default() < grace {
+                continue;
+            }
+            remove_dir_if_exists(&path)?;
         }
         Ok(())
     }
@@ -211,6 +239,44 @@ mod tests {
         s.remove_all().unwrap();
         assert_eq!(dir_names(s.root()), vec!["notes.txt".to_string()]);
         assert_eq!(fs::read(s.root().join("notes.txt")).unwrap(), b"not ours");
+    }
+
+    /// Sets a directory's modification time, as the sweep reads it.
+    fn set_age(dir: &Path, age: Duration) {
+        let when = SystemTime::now() - age;
+        fs::File::open(dir).unwrap().set_modified(when).unwrap();
+    }
+
+    #[test]
+    fn sweep_leaves_kept_and_recently_changed_directories() {
+        let tmp = TempDir::new();
+        let s = store(&tmp);
+        let sha = sha256_hex(b"x");
+        for n in [10, 11, 12] {
+            s.write(&id(n), &sha, "png", b"x").unwrap();
+        }
+        // 10 is old but listed, 11 is old and not listed, 12 is not listed but was written just now.
+        for n in [10, 11] {
+            set_age(&s.root().join(id(n)), Duration::from_secs(3600));
+        }
+        let keep: HashSet<String> = [id(10)].into_iter().collect();
+        s.sweep(&keep, SWEEP_GRACE).unwrap();
+        assert_eq!(dir_names(s.root()), vec![id(10), id(12)], "only the old unlisted directory goes");
+
+        // With no grace, the directory written just now goes too.
+        s.sweep(&keep, Duration::ZERO).unwrap();
+        assert_eq!(dir_names(s.root()), vec![id(10)]);
+    }
+
+    #[test]
+    fn a_directory_timestamp_in_the_future_is_kept_by_the_sweep() {
+        let tmp = TempDir::new();
+        let s = store(&tmp);
+        s.write(&id(13), &sha256_hex(b"x"), "png", b"x").unwrap();
+        let dir = s.root().join(id(13));
+        fs::File::open(&dir).unwrap().set_modified(SystemTime::now() + Duration::from_secs(3600)).unwrap();
+        s.sweep(&HashSet::new(), SWEEP_GRACE).unwrap();
+        assert_eq!(dir_names(s.root()), vec![id(13)]);
     }
 
     #[test]

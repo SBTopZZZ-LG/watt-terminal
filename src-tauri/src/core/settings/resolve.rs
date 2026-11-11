@@ -144,6 +144,7 @@ mod tests {
                 id: "big".into(),
                 context_limit: Some(50_000),
                 provider_context: Some(100_000),
+                vision: None,
                 source: ModelSource::Fetched,
             }],
         }

@@ -296,6 +296,8 @@ export interface Model {
   context_limit: number | null;
   /** What the provider reported when the list was fetched, in tokens. */
   provider_context: number | null;
+  /** Whether the provider reported image input. Absent or null when unknown. */
+  vision?: boolean | null;
   source: ModelSource;
 }
 
