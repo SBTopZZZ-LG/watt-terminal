@@ -289,3 +289,51 @@ describe('Transcript: interactive command groups', () => {
     expect(html).toContain('x'.repeat(80));
   });
 });
+
+describe('Transcript: attachments on a message the user sent', () => {
+  const THUMB = 'data:image/jpeg;base64,/9j/AAAA';
+
+  it('a live message shows its image as a thumbnail and its document as a chip with name and size, under the text', () => {
+    const html = render([
+      {
+        type: 'user_sent',
+        clientId: 1,
+        text: 'what is in these',
+        attachments: [
+          { kind: 'image', name: 'shot.png', bytes: 2048, thumb: THUMB },
+          { kind: 'file', name: 'notes.md', bytes: 300 },
+        ],
+      },
+    ]);
+    expect(html).toContain('<div class="msg-attachments">');
+    expect(html).toContain(`<img class="msg-attach-thumb" src="${THUMB}" alt="shot.png" title="shot.png"/>`);
+    expect(html).toContain('<span class="msg-attach-name" title="notes.md">notes.md</span><span class="msg-attach-size">300 B</span>');
+    // The text comes first, then the attachments.
+    expect(html.indexOf('what is in these')).toBeLessThan(html.indexOf('msg-attachments'));
+  });
+
+  it('an attachment-only message renders with no text, and no empty text row is needed', () => {
+    const html = render([{ type: 'user_sent', clientId: 2, text: '', attachments: [{ kind: 'file', name: 'only.md', bytes: 4096 }] }]);
+    expect(html).toContain('<span class="msg-attach-name" title="only.md">only.md</span><span class="msg-attach-size">4 KB</span>');
+  });
+
+  it('an image with no stored thumbnail is a chip with its name, not an image', () => {
+    const html = render([{ type: 'user_sent', clientId: 3, text: 'x', attachments: [{ kind: 'image', name: 'p.jpg', bytes: 900 }] }]);
+    expect(html).toContain('class="msg-attach is-placeholder"');
+    expect(html).toContain('<span class="msg-attach-name" title="p.jpg">p.jpg</span>');
+    expect(html).not.toContain('msg-attach-thumb');
+  });
+
+  it('names are shown as text: markup is escaped and bidi overrides are removed', () => {
+    const html = render([
+      { type: 'user_sent', clientId: 4, text: 'x', attachments: [{ kind: 'file', name: '<img src=x onerror=alert(1)>‮evil.txt', bytes: 1 }] },
+    ]);
+    expect(html).toContain('&lt;img src=x onerror=alert(1)&gt;evil.txt');
+    expect(html).not.toContain('<img src=x');
+    expect(html).not.toContain('‮');
+  });
+
+  it('a message with no attachments has no attachment row', () => {
+    expect(render([{ type: 'user_sent', clientId: 5, text: 'plain' }])).not.toContain('msg-attachments');
+  });
+});

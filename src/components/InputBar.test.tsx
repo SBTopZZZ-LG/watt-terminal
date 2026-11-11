@@ -17,6 +17,7 @@ const BASE = {
   onRestart: NOOP,
   restarting: false,
   onAgent: async () => null,
+  modelVision: null as boolean | null,
   onInterrupt: NOOP,
   onApproveFirst: NOOP,
   onDenyFirst: NOOP,
@@ -50,7 +51,9 @@ describe('InputBar: the field sizes to its text', () => {
     const html = render();
     const tag = tagHolding(html, 'div', 'bar-mirror');
     expect(tag).toContain('aria-hidden="true"');
-    expect(html).toContain('bar-mirror" aria-hidden="true">Ask the agent…  (Ctrl/Cmd+Shift+A to focus, Esc to return) </div>');
+    expect(html).toContain('bar-mirror" aria-hidden="true">Ask the agent… </div>');
+    // The shortcut hint is the input's tooltip, not its placeholder.
+    expect(tagHolding(html, 'textarea', 'bar-input')).toContain('title="Ctrl/Cmd+Shift+A to focus, Esc to return"');
   });
 
   it('the mirror holds the inline hint when the hint is the placeholder', () => {
@@ -70,7 +73,8 @@ describe('InputBar: the input', () => {
     const html = render();
     const tag = tagHolding(html, 'textarea', 'bar-input');
     expect(tag).toContain('rows="1"');
-    expect(html).not.toContain('<input');
+    // The only <input> is the hidden file input of the attach button, which is not a text field.
+    expect(html).not.toMatch(/<input(?! type="file")/);
   });
 
   it('is disabled while locked', () => {
@@ -126,5 +130,47 @@ describe('InputBar: the shell modes have no input', () => {
     const html = render({ mode: 'collapsed' });
     expect(html).not.toContain('<textarea');
     expect(html).not.toContain('bar-send');
+  });
+});
+
+describe('InputBar: attaching files', () => {
+  it('has a paperclip button, left of the field, that is a plain button', () => {
+    const html = render();
+    const tag = tagHolding(html, 'button', 'bar-attach-button');
+    expect(tag).toContain('aria-label="Attach files"');
+    expect(tag).toContain('type="button"');
+    expect(tag).not.toContain('disabled=""');
+    expect(html.indexOf('bar-attach-button')).toBeLessThan(html.indexOf('bar-field'));
+  });
+
+  it('has a hidden file input that takes several files', () => {
+    const tag = tagHolding(render(), 'input', 'type="file"');
+    expect(tag).toContain('multiple=""');
+    expect(tag).toContain('hidden=""');
+  });
+
+  it('the paperclip is disabled while locked', () => {
+    expect(tagHolding(render({ locked: true }), 'button', 'bar-attach-button')).toContain('disabled=""');
+  });
+
+  it('shows no chips row before any file is attached', () => {
+    expect(render()).not.toContain('bar-attachments');
+  });
+
+  it('the exited and collapsed modes have no attach button', () => {
+    expect(render({ mode: 'exited' })).not.toContain('bar-attach-button');
+    expect(render({ mode: 'collapsed' })).not.toContain('bar-attach-button');
+  });
+
+  it('is not highlighted as a drop target at rest', () => {
+    expect(render()).not.toContain('is-dragging');
+  });
+});
+
+describe('InputBar: the vision note', () => {
+  it('is not shown with an empty draft, whatever the model says (the note needs an image in the draft)', () => {
+    expect(render({ modelVision: false })).not.toContain('bar-vision');
+    expect(render({ modelVision: true })).not.toContain('bar-vision');
+    expect(render()).not.toContain('bar-vision');
   });
 });

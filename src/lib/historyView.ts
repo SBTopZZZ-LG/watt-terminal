@@ -7,7 +7,7 @@
 // cards, decision labels, UI notices, and raw tool results (only the projected text is kept).
 
 import type { ChatMessage, ConversationMeta } from './types';
-import type { NewItem, ToolStatus } from './transcript';
+import type { NewItem, ToolStatus, UserAttachment } from './transcript';
 import { TODO_TOOL } from './todoView';
 
 /**
@@ -46,7 +46,10 @@ export function safeText(text: string): string {
   return text.replace(CONTROL_CHARS, ' ').replace(INVISIBLE_FORMAT, '');
 }
 
-/** The text of a message's content. Strings pass through; null and missing give ''; anything else is shown as JSON. */
+/**
+ * The text of a message's content. Strings pass through; null and missing give ''. An array (the parts of a user message
+ * with attachments, see src-tauri/src/core/chat/attachments.rs) gives its text parts, joined. Other values are shown as JSON.
+ */
 function textOf(content: unknown): string {
   if (typeof content === 'string') {
     return content;
@@ -54,7 +57,40 @@ function textOf(content: unknown): string {
   if (content === null || content === undefined) {
     return '';
   }
+  if (Array.isArray(content)) {
+    return content.flatMap((part) => (isTextPart(part) ? [part.text] : [])).join('\n');
+  }
   return JSON.stringify(content) ?? '';
+}
+
+function isTextPart(part: unknown): part is { type: 'text'; text: string } {
+  return typeof part === 'object' && part !== null && (part as Record<string, unknown>).type === 'text' && typeof (part as Record<string, unknown>).text === 'string';
+}
+
+/** A stored thumbnail is kept only as a PNG or JPEG data URL, the same check the backend makes. Anything else is no thumbnail. */
+const THUMB_URL = /^data:image\/(?:png|jpeg);base64,[A-Za-z0-9+/=]*$/;
+
+/**
+ * The attachments of a user message's array content: a watt_image (with its stored thumbnail, when it has one) or a watt_file.
+ * Other parts are ignored. A missing name reads as "attachment"; a missing size as 0.
+ */
+function attachmentsOf(content: unknown[]): UserAttachment[] {
+  const out: UserAttachment[] = [];
+  for (const part of content) {
+    if (typeof part !== 'object' || part === null) {
+      continue;
+    }
+    const p = part as Record<string, unknown>;
+    const name = typeof p.name === 'string' ? p.name : 'attachment';
+    const bytes = typeof p.bytes === 'number' && Number.isFinite(p.bytes) ? p.bytes : 0;
+    if (p.type === 'watt_image') {
+      const thumb = typeof p.thumb === 'string' && THUMB_URL.test(p.thumb) ? p.thumb : null;
+      out.push({ kind: 'image', name, bytes, ...(thumb !== null ? { thumb } : {}) });
+    } else if (p.type === 'watt_file') {
+      out.push({ kind: 'file', name, bytes });
+    }
+  }
+  return out;
 }
 
 /** Arguments are a JSON string in the chat format. Parsed when they are valid JSON, otherwise kept as the raw string. */
@@ -108,7 +144,8 @@ function callsOf(toolCalls: unknown): ToolCall[] {
 }
 
 /**
- * The transcript items for a saved conversation's messages, in order. A user message is a user item. An assistant message
+ * The transcript items for a saved conversation's messages, in order. A user message is a user item, with its attachments when
+ * its content has any (see attachmentsOf). An assistant message
  * gives an agent item (when it has text), then one tool item per tool call. Each tool item takes the content of the tool
  * message with the same tool_call_id: failed when that content starts with `error:`, the DENIED prefix or `skipped:`, ok otherwise.
  * A call with no tool message is failed, with NO_RESULT_TEXT. Tool messages that answer no call are dropped. Empty
@@ -126,8 +163,9 @@ export function itemsFromMessages(messages: ChatMessage[]): NewItem[] {
   for (const m of messages) {
     if (m.role === 'user') {
       const text = textOf(m.content);
-      if (text !== '') {
-        items.push({ kind: 'user', clientId: 0, text });
+      const attachments = Array.isArray(m.content) ? attachmentsOf(m.content) : [];
+      if (text !== '' || attachments.length > 0) {
+        items.push({ kind: 'user', clientId: 0, text, ...(attachments.length > 0 ? { attachments } : {}) });
       }
     } else if (m.role === 'assistant') {
       const text = textOf(m.content);

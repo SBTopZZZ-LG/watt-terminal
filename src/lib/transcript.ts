@@ -9,8 +9,17 @@ import { openFramesBelow, openRecordIds, openedBy } from './interactive';
 export type ToolStatus = 'running' | 'ok' | 'failed';
 export type ApprovalState = 'pending' | 'answering' | 'resolved';
 
+/** An attachment on a message the user sent. `kind` is 'file' for a text document. `thumb` is a data URL, for an image. */
+export interface UserAttachment {
+  kind: 'image' | 'file';
+  name: string;
+  bytes: number;
+  thumb?: string;
+}
+
 export type TranscriptItem =
-  | { id: number; kind: 'user'; clientId: number; text: string }
+  /** `attachments` is absent when the message had none. */
+  | { id: number; kind: 'user'; clientId: number; text: string; attachments?: UserAttachment[] }
   /** `streaming` is true while text_delta events are still extending this message. */
   | { id: number; kind: 'agent'; text: string; streaming: boolean }
   /**
@@ -71,7 +80,7 @@ export type TranscriptAction =
   /** A command the shell ran has finished. Closes the interactive group it opened on, if one is open (see interactive.ts). */
   | { type: 'record_finished'; record: RecordSummary }
   /** A message was handed to the agent. Counts as in flight until its `done`. */
-  | { type: 'user_sent'; clientId: number; text: string }
+  | { type: 'user_sent'; clientId: number; text: string; attachments?: UserAttachment[] }
   /** The agent refused the message (Rust error). Drops the user item and the in-flight count. */
   | { type: 'user_failed'; clientId: number; message: string }
   | { type: 'approval_answering'; callId: string; approve: boolean }
@@ -116,6 +125,7 @@ export function transcriptReducer(t: Transcript, action: TranscriptAction): Tran
         kind: 'user',
         clientId: action.clientId,
         text: action.text,
+        ...(action.attachments && action.attachments.length > 0 ? { attachments: action.attachments } : {}),
       }));
     case 'user_failed': {
       const items = t.items.filter((i) => !(i.kind === 'user' && i.clientId === action.clientId));

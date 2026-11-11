@@ -5,6 +5,7 @@ import { Channel, invoke } from '@tauri-apps/api/core';
 import type {
   ApprovalPreview,
   ApprovalSettings,
+  AttachmentInput,
   AutoApproveState,
   ConversationMeta,
   DeleteResult,
@@ -56,8 +57,12 @@ export const api = {
   writeUser(text: string) {
     return invoke<void>('write_user', { sessionId: SESSION_ID, text });
   },
-  agentMessage(text: string) {
-    return invoke<void>('agent_message', { sessionId: SESSION_ID, text });
+  /**
+   * Sends one user message to the agent, with its attachments (images as PNG or JPEG, text documents as UTF-8). The field is
+   * left out when there are none, so a text-only send is the same call as before.
+   */
+  agentMessage(text: string, attachments: AttachmentInput[] = []) {
+    return invoke<void>('agent_message', attachments.length > 0 ? { sessionId: SESSION_ID, text, attachments } : { sessionId: SESSION_ID, text });
   },
   /** Cancels the running agent turn, if any. Harmless when none is running. */
   cancelAgent() {

@@ -90,4 +90,22 @@ describe('sendButtonFor', () => {
     expect(sendButtonFor(false, 'why', true)).toEqual({ stop: false, disabled: true });
     expect(sendButtonFor(true, '', true)).toEqual({ stop: true, disabled: true });
   });
+
+  it('a ready attachment makes an empty text sendable', () => {
+    expect(sendButtonFor(false, '', false, { ready: 1, processing: false })).toEqual({ stop: false, disabled: false });
+    expect(sendButtonFor(false, '  ', false, { ready: 2, processing: false })).toEqual({ stop: false, disabled: false });
+  });
+
+  it('an attachment still being prepared keeps Send disabled, even with text', () => {
+    expect(sendButtonFor(false, 'why', false, { ready: 1, processing: true })).toEqual({ stop: false, disabled: true });
+    expect(sendButtonFor(false, '', false, { ready: 0, processing: true })).toEqual({ stop: false, disabled: true });
+  });
+
+  it('busy stays Stop, enabled, whatever is being prepared', () => {
+    expect(sendButtonFor(true, '', false, { ready: 0, processing: true })).toEqual({ stop: true, disabled: false });
+  });
+
+  it('locked disables Send even with ready attachments', () => {
+    expect(sendButtonFor(false, '', true, { ready: 3, processing: false })).toEqual({ stop: false, disabled: true });
+  });
 });

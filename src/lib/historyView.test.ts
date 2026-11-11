@@ -390,3 +390,74 @@ describe('itemsFromMessages: todo_write', () => {
     expect(items).toEqual([]);
   });
 });
+
+describe('itemsFromMessages: a user message with attachments (array content)', () => {
+  const PNG_THUMB = 'data:image/png;base64,iVBORw0KGgo=';
+  const sha = 'a'.repeat(64);
+  /** The first attachment of the first item, as a plain record (the item is a union, so it is read through unknown). */
+  const firstAttachment = (item: unknown): Record<string, unknown> => (item as { attachments: Array<Record<string, unknown>> }).attachments[0];
+
+  it('turns the text part into the text, and each attachment part into an attachment', () => {
+    const items = itemsFromMessages([
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'what is in these' },
+          { type: 'watt_image', sha256: sha, mime: 'image/png', name: 'shot.png', bytes: 2048, w: 10, h: 10, thumb: PNG_THUMB },
+          { type: 'watt_file', name: 'notes.md', bytes: 300, text: 'stored text, not shown here' },
+        ],
+      },
+    ]);
+    expect(items).toEqual([
+      {
+        kind: 'user',
+        clientId: 0,
+        text: 'what is in these',
+        attachments: [
+          { kind: 'image', name: 'shot.png', bytes: 2048, thumb: PNG_THUMB },
+          { kind: 'file', name: 'notes.md', bytes: 300 },
+        ],
+      },
+    ]);
+  });
+
+  it('never shows the array as JSON: the text is the text part, and nothing else leaks into it', () => {
+    const [item] = itemsFromMessages([{ role: 'user', content: [{ type: 'text', text: 'hello' }, { type: 'watt_file', name: 'a.txt', bytes: 1, text: 'x' }] }]);
+    expect(item).toMatchObject({ kind: 'user', text: 'hello' });
+    expect(JSON.stringify(item)).not.toContain('watt_file"}');
+  });
+
+  it('an image without a stored thumbnail is an image attachment with no thumb', () => {
+    const [item] = itemsFromMessages([{ role: 'user', content: [{ type: 'text', text: 'x' }, { type: 'watt_image', sha256: sha, mime: 'image/jpeg', name: 'p.jpg', bytes: 9 }] }]);
+    expect(item).toMatchObject({ kind: 'user', attachments: [{ kind: 'image', name: 'p.jpg', bytes: 9 }] });
+    expect(firstAttachment(item)).not.toHaveProperty('thumb');
+  });
+
+  it('a thumbnail that is not a PNG or JPEG data URL is dropped', () => {
+    const [item] = itemsFromMessages([
+      { role: 'user', content: [{ type: 'watt_image', sha256: sha, mime: 'image/png', name: 'a.png', bytes: 1, thumb: 'https://example.test/t.png' }] },
+    ]);
+    expect(firstAttachment(item)).not.toHaveProperty('thumb');
+  });
+
+  it('unknown parts are ignored, and a missing name or size has a safe default', () => {
+    const items = itemsFromMessages([
+      { role: 'user', content: [{ type: 'text', text: 'hi' }, { type: 'mystery', x: 1 }, { type: 'watt_file', text: 'body' }] },
+    ]);
+    expect(items).toEqual([{ kind: 'user', clientId: 0, text: 'hi', attachments: [{ kind: 'file', name: 'attachment', bytes: 0 }] }]);
+  });
+
+  it('an attachment-only message (no text part text) is kept, with no text', () => {
+    const items = itemsFromMessages([{ role: 'user', content: [{ type: 'text', text: '' }, { type: 'watt_file', name: 'only.md', bytes: 4, text: 'data' }] }]);
+    expect(items).toEqual([{ kind: 'user', clientId: 0, text: '', attachments: [{ kind: 'file', name: 'only.md', bytes: 4 }] }]);
+  });
+
+  it('an array with no text and no known attachment is skipped, as an empty message is', () => {
+    expect(itemsFromMessages([{ role: 'user', content: [{ type: 'text', text: '' }, { type: 'other' }] }])).toEqual([]);
+    expect(itemsFromMessages([{ role: 'user', content: [] }])).toEqual([]);
+  });
+
+  it('a plain string message has no attachments key', () => {
+    expect(itemsFromMessages([{ role: 'user', content: 'plain' }])).toEqual([{ kind: 'user', clientId: 0, text: 'plain' }]);
+  });
+});

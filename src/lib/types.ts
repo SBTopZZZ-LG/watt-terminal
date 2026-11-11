@@ -449,3 +449,17 @@ export interface TestResult {
   message: string;
   millis: number;
 }
+
+/**
+ * One attachment as agent_message takes it (src-tauri/src/core/chat/attachments.rs, AttachmentInput). An image is PNG or JPEG,
+ * already re-encoded in the webview. A text document is its UTF-8 bytes. `thumb` is a PNG or JPEG data URL of at most 16 KB.
+ */
+export interface AttachmentInput {
+  name: string;
+  mime: string;
+  kind: 'image' | 'text';
+  data_b64: string;
+  thumb?: string;
+  w?: number;
+  h?: number;
+}

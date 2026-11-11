@@ -86,4 +86,6 @@ The Rust integration tests spawn real `zsh -l` sessions through the user's own s
 
 ## Notes
 
+Dropping a file on the terminal does nothing, as it did before: the app never inserted a dropped file's path. The native file drop is off (`dragDropEnabled: false` in `src-tauri/tauri.conf.json`), so the webview receives the drag and can take it. A file dropped on the agent's input bar is attached to the message; a drop anywhere else is cancelled (see `src/lib/dropGuard.ts`).
+
 The bundle identifier (`dev.agentterm.app`, in `src-tauri/tauri.conf.json`) and the Keychain service name keep the app's old name on purpose. They decide where settings, window state and stored API keys live, so changing them would orphan existing user data. `tauri.conf.json` is strict JSON, so the note cannot sit there; the Keychain constant has its own comment in `src-tauri/src/core/settings/secrets.rs`.

@@ -15,12 +15,25 @@ export function historyKeyTakesLine(dir: 'up' | 'down', text: string, caret: num
   return dir === 'up' ? !text.slice(0, caret).includes('\n') : !text.slice(caret).includes('\n');
 }
 
+/** The attachments on the bar: how many are ready to send, and whether any is still being prepared. */
+export interface DraftAttachments {
+  ready: number;
+  processing: boolean;
+}
+
 /**
  * The send button's state. While the agent is busy it is Stop, which interrupts. Otherwise it sends, and is disabled
- * when there is nothing to send or the bar is locked. Stop is disabled only when locked.
+ * when there is nothing to send (no text and no ready attachment), when an attachment is still being prepared, or when the
+ * bar is locked. Stop is disabled only when locked.
  */
-export function sendButtonFor(busy: boolean, text: string, locked: boolean): { stop: boolean; disabled: boolean } {
-  return { stop: busy, disabled: locked || (!busy && messageFor(text) === null) };
+export function sendButtonFor(
+  busy: boolean,
+  text: string,
+  locked: boolean,
+  attachments: DraftAttachments = { ready: 0, processing: false },
+): { stop: boolean; disabled: boolean } {
+  const nothingToSend = messageFor(text) === null && attachments.ready === 0;
+  return { stop: busy, disabled: locked || (!busy && (attachments.processing || nothingToSend)) };
 }
 
 /**

@@ -4,7 +4,9 @@ import { copyText } from '../lib/clipboard';
 import { previewJson } from '../lib/format';
 import { isAtBottom, shouldFollowAfterSend } from '../lib/stickScroll';
 import { approvalTitle } from '../lib/transcript';
-import type { TranscriptItem } from '../lib/transcript';
+import type { TranscriptItem, UserAttachment } from '../lib/transcript';
+import { formatSize } from '../lib/attachments';
+import { safeText } from '../lib/historyView';
 import { askedBecause, decisionLabel, decisionTooltip } from '../lib/approvalReasons';
 import { capDisplay, displayText, sendKeysDisplay } from '../lib/keysDisplay';
 import { interactiveHeader } from '../lib/interactive';
@@ -293,6 +295,35 @@ function toolName(item: Extract<TranscriptItem, { kind: 'tool' }>): string {
   return typed === '' ? item.name : `send_keys "${capDisplay(typed, SEND_KEYS_ROW_CHARS)}"`;
 }
 
+/**
+ * The attachments of a message the user sent, under its text: a 48px thumbnail for an image that has one, otherwise a chip with
+ * the name and size (a document, or an image whose thumbnail was not stored). Names are shown as text only.
+ */
+function MessageAttachments({ items }: { items: UserAttachment[] }) {
+  return (
+    <div className="msg-attachments">
+      {items.map((a, i) => {
+        const name = safeText(a.name);
+        if (a.kind === 'image' && a.thumb !== undefined) {
+          return (
+            <div key={i} className="msg-attach is-image">
+              <img className="msg-attach-thumb" src={a.thumb} alt={name} title={name} />
+            </div>
+          );
+        }
+        return (
+          <div key={i} className={a.kind === 'image' ? 'msg-attach is-placeholder' : 'msg-attach is-file'}>
+            <span className="msg-attach-name" title={name}>
+              {name}
+            </span>
+            <span className="msg-attach-size">{formatSize(a.bytes)}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function Entry({ item, onApprove }: { item: TranscriptItem; onApprove: Props['onApprove'] }) {
   switch (item.kind) {
     case 'user':
@@ -300,6 +331,7 @@ function Entry({ item, onApprove }: { item: TranscriptItem; onApprove: Props['on
         <div className="msg user">
           <span className="who">you</span>
           {item.text}
+          {item.attachments !== undefined && <MessageAttachments items={item.attachments} />}
         </div>
       );
     case 'agent':

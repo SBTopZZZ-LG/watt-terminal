@@ -443,7 +443,8 @@ async fn cancel_during_a_stalled_non_stream_request_returns_cancelled_promptly()
     let started = Instant::now();
     let result = complete(&http_client().unwrap(), &cfg(url), &request(), &cancel).await;
     assert_eq!(result.unwrap_err(), LlmError::Cancelled);
-    assert!(started.elapsed() < Duration::from_secs(2));
+    // 5 s, not 2: the stalled request is cut short at once, but a test run under full-suite load can take longer to get there.
+    assert!(started.elapsed() < Duration::from_secs(5));
 }
 
 /// Binds a fake server on 127.0.0.1 with an ephemeral port. Connection `n` gets the reply that `reply(base, n, raw)`

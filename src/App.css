@@ -1095,6 +1095,55 @@ input {
   color: var(--accent);
 }
 
+/* The attachments of a sent message, under its text. Chips wrap; a name is cut with an ellipsis. */
+.msg-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 4px;
+  white-space: normal;
+}
+
+.msg-attach {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  min-width: 0;
+  padding: 2px 6px 2px 2px;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  background: var(--panel);
+  color: var(--ink);
+  font-size: 11px;
+}
+
+.msg-attach.is-image {
+  padding: 0;
+}
+
+.msg-attach-thumb {
+  display: block;
+  width: 48px;
+  height: 48px;
+  object-fit: cover;
+  border-radius: 1px;
+}
+
+.msg-attach-name {
+  min-width: 0;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.msg-attach-size {
+  flex: 0 0 auto;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
 /*
  * Agent replies, rendered as markdown (src/components/Markdown.tsx). The Blueprint markdown look, sized for the panel:
  * no card, margins or shadow, labels at 11px or more. The .msg white-space (pre-wrap) is reset here, and only the code
@@ -1779,6 +1828,129 @@ input {
   color: var(--fail);
 }
 
+/* Attach files: the same size and frame as Send, on the field's left. */
+.bar-attach-button {
+  flex: 0 0 30px;
+  align-self: flex-end;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  background: var(--panel);
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.bar-attach-button:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.bar-attach-button:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.bar-attach-button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* A drag of files over the bar: the field's border turns dashed in the accent colour. */
+.bar.is-dragging .bar-input {
+  border-style: dashed;
+  border-color: var(--accent);
+}
+
+/* The attachments above the field: a row of chips that wraps. */
+.bar-attachments {
+  flex-basis: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.bar-attach {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  min-width: 0;
+  padding: 2px 4px 2px 2px;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  background: var(--panel);
+  font-size: 11px;
+}
+
+.bar-attach.is-image {
+  padding: 0;
+}
+
+.bar-attach-thumb {
+  display: block;
+  width: 48px;
+  height: 48px;
+  object-fit: cover;
+  border-radius: 1px;
+}
+
+.bar-attach-name {
+  min-width: 0;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bar-attach-size,
+.bar-attach.is-processing .bar-attach-size {
+  flex: 0 0 auto;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.bar-attach.is-processing {
+  color: var(--muted);
+}
+
+.bar-attach-remove {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  background: var(--bg);
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+/* An image's remove button sits over the top right corner of its thumbnail. */
+.bar-attach.is-image .bar-attach-remove {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+}
+
+.bar-attach-remove:hover {
+  border-color: var(--fail);
+  color: var(--fail);
+}
+
+.bar-attach-remove:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+}
+
 .bar-send:focus-visible {
   outline: 1px solid var(--accent);
   outline-offset: 2px;
@@ -1801,6 +1973,15 @@ input {
 
 .bar-error {
   color: var(--fail);
+  /* Several rejections of attachments are listed one per line. */
+  white-space: pre-line;
+}
+
+/* Under the attachment chips when the model may not take images. A note, not an error: the message can still be sent. */
+.bar-vision {
+  flex-basis: 100%;
+  color: var(--muted);
+  font-size: 11px;
 }
 
 .bar-collapsed {

@@ -17,8 +17,10 @@ import { isSideDock, loadPanelLayout, panelReducer, panelView, savePanelLayout }
 import type { Container } from './lib/panelLayout';
 import { defaultSizeStorage } from './lib/zoom';
 import { itemsFromMessages } from './lib/historyView';
+import { userAttachments } from './lib/attachments';
+import { defaultModelVision } from './lib/modelVision';
 import { createPatchSaver, fontPatch, panelPatch, reconcileFont, reconcileGroupBy, reconcilePanel, shouldRestoreLast } from './lib/uiState';
-import type { Cwd, HistoryGroupBy, InputState, IntegrationStatus, LevelInfo, LlmStatus, LoadedConversation, ObserverStatus, SettingsStateView, Status, UiState, UiStatePatch, WireEvent } from './lib/types';
+import type { AttachmentInput, Cwd, HistoryGroupBy, InputState, IntegrationStatus, LevelInfo, LlmStatus, LoadedConversation, ObserverStatus, SettingsStateView, Status, UiState, UiStatePatch, WireEvent } from './lib/types';
 import { recoveryKind } from './lib/settingsRecovery';
 import { TerminalView } from './components/TerminalView';
 import { InputBar } from './components/InputBar';
@@ -231,6 +233,28 @@ export default function App() {
     setSettingsOpen(false);
     refreshSettingsState();
   };
+
+  // Whether the selected model takes images. The status names the model; the saved settings say what it takes. Read again when
+  // the selected model changes and when the settings dialog closes. Unknown (no default, or a failed read) is null.
+  const [modelVision, setModelVision] = useState<boolean | null>(null);
+  useEffect(() => {
+    let live = true;
+    api.getSettings().then(
+      (view) => {
+        if (live) {
+          setModelVision(defaultModelVision(view.settings));
+        }
+      },
+      () => {
+        if (live) {
+          setModelVision(null);
+        }
+      },
+    );
+    return () => {
+      live = false;
+    };
+  }, [llm.enabled, llm.model, llm.provider, settingsOpen]);
 
   // The UI state file: read once, reconciled with the localStorage values, and kept in step after that. The file wins when it
   // has a valid value; a missing value is filled in from localStorage (see uiState.ts). With no file (no store), nothing changes.
@@ -512,14 +536,14 @@ export default function App() {
     api.writeUser(text).catch(reportError);
   };
 
-  const onAgent = async (text: string): Promise<string | null> => {
+  const onAgent = async (text: string, attachments: AttachmentInput[]): Promise<string | null> => {
     epoch.current += 1;
     clientIds.current += 1;
     const clientId = clientIds.current;
     // Added before the call, so the user's line lands above the agent's replies.
-    dispatchTranscript({ type: 'user_sent', clientId, text });
+    dispatchTranscript({ type: 'user_sent', clientId, text, attachments: userAttachments(attachments) });
     try {
-      await api.agentMessage(text);
+      await api.agentMessage(text, attachments);
       return null;
     } catch (e) {
       const message = errorText(e);
@@ -829,6 +853,7 @@ export default function App() {
               onRestart={restartShell}
               restarting={restarting}
               onAgent={onAgent}
+              modelVision={modelVision}
               onInterrupt={() => {
                 if (!locked) {
                   sendRaw(CTRL_C);

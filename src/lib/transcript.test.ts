@@ -71,6 +71,16 @@ describe('transcriptReducer: local actions', () => {
     expect(isBusy(t)).toBe(true);
   });
 
+  it('a sent message carries its attachments; without any, the item has no attachments field', () => {
+    const attachments = [{ kind: 'image' as const, name: 'shot.png', bytes: 2048, thumb: 'data:image/jpeg;base64,AAAA' }];
+    const withFiles = run([{ type: 'user_sent', clientId: 8, text: '', attachments }]);
+    expect(withFiles.items[0]).toMatchObject({ kind: 'user', text: '', attachments });
+    const none = run([{ type: 'user_sent', clientId: 9, text: 'plain', attachments: [] }]);
+    expect(none.items[0]).not.toHaveProperty('attachments');
+    const absent = run([{ type: 'user_sent', clientId: 10, text: 'plain' }]);
+    expect(absent.items[0]).not.toHaveProperty('attachments');
+  });
+
   it('a refused message is removed, shows the reason, and does not leave the turn busy', () => {
     const t = run([
       { type: 'user_sent', clientId: 3, text: 'second message' },
