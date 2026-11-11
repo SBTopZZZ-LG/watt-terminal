@@ -584,6 +584,37 @@ mod tests {
         assert_eq!(out["state"], "submitted");
     }
 
+    /// An early return names its reason and carries the record id, the prompt row in the tail and the next step, the same
+    /// shape as the timeout. Both reasons are shown.
+    #[test]
+    fn an_early_return_for_a_remote_shell_or_a_prompt_is_shown_with_its_reason_and_id() {
+        let remote = json!({
+            "outcome": "running", "reason": "remote_shell", "record_id": 9, "call_id": "run-4", "state": "running",
+            "foreground": {"kind": "ssh", "command": "ssh ubuntu@lidia"}, "waited_ms": 812,
+            "screen_tail": ["ubuntu@lidia:~$"],
+            "hint": "`ssh ubuntu@lidia` opened a shell that has no shell integration, so commands cannot run in it yet.",
+        });
+        let out = run_text(&remote);
+        assert_eq!(out["reason"], "remote_shell");
+        assert_eq!(out["record_id"], 9);
+        assert_eq!(out["screen_tail"], json!(["ubuntu@lidia:~$"]));
+        assert!(out["hint"].as_str().is_some_and(|h| h.contains("opened a shell that has no shell integration")), "{out}");
+
+        let prompt = json!({
+            "outcome": "running", "reason": "needs_user", "record_id": 10, "call_id": "run-5", "state": "running",
+            "waited_ms": 340, "screen_tail": ["Password: "],
+            "hint": "The shell is waiting for a password or other input. Do not type it. Ask the user to handle it, then wait with id 10 until it ends.",
+            "note": "The shell appears to be waiting for a password or other input. Do not type it. Ask the user to handle it, then use get_screen.",
+        });
+        let text = project("run_command", true, &prompt, &none());
+        let (json_part, note) = text.split_once('\n').expect("the note follows the outcome on its own line");
+        let out: Value = serde_json::from_str(json_part).expect("the outcome is JSON");
+        assert_eq!(out["reason"], "needs_user");
+        assert_eq!(out["record_id"], 10);
+        assert!(out["hint"].as_str().is_some_and(|h| h.contains("wait with id 10")), "{out}");
+        assert!(note.starts_with("The shell appears to be waiting for a password"), "{note}");
+    }
+
     fn run_text(v: &Value) -> Value {
         serde_json::from_str(&project("run_command", true, v, &none())).expect("a running result is JSON")
     }

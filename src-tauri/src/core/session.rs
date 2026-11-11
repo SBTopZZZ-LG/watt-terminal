@@ -20,7 +20,7 @@ use crate::core::foreground::Foreground;
 use crate::core::inject::{self, END_MARKER};
 use crate::core::observer::{
     run_observer, Activity, CallStatus, Core, EventSink, InjectRefusal, InputState, IntegrationStatus, LevelInfo,
-    ObsMsg, ObsQueue, ObserverStatus, OpenAgentRecord, ScreenLines, ScreenSnapshot, Shared,
+    ObsMsg, ObsQueue, ObserverStatus, OpenAgentRecord, ScreenLines, ScreenSnapshot, Shared, YieldSignals,
 };
 use crate::core::pty::{self, Gate, OutputSink};
 use crate::core::record::{Cwd, Record, RecordSummary, Source};
@@ -503,6 +503,16 @@ impl Session {
     /// The agent's own open commands, the top level's and the parked ones (see `OpenAgentRecord`).
     pub fn open_agent_records(&self) -> Vec<OpenAgentRecord> {
         self.shared.lock().open_agent_records()
+    }
+
+    /// The early-return signals of one agent call's record, from one lock read (see `YieldSignals`).
+    pub fn yield_signals(&self, call_id: &str) -> YieldSignals {
+        self.shared.lock().yield_signals(call_id, Instant::now())
+    }
+
+    /// True while the command in the foreground is a login, such as ssh with no remote command (see `Core::foreground_is_login`).
+    pub fn foreground_is_login(&self) -> bool {
+        self.shared.lock().foreground_is_login()
     }
 
     /// The last `n` logical lines of the screen and its history (see `Core::screen_lines`).

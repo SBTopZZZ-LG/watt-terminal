@@ -16,7 +16,9 @@ use serde_json::{json, Value};
 
 use crate::core::foreground::{Foreground, ForegroundKind};
 use crate::core::llm::TurnCancel;
-use crate::core::observer::{CallStatus, InjectRefusal, InputState, IntegrationStatus, LevelKind, ObserverStatus, OpenAgentRecord};
+use crate::core::observer::{
+    CallStatus, InjectRefusal, InputState, IntegrationStatus, LevelKind, ObserverStatus, OpenAgentRecord, YieldSignals,
+};
 use crate::core::record::{Cwd, Record, RecordSummary, Source};
 use crate::core::session::{user_text_refusal, IntegrateOutcome, Session};
 use crate::core::settings::LimitsSettings;
@@ -55,6 +57,13 @@ pub const INPUT_WAIT_NOTE: &str = "The shell appears to be waiting for a passwor
 pub const INTEGRATE_HINT: &str = "Call request_integration to ask for it.";
 /// The refusal for `request_integration` while the shell waits for a password or passphrase: the loader must not be typed there.
 pub const INTEGRATE_PASSWORD_REFUSAL: &str = "cannot integrate the shell now: it appears to be waiting for a password or other input. Do not type it. Ask the user to handle it, then call request_integration again.";
+/// The refusal for `request_integration` while the foreground is an ssh or mosh that runs a program on the remote host
+/// (`ssh host make`). The shell is not there to integrate, and the integration's Ctrl-C would stop that program.
+pub const REMOTE_PROGRAM_REFUSAL: &str = "cannot integrate the shell now: that command runs a program on the remote host, not a shell; wait for it with wait or stop it.";
+/// A remote or nested shell that has been quiet this long, after output, returns `run_command` early (see `early_reason`).
+pub const REMOTE_SHELL_QUIET: Duration = Duration::from_millis(500);
+/// A password-like prompt that has been quiet this long returns `run_command` early (see `early_reason`).
+pub const NEEDS_USER_QUIET: Duration = Duration::from_millis(300);
 const DEFAULT_LIST: usize = 10;
 const DEFAULT_LIMIT: usize = 4096;
 const MAX_LIMIT: usize = 64 << 10;
@@ -146,6 +155,13 @@ pub enum NotRunReason {
 pub enum YieldReason {
     /// The wait ran out while the command had not finished.
     Timeout,
+    /// The command opened a login shell (ssh with no remote command, su, a bare shell, a container shell) and the shell has
+    /// turned on bracketed paste, which shells with line editing do at their prompt. Its shell has no integration, so
+    /// commands cannot run in it yet.
+    RemoteShell,
+    /// The last row of the screen is a password, passphrase, host-key or verification prompt, and the screen is quiet: the
+    /// user must answer it.
+    NeedsUser,
 }
 
 // `Finished` carries a whole Record. Boxing it would change the public RunOutcome type, so it stays inline.
@@ -300,11 +316,22 @@ pub trait AgentTools {
                 let command = str_arg(args, "command")?;
                 let (seconds, clamp_note) = seconds_arg(args, "wait_seconds", DEFAULT_RUN_WAIT_SECONDS);
                 let outcome = self.run_command(command, Duration::from_secs(seconds), expected_level)?;
-                // In a nested shell, a call that is still running or sits at a password prompt gets the do-not-type note.
-                let running = matches!(outcome, RunOutcome::Running { .. });
+                let reason = match &outcome {
+                    RunOutcome::Running { reason, .. } => Some(*reason),
+                    _ => None,
+                };
                 let mut value = to_json(outcome)?;
                 let mut notes: Vec<String> = clamp_note.into_iter().collect();
-                if self.top_level().is_nested() && (running || screen_waits_for_input(&self.get_screen().rows)) {
+                // The do-not-type note. A password-like prompt always gets it. A remote shell never does: its hint says what to
+                // do, and that shell is ready for a request, not waiting for input. Otherwise, in a nested shell, a call that
+                // is still running or sits at a password prompt gets it, as before.
+                let input_note = match reason {
+                    Some(YieldReason::NeedsUser) => true,
+                    Some(YieldReason::RemoteShell) => false,
+                    Some(YieldReason::Timeout) => self.top_level().is_nested(),
+                    None => self.top_level().is_nested() && screen_waits_for_input(&self.get_screen().rows),
+                };
+                if input_note {
                     notes.push(INPUT_WAIT_NOTE.to_string());
                 }
                 if !notes.is_empty() {
@@ -492,8 +519,11 @@ impl AgentTools for SessionTools<'_> {
                     if self.cancelled() {
                         return Ok(RunOutcome::NotRun { reason: NotRunReason::Cancelled });
                     }
+                    if let Some(reason) = self.early_yield(&call_id, state) {
+                        return Ok(self.yielded(&call_id, state, record_id, started.elapsed(), reason));
+                    }
                     if Instant::now() >= deadline {
-                        return Ok(self.yielded(&call_id, state, record_id, started.elapsed()));
+                        return Ok(self.yielded(&call_id, state, record_id, started.elapsed(), YieldReason::Timeout));
                     }
                 }
             }
@@ -536,6 +566,11 @@ impl AgentTools for SessionTools<'_> {
     fn integration_precheck(&self) -> Result<String, String> {
         if let Some(reason) = self.session.integration_refusal() {
             return Err(integration_refusal_text(&reason));
+        }
+        // An ssh or mosh that runs a command runs a program on the remote host: there is no shell to integrate, and the
+        // integration's Ctrl-C would stop that program.
+        if self.session.foreground().is_some_and(|fg| fg.kind == ForegroundKind::Ssh) && !self.session.foreground_is_login() {
+            return Err(REMOTE_PROGRAM_REFUSAL.to_string());
         }
         if screen_waits_for_input(&self.session.screen_snapshot().rows) {
             return Err(INTEGRATE_PASSWORD_REFUSAL.to_string());
@@ -585,21 +620,36 @@ impl SessionTools<'_> {
         })
     }
 
-    /// The outcome of a `run_command` whose wait ended with the command still going (or not yet started). `record_id` and
-    /// `state` come from the same lock read as the poll that ended the wait.
-    fn yielded(&self, call_id: &str, state: InputState, record_id: Option<u64>, waited: Duration) -> RunOutcome {
+    /// The early return a running command has earned now, if any (see `early_reason`). Only while the shell is Running, so
+    /// a command that has not started, or is waiting for input at a prompt, is left to the wait.
+    fn early_yield(&self, call_id: &str, state: InputState) -> Option<YieldReason> {
+        if state != InputState::Running {
+            return None;
+        }
+        early_reason(&self.session.yield_signals(call_id))
+    }
+
+    /// The outcome of a `run_command` whose wait ended with the command still going (or not yet started), or that returned
+    /// early for `reason`. `record_id` and `state` come from the same lock read as the poll that ended the wait.
+    fn yielded(&self, call_id: &str, state: InputState, record_id: Option<u64>, waited: Duration, reason: YieldReason) -> RunOutcome {
         let mut tail: Vec<String> = self.session.screen_snapshot().rows.into_iter().filter(|r| !r.trim().is_empty()).collect();
         let keep_from = tail.len().saturating_sub(SCREEN_TAIL_ROWS);
         let screen_tail = tail.split_off(keep_from);
+        let foreground = self.session.foreground();
+        let hint = match reason {
+            YieldReason::Timeout => running_hint(record_id),
+            YieldReason::RemoteShell => remote_shell_hint(foreground.as_ref().map_or("the command", |fg| fg.command.as_str())),
+            YieldReason::NeedsUser => needs_user_hint(record_id),
+        };
         RunOutcome::Running {
-            reason: YieldReason::Timeout,
+            reason,
             record_id,
             call_id: call_id.to_string(),
             state,
-            foreground: self.session.foreground(),
+            foreground,
             waited_ms: u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
             screen_tail,
-            hint: running_hint(record_id),
+            hint,
         }
     }
 
@@ -693,6 +743,42 @@ pub fn running_hint(record_id: Option<u64>) -> String {
                  run_command is unavailable until the command ends."
             .to_string(),
     }
+}
+
+/// The next step when a command opened a shell that has no shell integration (`YieldReason::RemoteShell`). It names the
+/// command, and never suggests typing into the shell.
+pub fn remote_shell_hint(command: &str) -> String {
+    format!(
+        "`{command}` opened a shell that has no shell integration, so commands cannot run in it yet. Call request_integration \
+         (the user is asked first), or read it with get_screen. Do not type commands into it."
+    )
+}
+
+/// The next step when the shell waits for a password or other input (`YieldReason::NeedsUser`). The agent must not answer
+/// it, and waits for the command after the user has.
+pub fn needs_user_hint(record_id: Option<u64>) -> String {
+    let then = match record_id {
+        Some(id) => format!("wait with id {id} until it ends"),
+        None => "wait until it ends".to_string(),
+    };
+    format!("The shell is waiting for a password or other input. Do not type it. Ask the user to handle it, then {then}.")
+}
+
+/// Why `run_command` may return before its wait ends, from the signals of the call's record (see `YieldSignals`). Pure.
+///
+/// A password-like prompt on the last row, quiet for `NEEDS_USER_QUIET`, is `NeedsUser`. A login command (ssh with no
+/// remote command, su, a bare shell, a container shell) whose shell has turned on bracketed paste, with output since its
+/// start and the screen quiet for `REMOTE_SHELL_QUIET`, is `RemoteShell`. Nothing else returns early. The record must be on
+/// top: a parked command under a nested shell is left to the wait.
+pub fn early_reason(sig: &YieldSignals) -> Option<YieldReason> {
+    if !sig.on_top {
+        return None;
+    }
+    if sig.quiet_for >= NEEDS_USER_QUIET && sig.last_row.as_deref().is_some_and(prompt_row_waits_for_input) {
+        return Some(YieldReason::NeedsUser);
+    }
+    let remote_shell = sig.login && sig.bracketed_paste && sig.output_since_start && sig.quiet_for >= REMOTE_SHELL_QUIET;
+    remote_shell.then_some(YieldReason::RemoteShell)
 }
 
 /// How long a command has been running, for the notes and refusals: seconds, then minutes, then hours.
@@ -839,7 +925,7 @@ pub fn schemas() -> Vec<ToolSchema> {
         },
         ToolSchema {
             name: "run_command",
-            description: "Run a command in the shell on top: the user's own shell, or a shell the user opened inside another program (such as ssh) that the app integrated. Only works at an idle prompt with shell integration live. Waits up to wait_seconds (default 5, max 120) for the command to finish. If it is still running then, the result gives its record_id and the command keeps running: use wait with that id, or get_screen with lines, until it ends. run_command is unavailable until it ends. The user approves each call unless a saved rule or auto-approve allows it.",
+            description: "Run a command in the shell on top: the user's own shell, or a shell the user opened inside another program (such as ssh) that the app integrated. Only works at an idle prompt with shell integration live. Waits up to wait_seconds (default 5, max 120) for the command to finish. If it is still running then, the result gives its record_id and the command keeps running: use wait with that id, or get_screen with lines, until it ends. run_command is unavailable until it ends. The result can also come back early with reason remote_shell (the command opened a shell without shell integration, such as ssh with no remote command) or needs_user (the screen shows a password or other prompt). The user approves each call unless a saved rule or auto-approve allows it.",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -868,11 +954,21 @@ pub fn schemas() -> Vec<ToolSchema> {
 
 /// True when the last non-blank row of a screen looks like a password or passphrase prompt. Case-insensitive.
 pub fn screen_waits_for_input(rows: &[String]) -> bool {
+    rows.iter().rev().find(|r| !r.trim().is_empty()).is_some_and(|row| prompt_row_waits_for_input(row))
+}
+
+/// True when one row (the last non-blank row of the screen) is a prompt that wants the user's answer: a password, a
+/// passphrase, an ssh host-key question, a verification or one-time code, a passcode (Duo). Each pattern ends at the colon
+/// of the prompt, so a shell line that merely mentions one does not match. Case-insensitive.
+pub fn prompt_row_waits_for_input(row: &str) -> bool {
     static PROMPT: OnceLock<Regex> = OnceLock::new();
     let prompt = PROMPT.get_or_init(|| {
-        Regex::new(r"(?i)password.*:\s*$|\[sudo\] password|passphrase").expect("the prompt pattern compiles")
+        Regex::new(
+            r"(?i)password.*:\s*$|\[sudo\] password|passphrase|\(yes/no|verification code.*:\s*$|passcode.*:\s*$|\botp\b.*:\s*$|one-time code.*:\s*$",
+        )
+        .expect("the prompt pattern compiles")
     });
-    rows.iter().rev().find(|r| !r.trim().is_empty()).is_some_and(|row| prompt.is_match(row.trim_end()))
+    prompt.is_match(row.trim_end())
 }
 
 fn to_json<T: Serialize>(v: T) -> Result<Value, String> {
@@ -1064,6 +1160,108 @@ mod tests {
         assert!(!screen_waits_for_input(&rows(&["ubuntu@lidia:~$ echo password"])), "a shell prompt is not a password prompt");
         assert!(!screen_waits_for_input(&rows(&["ls", "ubuntu@lidia:~$"])));
         assert!(!screen_waits_for_input(&[]));
+    }
+
+    /// The host-key question, verification and one-time codes, and Duo's passcode prompt are prompts too. Shell lines that
+    /// only mention the words do not match.
+    #[test]
+    fn host_key_otp_and_duo_prompts_are_detected() {
+        let last = |row: &str| prompt_row_waits_for_input(row);
+        assert!(last("Are you sure you want to continue connecting (yes/no/[fingerprint])? "));
+        assert!(last("Are you sure you want to continue connecting (yes/no)?"));
+        assert!(last("Verification code: "));
+        assert!(last("Enter verification code:"));
+        assert!(last("verification code: "), "case does not matter");
+        assert!(last("Passcode or option (1-2): "));
+        assert!(last("Enter a passcode or select one of the following options:"));
+        assert!(last("OTP: "));
+        assert!(last("Enter OTP:"));
+        assert!(last("One-time code: "));
+        assert!(last("Password: "), "the existing ones still match");
+
+        assert!(!last("ubuntu@lidia:~$ echo passcode"), "a shell line is not a prompt");
+        assert!(!last("ubuntu@lidia:~$ verification code"), "the code is not asked for on this row");
+        assert!(!last("otp"), "a bare word is not a prompt: it needs the colon");
+        assert!(!last("Connection closed by 127.0.0.1"));
+        assert!(!last("ubuntu@lidia:~$ "));
+    }
+
+    fn signals(on_top: bool, login: bool, paste: bool, output: bool, quiet_ms: u64, row: Option<&str>) -> YieldSignals {
+        YieldSignals {
+            on_top,
+            login,
+            bracketed_paste: paste,
+            output_since_start: output,
+            quiet_for: Duration::from_millis(quiet_ms),
+            last_row: row.map(str::to_string),
+        }
+    }
+
+    /// The early return: a login with bracketed paste on, output since the start and 500 ms of quiet is `RemoteShell`. Each
+    /// missing condition, a short quiet time, and a parked record leave it to the wait.
+    #[test]
+    fn a_remote_shell_returns_early_only_when_every_condition_holds() {
+        let ready = |quiet| signals(true, true, true, true, quiet, Some("ubuntu@lidia:~$"));
+        assert_eq!(early_reason(&ready(500)), Some(YieldReason::RemoteShell));
+        assert_eq!(early_reason(&ready(4000)), Some(YieldReason::RemoteShell));
+        assert_eq!(early_reason(&ready(499)), None, "the screen must be quiet for the full 500 ms");
+        assert_eq!(early_reason(&signals(true, false, true, true, 900, Some("$ ls"))), None, "not a login");
+        assert_eq!(early_reason(&signals(true, true, false, true, 900, Some("$"))), None, "bracketed paste is off (bash 4.4)");
+        assert_eq!(early_reason(&signals(true, true, true, false, 900, Some("$"))), None, "no output since the start");
+        assert_eq!(early_reason(&signals(false, true, true, true, 900, Some("$"))), None, "parked under a nested shell");
+    }
+
+    /// The password prompt returns early after 300 ms of quiet, whatever the command is. Quiet less than that does not.
+    #[test]
+    fn a_password_prompt_returns_early_after_its_quiet_time() {
+        let prompt = |quiet| signals(true, false, false, true, quiet, Some("Password: "));
+        assert_eq!(early_reason(&prompt(300)), Some(YieldReason::NeedsUser));
+        assert_eq!(early_reason(&prompt(299)), None);
+        assert_eq!(early_reason(&signals(true, false, false, true, 900, Some("ls -la"))), None, "not a prompt");
+        assert_eq!(early_reason(&signals(false, false, false, true, 900, Some("Password: "))), None, "parked: left to the wait");
+        assert_eq!(early_reason(&signals(true, false, false, true, 900, None)), None, "a blank screen has no prompt");
+    }
+
+    /// When the screen has never changed (`Duration::MAX`), it is quiet. A prompt then returns, and so does a remote shell.
+    #[test]
+    fn a_screen_that_never_changed_counts_as_quiet() {
+        let never = YieldSignals {
+            on_top: true,
+            login: true,
+            bracketed_paste: true,
+            output_since_start: true,
+            quiet_for: Duration::MAX,
+            last_row: Some("Password: ".into()),
+        };
+        assert_eq!(early_reason(&never), Some(YieldReason::NeedsUser));
+    }
+
+    /// Both hints name the reason and the next step, and never suggest typing a command.
+    #[test]
+    fn the_remote_shell_and_needs_user_hints_say_what_to_do() {
+        let hint = remote_shell_hint("ssh ubuntu@lidia");
+        assert_eq!(
+            hint,
+            "`ssh ubuntu@lidia` opened a shell that has no shell integration, so commands cannot run in it yet. Call \
+             request_integration (the user is asked first), or read it with get_screen. Do not type commands into it."
+        );
+        let prompt = needs_user_hint(Some(7));
+        assert!(prompt.contains("Do not type it") && prompt.contains("Ask the user to handle it, then wait with id 7"), "{prompt}");
+        assert!(needs_user_hint(None).contains("then wait until it ends"));
+        for text in [&hint, &prompt] {
+            assert!(!text.contains("send_keys"), "{text}");
+        }
+    }
+
+    #[test]
+    fn the_yield_reasons_are_snake_case_on_the_wire() {
+        for (reason, code) in [
+            (YieldReason::Timeout, "timeout"),
+            (YieldReason::RemoteShell, "remote_shell"),
+            (YieldReason::NeedsUser, "needs_user"),
+        ] {
+            assert_eq!(serde_json::to_value(reason).unwrap(), code);
+        }
     }
 
     /// The top level of a nested shell is its label and Hello fields; the local shell has none.

@@ -678,3 +678,65 @@ fn ssh_into_zsh_integrates_and_the_agent_works_there() {
     let local = run(&h, "echo local-after-zsh");
     assert_eq!((local.output.as_str(), local.level), ("local-after-zsh", 0));
 }
+
+/// The remote bash's version as (major, minor), read inside the container.
+fn remote_bash(container: &str) -> (u32, u32) {
+    let text = docker_ok(&["exec", container, "bash", "-c", "echo ${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"]);
+    let (major, minor) = text.split_once('.').expect("the remote bash version is major.minor");
+    (major.parse().expect("major"), minor.parse().expect("minor"))
+}
+
+/// The agent runs `ssh` into the container with run_command, as a plain command. Bash 5.1 and later turn bracketed paste on
+/// at their prompt, so the call returns early with reason remote_shell, at that prompt. Bash 4.4 does not, so it yields at
+/// its wait (8 s here) with the timeout reason. The expectation follows the remote bash's version. Under auto-integration,
+/// request_integration then integrates the remote shell, and run_command works in it.
+#[test]
+#[ignore = "needs docker, network for apt on the first run, and the image in AT_TEST_IMAGE (default ubuntu:24.04)"]
+fn ssh_run_command_returns_early_at_the_remote_prompt_and_integration_follows() {
+    let _g = serial();
+    let remote = Remote::start();
+    let h = start();
+    wait_prompt(&h);
+    let bash = remote_bash(&remote.container.0);
+    let tools = SessionTools::new(&h);
+    let started = Instant::now();
+    let v = tools
+        .call("run_command", &json!({"command": remote.ssh_command("tester"), "wait_seconds": 8}), None)
+        .expect("run_command");
+    let took = started.elapsed();
+    println!(
+        "ssh run_command, remote bash {}.{}: reason {}, returned after {} ms (waited_ms {})",
+        bash.0, bash.1, v["reason"], took.as_millis(), v["waited_ms"]
+    );
+    assert_eq!(v["outcome"], "running", "{v}");
+    if bash < (5, 1) {
+        assert_eq!(v["reason"], "timeout", "bash {}.{} turns bracketed paste off: no early return: {v}", bash.0, bash.1);
+        assert!(took >= Duration::from_secs(7), "returned after {took:?}, before the wait ended");
+        return;
+    }
+    assert_eq!(v["reason"], "remote_shell", "{v}");
+    assert!(took < Duration::from_secs(8), "returned after {took:?}, not early");
+    assert_eq!(v["foreground"]["kind"], "ssh", "{v}");
+
+    let gate = ApprovalGate::with_timeout(WAIT);
+    let emit = |_ev: AgentEvent| {};
+    let rules = TurnRules { integrate_without_asking: true, ..TurnRules::default() };
+    let ctx = AgentCtx::new(&tools, &gate, &emit).with_rules(rules);
+    let text = ctx.call_tool("request_integration", json!({})).expect("integrated without asking");
+    let text = text.as_str().unwrap_or_default().to_string();
+    assert!(text.starts_with("Integrated ssh ") && text.contains("(bash as tester@"), "{text}");
+    let key = h.top_key();
+    wait_at_prompt(&h, key);
+
+    let pwd = tools.call("run_command", &json!({"command": "pwd", "wait_seconds": 10}), None).expect("run_command in the remote shell");
+    assert_eq!(pwd["outcome"], "finished", "{pwd}");
+    assert_eq!(pwd["record"]["output"], "/home/tester", "{pwd}");
+    assert_eq!(pwd["record"]["level"], key, "{pwd}");
+
+    h.write_user(b"exit\r").expect("type exit");
+    assert!(
+        wait_until(WAIT, || (h.levels().len() == 1 && at_prompt(&h, 0)).then_some(())).is_some(),
+        "exit did not return to the local prompt: levels {:?}",
+        h.levels()
+    );
+}

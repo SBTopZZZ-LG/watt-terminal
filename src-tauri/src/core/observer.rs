@@ -203,6 +203,25 @@ pub struct Activity {
     pub last_record_id: u64,
 }
 
+/// What `run_command`'s wait reads to decide an early return, all under one lock (see `Core::yield_signals`).
+#[derive(Debug, Clone)]
+pub struct YieldSignals {
+    /// The top level's open record is the one the call started (false while a nested shell is on top of it, or when the
+    /// command has not started or has finished).
+    pub on_top: bool,
+    /// The open command is a login: a remote shell, a nested shell, su, or a container shell (`foreground::is_login`).
+    pub login: bool,
+    /// The parser's bracketed-paste mode (vt100's `Screen::bracketed_paste`). Shells with line editing turn it on at their
+    /// prompt and off while a command runs.
+    pub bracketed_paste: bool,
+    /// Output has arrived since the command started (its C event).
+    pub output_since_start: bool,
+    /// How long the visible screen has been unchanged. `Duration::MAX` when it has never changed.
+    pub quiet_for: Duration,
+    /// The last non-blank visible row, trailing spaces trimmed. None on a blank screen, or when the call is not on top.
+    pub last_row: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LevelKind {
@@ -1456,6 +1475,38 @@ impl Core {
 
     pub fn bracketed_paste(&self) -> bool {
         self.parser.screen().bracketed_paste()
+    }
+
+    /// What the early return of `run_command` reads for one agent call, under the caller's lock (see `YieldSignals`). `now` is
+    /// the time of the poll, so the quiet time is measured to it. Writes nothing.
+    pub fn yield_signals(&self, call_id: &str, now: Instant) -> YieldSignals {
+        let screen = self.parser.screen();
+        let own = self
+            .parser
+            .callbacks()
+            .open
+            .as_ref()
+            .filter(|open| matches!(&open.record.source, Source::Agent { call_id: c } if c == call_id));
+        let last_row = own.and_then(|_| {
+            let (_, cols) = screen.size();
+            let rows: Vec<String> = screen.rows(0, cols.get()).collect();
+            rows.iter().rev().find(|r| !r.trim().is_empty()).map(|r| r.trim_end().to_string())
+        });
+        YieldSignals {
+            on_top: own.is_some(),
+            login: own.is_some_and(|open| foreground::is_login(&open.record.command)),
+            bracketed_paste: screen.bracketed_paste(),
+            output_since_start: own.is_some_and(|open| self.output_at.is_some_and(|t| t >= open.started)),
+            quiet_for: self.screen_changed_at.map_or(Duration::MAX, |t| now.saturating_duration_since(t)),
+            last_row,
+        }
+    }
+
+    /// True while the command in the foreground is a login (see `foreground::is_login`), read from the full command text of
+    /// the open record. False unless the shell is Running with a command open.
+    pub fn foreground_is_login(&self) -> bool {
+        self.lifecycle_view() == InputState::Running
+            && self.parser.callbacks().open.as_ref().is_some_and(|open| foreground::is_login(&open.record.command))
     }
 
     /// Called by the writer under the same lock as the check. Moves to Submitted and records the pending attribution.
@@ -2736,6 +2787,60 @@ mod tests {
         assert!(c.integration_starting(Instant::now()), "the screen changed just now");
         std::thread::sleep(STARTING_QUIET + Duration::from_millis(50));
         assert!(!c.integration_starting(Instant::now()), "output came and the screen has been still");
+    }
+
+    /// The early-return signals of an agent's command: on top, a login, bracketed paste from the parser's mode, output since
+    /// its start, the quiet time from the last screen change, and the last non-blank row. Another call sees none of it.
+    #[test]
+    fn yield_signals_read_the_agents_record_and_the_shell_state() {
+        let mut c = core();
+        agent_command_open(&mut c, "run-s", "zsh -f -i");
+        let sig = c.yield_signals("run-s", Instant::now());
+        assert!(sig.on_top && sig.login, "{sig:?}");
+        assert!(!sig.bracketed_paste && !sig.output_since_start, "{sig:?}");
+        assert_eq!(sig.quiet_for, Duration::MAX, "the screen has never changed");
+        assert_eq!(sig.last_row, None, "a blank screen has no row");
+        assert!(!c.yield_signals("someone-else", Instant::now()).on_top, "another call's record is not this one");
+        assert_eq!(c.yield_signals("someone-else", Instant::now()).last_row, None);
+
+        c.apply(ObsMsg::Bytes(b"\x1b[?2004h% ".to_vec()));
+        c.note_screen();
+        let now = Instant::now();
+        let sig = c.yield_signals("run-s", now);
+        assert!(sig.bracketed_paste, "vt100's mode is on after the shell turned it on");
+        assert!(sig.output_since_start, "output came after the command started");
+        assert_eq!(sig.last_row.as_deref(), Some("%"), "the last row, trailing blanks trimmed");
+        assert!(sig.quiet_for < Duration::from_secs(1), "{:?}", sig.quiet_for);
+        let later = c.yield_signals("run-s", now + Duration::from_millis(600));
+        assert!(later.quiet_for >= Duration::from_millis(590), "the quiet time is measured to the poll: {:?}", later.quiet_for);
+    }
+
+    /// Output that came before the command's C does not count as output since its start.
+    #[test]
+    fn output_before_the_command_start_is_not_output_since_start() {
+        let mut c = core();
+        c.apply(ObsMsg::Bytes(b"banner\r\n".to_vec()));
+        c.note_screen();
+        agent_command_open(&mut c, "run-t", "sleep 9");
+        assert!(!c.yield_signals("run-t", Instant::now()).output_since_start);
+        c.apply(ObsMsg::Bytes(b"tick".to_vec()));
+        assert!(c.yield_signals("run-t", Instant::now()).output_since_start);
+    }
+
+    /// The login test of the foreground: a login command with nothing open is not one, and a command that is not a login is
+    /// not one even while it runs.
+    #[test]
+    fn foreground_is_login_follows_the_open_record_only_while_running() {
+        assert!(running("zsh -f -i").foreground_is_login());
+        assert!(running("ssh ubuntu@lidia").foreground_is_login());
+        assert!(!running("ssh ubuntu@lidia make").foreground_is_login(), "ssh with a remote command");
+        assert!(!running("sleep 30").foreground_is_login());
+        let mut prompt = core();
+        prompt.lifecycle = Lifecycle::Prompt;
+        assert!(!prompt.foreground_is_login(), "no command open");
+        let mut ended = running("zsh -f -i");
+        ended.handle(Event::CommandEnd { exit: 0, pipestatus: vec![0] });
+        assert!(!ended.foreground_is_login(), "closed by D");
     }
 
     /// The agent's open command is found while it runs, through the alternate screen, and while a nested shell is on top of

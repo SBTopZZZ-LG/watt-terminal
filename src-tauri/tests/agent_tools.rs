@@ -1476,3 +1476,98 @@ fn wait_refuses_an_id_that_is_not_running_or_finished() {
     let err = SessionTools::new(&s).call("wait", &json!({"id": 999_999}), None).expect_err("no such command");
     assert!(err.contains("no command with id 999999"), "{err}");
 }
+
+/// Calls run_command the way the agent does (`call`, with wait_seconds), and returns the result with the time the call took.
+fn timed_run(tools: &SessionTools, command: &str, wait_seconds: u64) -> (Value, Duration) {
+    let started = Instant::now();
+    let v = tools.call("run_command", &json!({"command": command, "wait_seconds": wait_seconds}), None).expect("run_command");
+    (v, started.elapsed())
+}
+
+/// A zsh started with no command (`zsh -f -i`) is a login with no shell integration. Its prompt turns bracketed paste on, so
+/// run_command returns at once with reason remote_shell, well before its 30 s wait. The hint names the command and does not
+/// suggest typing into it.
+#[test]
+fn run_command_into_a_zsh_without_integration_returns_remote_shell_early() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let tools = SessionTools::new(&s);
+    let (v, took) = timed_run(&tools, "zsh -f -i", 30);
+    println!("remote_shell early return, zsh -f -i: {} ms (waited_ms {})", took.as_millis(), v["waited_ms"]);
+    assert_eq!(v["outcome"], "running", "{v}");
+    assert_eq!(v["reason"], "remote_shell", "{v}");
+    assert!(took < Duration::from_secs(4), "returned after {took:?}, not early");
+    assert!(v["record_id"].as_u64().is_some(), "{v}");
+    let hint = v["hint"].as_str().expect("hint");
+    assert!(
+        hint.starts_with("`zsh -f -i` opened a shell that has no shell integration, so commands cannot run in it yet.")
+            && hint.contains("request_integration") && hint.contains("Do not type commands into it."),
+        "{hint}"
+    );
+    assert_eq!(v["foreground"]["kind"], "shell", "{v}");
+    assert!(v["screen_tail"].as_array().is_some_and(|t| !t.is_empty()), "the prompt row is in the tail: {v}");
+    assert!(tools.run_command_precheck().is_err(), "a command is refused in the nested shell");
+}
+
+/// `sh -c` is not a login: it runs a command, not a shell. Its command finishes inside the wait, and nothing returns early.
+#[test]
+fn a_shell_given_a_command_is_not_returned_early() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let tools = SessionTools::new(&s);
+    let (v, took) = timed_run(&tools, "sh -c 'sleep 2'", 5);
+    println!("sh -c 'sleep 2' with wait 5: {} ms, outcome {}", took.as_millis(), v["outcome"]);
+    assert_eq!(v["outcome"], "finished", "{v}");
+    assert!(took >= Duration::from_millis(1900), "returned after {took:?}, before the command finished");
+}
+
+/// A password-like prompt on the last row, quiet for 300 ms, returns at once with reason needs_user. The do-not-type note
+/// comes with it, and the agent is told to ask the user, then wait.
+#[test]
+fn a_password_prompt_returns_needs_user_at_once() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let tools = SessionTools::new(&s);
+    let (v, took) = timed_run(&tools, "printf 'Password: '; sleep 6", 30);
+    println!("needs_user early return: {} ms (waited_ms {})", took.as_millis(), v["waited_ms"]);
+    assert_eq!(v["outcome"], "running", "{v}");
+    assert_eq!(v["reason"], "needs_user", "{v}");
+    assert!(took < Duration::from_millis(2500), "returned after {took:?}, not at once");
+    assert!(took >= Duration::from_millis(250), "returned after {took:?}, before the screen was quiet");
+    assert!(v["screen_tail"].as_array().is_some_and(|t| t.iter().any(|r| r == "Password:")), "{v}");
+    let hint = v["hint"].as_str().expect("hint");
+    assert!(hint.contains("Do not type it") && hint.contains("Ask the user to handle it, then wait with id"), "{hint}");
+    let note = v["note"].as_str().expect("the do-not-type note");
+    assert!(note.contains("Do not type it"), "{v}");
+}
+
+/// The foreground ssh that runs a program on the remote host (`ssh host sleep 3`) has no shell to integrate. The precheck
+/// refuses request_integration with the remote-program text, and run_command does not return early for it.
+/// A shell function named ssh stands in for it here, so no network is needed: the command text is what the hint reads.
+#[test]
+fn request_integration_is_refused_while_an_ssh_runs_a_remote_command() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    s.submit(Source::User, "ssh() { sleep 3; }").expect("define the stand-in");
+    wait_prompt(&s);
+    let tools = SessionTools::new(&s);
+    let (v, _took) = timed_run(&tools, "ssh 127.0.0.1 sleep 3", 1);
+    assert_eq!(v["outcome"], "running", "{v}");
+    assert_eq!(v["reason"], "timeout", "a command on a remote host is not a login, so no early return: {v}");
+    assert_eq!(v["foreground"]["kind"], "ssh", "{v}");
+
+    let err = tools.integration_precheck().expect_err("refused while the ssh runs a program");
+    assert_eq!(
+        err,
+        "cannot integrate the shell now: that command runs a program on the remote host, not a shell; wait for it with wait or stop it.",
+        "{err}"
+    );
+    assert_eq!(err, agent_term_lib::core::tools::REMOTE_PROGRAM_REFUSAL);
+
+    let w = tools.call("wait", &json!({"id": v["record_id"], "seconds": 20, "ignore_updates": true}), None).expect("wait");
+    assert_eq!(w["reason"], "command_finished", "{w}");
+}
