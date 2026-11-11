@@ -257,16 +257,16 @@ fn run_command_returns_running_at_its_wait_and_the_session_stays_usable() {
     assert!(s.records().iter().any(|r| r.command == "sleep 30" && r.exit_code.is_some()), "the timed-out command never finished");
 }
 
+/// At an idle prompt there is no command of the agent's to type into: the refusal says to use run_command. The schemas list
+/// every tool, send_keys among them.
 #[test]
-fn send_keys_is_disabled_and_schemas_list_every_tool() {
+fn send_keys_is_refused_at_a_prompt_and_the_schemas_list_every_tool() {
     let _g = serial();
     let s = start();
     wait_prompt(&s);
     let tools = SessionTools::new(&s);
-    let err = tools.send_keys(b"ls\r").expect_err("send_keys must fail in slice 1");
-    assert!(err.contains("disabled in slice 1"), "error: {err}");
-    let err = tools.call("send_keys", &json!({"bytes": [108, 115, 13]}), None).expect_err("send_keys via JSON");
-    assert!(err.contains("disabled in slice 1"), "error: {err}");
+    let err = tools.call("send_keys", &json!({"keys": ["Enter"]}), None).expect_err("nothing is running");
+    assert!(err.contains("nothing is running; use run_command"), "error: {err}");
     let names: Vec<&str> = schemas().iter().map(|t| t.name).collect();
     assert_eq!(
         names,
@@ -1571,3 +1571,134 @@ fn request_integration_is_refused_while_an_ssh_runs_a_remote_command() {
     let w = tools.call("wait", &json!({"id": v["record_id"], "seconds": 20, "ignore_updates": true}), None).expect("wait");
     assert_eq!(w["reason"], "command_finished", "{w}");
 }
+
+/// `send_keys` types into the command the agent started: the echo and cat's copy show the text, and Ctrl-D ends cat, so the
+/// call reports the finished command.
+#[test]
+fn send_keys_types_into_a_running_command_and_ctrl_d_finishes_it() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let tools = SessionTools::new(&s);
+    let v = tools.call("run_command", &json!({"command": "cat", "wait_seconds": 1}), None).expect("run_command");
+    assert_eq!(v["outcome"], "running", "{v}");
+    let id = v["record_id"].as_u64().expect("the record id");
+    let sent = tools.call("send_keys", &json!({"text": "hello", "keys": ["Enter"], "id": id}), None).expect("send_keys");
+    assert_eq!(sent["outcome"], "sent", "{sent}");
+    assert_eq!(sent["bytes"], 6, "the text, then Enter: {sent}");
+    let shown = wait_until(Duration::from_secs(5), || {
+        (snapshot(&s).rows.iter().filter(|r| r.trim() == "hello").count() >= 2).then_some(())
+    });
+    assert!(shown.is_some(), "the echo and cat's copy both show: {:?}", snapshot(&s).rows);
+    let done = tools.call("send_keys", &json!({"keys": ["Ctrl-D"]}), None).expect("ctrl-d");
+    assert_eq!(done["outcome"], "finished", "{done}");
+    assert_eq!(done["record"]["id"], id, "{done}");
+    assert_eq!(done["record"]["output"].as_str().unwrap_or("").matches("hello").count(), 2, "{done}");
+}
+
+/// Ctrl-C interrupts the agent's own `sleep`: the record finishes with exit 130.
+#[test]
+fn send_keys_ctrl_c_interrupts_the_agents_own_command() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let tools = SessionTools::new(&s);
+    let v = tools.call("run_command", &json!({"command": "sleep 30", "wait_seconds": 1}), None).expect("run_command");
+    assert_eq!(v["outcome"], "running", "{v}");
+    let id = v["record_id"].as_u64().expect("the record id");
+    tools.call("send_keys", &json!({"keys": ["Ctrl-C"], "id": id}), None).expect("ctrl-c");
+    let w = tools.call("wait", &json!({"id": id, "seconds": 10, "ignore_updates": true}), None).expect("wait");
+    assert_eq!(w["reason"], "command_finished", "{w}");
+    assert_eq!(w["record"]["exit_code"], 130, "{w}");
+}
+
+/// An id that is not the command on top is refused, and nothing is typed.
+#[test]
+fn send_keys_refuses_an_id_that_is_not_the_command_on_top() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let tools = SessionTools::new(&s);
+    let v = tools.call("run_command", &json!({"command": "sleep 30", "wait_seconds": 1}), None).expect("run_command");
+    let id = v["record_id"].as_u64().expect("the record id");
+    let err = tools.call("send_keys", &json!({"keys": ["Ctrl-C"], "id": id + 1000}), None).expect_err("wrong id");
+    assert!(err.contains(&format!("the running command is id {id}")), "error: {err}");
+    tools.call("send_keys", &json!({"keys": ["Ctrl-C"]}), None).expect("the right command takes the interrupt");
+    tools.call("wait", &json!({"id": id, "seconds": 10, "ignore_updates": true}), None).expect("wait");
+}
+
+/// A program asking for a password is never typed into, even by the agent's own command.
+#[test]
+fn send_keys_refuses_a_password_prompt() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let tools = SessionTools::new(&s);
+    let v = tools
+        .call("run_command", &json!({"command": "printf 'Password: '; sleep 6", "wait_seconds": 1}), None)
+        .expect("run_command");
+    let id = v["record_id"].as_u64().expect("the record id");
+    let err = tools.call("send_keys", &json!({"text": "hunter2", "keys": ["Enter"]}), None).expect_err("a password prompt");
+    assert!(err.contains("asking for a password or secret"), "error: {err}");
+    assert!(!snapshot(&s).rows.iter().any(|r| r.contains("hunter2")), "nothing was typed: {:?}", snapshot(&s).rows);
+    tools.call("wait", &json!({"id": id, "seconds": 20, "ignore_updates": true}), None).expect("wait for the sleep to end");
+}
+
+/// Through the approval gate on a real shell: the first write shows a card, the next one runs without it, and Ctrl-D needs
+/// no card at all.
+#[test]
+fn the_approval_gate_asks_for_the_first_send_keys_and_then_latches_the_command() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let tools = SessionTools::new(&s);
+    let gate = ApprovalGate::with_timeout(Duration::from_secs(5));
+    let log: Log = Arc::default();
+    let sink = log.clone();
+    let gate_ref = &gate;
+    let emit = move |ev: AgentEvent| {
+        if let AgentEvent::ApprovalRequest { call_id, .. } = &ev {
+            assert!(gate_ref.decide(call_id, true), "the card was waiting");
+        }
+        sink.lock().unwrap().push(ev);
+    };
+    let ctx = AgentCtx::new(&tools, &gate, &emit);
+    let v = ctx.call_tool("run_command", json!({"command": "cat", "wait_seconds": 1})).expect("approved and started");
+    assert_eq!(v["outcome"], "running", "{v}");
+    ctx.call_tool("send_keys", json!({"text": "one", "keys": ["Enter"]})).expect("the first write asks, then goes");
+    ctx.call_tool("send_keys", json!({"text": "two", "keys": ["Enter"]})).expect("the latched command takes it");
+    let done = ctx.call_tool("send_keys", json!({"keys": ["Ctrl-D"]})).expect("ctrl-d");
+    assert!(matches!(done["outcome"].as_str(), Some("finished" | "sent")), "{done}");
+    let cards: Vec<String> = log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ApprovalRequest { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(cards, ["run_command", "send_keys"], "one card per tool that needed one");
+    assert_eq!(
+        reasons_of(&log),
+        [
+            ("run_command".to_string(), "manual", Some("manual_mode")),
+            ("send_keys".to_string(), "manual", Some("send_keys")),
+            ("send_keys".to_string(), "auto", Some("latched")),
+            ("send_keys".to_string(), "auto", Some("interrupt")),
+        ]
+    );
+}
+
+/// `(name, decision, reason)` of every ToolResult, in order.
+fn reasons_of(log: &Log) -> Vec<(String, &'static str, Option<&'static str>)> {
+    log.lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolResult { name, decision, reason, .. } => Some((name.clone(), *decision, *reason)),
+            _ => None,
+        })
+        .collect()
+}
+

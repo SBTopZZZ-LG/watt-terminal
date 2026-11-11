@@ -20,9 +20,10 @@ use agent_term_lib::core::llm::{TurnCancel, http_client};
 use agent_term_lib::core::persist::conversations::{ConversationMeta, SaveRequest};
 use agent_term_lib::core::persist::turn::{FinishedTurn, TurnEnv, resume, save_turn};
 use agent_term_lib::core::persist::workspace::Workspace;
+use agent_term_lib::core::keys::KeyPlan;
 use agent_term_lib::core::persist::{Persist, PersistError};
 use agent_term_lib::core::record::{Cwd, RecordSummary};
-use agent_term_lib::core::tools::{AgentTools, CommandView, RunOutcome, ScreenView, WaitView};
+use agent_term_lib::core::tools::{AgentTools, CommandView, RunOutcome, ScreenView, SendKeysOutcome, WaitView};
 use serde_json::{Value, json};
 
 const KEY: &str = "sk-or-test-SECRETVALUE-0123456789";
@@ -161,7 +162,7 @@ impl AgentTools for NoTools {
     fn wait(&self, _seconds: u64, _ignore_updates: bool, _record: Option<u64>) -> Result<WaitView, String> {
         unreachable!("no tool is called in these tests")
     }
-    fn send_keys(&self, _bytes: &[u8]) -> Result<(), String> {
+    fn send_keys(&self, _plan: &KeyPlan, _record: Option<u64>, _level: Option<u64>) -> Result<SendKeysOutcome, String> {
         unreachable!("no tool is called in these tests")
     }
 }

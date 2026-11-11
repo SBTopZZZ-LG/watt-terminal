@@ -8,6 +8,7 @@ pub mod approval;
 pub mod chat;
 pub mod foreground;
 pub mod inject;
+pub mod keys;
 pub mod llm;
 pub mod observer;
 pub mod persist;

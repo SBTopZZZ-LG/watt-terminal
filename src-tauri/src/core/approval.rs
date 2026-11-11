@@ -19,6 +19,7 @@ use regex::{Regex, RegexBuilder};
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::core::keys::TypedLine;
 use crate::core::settings::{ApprovalMode, ApprovalSettings};
 
 /// Automatic approvals a regex policy gives in one turn. The next one asks, with reason `auto_cap`.
@@ -62,8 +63,15 @@ pub enum Reason {
     Rule,
     /// Manual mode: every call asks.
     ManualMode,
-    /// Not a `run_command` call: `send_keys` always asks.
+    /// `send_keys`: the first write to a command asks, and the approval covers that command's later writes (`Latched`).
     SendKeys,
+    /// `send_keys` with only Ctrl-C, Ctrl-D or Esc: it can only interrupt or leave the command the agent started.
+    Interrupt,
+    /// `send_keys` into a command whose first write the user approved. The rules do not run again for it.
+    Latched,
+    /// `send_keys` that presses Enter in a shell the app did not integrate (ssh, a shell, su, a container shell): the rules
+    /// cannot see what the shell will run, so each such Enter asks.
+    UnintegratedShell,
     /// The hard gate: empty, or a character outside the safe set.
     GateChars,
     /// The hard gate: the first word does not start with a plain command name: it starts with something other than an
@@ -90,6 +98,9 @@ impl Reason {
             Reason::Rule => "rule",
             Reason::ManualMode => "manual_mode",
             Reason::SendKeys => "send_keys",
+            Reason::Interrupt => "interrupt",
+            Reason::Latched => "latched",
+            Reason::UnintegratedShell => "unintegrated_shell",
             Reason::GateChars => "gate_chars",
             Reason::GatePath => "gate_path",
             Reason::GateDenylist => "gate_denylist",
@@ -114,6 +125,12 @@ pub enum Verdict {
 /// `TopLevel` in core/tools): allow rules never run a command there without a card.
 pub trait ApprovalPolicy: Send + Sync {
     fn decide(&self, tool: &str, args: &Value, nested: bool) -> Verdict;
+
+    /// The floor for one line the agent types with `send_keys` (see `send_keys_verdict`): the hard gate, and the user's deny
+    /// rules. None when the line may go on. Allow rules never apply to typed lines.
+    fn check_line(&self, line: &str) -> Option<Reason> {
+        hard_gate(line)
+    }
 }
 
 /// Every call asks. The default, and the fallback when the settings cannot be used.
@@ -157,9 +174,133 @@ impl ApprovalPolicy for RegexPolicy {
             verdict => verdict,
         }
     }
+
+    fn check_line(&self, line: &str) -> Option<Reason> {
+        self.line_floor(line)
+    }
+}
+
+/// What `send_keys_verdict` needs to know about one call. The caller works these out from the call, the shell on top, the
+/// approve-all state and the memory of earlier writes (`SendKeysMemory`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendKeysCall {
+    /// Only Ctrl-C, Ctrl-D or Esc, with no text (`KeyPlan::is_interrupt_only`).
+    pub interrupt_only: bool,
+    /// The call presses Enter (`KeyPlan::has_enter`).
+    pub has_enter: bool,
+    /// The command on top is a shell or login the app did not integrate (ssh, a shell, su, a container shell).
+    pub shell_like: bool,
+    /// Approve-all covers this call. The caller decides that: for a shell_like command it needs follow_local_in_nested.
+    pub approve_all: bool,
+    /// The record's first write was approved, and that approval has not been revoked (`SendKeysMemory::latched`).
+    pub latched: bool,
+    /// The line each Enter of the call submits, in order: None where the line is not known (`TypedLine::after`).
+    pub lines: Vec<Option<String>>,
+}
+
+/// The verdict for one `send_keys` call. Only the order matters, and the first rule that decides wins:
+/// 1. Ctrl-C, Ctrl-D or Esc alone (`Interrupt`), in every mode.
+/// 2. Approve-all, when it covers the call (`ApproveAll`). It skips the line floor, as it does for run_command.
+/// 3. An Enter in an un-integrated shell asks (`UnintegratedShell`), even when the call is latched.
+/// 4. A line the floor refuses asks with the floor's reason; a line that is not known asks (`SendKeys`).
+/// 5. A latched record runs without a card (`Latched`). Otherwise the first write asks (`SendKeys`).
+///
+/// Allow rules play no part: they never run a typed line by themselves.
+pub fn send_keys_verdict(policy: &dyn ApprovalPolicy, call: &SendKeysCall) -> Verdict {
+    if call.interrupt_only {
+        return Verdict::Auto(Reason::Interrupt);
+    }
+    if call.approve_all {
+        return Verdict::Auto(Reason::ApproveAll);
+    }
+    if call.shell_like && call.has_enter {
+        return Verdict::Ask(Reason::UnintegratedShell);
+    }
+    for line in &call.lines {
+        match line {
+            None => return Verdict::Ask(Reason::SendKeys),
+            // A blank line runs nothing (in a REPL or a pager it is just Enter), so the floor has nothing to judge.
+            Some(line) if !line.trim().is_empty() => {
+                if let Some(reason) = policy.check_line(line) {
+                    return Verdict::Ask(reason);
+                }
+            }
+            Some(_) => {}
+        }
+    }
+    if call.latched { Verdict::Auto(Reason::Latched) } else { Verdict::Ask(Reason::SendKeys) }
+}
+
+/// What the agent may type into one command without a new card: the latch (the first write's approval) and the line typed so
+/// far, both per record. The approval gate keeps one of these for the session.
+///
+/// A user keystroke revokes the latch: the user may have taken the terminal over. The next `send_keys` is then refused once,
+/// and the one after it asks again. The line is unknown after a user keystroke, since their typing is not seen here.
+#[derive(Debug, Default)]
+pub struct SendKeysMemory {
+    latch: Option<Latch>,
+    line_record: Option<u64>,
+    line: TypedLine,
+    /// The user's keystroke count when this memory last looked.
+    seen_user_writes: u64,
+}
+
+/// A first write's approval: the record it was given for, and the user's keystroke count at the time.
+#[derive(Debug, Clone, Copy)]
+struct Latch {
+    record: u64,
+    user_writes: u64,
+}
+
+impl SendKeysMemory {
+    /// Called before each `send_keys` decision, with the record it targets and the user's keystroke count. Returns true when
+    /// the user typed since the latch was approved: the latch is revoked, and the caller refuses this call.
+    pub fn observe(&mut self, record: u64, user_writes: u64) -> bool {
+        if self.line_record != Some(record) {
+            self.line_record = Some(record);
+            self.line = TypedLine::default();
+        }
+        if user_writes != self.seen_user_writes {
+            self.seen_user_writes = user_writes;
+            self.line.mark_unknown();
+        }
+        match self.latch {
+            Some(latch) if latch.user_writes != user_writes => {
+                self.latch = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// True when the record's first write was approved, and nothing has revoked it since.
+    pub fn latched(&self, record: u64) -> bool {
+        self.latch.is_some_and(|latch| latch.record == record)
+    }
+
+    /// The line typed at the record so far, as far as it is known (`TypedLine::after` takes it).
+    pub fn line(&self, record: u64) -> TypedLine {
+        if self.line_record == Some(record) { self.line.clone() } else { TypedLine::default() }
+    }
+
+    /// Records a first write the user approved. `user_writes` is the keystroke count read before the card was shown.
+    pub fn approve_first_write(&mut self, record: u64, user_writes: u64) {
+        self.latch = Some(Latch { record, user_writes });
+    }
+
+    /// Records the line after a `send_keys` that was sent to the record.
+    pub fn sent(&mut self, record: u64, line: TypedLine) {
+        self.line_record = Some(record);
+        self.line = line;
+    }
 }
 
 impl RegexPolicy {
+    /// The same floor as `check_line` on the trait: the hard gate, then the deny rules. Used for typed lines.
+    fn line_floor(&self, line: &str) -> Option<Reason> {
+        hard_gate(line).or_else(|| self.deny.iter().any(|rule| rule.is_match(line)).then_some(Reason::DenyRule))
+    }
+
     /// The order of evaluation, first hit wins: not `run_command`; the hard gate; a deny rule; an allow rule (asks in a
     /// nested shell); else ask. Says `Auto` only for an allow rule. The turn's allowance is applied by `decide`.
     fn classify(&self, tool: &str, args: &Value, nested: bool) -> Verdict {
@@ -560,10 +701,125 @@ mod tests {
             (Reason::AutoCap, "auto_cap"),
             (Reason::NestedLevel, "nested_level"),
             (Reason::ApproveAllSuspended, "approve_all_suspended"),
+            (Reason::Interrupt, "interrupt"),
+            (Reason::Latched, "latched"),
+            (Reason::UnintegratedShell, "unintegrated_shell"),
         ];
         for (reason, code) in codes {
             assert_eq!(reason.code(), code);
         }
+    }
+
+    /// A send_keys call of a command on a local shell, with nothing latched, no approve-all, and no line.
+    fn keys_call() -> SendKeysCall {
+        SendKeysCall {
+            interrupt_only: false,
+            has_enter: false,
+            shell_like: false,
+            approve_all: false,
+            latched: false,
+            lines: Vec::new(),
+        }
+    }
+
+    fn keys(policy: &dyn ApprovalPolicy, call: SendKeysCall) -> Verdict {
+        send_keys_verdict(policy, &call)
+    }
+
+    /// Ctrl-C alone is an interrupt in every mode, and it is the only thing that is.
+    #[test]
+    fn interrupt_only_is_auto_in_every_mode() {
+        let call = SendKeysCall { interrupt_only: true, ..keys_call() };
+        assert_eq!(keys(&ManualPolicy, call.clone()), Verdict::Auto(Reason::Interrupt));
+        assert_eq!(keys(&regex_policy(&[], &[]), call), Verdict::Auto(Reason::Interrupt));
+    }
+
+    /// The first write to a command asks, and the latch then lets the rest through. Allow rules do not run typed lines.
+    #[test]
+    fn the_first_write_asks_and_the_latch_covers_the_rest() {
+        let policy = regex_policy(&[".*"], &[]);
+        assert_eq!(keys(&policy, keys_call()), Verdict::Ask(Reason::SendKeys));
+        let latched = SendKeysCall { latched: true, ..keys_call() };
+        assert_eq!(keys(&policy, latched.clone()), Verdict::Auto(Reason::Latched));
+        let enter = SendKeysCall { has_enter: true, lines: vec![Some("ls -l".into())], ..latched };
+        assert_eq!(keys(&policy, enter), Verdict::Auto(Reason::Latched), "an allow rule is not needed, and a plain line passes");
+    }
+
+    /// Approve-all covers a call that the policy would otherwise ask about, and skips the line floor as run_command does.
+    #[test]
+    fn approve_all_covers_the_call_and_skips_the_line_floor() {
+        let policy = regex_policy(&[], &[]);
+        let call = SendKeysCall { approve_all: true, has_enter: true, lines: vec![Some("sudo ls".into())], ..keys_call() };
+        assert_eq!(keys(&policy, call), Verdict::Auto(Reason::ApproveAll));
+    }
+
+    /// Enter in an un-integrated shell asks every time, even when latched.
+    #[test]
+    fn an_enter_in_an_unintegrated_shell_asks_even_when_latched() {
+        let call = SendKeysCall { shell_like: true, has_enter: true, latched: true, lines: vec![Some("ls".into())], ..keys_call() };
+        assert_eq!(keys(&ManualPolicy, call.clone()), Verdict::Ask(Reason::UnintegratedShell));
+        let no_enter = SendKeysCall { has_enter: false, lines: Vec::new(), ..call };
+        assert_eq!(keys(&ManualPolicy, no_enter), Verdict::Auto(Reason::Latched), "without Enter the latch rule applies");
+    }
+
+    /// The floor judges each typed line: a deny rule and the hard gate refuse with their reasons, in regex mode, and the hard
+    /// gate alone applies in manual mode. A blank line is nothing to judge.
+    #[test]
+    fn the_floor_judges_each_typed_line() {
+        let policy = RegexPolicy::new(&ApprovalSettings {
+            mode: ApprovalMode::Regex,
+            allow: Vec::new(),
+            deny: vec!["cargo .*".to_string()],
+            ..Default::default()
+        })
+        .expect("the rules compile");
+        let line = |text: &str| SendKeysCall { has_enter: true, latched: true, lines: vec![Some(text.to_string())], ..keys_call() };
+        assert_eq!(keys(&policy, line("cargo test")), Verdict::Ask(Reason::DenyRule));
+        assert_eq!(keys(&policy, line("rm x")), Verdict::Ask(Reason::GateDenylist), "the built-in list comes first");
+        assert_eq!(keys(&policy, line("sudo x")), Verdict::Ask(Reason::GateDenylist));
+        assert_eq!(keys(&policy, line("ls | wc")), Verdict::Ask(Reason::GateChars));
+        assert_eq!(keys(&policy, line("ls")), Verdict::Auto(Reason::Latched));
+        assert_eq!(keys(&ManualPolicy, line("cargo test")), Verdict::Auto(Reason::Latched), "manual mode has no deny rules");
+        assert_eq!(keys(&ManualPolicy, line("sudo x")), Verdict::Ask(Reason::GateDenylist), "the hard gate applies in manual mode");
+        assert_eq!(keys(&policy, line("   ")), Verdict::Auto(Reason::Latched), "a blank line is nothing to judge");
+    }
+
+    /// A line that is not known asks, latched or not: the floor cannot judge it.
+    #[test]
+    fn an_unknown_line_asks() {
+        let call = SendKeysCall { has_enter: true, latched: true, lines: vec![None], ..keys_call() };
+        assert_eq!(keys(&ManualPolicy, call), Verdict::Ask(Reason::SendKeys));
+    }
+
+    /// The latch belongs to one command, and a user keystroke after the approval revokes it once.
+    #[test]
+    fn the_memory_latches_per_command_and_a_keystroke_revokes_it_once() {
+        let mut memory = SendKeysMemory::default();
+        assert!(!memory.observe(7, 0));
+        assert!(!memory.latched(7));
+        memory.approve_first_write(7, 0);
+        assert!(memory.latched(7) && !memory.latched(8), "the latch is for command 7");
+        assert!(!memory.observe(7, 0), "nothing typed, nothing revoked");
+        assert!(memory.observe(7, 1), "a keystroke after the approval revokes it");
+        assert!(!memory.latched(7));
+        assert!(!memory.observe(7, 1), "the revocation is not repeated");
+    }
+
+    /// The typed line follows each sent call per command, and a keystroke makes it unknown.
+    #[test]
+    fn the_memory_follows_the_typed_line_and_a_keystroke_makes_it_unknown() {
+        let mut memory = SendKeysMemory::default();
+        memory.observe(7, 0);
+        let plan = crate::core::keys::KeyPlan { text: "rm -rf".into(), ..Default::default() };
+        let (lines, next) = memory.line(7).after(&plan);
+        assert!(lines.is_empty());
+        memory.sent(7, next);
+        memory.observe(7, 0);
+        let enter = crate::core::keys::KeyPlan { keys: vec![crate::core::keys::Key::Enter], ..Default::default() };
+        assert_eq!(memory.line(7).after(&enter).0, [Some("rm -rf".to_string())], "the line sent before is remembered");
+        memory.observe(7, 1);
+        assert_eq!(memory.line(7).after(&enter).0, [None], "a keystroke makes the line unknown");
+        assert_eq!(memory.line(8).after(&enter).0, [Some(String::new())], "another command starts with an empty line");
     }
 
     #[test]

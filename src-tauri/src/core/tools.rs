@@ -1,8 +1,8 @@
 //! The agent's tools: plain Rust methods over a session, plus JSON schemas so a model can call them later.
 //!
-//! Read tools are always available. `run_command` is the only tool that writes to the shell, and it is
-//! refused unless the session is at an idle prompt with shell integration live. `send_keys` is a stub.
-//! Approval is not checked here; `agent::AgentCtx::call_tool` asks for it before calling these methods.
+//! Read tools are always available. `run_command` starts a command, and it is refused unless the session is at an idle
+//! prompt with shell integration live. `send_keys` types into the command the agent started, while it runs, and only that
+//! one. Approval is not checked here; `agent::AgentCtx::call_tool` asks for it before calling these methods.
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,7 +14,8 @@ use regex::Regex;
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::core::foreground::{Foreground, ForegroundKind};
+use crate::core::foreground::{self, Foreground, ForegroundKind};
+use crate::core::keys::KeyPlan;
 use crate::core::llm::TurnCancel;
 use crate::core::observer::{
     CallStatus, InjectRefusal, InputState, IntegrationStatus, LevelKind, ObserverStatus, OpenAgentRecord, YieldSignals,
@@ -38,6 +39,17 @@ const SCREEN_TAIL_ROWS: usize = 20;
 /// `NotRun { WaitingForInput }`. Short enough to report promptly, long enough that a multi-line command passing
 /// through PS2 for a moment is not cut off.
 pub const WAITING_FOR_INPUT_AFTER: Duration = Duration::from_secs(2);
+/// The most `send_keys` calls one turn may make. Its own limit: it is not the run_command limit.
+pub const SEND_KEYS_PER_TURN: u32 = 60;
+/// The last non-blank rows a `send_keys` result carries.
+const SEND_TAIL_ROWS: usize = 15;
+/// After keys are sent, `send_keys` returns once the screen has been quiet for `SEND_QUIET`, or `SEND_WAIT` has passed, or the
+/// command has finished. The wait is short: the agent polls with wait or get_screen for the rest.
+const SEND_QUIET: Duration = Duration::from_millis(300);
+const SEND_WAIT: Duration = Duration::from_millis(1500);
+/// The refusal for `send_keys` while the program on the screen asks for a password or other secret. Refused even when the
+/// user has approved the call: the agent never types a secret, and the user types it.
+pub const KEYS_PASSWORD_REFUSAL: &str = "cannot send keys: the program is asking for a password or secret: do not type it; ask the user to type it themselves";
 /// The longest one `wait` call may last, and the length when the model gives no `seconds`.
 pub const MAX_WAIT_SECONDS: u64 = 120;
 pub const DEFAULT_WAIT_SECONDS: u64 = 10;
@@ -119,6 +131,38 @@ impl TopLevel {
     pub fn is_nested(&self) -> bool {
         self.location.is_some()
     }
+}
+
+/// The command `send_keys` would type into, as the approval card names it (see `AgentTools::send_keys_precheck`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendTarget {
+    /// The command's record id.
+    pub record: u64,
+    /// The command text.
+    pub command: String,
+}
+
+/// What `send_keys` gives back. `Sent` when the keys went in and the command is still running; `Finished` when the command
+/// ended while the call waited (like `wait`, with the record).
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum SendKeysOutcome {
+    Sent {
+        /// The bytes written: the text, then each key.
+        bytes: usize,
+        /// The key names, in the order sent.
+        keys: Vec<String>,
+        /// The literal text, when the call typed some. Left out otherwise.
+        #[serde(skip_serializing_if = "String::is_empty")]
+        text: String,
+        state: InputState,
+        /// The last non-blank rows of the screen after the keys.
+        screen_tail: Vec<String>,
+    },
+    Finished {
+        record: Record,
+    },
 }
 
 /// One page of a command's rendered output. `offset` and `limit` are byte counts, moved to character boundaries.
@@ -278,7 +322,22 @@ pub trait AgentTools {
     fn integrate_shell(&self) -> IntegrateOutcome {
         IntegrateOutcome::Failed { hint: "shell integration is not available here".into() }
     }
-    fn send_keys(&self, bytes: &[u8]) -> Result<(), String>;
+    /// Checks `send_keys` before the approval card: the cap, the target (see `send_keys`), and the password refusal. Writes
+    /// nothing. A fake without a shell refuses.
+    fn send_keys_precheck(&self, _plan: &KeyPlan) -> Result<SendTarget, String> {
+        Err("send_keys is not available here".into())
+    }
+    /// How many times the user has typed into the terminal since the session started. A `send_keys` approval ends when it
+    /// changes. Defaults to 0 (a fake has no user).
+    fn user_writes(&self) -> u64 {
+        0
+    }
+    /// Types `plan` into the command the agent started, when it may take keys now: a running command the agent started, on
+    /// the top level. `record` is the command the call is bound to (the approved one, or the id the model named) and
+    /// `expected_level` the shell key it was approved for. The result is what the model reads. A fake without a shell refuses.
+    fn send_keys(&self, _plan: &KeyPlan, _record: Option<u64>, _expected_level: Option<u64>) -> Result<SendKeysOutcome, String> {
+        Err("send_keys is not available here".into())
+    }
 
     /// Calls a tool by schema name. Optional arguments take their defaults. Does not ask for approval. `expected_level` is
     /// passed to `run_command` (see there).
@@ -340,10 +399,9 @@ pub trait AgentTools {
                 Ok(value)
             }
             "send_keys" => {
-                let bytes: Vec<u8> = serde_json::from_value(args.get("bytes").cloned().unwrap_or(Value::Null))
-                    .map_err(|_| "argument `bytes` must be an array of integers 0-255".to_string())?;
-                self.send_keys(&bytes)?;
-                Ok(json!({"ok": true}))
+                let plan = KeyPlan::from_args(args)?;
+                let record = plan.record;
+                to_json(self.send_keys(&plan, record, expected_level)?)
             }
             other => Err(format!("unknown tool `{other}`")),
         }
@@ -362,6 +420,8 @@ pub struct SessionTools<'a> {
     wait_budget: Duration,
     /// Time spent in `wait` through this value so far.
     wait_used: Cell<Duration>,
+    /// `send_keys` calls that wrote keys, this turn (see `SEND_KEYS_PER_TURN`).
+    keys_sent: Cell<u32>,
 }
 
 impl<'a> SessionTools<'a> {
@@ -377,6 +437,7 @@ impl<'a> SessionTools<'a> {
             cancel: None,
             wait_budget: LimitsSettings::default().max_wait(),
             wait_used: Cell::new(Duration::ZERO),
+            keys_sent: Cell::new(0),
         }
     }
 
@@ -585,8 +646,37 @@ impl AgentTools for SessionTools<'_> {
         self.session.integrate_shell()
     }
 
-    fn send_keys(&self, _bytes: &[u8]) -> Result<(), String> {
-        Err("send_keys is disabled in slice 1".into())
+    fn send_keys_precheck(&self, plan: &KeyPlan) -> Result<SendTarget, String> {
+        self.keys_budget()?;
+        self.keys_target_checked(plan.record)
+    }
+
+    fn user_writes(&self) -> u64 {
+        self.session.user_writes()
+    }
+
+    fn send_keys(&self, plan: &KeyPlan, record: Option<u64>, expected_level: Option<u64>) -> Result<SendKeysOutcome, String> {
+        self.keys_budget()?;
+        let target = self.keys_target_checked(record)?;
+        let before = self.session.activity().screen_gen;
+        let started = Instant::now();
+        // The writer checks the target again, under the lock, and binds the bytes to it: a command that changed since the
+        // check above is refused there, with nothing sent.
+        let sent = self.session.send_keys(plan.clone(), Some(target.record), expected_level).map_err(|e| e.to_string())?;
+        self.keys_sent.set(self.keys_sent.get() + 1);
+        if self.settle_after_keys(sent.record_id, before, started) {
+            self.settle_at_prompt();
+            if let Some(record) = self.session.get_record(sent.record_id) {
+                return Ok(SendKeysOutcome::Finished { record });
+            }
+        }
+        Ok(SendKeysOutcome::Sent {
+            bytes: sent.bytes,
+            keys: plan.key_names(),
+            text: plan.text.clone(),
+            state: self.session.state(),
+            screen_tail: self.screen_tail(SEND_TAIL_ROWS),
+        })
     }
 }
 
@@ -603,6 +693,58 @@ impl SessionTools<'_> {
                 _ => thread::sleep(RUN_POLL),
             }
         }
+    }
+
+    /// The per-turn cap on `send_keys` calls that write.
+    fn keys_budget(&self) -> Result<(), String> {
+        if self.keys_sent.get() >= SEND_KEYS_PER_TURN {
+            return Err(format!(
+                "the send_keys limit for this turn is reached ({SEND_KEYS_PER_TURN} calls). Use wait or get_screen, or ask the user to act."
+            ));
+        }
+        Ok(())
+    }
+
+    /// The command `send_keys` may type into now, read under one lock, and the password refusal. The text is the model's.
+    fn keys_target_checked(&self, record: Option<u64>) -> Result<SendTarget, String> {
+        let id = self.session.send_keys_target(record).map_err(|refusal| refusal.to_string())?;
+        if screen_waits_for_input(&self.session.screen_snapshot().rows) {
+            return Err(KEYS_PASSWORD_REFUSAL.to_string());
+        }
+        let command = self.session.open_agent_records().into_iter().find(|r| r.id == id).map(|r| r.command).unwrap_or_default();
+        Ok(SendTarget { record: id, command })
+    }
+
+    /// Waits after keys were sent: until the screen has been quiet for `SEND_QUIET`, the command finished, the turn was
+    /// cancelled, the session exited, or `SEND_WAIT` passed. `seen` is the screen generation before the write. Returns true
+    /// when the command finished.
+    fn settle_after_keys(&self, record_id: u64, mut seen: u64, started: Instant) -> bool {
+        let mut changed_at = started;
+        loop {
+            let act = self.session.activity();
+            let now = Instant::now();
+            if act.screen_gen != seen {
+                seen = act.screen_gen;
+                changed_at = now;
+            }
+            if self.session.has_finished_record(record_id) {
+                return true;
+            }
+            if act.state == InputState::Exited || self.cancelled() {
+                return false;
+            }
+            if now.duration_since(changed_at) >= SEND_QUIET || now.duration_since(started) >= SEND_WAIT {
+                return false;
+            }
+            thread::sleep(RUN_POLL);
+        }
+    }
+
+    /// The last non-blank rows of the screen, at most `rows` of them.
+    fn screen_tail(&self, rows: usize) -> Vec<String> {
+        let mut tail: Vec<String> = self.session.screen_snapshot().rows.into_iter().filter(|r| !r.trim().is_empty()).collect();
+        let keep_from = tail.len().saturating_sub(rows);
+        tail.split_off(keep_from)
     }
 
     /// Why `run_command` cannot run now, when the shell is not live or not at an idle prompt. None when it may run.
@@ -745,6 +887,15 @@ pub fn running_hint(record_id: Option<u64>) -> String {
     }
 }
 
+/// What the model is told to wait for, when a foreground program has no shell integration and there is nothing to integrate.
+pub const WAIT_HINT: &str = "Wait for it to end (wait), or ask the user to stop it.";
+
+/// The next step for a foreground program without shell integration: request_integration when it is a login the app can
+/// integrate (see `foreground::integration_offered`), else wait for it. Used by every model-facing note about it.
+pub fn foreground_next_step(fg: &Foreground) -> &'static str {
+    if foreground::integration_offered(fg) { INTEGRATE_HINT } else { WAIT_HINT }
+}
+
 /// The next step when a command opened a shell that has no shell integration (`YieldReason::RemoteShell`). It names the
 /// command, and never suggests typing into the shell.
 pub fn remote_shell_hint(command: &str) -> String {
@@ -820,11 +971,19 @@ pub fn not_at_prompt_text(state: InputState, foreground: Option<&Foreground>, ag
             "{text}. The command `{}` is still running in the shell. Wait for it to finish (wait), then run the command again.",
             fg.command
         ),
-        kind => format!(
+        // A login the app can integrate: the next step is request_integration.
+        _ if foreground::integration_offered(fg) => format!(
             "{text}. The foreground program is `{}`: {}, without shell integration, so commands cannot run in it. \
              Read it with get_screen and wait for it to end. Ask the user to leave it, so commands can run again. {INTEGRATE_HINT}",
             fg.command,
-            kind.describe()
+            fg.kind.describe()
+        ),
+        // A remote command or a script: there is no shell to integrate. Wait for it, or stop it if it is the agent's own.
+        _ => format!(
+            "{text}. The foreground program is `{}`: {}, without shell integration, so commands cannot run in it. \
+             Read it with get_screen and wait for it to end (wait), or ask the user to stop it.",
+            fg.command,
+            fg.kind.describe()
         ),
     }
 }
@@ -942,11 +1101,22 @@ pub fn schemas() -> Vec<ToolSchema> {
         },
         ToolSchema {
             name: "send_keys",
-            description: "Send raw bytes to the terminal. Disabled in this version; always returns an error.",
+            description: "Type into a command you started that is still running, to answer its prompt, drive a pager, an editor \
+                 or a REPL, or interrupt it (Ctrl-C). Only for a command run_command gave a record_id for, while it has not \
+                 finished: never to start a command (at an idle prompt, use run_command). Never type a password or other secret: \
+                 when the program asks for one the call is refused, and the user types it. text is typed literally, up to 4096 \
+                 bytes, with no control characters (use keys for Enter, Tab or Esc). keys are named keys sent in order: Enter, \
+                 Tab, Esc, Backspace, Delete, Space, Up, Down, Left, Right, Home, End, PageUp, PageDown, or Ctrl-A to Ctrl-Z, up \
+                 to 64 per call. The text is sent first, then the keys. The result shows the screen after the keys, or the \
+                 finished command. The user approves the first call for each command, and a shell the app did not integrate \
+                 asks for every Enter.",
             parameters: json!({
                 "type": "object",
-                "properties": {"bytes": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 255}}},
-                "required": ["bytes"],
+                "properties": {
+                    "text": {"type": "string", "description": "Literal text to type. No control characters."},
+                    "keys": {"type": "array", "items": {"type": "string"}, "description": "Named keys, in order."},
+                    "id": {"type": "integer", "minimum": 1, "description": "The record_id of the command, if you want to be sure it is the one running."},
+                },
             }),
         },
     ]
@@ -1321,6 +1491,25 @@ mod tests {
         assert!(!not_at_prompt_text(InputState::Running, Some(&sleep), None).contains("request_integration"));
     }
 
+    /// A remote command (`ssh host make`) is not a login: the refusal says to wait for it, and does not offer request_integration.
+    #[test]
+    fn a_remote_command_refusal_waits_for_it_instead_of_offering_integration() {
+        let make = hint(ForegroundKind::Ssh, "ssh host make");
+        let text = not_at_prompt_text(InputState::Running, Some(&make), None);
+        assert!(!text.contains("request_integration"), "{text}");
+        assert!(text.contains("wait for it to end (wait)"), "{text}");
+    }
+
+    /// The send_keys caps and the schema: the per-turn count is its own constant, and the schema has no `bytes`.
+    #[test]
+    fn send_keys_has_its_own_turn_limit_and_a_text_and_keys_schema() {
+        assert_eq!(SEND_KEYS_PER_TURN, 60);
+        let schema = schemas().into_iter().find(|s| s.name == "send_keys").expect("offered");
+        assert!(schema.parameters["properties"]["text"].is_object(), "{}", schema.parameters);
+        assert!(schema.parameters["properties"]["keys"].is_object(), "{}", schema.parameters);
+        assert!(schema.description.contains("never to start a command"), "{}", schema.description);
+    }
+
     #[test]
     fn the_password_refusal_tells_the_agent_not_to_type() {
         assert!(INTEGRATE_PASSWORD_REFUSAL.contains("Do not type it"), "{INTEGRATE_PASSWORD_REFUSAL}");
@@ -1397,5 +1586,8 @@ mod tests {
         assert!(by_name("get_screen").parameters["properties"]["lines"].is_object());
         assert!(by_name("wait").parameters["properties"]["id"].is_object());
         assert!(!by_name("send_keys").description.is_empty());
+        let keys = by_name("send_keys").parameters;
+        assert!(keys["properties"]["text"].is_object() && keys["properties"]["keys"].is_object(), "{keys}");
+        assert!(keys["properties"].get("bytes").is_none(), "{keys}");
     }
 }

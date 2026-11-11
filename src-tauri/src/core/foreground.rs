@@ -110,6 +110,14 @@ pub fn is_login(command: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// True when `request_integration` can help with this foreground program: a shell, ssh, su or a container shell that is a
+/// login (see `is_login`). A remote command or a script (`ssh host make`) is not one: there is no shell to integrate there,
+/// so the agent should wait for it, and the model text must not suggest integrating it.
+pub fn integration_offered(fg: &Foreground) -> bool {
+    matches!(fg.kind, ForegroundKind::Ssh | ForegroundKind::Shell | ForegroundKind::Su | ForegroundKind::ContainerExec)
+        && is_login(&fg.command)
+}
+
 /// The words after any assignments and wrappers (see WRAPPERS): the program, then its arguments.
 fn program_words<'w, 'a>(words: &'w [&'a str]) -> &'w [&'a str] {
     let mut rest = words;

@@ -2,8 +2,8 @@
 //!
 //! SECURITY: command output and screen contents are untrusted input to a model. Text printed in the
 //! terminal (by a program, a file, or a web page) can try to steer a real LLM (prompt injection), and both
-//! can contain secrets. So `run_command` asks for approval every time by default, `send_keys` always asks,
-//! and auto-approve starts off. Auto-approve only skips the approval step; it never lets a command run
+//! can contain secrets. So `run_command` asks for approval every time by default, `send_keys` asks for the first write
+//! to each command and checks the line it types, and auto-approve starts off. Auto-approve only skips the approval step; it never lets a command run
 //! while the shell is busy.
 
 use std::collections::HashMap;
@@ -16,9 +16,10 @@ use std::time::Duration;
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::core::approval::{ApprovalPolicy, ManualPolicy, Reason, Verdict};
+use crate::core::approval::{self, ApprovalPolicy, ManualPolicy, Reason, SendKeysCall, SendKeysMemory, Verdict};
 use crate::core::chat::todo::Todo;
-use crate::core::foreground::Foreground;
+use crate::core::foreground::{self, Foreground, ForegroundKind};
+use crate::core::keys::KeyPlan;
 use crate::core::llm::TurnCancel;
 use crate::core::observer::OpenAgentRecord;
 use crate::core::record::RecordSummary;
@@ -30,6 +31,11 @@ pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
 /// Prefix of the error for a call the user did not approve: denied, cancelled, or timed out. Callers match on it to tell
 /// a denial from a tool error. The text after it is for people.
 pub const DENIED: &str = "not_approved";
+
+/// The refusal for `send_keys` when the user typed into the terminal after the agent's approval. Nothing is sent. The next
+/// call asks again.
+const KEYS_USER_TOOK_OVER: &str = "the user typed into the terminal since your last write; they may have taken over: read \
+     get_screen and decide. Nothing was sent. The next send_keys asks for approval again.";
 
 /// Whether approve-all applies to the shell on top right now (see `ApprovalGate::auto_state`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +96,8 @@ pub struct ApprovalGate {
     /// Approve-all: None when off. When on, the key of the shell level it was switched on in. It applies only while that
     /// level is on top (see `auto_state`), so it never carries into a nested shell or back out of one unseen.
     auto: Mutex<Option<u64>>,
+    /// What `send_keys` may do without a new card: the first write's approval and the typed line, per command.
+    keys: Mutex<SendKeysMemory>,
 }
 
 impl Default for ApprovalGate {
@@ -108,7 +116,13 @@ impl ApprovalGate {
             pending: Pending::new(timeout),
             integrations: IntegrationGate::with_timeout(timeout),
             auto: Mutex::new(None),
+            keys: Mutex::new(SendKeysMemory::default()),
         }
+    }
+
+    /// The `send_keys` memory (see `SendKeysMemory`). Hold it only for the check and the update, never across an approval.
+    pub fn send_keys_memory(&self) -> MutexGuard<'_, SendKeysMemory> {
+        self.keys.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Switches approve-all on or off. `level` is the key of the shell on top when it is switched on. The caller takes it
@@ -252,6 +266,10 @@ pub enum AgentEvent {
         call_id: String,
         name: String,
         text: String,
+        /// The decoded input of a `send_keys` card: the text, then the keys in short form (`echo hi⏎`, `:wq⏎`, `^C`). Left out
+        /// for the other cards.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        display: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         reason: Option<&'static str>,
         level: u64,
@@ -438,11 +456,12 @@ impl<'a> AgentCtx<'a> {
         }
         // The shell on top now. The card and the submit are both bound to its key.
         let top = self.tools.top_level();
-        // Approve-all skips the policy for run_command. send_keys always goes to the policy, which always asks.
+        if name == "send_keys" {
+            return self.gate_send_keys(call_id, args, &top);
+        }
+        // Approve-all skips the policy for run_command. Nothing else is gated: it runs as it always did, without a card.
         let verdict = match name {
             "run_command" => self.run_command_verdict(&top, args),
-            "send_keys" => self.policy.decide(name, args, self.policy_nested(&top)),
-            // Nothing else is gated: it runs as it always did, without a card.
             _ => return self.run_ungated(name, args),
         };
         let level = (name == "run_command").then_some(top.key);
@@ -459,6 +478,7 @@ impl<'a> AgentCtx<'a> {
                         call_id: call_id.to_string(),
                         name: name.to_string(),
                         text: text.clone(),
+                        display: None,
                         reason: Some(reason.code()),
                         level: top.key,
                         location: top.location.clone(),
@@ -472,6 +492,102 @@ impl<'a> AgentCtx<'a> {
                 ("manual", Some(reason.code()), self.execute(name, args, true, level))
             }
         }
+    }
+
+    /// `send_keys`: types into the command the agent started (see `approval::send_keys_verdict`). Refused before the card when
+    /// the target is wrong, the per-turn cap is reached, or the screen asks for a password (the tool checks these). The card
+    /// shows the decoded input. Approve-all covers a shell the app did not integrate only when nested shells follow the local
+    /// rules. The approval memory (the first write's approval, the typed line) lives in the gate, per command.
+    ///
+    /// Best effort, not a security boundary: the typed line is only what the agent sent, and a program may change it.
+    fn gate_send_keys(&self, call_id: &str, args: &Value, top: &TopLevel) -> (&'static str, Option<&'static str>, Result<Value, String>) {
+        let plan = match KeyPlan::from_args(args) {
+            Ok(plan) => plan,
+            Err(e) => return ("refused", None, Err(e)),
+        };
+        let target = match self.tools.send_keys_precheck(&plan) {
+            Ok(target) => target,
+            Err(e) => return ("refused", None, Err(e)),
+        };
+        let writes = self.tools.user_writes();
+        let follow = self.rules.follow_local_in_nested;
+        let shell_like = matches!(
+            foreground::classify(&target.command).kind,
+            ForegroundKind::Ssh | ForegroundKind::Shell | ForegroundKind::Su | ForegroundKind::ContainerExec
+        );
+        let approve_all = if shell_like {
+            follow && self.approvals.auto_approve()
+        } else {
+            self.approvals.auto_state_across(top.key, follow) == AutoState::On
+        };
+        let (call, next_line) = {
+            let mut memory = self.approvals.send_keys_memory();
+            if memory.observe(target.record, writes) {
+                return ("refused", None, Err(KEYS_USER_TOOK_OVER.to_string()));
+            }
+            let (lines, next_line) = memory.line(target.record).after(&plan);
+            let call = SendKeysCall {
+                interrupt_only: plan.is_interrupt_only(),
+                has_enter: plan.has_enter(),
+                shell_like,
+                approve_all,
+                latched: memory.latched(target.record),
+                lines,
+            };
+            (call, next_line)
+        };
+        let display = plan.display();
+        match approval::send_keys_verdict(self.policy, &call) {
+            Verdict::Auto(reason) => {
+                let result = self.execute_send_keys(&plan, target.record, top.key);
+                if result.is_ok() {
+                    self.approvals.send_keys_memory().sent(target.record, next_line);
+                }
+                (if result.is_ok() { "auto" } else { "refused" }, Some(reason.code()), result)
+            }
+            Verdict::Ask(reason) => {
+                let approved = self.approvals.ask(call_id, || {
+                    self.emit(AgentEvent::ApprovalRequest {
+                        call_id: call_id.to_string(),
+                        name: "send_keys".to_string(),
+                        text: display.clone(),
+                        display: Some(display.clone()),
+                        reason: Some(reason.code()),
+                        level: top.key,
+                        location: top.location.clone(),
+                    })
+                });
+                if !approved {
+                    let err = format!("{DENIED}: the user did not approve this call (denied, cancelled, or timed out)");
+                    return ("denied", Some(reason.code()), Err(err));
+                }
+                // The user approved, so the decision stays "manual" even if the tool then refuses.
+                let result = self.execute_send_keys(&plan, target.record, top.key);
+                if result.is_ok() {
+                    let mut memory = self.approvals.send_keys_memory();
+                    memory.sent(target.record, next_line);
+                    // A first write the user approved latches the command: its later writes run without a card, until the
+                    // user types. The latch uses the keystroke count from before the card, so a keystroke during the card
+                    // revokes it.
+                    if reason == Reason::SendKeys {
+                        memory.approve_first_write(target.record, writes);
+                    }
+                }
+                ("manual", Some(reason.code()), result)
+            }
+        }
+    }
+
+    /// Types the keys into the command `record`, bracketed as control of the shell (see `execute`). The tool checks the
+    /// target again under its lock, and refuses with nothing sent if the command changed.
+    fn execute_send_keys(&self, plan: &KeyPlan, record: u64, level: u64) -> Result<Value, String> {
+        self.emit(AgentEvent::AgentControl { active: true });
+        let result = self
+            .tools
+            .send_keys(plan, Some(record), Some(level))
+            .and_then(|outcome| serde_json::to_value(outcome).map_err(|e| e.to_string()));
+        self.emit(AgentEvent::AgentControl { active: false });
+        result
     }
 
     /// The verdict for a run_command. Approve-all decides it while it applies to the shell on top, and asks (suspended)
@@ -737,12 +853,13 @@ mod tests {
 
     use super::*;
     use crate::core::approval::{MAX_AUTO_PER_TURN, RegexPolicy};
+    use crate::core::keys::KeyPlan;
     use crate::core::foreground::ForegroundKind;
     use crate::core::observer::{InputState, IntegrationStatus, ObserverStatus};
     use crate::core::record::{Cwd, RecordSummary};
     use crate::core::session::IntegrateOutcome;
     use crate::core::settings::{ApprovalMode, ApprovalSettings};
-    use crate::core::tools::{CommandView, RunOutcome, ScreenView, TopLevel, WaitView};
+    use crate::core::tools::{CommandView, RunOutcome, ScreenView, SendKeysOutcome, SendTarget, TopLevel, WaitView};
 
     /// Records every tool call the agent manages to reach. Nothing here touches a shell.
     #[derive(Default)]
@@ -764,6 +881,12 @@ mod tests {
         integrate_outcome: Mutex<Option<IntegrateOutcome>>,
         /// How many times the handshake was run.
         integrate_calls: Mutex<usize>,
+        /// The command `send_keys` targets (what `send_keys_precheck` reports). None: no command of the agent is running.
+        keys_target: Mutex<Option<SendTarget>>,
+        /// The user's keystroke count (what `user_writes` reports).
+        user_writes: Mutex<u64>,
+        /// Every `send_keys` that reached the tools.
+        keys_reached: Mutex<Vec<KeysCall>>,
     }
 
     impl Recorder {
@@ -775,6 +898,9 @@ mod tests {
             *self.top.lock().unwrap() = top;
         }
     }
+
+    /// A `send_keys` that reached the fake: its display, the record and the level it was bound to.
+    type KeysCall = (String, Option<u64>, Option<u64>);
 
     /// A nested shell on top, as the session reports it: its key and the command that started it.
     fn nested(key: u64, label: &str) -> TopLevel {
@@ -811,8 +937,25 @@ mod tests {
         fn wait(&self, _seconds: u64, _ignore_updates: bool, _record: Option<u64>) -> Result<WaitView, String> {
             Err("not used".into())
         }
-        fn send_keys(&self, _bytes: &[u8]) -> Result<(), String> {
-            Err("not used".into())
+        fn send_keys_precheck(&self, _plan: &KeyPlan) -> Result<SendTarget, String> {
+            self.keys_target.lock().unwrap().clone().ok_or_else(|| "nothing is running; use run_command".to_string())
+        }
+        fn user_writes(&self) -> u64 {
+            *self.user_writes.lock().unwrap()
+        }
+        fn send_keys(&self, plan: &KeyPlan, record: Option<u64>, level: Option<u64>) -> Result<SendKeysOutcome, String> {
+            self.reached.lock().unwrap().push("send_keys".to_string());
+            self.keys_reached.lock().unwrap().push((plan.display(), record, level));
+            match &self.call_error {
+                Some(e) => Err(e.clone()),
+                None => Ok(SendKeysOutcome::Sent {
+                    bytes: 0,
+                    keys: plan.key_names(),
+                    text: plan.text.clone(),
+                    state: InputState::Running,
+                    screen_tail: Vec::new(),
+                }),
+            }
         }
         fn run_command_precheck(&self) -> Result<(), String> {
             self.precheck.clone().map_or(Ok(()), Err)
@@ -866,6 +1009,7 @@ mod tests {
                 call_id: "c1".into(),
                 name: "run_command".into(),
                 text: "pwd".into(),
+                display: None,
                 reason: None,
                 level: 0,
                 location: None,
@@ -878,6 +1022,7 @@ mod tests {
                 call_id: "c1".into(),
                 name: "run_command".into(),
                 text: "pwd".into(),
+                display: None,
                 reason: Some("nested_level"),
                 level: 2,
                 location: Some("ssh ubuntu@lidia".into()),
@@ -901,6 +1046,7 @@ mod tests {
                 call_id: "c1".into(),
                 name: "run_command".into(),
                 text: "ls | wc".into(),
+                display: None,
                 reason: Some("gate_chars"),
                 level: 0,
                 location: None,
@@ -1146,6 +1292,202 @@ mod tests {
     }
 
     /// `(name, decision, reason)` of every ToolResult, in order.
+    /// An emit that answers every approval card with `answer` and logs every event.
+    fn answering<'a>(gate: &'a ApprovalGate, log: &'a Mutex<Vec<AgentEvent>>, answer: bool) -> impl Fn(AgentEvent) + 'a {
+        move |ev: AgentEvent| {
+            if let AgentEvent::ApprovalRequest { call_id, .. } = &ev {
+                assert!(gate.decide(call_id, answer));
+            }
+            log.lock().unwrap().push(ev);
+        }
+    }
+
+    /// The approval cards of a log: `(name, text, display)` of each.
+    fn cards(log: &Mutex<Vec<AgentEvent>>) -> Vec<(String, String, Option<String>)> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ApprovalRequest { name, text, display, .. } => Some((name.clone(), text.clone(), display.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn target(record: u64, command: &str) -> Option<SendTarget> {
+        Some(SendTarget { record, command: command.to_string() })
+    }
+
+    /// The first write to a command asks; later writes to it run without a card (the latch).
+    #[test]
+    fn send_keys_first_write_asks_then_the_command_is_latched() {
+        let tools = Recorder::default();
+        *tools.keys_target.lock().unwrap() = target(7, "cat");
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let log = Mutex::new(Vec::new());
+        let emit = answering(&gate, &log, true);
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        assert!(ctx.call_tool("send_keys", json!({"text": "ls"})).is_ok());
+        assert!(ctx.call_tool("send_keys", json!({"text": " -l", "keys": ["Enter"]})).is_ok());
+        assert_eq!(
+            reasons(&log),
+            [("send_keys".to_string(), "manual", Some("send_keys")), ("send_keys".to_string(), "auto", Some("latched"))]
+        );
+        assert_eq!(cards(&log).len(), 1, "only the first write showed a card");
+        assert_eq!(tools.keys_reached.lock().unwrap().len(), 2);
+    }
+
+    /// The card shows the decoded input, names the tool, and carries the shell it is for.
+    #[test]
+    fn the_send_keys_card_shows_the_decoded_input() {
+        let tools = Recorder::default();
+        *tools.keys_target.lock().unwrap() = target(7, "cat");
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let log = Mutex::new(Vec::new());
+        let emit = answering(&gate, &log, false);
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        assert!(ctx.call_tool("send_keys", json!({"text": "echo hi", "keys": ["Enter"]})).is_err());
+        assert_eq!(cards(&log), [("send_keys".to_string(), "echo hi⏎".to_string(), Some("echo hi⏎".to_string()))]);
+        assert_eq!(decisions(&log), [named("send_keys", "denied", false)]);
+        assert!(tools.keys_reached.lock().unwrap().is_empty(), "a denied call sends nothing");
+    }
+
+    /// Ctrl-C alone is an interrupt of the agent's own command: auto, in every mode, with no card.
+    #[test]
+    fn ctrl_c_alone_is_auto_in_every_mode() {
+        let tools = Recorder::default();
+        *tools.keys_target.lock().unwrap() = target(7, "sleep 30");
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let log = Mutex::new(Vec::new());
+        let emit = answering(&gate, &log, false);
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        assert!(ctx.call_tool("send_keys", json!({"keys": ["Ctrl-C"]})).is_ok());
+        assert_eq!(reasons(&log), [("send_keys".to_string(), "auto", Some("interrupt"))]);
+        assert!(cards(&log).is_empty());
+        assert_eq!(tools.keys_reached.lock().unwrap().len(), 1);
+    }
+
+    /// Latches are per command: a new command asks again.
+    #[test]
+    fn a_latch_belongs_to_one_command() {
+        let tools = Recorder::default();
+        *tools.keys_target.lock().unwrap() = target(7, "cat");
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let log = Mutex::new(Vec::new());
+        let emit = answering(&gate, &log, true);
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        assert!(ctx.call_tool("send_keys", json!({"text": "a"})).is_ok());
+        *tools.keys_target.lock().unwrap() = target(8, "cat");
+        assert!(ctx.call_tool("send_keys", json!({"text": "b"})).is_ok());
+        assert_eq!(
+            reasons(&log),
+            [("send_keys".to_string(), "manual", Some("send_keys")), ("send_keys".to_string(), "manual", Some("send_keys"))]
+        );
+    }
+
+    /// In a shell the app did not integrate, every Enter asks, latched or not. Approve-all covers it only when nested shells
+    /// follow the local rules.
+    #[test]
+    fn an_enter_in_an_unintegrated_shell_asks_every_time_and_approve_all_follows_the_rules() {
+        let tools = Recorder::default();
+        *tools.keys_target.lock().unwrap() = target(7, "ssh ubuntu@lidia");
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let log = Mutex::new(Vec::new());
+        let emit = answering(&gate, &log, true);
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        let enter = |text: &str| json!({"text": text, "keys": ["Enter"]});
+        assert!(ctx.call_tool("send_keys", enter("echo hi")).is_ok());
+        assert!(ctx.call_tool("send_keys", enter("echo two")).is_ok());
+        gate.set_auto_approve(true, 0);
+        assert!(ctx.call_tool("send_keys", enter("echo three")).is_ok(), "approve-all without follow still asks");
+        let follow = AgentCtx::new(&tools, &gate, &emit).with_rules(TurnRules { follow_local_in_nested: true, ..TurnRules::default() });
+        assert!(follow.call_tool("send_keys", enter("echo four")).is_ok());
+        assert_eq!(
+            reasons(&log),
+            [
+                ("send_keys".to_string(), "manual", Some("unintegrated_shell")),
+                ("send_keys".to_string(), "manual", Some("unintegrated_shell")),
+                ("send_keys".to_string(), "manual", Some("unintegrated_shell")),
+                ("send_keys".to_string(), "auto", Some("approve_all")),
+            ]
+        );
+    }
+
+    /// A line that a deny rule or the hard gate refuses asks with that reason, and nothing is sent unless the user approves.
+    #[test]
+    fn a_deny_rule_or_the_hard_gate_stops_a_typed_line() {
+        let policy = RegexPolicy::new(&ApprovalSettings {
+            mode: ApprovalMode::Regex,
+            allow: Vec::new(),
+            deny: vec!["echo .*".to_string()],
+            ..Default::default()
+        })
+        .expect("the rules compile");
+        let tools = Recorder::default();
+        *tools.keys_target.lock().unwrap() = target(7, "cat");
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let log = Mutex::new(Vec::new());
+        let emit = answering(&gate, &log, false);
+        let ctx = AgentCtx::new(&tools, &gate, &emit).with_policy(&policy);
+        assert!(ctx.call_tool("send_keys", json!({"text": "echo hi", "keys": ["Enter"]})).is_err());
+        assert!(ctx.call_tool("send_keys", json!({"text": "sudo ls", "keys": ["Enter"]})).is_err());
+        assert_eq!(
+            reasons(&log),
+            [("send_keys".to_string(), "denied", Some("deny_rule")), ("send_keys".to_string(), "denied", Some("gate_denylist"))]
+        );
+        assert!(tools.keys_reached.lock().unwrap().is_empty());
+    }
+
+    /// The user typing after an approval revokes the latch: the next call is refused once, and the one after it asks again.
+    #[test]
+    fn user_typing_revokes_the_latch_once_and_the_next_call_asks_again() {
+        let tools = Recorder::default();
+        *tools.keys_target.lock().unwrap() = target(7, "cat");
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let log = Mutex::new(Vec::new());
+        let emit = answering(&gate, &log, true);
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        assert!(ctx.call_tool("send_keys", json!({"text": "x"})).is_ok());
+        *tools.user_writes.lock().unwrap() += 1;
+        let refused = ctx.call_tool("send_keys", json!({"text": "y"})).expect_err("refused once");
+        assert!(refused.contains("the user typed into the terminal since your last write"), "{refused}");
+        assert!(ctx.call_tool("send_keys", json!({"text": "z"})).is_ok());
+        assert_eq!(
+            reasons(&log),
+            [
+                ("send_keys".to_string(), "manual", Some("send_keys")),
+                ("send_keys".to_string(), "refused", None),
+                ("send_keys".to_string(), "manual", Some("send_keys")),
+            ]
+        );
+    }
+
+    /// No command of the agent's, or bad arguments: refused before the card, so the user is not asked.
+    #[test]
+    fn a_call_with_no_target_or_bad_arguments_is_refused_before_the_card() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let log = Mutex::new(Vec::new());
+        let emit = answering(&gate, &log, true);
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        assert!(ctx.call_tool("send_keys", json!({"text": "x"})).is_err());
+        *tools.keys_target.lock().unwrap() = target(7, "cat");
+        assert!(ctx.call_tool("send_keys", json!({"text": "a\nb"})).is_err());
+        assert!(ctx.call_tool("send_keys", json!({})).is_err());
+        assert!(ctx.call_tool("send_keys", json!({"keys": ["Hyper"]})).is_err());
+        assert!(cards(&log).is_empty(), "no card for a refused call");
+        assert_eq!(
+            reasons(&log),
+            [
+                ("send_keys".to_string(), "refused", None),
+                ("send_keys".to_string(), "refused", None),
+                ("send_keys".to_string(), "refused", None),
+                ("send_keys".to_string(), "refused", None),
+            ]
+        );
+        assert!(tools.keys_reached.lock().unwrap().is_empty());
+    }
+
     fn reasons(log: &Mutex<Vec<AgentEvent>>) -> Vec<(String, &'static str, Option<&'static str>)> {
         log.lock()
             .unwrap()
@@ -1220,8 +1562,9 @@ mod tests {
     }
 
     #[test]
-    fn approve_all_skips_the_policy_and_says_approve_all_but_send_keys_still_asks() {
+    fn approve_all_skips_the_policy_for_run_command_and_for_send_keys_in_the_shell_it_is_on() {
         let tools = Recorder::default();
+        *tools.keys_target.lock().unwrap() = Some(SendTarget { record: 7, command: "cat".into() });
         let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
         gate.set_auto_approve(true, 0);
         // No rules: the policy would ask for everything, and the gate would refuse the pipe.
@@ -1230,10 +1573,10 @@ mod tests {
         let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
         let ctx = AgentCtx::new(&tools, &gate, &emit).with_policy(&policy);
         assert!(ctx.call_tool("run_command", json!({"command": "ls | wc"})).is_ok());
-        assert!(ctx.call_tool("send_keys", json!({"bytes": [13]})).is_err());
+        assert!(ctx.call_tool("send_keys", json!({"text": "x"})).is_ok());
         assert_eq!(
             reasons(&log),
-            [("run_command".to_string(), "auto", Some("approve_all")), ("send_keys".to_string(), "denied", Some("send_keys"))]
+            [("run_command".to_string(), "auto", Some("approve_all")), ("send_keys".to_string(), "auto", Some("approve_all"))]
         );
         let asked_for_run_command = log
             .lock()
@@ -1241,7 +1584,7 @@ mod tests {
             .iter()
             .any(|e| matches!(e, AgentEvent::ApprovalRequest { name, .. } if name == "run_command"));
         assert!(!asked_for_run_command, "approve-all showed a card for run_command");
-        assert_eq!(tools.reached(), ["run_command"]);
+        assert_eq!(tools.reached(), ["run_command", "send_keys"]);
     }
 
     #[test]

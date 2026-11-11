@@ -17,10 +17,11 @@ use agent_term_lib::core::chat::redact::Redactor;
 use agent_term_lib::core::chat::todo;
 use agent_term_lib::core::foreground::{Foreground, ForegroundKind};
 use agent_term_lib::core::llm::{TurnCancel, http_client};
+use agent_term_lib::core::keys::KeyPlan;
 use agent_term_lib::core::observer::OpenAgentRecord;
 use agent_term_lib::core::record::{Cwd, RecordStatus, RecordSummary, Source};
 use agent_term_lib::core::session::IntegrateOutcome;
-use agent_term_lib::core::tools::{AgentTools, CommandView, RunOutcome, ScreenView, WaitView};
+use agent_term_lib::core::tools::{AgentTools, CommandView, RunOutcome, ScreenView, SendKeysOutcome, WaitView};
 use serde_json::{Value, json};
 
 const KEY: &str = "sk-or-test-SECRETVALUE-0123456789";
@@ -250,7 +251,7 @@ impl AgentTools for FakeTools {
     fn wait(&self, _seconds: u64, _ignore_updates: bool, _record: Option<u64>) -> Result<WaitView, String> {
         panic!("the loop calls tools by name through `call`")
     }
-    fn send_keys(&self, _bytes: &[u8]) -> Result<(), String> {
+    fn send_keys(&self, _plan: &KeyPlan, _record: Option<u64>, _level: Option<u64>) -> Result<SendKeysOutcome, String> {
         panic!("the loop calls tools by name through `call`")
     }
     fn open_agent_records(&self) -> Vec<OpenAgentRecord> {
@@ -616,10 +617,12 @@ fn invalid_json_arguments_go_back_as_an_error_and_the_model_is_called_again() {
     assert_paired(&msgs);
 }
 
+/// An unknown tool is an error the model sees. send_keys is no longer refused by the loop: it reaches the approval gate, which
+/// refuses this call before any card, because no command of the agent's is running in the fake.
 #[test]
-fn unknown_tool_and_send_keys_are_errors_the_model_can_see() {
+fn unknown_tool_is_an_error_and_send_keys_goes_to_the_gate() {
     let provider = serve(vec![
-        Script::json(tool_reply(&[("call_1", "frobnicate", "{}"), ("call_2", "send_keys", "{\"bytes\":[13]}")])),
+        Script::json(tool_reply(&[("call_1", "frobnicate", "{}"), ("call_2", "send_keys", "{\"keys\":[\"Enter\"]}")])),
         Script::json(text_reply("Understood.")),
     ]);
     let conv = Conversation::new().unwrap();
@@ -631,7 +634,7 @@ fn unknown_tool_and_send_keys_are_errors_the_model_can_see() {
     assert_eq!(provider.requests().len(), 2);
     let msgs = stored(&conv.history());
     assert_eq!(tool_content(&msgs, "call_1"), "error: unknown tool `frobnicate`");
-    assert_eq!(tool_content(&msgs, "call_2"), "error: send_keys is not available in this version");
+    assert_eq!(tool_content(&msgs, "call_2"), "error: send_keys is not available here");
     assert_paired(&msgs);
 }
 
@@ -806,7 +809,7 @@ fn polling_replies_do_not_count_toward_the_model_call_cap() {
     let provider = serve(vec![
         Script::json(tool_reply(&[("call_1", "wait", "{\"seconds\":1}")])),
         Script::json(tool_reply(&[("call_2", "get_screen", "{}")])),
-        Script::json(tool_reply(&[("call_3", "wait", "{\"seconds\":1}"), ("call_4", "send_keys", "{\"bytes\":[13]}")])),
+        Script::json(tool_reply(&[("call_3", "wait", "{\"seconds\":1}"), ("call_4", "send_keys", "{\"keys\":[\"Enter\"]}")])),
         Script::json(tool_reply(&[("call_5", "wait", "{\"seconds\":1}")])),
         Script::json(tool_reply(&[("call_6", "get_screen", "{}")])),
         Script::json(text_reply("done")),
@@ -946,7 +949,7 @@ fn the_request_carries_the_system_prompt_tools_auth_session_header_and_history()
     assert_eq!(first["stream"], false);
     let names: Vec<&str> = first["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
     assert!(names.contains(&"get_cwd") && names.contains(&"run_command"), "{names:?}");
-    assert!(!names.contains(&"send_keys"), "send_keys is not advertised: {names:?}");
+    assert!(names.contains(&"send_keys"), "send_keys is advertised: {names:?}");
     assert_eq!(names.len(), prompt::tool_definitions().len());
 
     let second = body_of(&requests[1]);

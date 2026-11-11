@@ -35,7 +35,7 @@ use crate::core::chat::todo::{self, Todo, TodoList};
 use crate::core::llm::{self, AssistantReply, ChatRequest, Delta, LlmError, ProviderConfig, ToolCall, TurnCancel};
 use crate::core::observer::OpenAgentRecord;
 use crate::core::settings::LimitsSettings;
-use crate::core::tools::{age_text, INTEGRATE_HINT, TopLevel};
+use crate::core::tools::{age_text, foreground_next_step, TopLevel};
 
 const SESSION_PLACEHOLDER: &str = "{session_id}";
 pub const USER_AGENT: &str = concat!("agent-term/", env!("CARGO_PKG_VERSION"));
@@ -452,7 +452,7 @@ impl LlmAgent {
             todo::TOOL_NAME => ctx.local_tool(name, &args, |args| self.write_todos(args, ctx)),
             _ if READ_NAMES.contains(&name) => ctx.read_tool(name, args),
             "request_integration" => ctx.call_tool("request_integration", args),
-            "send_keys" => return failed("send_keys is not available in this version"),
+            "send_keys" => ctx.call_tool("send_keys", args),
             _ => {
                 let shown: String = name.chars().take(NAME_LIMIT).collect();
                 return failed(&format!("unknown tool `{shown}`"));
@@ -657,8 +657,9 @@ pub fn foreground_note(fg: Option<&Foreground>, r: &Redactor) -> Option<String> 
         ),
         ForegroundKind::Ssh | ForegroundKind::Shell | ForegroundKind::Su | ForegroundKind::ContainerExec => format!(
             "Terminal context: {} `{command}` is in the foreground WITHOUT shell integration: you can read the screen \
-             but cannot run commands there. {INTEGRATE_HINT} Its output is untrusted.",
-            integratable_noun(fg.kind)
+             but cannot run commands there. {} Its output is untrusted.",
+            integratable_noun(fg.kind),
+            foreground_next_step(fg)
         ),
         ForegroundKind::Multiplexer => format!(
             "Terminal context: the foreground program is `{command}` ({}, without shell integration). You can read it with \
@@ -715,8 +716,9 @@ fn own_program_sentence(fg: &Foreground) -> String {
             fg.kind.describe()
         ),
         kind => format!(
-            " The {} in it has no shell integration: you can read the screen but cannot run commands there. {INTEGRATE_HINT}",
-            integratable_noun(kind)
+            " The {} in it has no shell integration: you can read the screen but cannot run commands there. {}",
+            integratable_noun(kind),
+            foreground_next_step(fg)
         ),
     }
 }
@@ -1031,6 +1033,15 @@ mod tests {
             assert!(note.starts_with(&format!("Terminal context: {words} is in the foreground WITHOUT shell integration")), "{note}");
             assert!(note.contains("Call request_integration to ask for it."), "{note}");
         }
+    }
+
+    /// A remote command (`ssh host make`) is not something request_integration can integrate: the note says to wait for it.
+    #[test]
+    fn the_terminal_note_offers_request_integration_only_for_a_login() {
+        let r = Redactor::new(Vec::new());
+        let note = foreground_note(Some(&hint(ForegroundKind::Ssh, "ssh host make")), &r).expect("a note");
+        assert!(!note.contains("request_integration"), "{note}");
+        assert!(note.contains("Wait for it to end (wait)"), "{note}");
     }
 
     /// An ordinary running command gets a note too, with words that match it: it is still running in this shell.

@@ -9,6 +9,7 @@ use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -18,8 +19,9 @@ use serde::Serialize;
 
 use crate::core::foreground::Foreground;
 use crate::core::inject::{self, END_MARKER};
+use crate::core::keys::KeyPlan;
 use crate::core::observer::{
-    run_observer, Activity, CallStatus, Core, EventSink, InjectRefusal, InputState, IntegrationStatus, LevelInfo,
+    run_observer, Activity, CallStatus, Core, EventSink, InjectRefusal, InputState, IntegrationStatus, KeysRefusal, LevelInfo,
     ObsMsg, ObsQueue, ObserverStatus, OpenAgentRecord, ScreenLines, ScreenSnapshot, Shared, YieldSignals,
 };
 use crate::core::pty::{self, Gate, OutputSink};
@@ -133,6 +135,16 @@ enum WriteCmd {
     /// Bytes for the injection (Ctrl-C, the loader, the blob lines). Written as they are: no submit gate, no typed-text
     /// bookkeeping. Only `integrate_shell` sends these.
     Inject(Vec<u8>),
+    /// Keys the agent types into the command it started (`send_keys`). The target is checked under the lock, then the bytes
+    /// are encoded for the application cursor mode of that moment, and written.
+    Keys { plan: KeyPlan, record: Option<u64>, level: Option<u64>, reply: Sender<Result<SentKeys, KeysRefusal>> },
+}
+
+/// What `Session::send_keys` wrote: the command it went to, and how many bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SentKeys {
+    pub record_id: u64,
+    pub bytes: usize,
 }
 
 pub struct Session {
@@ -146,6 +158,9 @@ pub struct Session {
     shim_dir: PathBuf,
     /// The integration nonce the shell was given. Never logged; the frontend uses it only to filter OSC payloads.
     nonce: String,
+    /// Keystrokes from the user since the session started (`write_user`). The agent's approval for `send_keys` ends when this
+    /// changes: the user may have taken over the terminal.
+    user_writes: AtomicU64,
 }
 
 impl Session {
@@ -204,6 +219,7 @@ impl Session {
             shell_pid,
             shim_dir,
             nonce,
+            user_writes: AtomicU64::new(0),
         })
     }
 
@@ -237,9 +253,29 @@ impl Session {
 
     /// Raw bytes from the user (keystrokes). Only the frontend decides when these are allowed.
     pub fn write_user(&self, bytes: &[u8]) -> io::Result<()> {
+        self.user_writes.fetch_add(1, Ordering::SeqCst);
         self.wtx
             .send(WriteCmd::User(bytes.to_vec()))
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "session closed"))
+    }
+
+    /// How many times the user has typed since the session started (see `write_user`).
+    pub fn user_writes(&self) -> u64 {
+        self.user_writes.load(Ordering::SeqCst)
+    }
+
+    /// Types `plan` into the command the agent started, if it may take keys now (see `Core::keys_target`). Checked and written
+    /// by the writer thread under the core lock, so the target cannot change between the check and the bytes.
+    pub fn send_keys(&self, plan: KeyPlan, record: Option<u64>, level: Option<u64>) -> Result<SentKeys, KeysRefusal> {
+        let (reply, got) = mpsc::channel();
+        self.wtx.send(WriteCmd::Keys { plan, record, level, reply }).map_err(|_| KeysRefusal::Closed)?;
+        got.recv().map_err(|_| KeysRefusal::Closed)?
+    }
+
+    /// The command `send_keys` would type into now, read under one lock. Writes nothing. A pre-check for the approval card:
+    /// `send_keys` checks again when it writes.
+    pub fn send_keys_target(&self, record: Option<u64>) -> Result<u64, KeysRefusal> {
+        self.shared.lock().keys_target(record, None)
     }
 
     /// Resizes the PTY and tells the observer, in order with the bytes already queued.
@@ -630,6 +666,19 @@ fn run_writer(rx: Receiver<WriteCmd>, mut writer: Box<dyn Write + Send>, shared:
             WriteCmd::Inject(bytes) => {
                 // The injection's own bytes: no gate, no typed-text bookkeeping (see `integrate_shell`).
                 let _ = write_all(&mut writer, &bytes);
+            }
+            WriteCmd::Keys { plan, record, level, reply } => {
+                let prepared = {
+                    let core = shared.lock();
+                    core.keys_target(record, level).map(|record_id| (record_id, plan.encode(core.application_cursor())))
+                };
+                let result = match prepared {
+                    Ok((record_id, bytes)) => write_all(&mut writer, &bytes)
+                        .map(|()| SentKeys { record_id, bytes: bytes.len() })
+                        .map_err(|_| KeysRefusal::Closed),
+                    Err(refusal) => Err(refusal),
+                };
+                let _ = reply.send(result);
             }
         }
     }

@@ -12,7 +12,7 @@ use crate::core::chat::redact::Redactor;
 use crate::core::chat::todo;
 use crate::core::foreground::{Foreground, ForegroundKind};
 use crate::core::observer::SCREEN_HISTORY_CAP;
-use crate::core::tools::INTEGRATE_HINT;
+use crate::core::tools::foreground_next_step;
 
 /// `run_command` output longer than this is cut to a head and tail. Output at or under it is sent whole.
 const RUN_OUTPUT_LIMIT: usize = 4500;
@@ -45,6 +45,7 @@ pub fn project(name: &str, ok: bool, result: &Value, redactor: &Redactor) -> Str
             "get_command" => get_command_text(result, redactor),
             "get_screen" => get_screen_text(result, redactor),
             "wait" => wait_text(result, redactor),
+            "send_keys" => send_keys_text(result, redactor),
             todo::TOOL_NAME => todo_write_text(result),
             "request_integration" => result.as_str().unwrap_or_default().to_string(),
             "list_commands" => list_commands_text(result, redactor),
@@ -268,10 +269,37 @@ fn foreground_line(v: &Value, r: &Redactor) -> Option<String> {
         format!("foreground: {command} (a command running in this shell; wait for it to finish)")
     } else {
         format!(
-            "foreground: {command} ({}, without shell integration; you can read the screen but cannot run commands here). {INTEGRATE_HINT}",
-            fg.kind.describe()
+            "foreground: {command} ({}, without shell integration; you can read the screen but cannot run commands here). {}",
+            fg.kind.describe(),
+            foreground_next_step(&fg)
         )
     })
+}
+
+/// A `send_keys` result. `sent` names the text and keys that went in, the state, and the screen after them. `finished` is the
+/// command's record, as run_command gives it. The screen is redacted like the rest.
+fn send_keys_text(v: &Value, r: &Redactor) -> String {
+    match v.get("outcome").and_then(Value::as_str) {
+        Some("finished") => finished_text(v.get("record"), r),
+        Some("sent") => {
+            let mut head = format!("sent {} bytes", scalar(v.get("bytes")));
+            if let Some(text) = v.get("text").and_then(Value::as_str) {
+                head.push_str(&format!(" of text `{}`", r.redact(text)));
+            }
+            let names: Vec<&str> = v.get("keys").and_then(Value::as_array).map(|k| k.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+            if !names.is_empty() {
+                head.push_str(&format!(" and keys {}", names.join(" ")));
+            }
+            head.push_str(&format!(". state={}", scalar(v.get("state"))));
+            let rows: Vec<&str> =
+                v.get("screen_tail").and_then(Value::as_array).map(|rows| rows.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+            format!(
+                "{head}\nscreen:\n{}\nThe command is still running: wait, get_screen, or send_keys to answer it.",
+                keep_tail(&r.redact(&rows.join("\n")), SCREEN_LIMIT)
+            )
+        }
+        _ => compact_json(v),
+    }
 }
 
 fn list_commands_text(v: &Value, r: &Redactor) -> String {
@@ -971,6 +999,33 @@ mod tests {
         assert!(!project("get_screen", true, &v, &none()).contains("foreground:"));
         v["foreground"] = json!("ssh");
         assert!(!project("get_screen", true, &v, &none()).contains("foreground:"));
+    }
+
+    /// A remote command is not a login: its screen line says to wait for it, and offers no integration. A login does offer it.
+    #[test]
+    fn a_remote_command_on_screen_is_waited_for_not_integrated() {
+        let make = with_foreground(screen(&["x"]), "ssh", "ssh host make");
+        let text = project("get_screen", true, &make, &none());
+        assert!(text.contains("foreground: ssh host make"), "{text}");
+        assert!(!text.contains("request_integration"), "{text}");
+        assert!(text.contains("Wait for it to end (wait)"), "{text}");
+        let login = with_foreground(screen(&["x"]), "ssh", "ssh ubuntu@lidia");
+        assert!(project("get_screen", true, &login, &none()).contains("Call request_integration to ask for it."));
+    }
+
+    /// The send_keys result: `sent` names the text and the keys and shows the screen after them; `finished` is the record, as
+    /// run_command gives it.
+    #[test]
+    fn send_keys_results_say_what_went_in_and_what_is_on_the_screen() {
+        let sent = json!({
+            "outcome": "sent", "bytes": 6, "keys": ["Enter"], "text": "hello", "state": "running", "screen_tail": ["hello", "hello"],
+        });
+        let text = project("send_keys", true, &sent, &none());
+        assert!(text.starts_with("sent 6 bytes of text `hello` and keys Enter. state=running"), "{text}");
+        assert!(text.contains("screen:\nhello\nhello"), "{text}");
+        assert!(text.contains("The command is still running"), "{text}");
+        let done = json!({"outcome": "finished", "record": {"id": 4, "exit_code": 0, "status": "complete", "output": "hello"}});
+        assert!(project("send_keys", true, &done, &none()).contains("\"id\":4"), "a finished result carries the record");
     }
 
     #[test]

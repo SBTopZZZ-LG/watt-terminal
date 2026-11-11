@@ -740,3 +740,66 @@ fn ssh_run_command_returns_early_at_the_remote_prompt_and_integration_follows() 
         h.levels()
     );
 }
+
+/// Un-integrated ssh: run_command returns `remote_shell` at the remote prompt. send_keys then types into that shell. Each Enter
+/// asks, since the shell has no integration, and approve-all in the local shell does not cover it without follow_local.
+/// request_integration still works after that.
+#[test]
+#[ignore = "needs docker, network for apt on the first run, and the image in AT_TEST_IMAGE (default ubuntu:24.04)"]
+fn send_keys_types_into_an_unintegrated_remote_shell_with_approval_and_integration_still_works() {
+    let _g = serial();
+    let remote = Remote::start();
+    let h = start();
+    wait_prompt(&h);
+    let bash = remote_bash(&remote.container.0);
+    let tools = SessionTools::new(&h);
+    let v = tools
+        .call("run_command", &json!({"command": remote.ssh_command("tester"), "wait_seconds": 8}), None)
+        .expect("run_command");
+    assert_eq!(v["outcome"], "running", "{v}");
+    if bash < (5, 1) {
+        println!("bash {}.{} turns bracketed paste off: no early return, so this test has nothing to check", bash.0, bash.1);
+        return;
+    }
+    assert_eq!(v["reason"], "remote_shell", "{v}");
+    let id = v["record_id"].as_u64().expect("the record id");
+
+    let gate = Arc::new(ApprovalGate::with_timeout(WAIT));
+    let log: Log = Arc::default();
+    let (sink, answers) = (log.clone(), gate.clone());
+    let emit = move |ev: AgentEvent| {
+        if let AgentEvent::ApprovalRequest { call_id, .. } = &ev {
+            assert!(answers.decide(call_id, true), "the card was waiting");
+        }
+        sink.lock().unwrap().push(ev);
+    };
+    let ctx = AgentCtx::new(&tools, &gate, &emit);
+    let sent = ctx
+        .call_tool("send_keys", json!({"text": "echo hi", "keys": ["Enter"], "id": id}))
+        .expect("the Enter asks, then is typed");
+    assert_eq!(sent["outcome"], "sent", "{sent}");
+    assert!(
+        wait_until(WAIT, || h.screen_snapshot().rows.iter().any(|r| r.trim() == "hi").then_some(())).is_some(),
+        "the remote shell printed hi: {:?}",
+        h.screen_snapshot().rows
+    );
+
+    gate.set_auto_approve(true, h.top_key());
+    ctx.call_tool("send_keys", json!({"text": "echo again", "keys": ["Enter"]})).expect("asks again under approve-all");
+    let reasons: Vec<&'static str> = log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ApprovalRequest { name, reason, .. } if name == "send_keys" => *reason,
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reasons, ["unintegrated_shell", "unintegrated_shell"], "every Enter in the un-integrated shell asked");
+
+    let rules = TurnRules { integrate_without_asking: true, ..TurnRules::default() };
+    let ctx = AgentCtx::new(&tools, &gate, &emit).with_rules(rules);
+    let text = ctx.call_tool("request_integration", json!({})).expect("integrated after the sends");
+    let text = text.as_str().unwrap_or_default().to_string();
+    assert!(text.starts_with("Integrated ssh ") && text.contains("(bash as tester@"), "{text}");
+}

@@ -5,8 +5,8 @@ use serde_json::{Value, json};
 use crate::core::chat::todo;
 use crate::core::tools::{self, ToolSchema};
 
-/// Tools the model is never offered. `send_keys` is a stub and stays out of the request until it has its own approval.
-const HIDDEN_TOOLS: [&str; 1] = ["send_keys"];
+/// Tools the model is never offered. None now: `send_keys` is offered, with its own approval (core/approval).
+const HIDDEN_TOOLS: [&str; 0] = [];
 
 const SYSTEM_PROMPT: &str = "You are an assistant inside a terminal app. You share the user's live zsh session: \
 commands you run are typed into the user's own interactive shell, and the user can see them. \
@@ -52,9 +52,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn send_keys_is_not_advertised() {
-        let names: Vec<String> = tool_definitions().iter().map(|d| d["function"]["name"].to_string()).collect();
-        assert!(!names.iter().any(|n| n.contains("send_keys")), "{names:?}");
+    fn send_keys_is_advertised_once() {
+        let defs = tool_definitions();
+        let count = defs.iter().filter(|d| d["function"]["name"] == "send_keys").count();
+        assert_eq!(count, 1);
     }
 
     #[test]

@@ -274,6 +274,74 @@ impl std::fmt::Display for InjectRefusal {
     }
 }
 
+/// Why `send_keys` may not type now (see `Core::keys_target`). The texts are for the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeysRefusal {
+    /// The session is closed: nothing can be written.
+    Closed,
+    /// The observer lost output and has not seen a prompt since.
+    Desynced,
+    /// The shell on top is not the one the call was approved for (another shell started, or the shell exited).
+    Location,
+    /// The shell is at its prompt or has just been submitted: no command is running.
+    NothingRunning,
+    /// The top level is in a state that takes no keys (booting, a continuation, unresponsive, no integration, exited).
+    NotRunning(InputState),
+    /// No command is open at the top level.
+    NoCommand,
+    /// The command open at the top level was not started by the agent: it is the user's.
+    NotAgents,
+    /// The command open at the top level is not the one the call names (`wanted`), or the call is bound to another one.
+    WrongCommand { wanted: Option<u64>, open: u64 },
+    /// The command has finished: its D has been seen.
+    Finished,
+}
+
+impl std::fmt::Display for KeysRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KeysRefusal::Closed => write!(f, "the session is closed"),
+            KeysRefusal::Desynced => write!(f, "the shell output was lost; nothing was sent: use get_screen, then decide again"),
+            KeysRefusal::Location => write!(
+                f,
+                "the shell you were working in has changed (it exited or another shell started); nothing was sent: check the \
+                 screen and decide again"
+            ),
+            KeysRefusal::NothingRunning => write!(
+                f,
+                "nothing is running; use run_command to start a command at an idle prompt"
+            ),
+            KeysRefusal::NotRunning(state) => write!(
+                f,
+                "the session is {state:?}, so keys cannot be sent to a command now: use get_screen and wait, or ask the user"
+            ),
+            KeysRefusal::NoCommand => write!(
+                f,
+                "no command is open at the top of the shell: use get_screen to see what is there, and run_command only at an \
+                 idle prompt"
+            ),
+            KeysRefusal::NotAgents => write!(
+                f,
+                "the command in the shell was not started by you, so keys cannot be sent to it: use get_screen and ask the user \
+                 to act"
+            ),
+            KeysRefusal::WrongCommand { wanted: Some(id), open } => write!(
+                f,
+                "command id {id} is not the one running; the running command is id {open}. Use that id, or leave out id."
+            ),
+            KeysRefusal::WrongCommand { wanted: None, open } => write!(
+                f,
+                "the command you sent keys to has changed; the running command is id {open}. Use get_screen and decide again."
+            ),
+            KeysRefusal::Finished => write!(
+                f,
+                "that command has finished, so keys cannot be sent to it: use get_command for its output, or run_command for a \
+                 new command"
+            ),
+        }
+    }
+}
+
 /// Session changes for listeners (the UI). Delivered in order, outside the core lock.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -1507,6 +1575,48 @@ impl Core {
     pub fn foreground_is_login(&self) -> bool {
         self.lifecycle_view() == InputState::Running
             && self.parser.callbacks().open.as_ref().is_some_and(|open| foreground::is_login(&open.record.command))
+    }
+
+    /// True while the application cursor mode is on (vt100's `Screen::application_cursor`): arrows and Home/End then take the
+    /// `ESC O` form. Read under the caller's lock, right before the keys are encoded.
+    pub fn application_cursor(&self) -> bool {
+        self.parser.screen().application_cursor()
+    }
+
+    /// Whether `send_keys` may type into the command on top now, and the id of that command. Writes nothing. The writer
+    /// calls it under the same lock as the write, so the answer holds for the bytes it sends. Only a command the agent
+    /// started and that is running (Running or Alt) takes keys. `record` is the id the call was approved for (or the one
+    /// the model named), and `level` the shell key it was approved for. None means no check of that kind.
+    pub fn keys_target(&self, record: Option<u64>, level: Option<u64>) -> Result<u64, KeysRefusal> {
+        if self.desynced {
+            return Err(KeysRefusal::Desynced);
+        }
+        if level.is_some_and(|key| key != self.top_key()) {
+            return Err(KeysRefusal::Location);
+        }
+        let state = self.lifecycle_view();
+        if matches!(state, InputState::Prompt | InputState::Submitted) {
+            return Err(KeysRefusal::NothingRunning);
+        }
+        if !matches!(state, InputState::Running | InputState::Alt) {
+            return Err(KeysRefusal::NotRunning(state));
+        }
+        let Some(open) = self.parser.callbacks().open.as_ref() else {
+            return Err(KeysRefusal::NoCommand);
+        };
+        if !matches!(open.record.source, Source::Agent { .. }) {
+            return Err(KeysRefusal::NotAgents);
+        }
+        let open_id = open.record.id;
+        // A command's D closes its record, so an open record has not had its D. The check is kept anyway: a finished record
+        // must never take keys, whatever closed it.
+        if self.records.iter().any(|r| r.id == open_id) {
+            return Err(KeysRefusal::Finished);
+        }
+        if let Some(wanted) = record.filter(|&id| id != open_id) {
+            return Err(KeysRefusal::WrongCommand { wanted: Some(wanted), open: open_id });
+        }
+        Ok(open_id)
     }
 
     /// Called by the writer under the same lock as the check. Moves to Submitted and records the pending attribution.
@@ -2813,6 +2923,43 @@ mod tests {
         assert!(sig.quiet_for < Duration::from_secs(1), "{:?}", sig.quiet_for);
         let later = c.yield_signals("run-s", now + Duration::from_millis(600));
         assert!(later.quiet_for >= Duration::from_millis(590), "the quiet time is measured to the poll: {:?}", later.quiet_for);
+    }
+
+    /// `send_keys` may type into the agent's own command on top, while it runs. Each other case is its own refusal.
+    #[test]
+    fn keys_target_takes_only_the_agents_running_command_on_top() {
+        let mut idle = core();
+        idle.lifecycle = Lifecycle::Prompt;
+        assert_eq!(idle.keys_target(None, None), Err(KeysRefusal::NothingRunning), "at a prompt");
+
+        let mut c = core();
+        agent_command_open(&mut c, "run-k", "cat");
+        let id = c.open_agent_records()[0].id;
+        assert_eq!(c.keys_target(None, None), Ok(id));
+        assert_eq!(c.keys_target(Some(id), Some(LOCAL_KEY)), Ok(id), "the named id and the approved shell match");
+        assert_eq!(c.keys_target(Some(id + 1), None), Err(KeysRefusal::WrongCommand { wanted: Some(id + 1), open: id }));
+        assert_eq!(c.keys_target(None, Some(LOCAL_KEY + 5)), Err(KeysRefusal::Location), "another shell is on top");
+
+        let mut user = core();
+        user.lifecycle = Lifecycle::Prompt;
+        user.handle(Event::CommandLine("cat".into()));
+        user.handle(Event::CommandStart);
+        assert_eq!(user.keys_target(None, None), Err(KeysRefusal::NotAgents), "the user's own command");
+
+        c.handle(Event::CommandEnd { exit: 0, pipestatus: vec![0] });
+        assert_eq!(c.keys_target(None, None), Err(KeysRefusal::NoCommand), "after its D there is no open command");
+        assert!(c.records.iter().any(|r| r.id == id), "the finished record is kept");
+    }
+
+    /// The application cursor mode is read from the screen: DECCKM on turns it on.
+    #[test]
+    fn the_application_cursor_mode_follows_the_screen() {
+        let mut c = core();
+        assert!(!c.application_cursor());
+        c.apply(ObsMsg::Bytes(b"\x1b[?1h".to_vec()));
+        assert!(c.application_cursor());
+        c.apply(ObsMsg::Bytes(b"\x1b[?1l".to_vec()));
+        assert!(!c.application_cursor());
     }
 
     /// Output that came before the command's C does not count as output since its start.
