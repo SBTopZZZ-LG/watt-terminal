@@ -6,19 +6,36 @@
 //! escape codes) from faking prompts or command boundaries. It does not stop code running in the
 //! pane, which can read the nonce from the shell's own events. That is accepted for slice 1.
 //!
+//! The scanner accepts a set of nonces, one per shell level (level 0 is the local shell's session
+//! nonce). Each accepted nonce carries its level key, and every Found says which level tagged it. A
+//! nonce that was accepted and later retired (its level was popped) counts as stale, not forged: a
+//! late event from a shell that has gone is expected. A nonce never seen is forged.
+//!
 //! OSC 7 is not nonce-tagged: it can only change the displayed cwd. Titles (OSC 0/1/2) are ignored.
 //! The parser keeps its state between `feed` calls, so sequences split across PTY reads still parse.
 
+use std::collections::VecDeque;
+
 /// OSC payloads longer than this are discarded. Integration events are much shorter.
 pub const OSC_CAP: usize = 4096;
+/// Retired nonces remembered for the stale count. The oldest are forgotten first.
+pub const RETIRED_CAP: usize = 16;
+/// Longest value kept from a 633;Hello text field (sh, ver, user, host). Longer values are cut.
+pub const HELLO_FIELD_CAP: usize = 255;
 
 const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
-    /// 633;Hello: the shell finished loading the integration.
-    Hello { pid: u32 },
+    /// 633;Hello: the shell finished loading the integration. The text fields are optional and unknown ones are ignored.
+    Hello {
+        pid: u32,
+        sh: Option<String>,
+        ver: Option<String>,
+        user: Option<String>,
+        host: Option<String>,
+    },
     /// 133;A: prompt start.
     PromptStart,
     /// 133;P: continuation prompt (PS2), zsh is waiting for more input.
@@ -29,17 +46,21 @@ pub enum Event {
     CommandStart,
     /// 133;D: command finished.
     CommandEnd { exit: i32, pipestatus: Vec<i32> },
+    /// 633;Cwd (tagged): the working directory of a nested level, escaped like E.
+    LevelCwd { path: String },
     /// OSC 7: working directory.
     Cwd { host: String, path: String },
     /// CSI ... r (DECSTBM). vt100 does not report rows scrolled inside a region, so records are marked approximate.
     ScrollRegion,
 }
 
-/// An event and the index just past its terminator, relative to the slice given to `feed`.
+/// An event and the index just past its terminator, relative to the slice given to `feed`. `level` is the key of the
+/// level whose nonce tagged the event. None for untagged events (OSC 7).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Found {
     pub end: usize,
     pub event: Event,
+    pub level: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,28 +74,59 @@ enum State {
 }
 
 pub struct Scanner {
-    /// The exact field that must appear at index 2 of a tagged event: `n=<nonce>`.
-    nonce_field: Vec<u8>,
+    /// Accepted nonces, each with its level key. Key 0 is the local shell's session nonce.
+    accepted: Vec<(u64, String)>,
+    /// Nonces of popped levels, most recent last. Bounded by `RETIRED_CAP`.
+    retired: VecDeque<String>,
     state: State,
     buf: Vec<u8>,
     osc_overflow: bool,
     forged: u64,
+    stale: u64,
 }
 
 impl Scanner {
     pub fn new(nonce: &str) -> Self {
         Scanner {
-            nonce_field: format!("n={nonce}").into_bytes(),
+            accepted: vec![(0, nonce.to_string())],
+            retired: VecDeque::new(),
             state: State::Ground,
             buf: Vec::new(),
             osc_overflow: false,
             forged: 0,
+            stale: 0,
         }
+    }
+
+    /// Accepts `nonce` as the tag of level `key`. Keys are never reused.
+    pub fn add_nonce(&mut self, key: u64, nonce: &str) {
+        self.accepted.push((key, nonce.to_string()));
+    }
+
+    /// Stops accepting the nonce of level `key`. Its late events are then counted as stale.
+    pub fn retire_nonce(&mut self, key: u64) {
+        if let Some(pos) = self.accepted.iter().position(|(k, _)| *k == key) {
+            let (_, nonce) = self.accepted.remove(pos);
+            self.retired.push_back(nonce);
+            while self.retired.len() > RETIRED_CAP {
+                self.retired.pop_front();
+            }
+        }
+    }
+
+    /// The nonces currently accepted (the local one, the live levels and any pending one). Retired ones are left out.
+    pub fn accepted_nonces(&self) -> Vec<String> {
+        self.accepted.iter().map(|(_, n)| n.clone()).collect()
     }
 
     /// Number of 133/633 sequences rejected for a missing or wrong nonce.
     pub fn forged_events(&self) -> u64 {
         self.forged
+    }
+
+    /// Number of 133/633 sequences tagged with a retired nonce: late events from a popped level.
+    pub fn stale_events(&self) -> u64 {
+        self.stale
     }
 
     /// Drops any partial sequence. Used after the observer lost bytes, so a half-read sequence is not completed by later data.
@@ -87,14 +139,14 @@ impl Scanner {
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<Found> {
         let mut out = Vec::new();
         for (i, &b) in bytes.iter().enumerate() {
-            if let Some(event) = self.step(b) {
-                out.push(Found { end: i + 1, event });
+            if let Some((event, level)) = self.step(b) {
+                out.push(Found { end: i + 1, event, level });
             }
         }
         out
     }
 
-    fn step(&mut self, b: u8) -> Option<Event> {
+    fn step(&mut self, b: u8) -> Option<(Event, Option<u64>)> {
         match self.state {
             State::Ground => {
                 if b == ESC {
@@ -163,14 +215,14 @@ impl Scanner {
                 }
                 0x40..=0x7e => {
                     self.state = State::Ground;
-                    (plain && b == b'r').then_some(Event::ScrollRegion)
+                    (plain && b == b'r').then_some((Event::ScrollRegion, None))
                 }
                 _ => None,
             },
         }
     }
 
-    fn finish_osc(&mut self) -> Option<Event> {
+    fn finish_osc(&mut self) -> Option<(Event, Option<u64>)> {
         let payload = std::mem::take(&mut self.buf);
         if self.osc_overflow {
             self.osc_overflow = false;
@@ -178,29 +230,43 @@ impl Scanner {
         }
         let (code, rest) = split_first(&payload, b';');
         match code {
-            b"7" => parse_cwd(rest),
+            b"7" => parse_cwd(rest).map(|e| (e, None)),
             b"133" | b"633" => self.parse_integration(&payload),
             _ => None,
         }
     }
 
-    /// `payload` is the whole OSC body, e.g. `133;D;n=<nonce>;exit=0;ps=0`.
-    fn parse_integration(&mut self, payload: &[u8]) -> Option<Event> {
+    /// `payload` is the whole OSC body, e.g. `133;D;n=<nonce>;exit=0;ps=0`. The nonce at field 2 picks the level:
+    /// accepted gives its key, retired counts as stale, anything else is forged.
+    fn parse_integration(&mut self, payload: &[u8]) -> Option<(Event, Option<u64>)> {
         let fields: Vec<&[u8]> = payload.split(|&c| c == b';').collect();
-        if fields.len() < 3 || fields[2] != self.nonce_field.as_slice() {
+        let Some(nonce) = fields.get(2).and_then(|f| f.strip_prefix(b"n=")) else {
             self.forged += 1;
             return None;
-        }
-        match (fields[0], fields[1]) {
-            (b"133", b"A") => Some(Event::PromptStart),
-            (b"133", b"P") => Some(Event::Continuation),
-            (b"133", b"C") => Some(Event::CommandStart),
-            (b"133", b"D") => parse_command_end(&fields[3..]),
-            (b"633", b"E") => Some(Event::CommandLine(unescape_e(&join_fields(&fields[3..])))),
-            (b"633", b"Hello") => parse_hello(&fields[3..]),
+        };
+        let level = match self.accepted.iter().find(|(_, n)| n.as_bytes() == nonce) {
+            Some((key, _)) => *key,
+            None if self.retired.iter().any(|n| n.as_bytes() == nonce) => {
+                self.stale += 1;
+                return None;
+            }
+            None => {
+                self.forged += 1;
+                return None;
+            }
+        };
+        let event = match (fields[0], fields[1]) {
+            (b"133", b"A") => Event::PromptStart,
+            (b"133", b"P") => Event::Continuation,
+            (b"133", b"C") => Event::CommandStart,
+            (b"133", b"D") => parse_command_end(&fields[3..])?,
+            (b"633", b"E") => Event::CommandLine(unescape_e(&join_fields(&fields[3..]))),
+            (b"633", b"Hello") => parse_hello(&fields[3..])?,
+            (b"633", b"Cwd") => Event::LevelCwd { path: unescape_e(&join_fields(&fields[3..])) },
             // B (prompt end) and Degraded carry no state change for the observer.
-            _ => None,
-        }
+            _ => return None,
+        };
+        Some((event, Some(level)))
     }
 }
 
@@ -233,7 +299,20 @@ fn parse_hello(fields: &[&[u8]]) -> Option<Event> {
         return None;
     }
     let pid = std::str::from_utf8(field_value(fields, b"pid=")?).ok()?.parse().ok()?;
-    Some(Event::Hello { pid })
+    Some(Event::Hello {
+        pid,
+        sh: text_field(fields, b"sh="),
+        ver: text_field(fields, b"ver="),
+        user: text_field(fields, b"user="),
+        host: text_field(fields, b"host="),
+    })
+}
+
+/// An optional text field of a Hello, cut to `HELLO_FIELD_CAP` bytes.
+fn text_field(fields: &[&[u8]], key: &[u8]) -> Option<String> {
+    let value = field_value(fields, key)?;
+    let kept = &value[..value.len().min(HELLO_FIELD_CAP)];
+    Some(String::from_utf8_lossy(kept).into_owned())
 }
 
 /// `7;file://HOST/PATH` (payload after the code), path percent-encoded.
@@ -321,9 +400,82 @@ mod tests {
                 Event::CommandLine("echo a;b".into()),
                 Event::CommandStart,
                 Event::CommandEnd { exit: 3, pipestatus: vec![0, 3] },
-                Event::Hello { pid: 4242 },
+                Event::Hello { pid: 4242, sh: None, ver: None, user: None, host: None },
             ]
         );
+    }
+
+    /// The zsh shim's Hello (no sh/ver/user/host) and the new optional fields, with unknown fields ignored.
+    #[test]
+    fn hello_fields_are_optional_and_capped() {
+        let long = "h".repeat(HELLO_FIELD_CAP + 40);
+        let body = format!("633;Hello;n={NONCE};v=1;sh=bash;ver=5.2;user=ubuntu;host={long};pid=77;extra=zzz");
+        let got = events(&osc(&body));
+        assert_eq!(
+            got,
+            vec![Event::Hello {
+                pid: 77,
+                sh: Some("bash".into()),
+                ver: Some("5.2".into()),
+                user: Some("ubuntu".into()),
+                host: Some("h".repeat(HELLO_FIELD_CAP)),
+            }]
+        );
+        assert!(events(&osc(&format!("633;Hello;n={NONCE};v=2;pid=1"))).is_empty(), "other protocol versions are ignored");
+    }
+
+    #[test]
+    fn level_cwd_is_tagged_and_escaped_like_e() {
+        let mut sc = Scanner::new(NONCE);
+        let found = sc.feed(&osc(&format!("633;Cwd;n={NONCE};/srv/a\\x3bb")));
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].event, Event::LevelCwd { path: "/srv/a;b".into() });
+        assert_eq!(found[0].level, Some(0));
+        assert_eq!(sc.forged_events(), 0);
+    }
+
+    #[test]
+    fn each_found_names_the_level_of_its_nonce() {
+        let second = "11111111111111111111111111111111";
+        let mut sc = Scanner::new(NONCE);
+        sc.add_nonce(1, second);
+        let mut s = Vec::new();
+        s.extend(osc(&format!("133;A;n={NONCE}")));
+        s.extend(osc(&format!("133;A;n={second}")));
+        s.extend(osc("7;file://mac.local/tmp"));
+        let found = sc.feed(&s);
+        let levels: Vec<Option<u64>> = found.iter().map(|f| f.level).collect();
+        assert_eq!(levels, vec![Some(0), Some(1), None], "the untagged OSC 7 has no level");
+    }
+
+    /// A retired nonce is stale, not forged. A nonce that was never accepted is forged. Both are ignored.
+    #[test]
+    fn retired_nonces_are_stale_and_unknown_ones_are_forged() {
+        let child = "22222222222222222222222222222222";
+        let mut sc = Scanner::new(NONCE);
+        sc.add_nonce(1, child);
+        assert_eq!(sc.feed(&osc(&format!("133;A;n={child}"))).len(), 1);
+        sc.retire_nonce(1);
+        assert!(sc.feed(&osc(&format!("133;A;n={child}"))).is_empty());
+        assert_eq!((sc.stale_events(), sc.forged_events()), (1, 0));
+        assert!(sc.feed(&osc("133;A;n=ffffffffffffffffffffffffffffffff")).is_empty());
+        assert_eq!((sc.stale_events(), sc.forged_events()), (1, 1));
+        assert_eq!(sc.accepted_nonces(), vec![NONCE.to_string()], "the retired nonce is no longer accepted");
+    }
+
+    #[test]
+    fn retired_nonces_are_remembered_up_to_the_cap() {
+        let mut sc = Scanner::new(NONCE);
+        let nonces: Vec<String> = (1..=(RETIRED_CAP as u64 + 2)).map(|k| format!("{k:032x}")).collect();
+        for (i, n) in nonces.iter().enumerate() {
+            sc.add_nonce(i as u64 + 1, n);
+            sc.retire_nonce(i as u64 + 1);
+        }
+        // The two oldest were forgotten, so they now count as forged. The newest is still stale.
+        sc.feed(&osc(&format!("133;A;n={}", nonces[0])));
+        sc.feed(&osc(&format!("133;A;n={}", nonces[RETIRED_CAP + 1])));
+        assert_eq!(sc.forged_events(), 1);
+        assert_eq!(sc.stale_events(), 1);
     }
 
     #[test]

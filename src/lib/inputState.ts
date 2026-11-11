@@ -103,6 +103,14 @@ export function routeFor(state: InputState, foreground: Foreground | null = null
         hint: 'The shell is waiting for the rest of a multi-line command. The agent cannot run commands now.',
         hintInline: false,
       };
+    case 'unresponsive':
+      // Keys still go to the shell, so Ctrl-C reaches it. The agent cannot run commands until the shell answers.
+      return {
+        keys: 'pty',
+        bar: 'chat',
+        hint: 'The shell is not answering. Press Ctrl-C or wait.',
+        hintInline: false,
+      };
     case 'running':
       return {
         keys: 'pty',

@@ -26,6 +26,7 @@ const INPUT_LABEL: Record<InputState, string> = {
   submitted: 'submitted',
   running: 'running',
   continuation: 'continuation',
+  unresponsive: 'UNRESPONSIVE',
   alt: 'full-screen app',
   raw: 'raw',
   exited: 'exited',

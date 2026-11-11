@@ -7,6 +7,7 @@ export type InputState =
   | 'submitted'
   | 'running'
   | 'continuation'
+  | 'unresponsive'
   | 'alt'
   | 'raw'
   | 'exited';
@@ -49,6 +50,17 @@ export interface RecordSummary {
   output_bytes: number;
 }
 
+/** One shell level (core/observer.rs). `key` 0 is the local shell. Nested levels are integrated shells inside another program. */
+export interface LevelInfo {
+  key: number;
+  kind: 'local' | 'remote';
+  label: string;
+  sh: string | null;
+  host: string | null;
+  user: string | null;
+  state: InputState;
+}
+
 export type SessionEvent =
   /** `foreground` is left out when there is no hint: not Running, or a blank command. An ordinary command is kind `other`. */
   | { type: 'state'; state: InputState; foreground?: Foreground }
@@ -56,7 +68,9 @@ export type SessionEvent =
   | { type: 'observer'; status: ObserverStatus }
   | { type: 'cwd'; cwd: Cwd | null }
   | { type: 'record_started'; id: number; command: string; source: Source }
-  | { type: 'record_finished'; record: RecordSummary };
+  | { type: 'record_finished'; record: RecordSummary }
+  /** The shell levels changed. `nonces` are every accepted nonce, for checking OSC events. */
+  | { type: 'levels'; levels: LevelInfo[]; nonces: string[] };
 
 /**
  * How a tool call was allowed or stopped. read: a read tool, no approval. manual: the user approved. auto: auto-approve

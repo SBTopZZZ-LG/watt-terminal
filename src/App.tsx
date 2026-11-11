@@ -294,6 +294,9 @@ export default function App() {
           return;
         case 'record_finished':
           return;
+        case 'levels':
+          // Nested shell levels are not shown yet. Without this case the event would reach the transcript reducer.
+          return;
         default:
           dispatchTranscript({ type: 'agent_event', event: ev });
       }

@@ -18,7 +18,7 @@ use serde::Serialize;
 
 use crate::core::foreground::Foreground;
 use crate::core::observer::{
-    run_observer, Activity, CallStatus, Core, EventSink, InputState, IntegrationStatus, ObsMsg, ObsQueue,
+    run_observer, Activity, CallStatus, Core, EventSink, InputState, IntegrationStatus, LevelInfo, ObsMsg, ObsQueue,
     ObserverStatus, ScreenSnapshot, Shared,
 };
 use crate::core::pty::{self, Gate, OutputSink};
@@ -217,6 +217,11 @@ impl Session {
     /// remote login or a nested shell. See core/foreground.rs. None at a prompt and in the other states.
     pub fn foreground(&self) -> Option<Foreground> {
         self.shared.lock().foreground()
+    }
+
+    /// Every shell level, the local one first. Only the status reads it, to show the nested levels.
+    pub fn levels(&self) -> Vec<LevelInfo> {
+        self.shared.lock().levels()
     }
 
     pub fn observer_status(&self) -> ObserverStatus {

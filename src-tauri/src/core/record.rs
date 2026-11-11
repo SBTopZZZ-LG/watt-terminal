@@ -43,6 +43,10 @@ pub struct Record {
     pub source: Source,
     pub shell_pid: Option<u32>,
     pub cwd: Option<Cwd>,
+    /// The key of the shell level the command ran in (0 is the local shell).
+    pub level: u64,
+    /// The label of the nested level the command ran in (for example `ssh ubuntu@lidia`). None on the local shell.
+    pub location: Option<String>,
     pub exit_code: Option<i32>,
     pub pipestatus: Vec<i32>,
     pub status: RecordStatus,
@@ -63,6 +67,8 @@ pub struct RecordSummary {
     pub id: u64,
     pub command: String,
     pub source: Source,
+    pub level: u64,
+    pub location: Option<String>,
     pub exit_code: Option<i32>,
     pub status: RecordStatus,
     pub used_alt_screen: bool,
@@ -75,6 +81,8 @@ impl From<&Record> for RecordSummary {
             id: r.id,
             command: r.command.clone(),
             source: r.source.clone(),
+            level: r.level,
+            location: r.location.clone(),
             exit_code: r.exit_code,
             status: r.status,
             used_alt_screen: r.used_alt_screen,

@@ -24,8 +24,17 @@ use crate::core::scanner::{Event, Found, Scanner};
 pub const OBSERVER_QUEUE_CAP: usize = 4 << 20;
 /// No integration event within this long after spawn means the shell is not observable (`Raw`).
 pub const INTEGRATION_TIMEOUT: Duration = Duration::from_secs(5);
-/// A submitted line that never reaches C is released after this long, so the gate cannot stick.
+/// A submitted line that never reaches C is released after this long, so the gate cannot stick. At a nested level it
+/// becomes `Unresponsive` instead of `Prompt`, and only that level's C or A ends it.
 pub const SUBMIT_TIMEOUT: Duration = Duration::from_millis(1500);
+/// Shell levels the session may hold at once, the local shell included. A push beyond this is refused and counted.
+pub const MAX_DEPTH: usize = 8;
+/// A level expected by `expect_level` must say Hello within this long. Otherwise its nonce is retired.
+pub const PENDING_TIMEOUT: Duration = Duration::from_secs(30);
+/// Longest label kept for a nested level.
+pub const LABEL_CAP: usize = 200;
+/// The key of the local shell's level.
+pub const LOCAL_KEY: u64 = 0;
 
 // ---------- queue ----------
 
@@ -145,6 +154,9 @@ pub enum InputState {
     Running,
     /// zsh is waiting for more of a multi-line command (PS2).
     Continuation,
+    /// A nested shell did not answer a submitted line within SUBMIT_TIMEOUT. Only its C or A ends it. Never reported
+    /// for the local shell.
+    Unresponsive,
     /// The alternate screen is active (vim, less, ...).
     Alt,
     /// No integration within INTEGRATION_TIMEOUT. The agent can read the screen only.
@@ -189,6 +201,28 @@ pub struct Activity {
     pub last_record_id: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LevelKind {
+    /// The shell the app started.
+    Local,
+    /// A shell that the app integrated inside another program (ssh, a nested shell).
+    Remote,
+}
+
+/// One shell level, for the UI and the status. `state` is the top level's state for the top one; the levels below it
+/// are parked, so they are Running.
+#[derive(Debug, Clone, Serialize)]
+pub struct LevelInfo {
+    pub key: u64,
+    pub kind: LevelKind,
+    pub label: String,
+    pub sh: Option<String>,
+    pub host: Option<String>,
+    pub user: Option<String>,
+    pub state: InputState,
+}
+
 /// Session changes for listeners (the UI). Delivered in order, outside the core lock.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -204,6 +238,9 @@ pub enum SessionEvent {
     Cwd { cwd: Option<Cwd> },
     RecordStarted { id: u64, command: String, source: Source },
     RecordFinished { record: RecordSummary },
+    /// The shell levels changed (a push, a pop, a pending level). `nonces` are every nonce now accepted, the local one
+    /// included, so the frontend can check OSC events against them. The same exposure as the session nonce.
+    Levels { levels: Vec<LevelInfo>, nonces: Vec<String> },
 }
 
 pub trait EventSink: Send + Sync {
@@ -319,6 +356,58 @@ fn screen_fingerprint(screen: &vt100::Screen) -> u64 {
     hasher.finish()
 }
 
+/// What a level keeps while another level is on top. The top level's own state lives in the Core's fields (lifecycle,
+/// pending, last_e, and the parser's capture target), so the existing code reads the top unchanged. Put back on pop.
+/// A level is only parked while it is Running (a push needs that), so its lifecycle is not stored: on pop it is Running.
+struct Parked {
+    pending: Option<(Source, Option<String>)>,
+    last_e: Option<(String, Source)>,
+    open: Option<OpenRecord>,
+}
+
+impl Parked {
+    /// The state of a level that has nothing open and nothing pending.
+    fn idle() -> Self {
+        Parked { pending: None, last_e: None, open: None }
+    }
+}
+
+/// One shell level in the stack. The stack is never empty: index 0 is the local shell, and the last entry is the top.
+struct Level {
+    key: u64,
+    kind: LevelKind,
+    label: String,
+    sh: Option<String>,
+    host: Option<String>,
+    user: Option<String>,
+    /// The cwd path from 633;Cwd. Nested levels only: level 0 reports its cwd through OSC 7.
+    cwd: Option<String>,
+    /// Set while the level is not on top.
+    parked: Option<Parked>,
+}
+
+impl Level {
+    fn local() -> Self {
+        Level {
+            key: LOCAL_KEY,
+            kind: LevelKind::Local,
+            label: "local".into(),
+            sh: None,
+            host: None,
+            user: None,
+            cwd: None,
+            parked: None,
+        }
+    }
+}
+
+/// A level that `expect_level` registered, waiting for its Hello.
+struct PendingLevel {
+    key: u64,
+    label: String,
+    since: Instant,
+}
+
 pub struct Core {
     parser: Parser<Collector>,
     /// Hash of the visible screen at the last `note_screen`. Compared on each call.
@@ -327,15 +416,25 @@ pub struct Core {
     screen_gen: u64,
     size: (u16, u16),
     scanner: Scanner,
+    /// The shell levels, outermost (local) first. Never empty; the last one is the top.
+    stack: Vec<Level>,
+    /// The next level key to hand out. Keys are never reused.
+    next_key: u64,
+    /// The level expected by `expect_level`, if any.
+    pending_level: Option<PendingLevel>,
+    /// Pushes refused (not Running, depth cap) and nested events refused for want of a pending level.
+    refused: u64,
+    /// The top level's lifecycle.
     lifecycle: Lifecycle,
     spawned_at: Instant,
+    /// The local shell's pid, from its Hello.
     shell_pid: Option<u32>,
     desynced: bool,
     eof: bool,
     /// Set by a submit or a user CR. Matched against the next E event to attribute the command. A None text matches
     /// any command: that is a line the user typed in the terminal, whose text Rust never sees.
     pending: Option<(Source, Option<String>)>,
-    /// E seen, waiting for its C.
+    /// E seen, waiting for its C. The top level's.
     last_e: Option<(String, Source)>,
     /// The user has typed text that may be on the prompt line. Set by `note_user_bytes`, which counts typing at the
     /// prompt and type-ahead typed while a command runs (zsh reads that from the tty at the next prompt). Cleared by
@@ -365,6 +464,10 @@ impl Core {
             parser,
             size,
             scanner: Scanner::new(nonce),
+            stack: vec![Level::local()],
+            next_key: LOCAL_KEY + 1,
+            pending_level: None,
+            refused: 0,
             lifecycle: Lifecycle::Booting,
             spawned_at: Instant::now(),
             shell_pid: None,
@@ -386,6 +489,7 @@ impl Core {
     /// `deliver` false (no listener yet) the queued record events are dropped and nothing is reported,
     /// so a listener attached later still gets the current state.
     pub fn take_events(&mut self, deliver: bool) -> Vec<SessionEvent> {
+        self.prune_pending();
         if !deliver {
             self.events.clear();
             return Vec::new();
@@ -422,7 +526,9 @@ impl Core {
             ObsMsg::Resize { rows, cols } => self.resize(rows, cols),
             ObsMsg::Resync => self.resync(),
             ObsMsg::Eof => {
-                // The shell is gone, so a command still open will never get its D. It ends here, incomplete.
+                // The shell is gone, so the nested levels and a command still open will never get their D. They end
+                // here, incomplete. Popping first hands the local record back, so it is closed too.
+                self.truncate_to(LOCAL_KEY);
                 self.close_open(RecordStatus::Incomplete);
                 self.eof = true;
             }
@@ -436,9 +542,164 @@ impl Core {
             // Feed the parser up to the event, so the screen matches the event's position in the stream.
             self.process_segment(&bytes[pos..f.end]);
             pos = f.end;
-            self.handle(f.event);
+            self.route(f.level, f.event);
         }
         self.process_segment(&bytes[pos..]);
+    }
+
+    /// Sends one authenticated event to the level that sent it. An event from a level below the top first pops the
+    /// levels above it. Hello and 633;Cwd need the level, so they are handled here. The rest go to `handle`, which works
+    /// on the top level.
+    fn route(&mut self, level: Option<u64>, event: Event) {
+        // While desynced, only a prompt is trusted: it is the next point where the observer knows the state.
+        if self.desynced && event != Event::PromptStart {
+            return;
+        }
+        self.prune_pending();
+        let Some(key) = level else {
+            // Untagged OSC 7 is the local shell's cwd only. A nested shell does not change it.
+            if self.top_is_local() {
+                self.handle(event);
+            }
+            return;
+        };
+        if self.pending_level.as_ref().is_some_and(|p| p.key == key) {
+            // Only the Hello of the expected level means anything. Its nonce was accepted by the scanner, so it is authentic.
+            if let Event::Hello { sh, user, host, .. } = event {
+                self.push_level(sh, user, host);
+            }
+            return;
+        }
+        if !self.stack.iter().any(|l| l.key == key) {
+            return;
+        }
+        if key != self.top_key() {
+            self.truncate_to(key);
+        }
+        match event {
+            Event::Hello { pid, sh, user, host, .. } => {
+                if key == LOCAL_KEY {
+                    self.shell_pid = Some(pid);
+                }
+                if let Some(level) = self.stack.last_mut() {
+                    level.sh = sh;
+                    level.user = user;
+                    level.host = host;
+                }
+                self.levels_changed();
+            }
+            Event::LevelCwd { path } => {
+                // The local shell's cwd comes from OSC 7 only.
+                if let Some(level) = self.stack.last_mut().filter(|l| l.key != LOCAL_KEY) {
+                    level.cwd = Some(path);
+                }
+            }
+            other => self.handle(other),
+        }
+    }
+
+    /// Pushes the pending level when its Hello arrives. Refused (and counted) unless the top is Running and the depth cap
+    /// allows it. A refused Hello leaves the pending level in place until it expires.
+    fn push_level(&mut self, sh: Option<String>, user: Option<String>, host: Option<String>) {
+        if self.lifecycle != Lifecycle::Running || self.stack.len() >= MAX_DEPTH {
+            self.refused += 1;
+            return;
+        }
+        let Some(pending) = self.pending_level.take() else {
+            return;
+        };
+        // The parent's record keeps its slot and its state. From here on the parser captures into the child's record
+        // only, so no output is attributed to the parent while the child is on top.
+        let parked = Parked {
+            pending: self.pending.take(),
+            last_e: self.last_e.take(),
+            open: self.parser.callbacks_mut().open.take(),
+        };
+        if let Some(parent) = self.stack.last_mut() {
+            parent.parked = Some(parked);
+        }
+        self.lifecycle = Lifecycle::Booting;
+        self.user_typed = false;
+        self.stack.push(Level {
+            key: pending.key,
+            kind: LevelKind::Remote,
+            label: pending.label,
+            sh,
+            host,
+            user,
+            cwd: None,
+            parked: None,
+        });
+        self.levels_changed();
+    }
+
+    /// Pops every level above `key`. Each popped level's open record closes Incomplete, and its nonce is retired, so its
+    /// late events count as stale. Level `key` resumes Running (never Prompt) with its record open again. That record
+    /// is marked approximate, since the output of the time the child was on top was not captured.
+    fn truncate_to(&mut self, key: u64) {
+        let mut changed = false;
+        while self.top_key() != key && self.stack.len() > 1 {
+            self.close_open(RecordStatus::Incomplete);
+            let Some(popped) = self.stack.pop() else {
+                break;
+            };
+            self.scanner.retire_nonce(popped.key);
+            let parked = self.stack.last_mut().and_then(|parent| parent.parked.take()).unwrap_or_else(Parked::idle);
+            let mut open = parked.open;
+            if let Some(open) = open.as_mut() {
+                open.approximate = true;
+            }
+            self.lifecycle = Lifecycle::Running;
+            self.pending = parked.pending;
+            self.last_e = parked.last_e;
+            self.user_typed = false;
+            self.parser.callbacks_mut().open = open;
+            changed = true;
+        }
+        if changed {
+            self.levels_changed();
+        }
+    }
+
+    /// Registers a level the app expects to start. Its shell must send a Hello that carries `nonce`, and that Hello pushes
+    /// the level. One at a time: a new call replaces the pending level, and the replaced nonce is retired. Returns the key.
+    pub fn expect_level(&mut self, nonce: &str, label: &str) -> u64 {
+        self.prune_pending();
+        if let Some(old) = self.pending_level.take() {
+            self.scanner.retire_nonce(old.key);
+        }
+        let key = self.next_key;
+        self.next_key += 1;
+        self.scanner.add_nonce(key, nonce);
+        let label: String = label.chars().take(LABEL_CAP).collect();
+        self.pending_level = Some(PendingLevel { key, label, since: Instant::now() });
+        self.levels_changed();
+        key
+    }
+
+    /// A pending level that waited too long is dropped and its nonce retired.
+    fn prune_pending(&mut self) {
+        if self.pending_level.as_ref().is_some_and(|p| p.since.elapsed() > PENDING_TIMEOUT) {
+            if let Some(pending) = self.pending_level.take() {
+                self.scanner.retire_nonce(pending.key);
+            }
+            self.levels_changed();
+        }
+    }
+
+    fn levels_changed(&mut self) {
+        let levels = self.levels();
+        let nonces = self.scanner.accepted_nonces();
+        self.events.push(SessionEvent::Levels { levels, nonces });
+    }
+
+    /// The key of the level on top, the one that takes events and submits. 0 is the local shell.
+    pub fn top_key(&self) -> u64 {
+        self.stack.last().map_or(LOCAL_KEY, |l| l.key)
+    }
+
+    fn top_is_local(&self) -> bool {
+        self.stack.len() <= 1
     }
 
     fn process_segment(&mut self, seg: &[u8]) {
@@ -462,15 +723,19 @@ impl Core {
             return;
         }
         match event {
-            Event::Hello { pid } => self.shell_pid = Some(pid),
+            // Hello and 633;Cwd are handled in `route`, which knows the level they came from.
+            Event::Hello { .. } | Event::LevelCwd { .. } => {}
             Event::PromptStart => {
                 self.desynced = false;
                 self.close_open(RecordStatus::Incomplete);
                 self.last_e = None;
+                // At a nested level a submit that timed out is Unresponsive: its own A is what ends that.
+                let unresponsive = !self.top_is_local()
+                    && matches!(self.lifecycle, Lifecycle::Submitted { since } if since.elapsed() > SUBMIT_TIMEOUT);
                 match self.lifecycle {
                     // A redraw of the prompt right after a submit must not open the gate before C.
-                    Lifecycle::Submitted { .. } => {}
-                    Lifecycle::Booting if self.shell_pid.is_none() => {}
+                    Lifecycle::Submitted { .. } if !unresponsive => {}
+                    Lifecycle::Booting if self.top_is_local() && self.shell_pid.is_none() => {}
                     _ => {
                         // An agent line still waiting for its C, and zsh is back at the prompt: the line was cancelled.
                         if let Some((Source::Agent { call_id }, _)) = &self.pending {
@@ -521,6 +786,7 @@ impl Core {
                 }
             }
             Event::Cwd { host, path } => {
+                // Reached only when the local shell is on top (see `route`).
                 let cwd = Cwd { host, path };
                 if self.cwd.as_ref() != Some(&cwd) {
                     self.cwd = Some(cwd);
@@ -554,8 +820,17 @@ impl Core {
         let (crow, _) = self.parser.screen().cursor_position();
         let id = self.next_id;
         self.next_id += 1;
-        let cwd = self.cwd.clone();
-        let shell_pid = self.shell_pid;
+        // A record made while a nested level is on top belongs to that level: its cwd is the level's, and its location is
+        // the label the level was registered with. Level 0 keeps the local cwd and shell pid.
+        let (cwd, shell_pid, level, location) = match self.stack.last() {
+            Some(top) if top.key != LOCAL_KEY => (
+                top.cwd.clone().map(|path| Cwd { host: top.host.clone().unwrap_or_default(), path }),
+                None,
+                top.key,
+                Some(top.label.clone()),
+            ),
+            _ => (self.cwd.clone(), self.shell_pid, LOCAL_KEY, None),
+        };
         self.events.push(SessionEvent::RecordStarted { id, command: command.clone(), source: source.clone() });
         let cb = self.parser.callbacks_mut();
         let start_abs = cb.scrolled_total + u64::from(crow);
@@ -566,6 +841,8 @@ impl Core {
                 source,
                 shell_pid,
                 cwd,
+                level,
+                location,
                 exit_code: None,
                 pipestatus: Vec::new(),
                 status: RecordStatus::Incomplete,
@@ -643,11 +920,59 @@ impl Core {
         match &self.lifecycle {
             Lifecycle::Booting => InputState::Booting,
             Lifecycle::Prompt => InputState::Prompt,
-            Lifecycle::Submitted { since } if since.elapsed() > SUBMIT_TIMEOUT => InputState::Prompt,
+            Lifecycle::Submitted { since } if since.elapsed() > SUBMIT_TIMEOUT => {
+                if self.top_is_local() {
+                    InputState::Prompt
+                } else {
+                    InputState::Unresponsive
+                }
+            }
             Lifecycle::Submitted { .. } => InputState::Submitted,
             Lifecycle::Running => InputState::Running,
             Lifecycle::Continuation { .. } => InputState::Continuation,
         }
+    }
+
+    /// Every level, outermost first, with the top level's state. The levels below the top are parked, so Running.
+    pub fn levels(&self) -> Vec<LevelInfo> {
+        let top = self.stack.len().saturating_sub(1);
+        self.stack
+            .iter()
+            .enumerate()
+            .map(|(i, l)| LevelInfo {
+                key: l.key,
+                kind: l.kind,
+                label: l.label.clone(),
+                sh: l.sh.clone(),
+                host: l.host.clone(),
+                user: l.user.clone(),
+                state: if i == top { self.lifecycle_view() } else { InputState::Running },
+            })
+            .collect()
+    }
+
+    /// How many levels the session holds, the local one included. 1 means no nested shell.
+    pub fn depth(&self) -> usize {
+        self.stack.len()
+    }
+
+    /// The label of the nested level on top, the command that started it (for example `ssh ubuntu@lidia`). None on the
+    /// local shell.
+    pub fn location(&self) -> Option<String> {
+        if self.top_is_local() {
+            return None;
+        }
+        self.stack.last().map(|l| l.label.clone())
+    }
+
+    /// Pushes refused (not Running, or the depth cap) since the session started.
+    pub fn refused_levels(&self) -> u64 {
+        self.refused
+    }
+
+    /// Tagged events from popped levels, counted apart from forged ones.
+    pub fn stale_events(&self) -> u64 {
+        self.scanner.stale_events()
     }
 
     /// Remembers that an agent call's line never ran. Bounded: the oldest entry goes first.
@@ -701,7 +1026,8 @@ impl Core {
     }
 
     pub fn integration_status(&self) -> IntegrationStatus {
-        if self.lifecycle != Lifecycle::Booting {
+        // A nested level exists only after the local shell was Running, so it has been live since then.
+        if self.stack.len() > 1 || self.lifecycle != Lifecycle::Booting {
             IntegrationStatus::Live
         } else if self.spawned_at.elapsed() > INTEGRATION_TIMEOUT {
             IntegrationStatus::Raw
@@ -753,7 +1079,11 @@ impl Core {
     /// not count. Nothing clears the flag when that program exits, so the bytes must not set it in the first place.
     pub fn note_user_bytes(&mut self, bytes: &[u8]) {
         let state = self.lifecycle_view();
-        if !matches!(state, InputState::Prompt | InputState::Submitted | InputState::Continuation | InputState::Running) {
+        // Unresponsive counts like Submitted: a submitted line is still in the tty and may reach the prompt.
+        if !matches!(
+            state,
+            InputState::Prompt | InputState::Submitted | InputState::Unresponsive | InputState::Continuation | InputState::Running
+        ) {
             return;
         }
         if state == InputState::Running && self.foreground_holds_the_keys() {
@@ -1270,5 +1600,356 @@ mod tests {
         assert_eq!(alt.lifecycle_view(), InputState::Alt);
         alt.note_user_bytes(b"x");
         assert!(!alt.user_typed_since_prompt(), "alt screen rule changed");
+    }
+
+    // ---------- nested levels ----------
+
+    const LOCAL: &str = "test-nonce";
+    const CHILD: &str = "child-nonce";
+
+    fn osc(body: &str) -> Vec<u8> {
+        format!("\x1b]{body}\x1b\\").into_bytes()
+    }
+
+    /// A tagged integration event: `code` (e.g. `133;A`), the nonce in field 2, then `rest` (empty or starting with `;`).
+    fn tagged(code: &str, nonce: &str, rest: &str) -> Vec<u8> {
+        osc(&format!("{code};n={nonce}{rest}"))
+    }
+
+    /// The local shell runs `ssh ubuntu@lidia`, and the remote shell has said Hello with CHILD: it is pushed, Booting.
+    fn nested() -> Core {
+        let mut c = running("ssh ubuntu@lidia");
+        assert_eq!(c.expect_level(CHILD, "ssh ubuntu@lidia"), 1);
+        c.feed(&tagged("633;Hello", CHILD, ";v=1;sh=bash;user=ubuntu;host=lidia;pid=77"));
+        c
+    }
+
+    /// The remote shell at its first prompt.
+    fn nested_at_prompt() -> Core {
+        let mut c = nested();
+        c.feed(&tagged("133;A", CHILD, ""));
+        c
+    }
+
+    /// The remote shell runs `command` (E, then C).
+    fn remote_running(c: &mut Core, command: &str) {
+        c.feed(&tagged("633;E", CHILD, &format!(";{command}")));
+        c.feed(&tagged("133;C", CHILD, ""));
+    }
+
+    /// (level count, nonces) of each Levels event in `evs`.
+    fn levels_events(evs: &[SessionEvent]) -> Vec<(usize, Vec<String>)> {
+        evs.iter()
+            .filter_map(|e| match e {
+                SessionEvent::Levels { levels, nonces } => Some((levels.len(), nonces.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_hello_with_the_expected_nonce_pushes_a_level_that_boots() {
+        let c = nested();
+        assert_eq!(c.depth(), 2);
+        assert_eq!(c.lifecycle_view(), InputState::Booting);
+        let levels = c.levels();
+        assert_eq!(levels.iter().map(|l| l.key).collect::<Vec<_>>(), vec![0, 1]);
+        assert_eq!(levels[0].kind, LevelKind::Local);
+        assert_eq!(levels[1].kind, LevelKind::Remote);
+        assert_eq!(levels[1].label, "ssh ubuntu@lidia");
+        assert_eq!(levels[1].host.as_deref(), Some("lidia"));
+        assert_eq!(levels[1].user.as_deref(), Some("ubuntu"));
+        assert_eq!(levels[1].sh.as_deref(), Some("bash"));
+        assert_eq!(levels[1].state, InputState::Booting);
+        assert_eq!(levels[0].state, InputState::Running, "the parked local shell is Running");
+        assert_eq!(c.location().as_deref(), Some("ssh ubuntu@lidia"));
+        assert_eq!(c.integration_status(), IntegrationStatus::Live);
+        assert_eq!(c.shell_pid(), None, "a nested Hello does not change the local shell's pid");
+        assert_eq!(core().location(), None);
+    }
+
+    #[test]
+    fn a_nested_level_goes_booting_prompt_submitted_running_prompt() {
+        let mut c = nested_at_prompt();
+        assert_eq!(c.lifecycle_view(), InputState::Prompt);
+        c.begin_submit(Some((agent("run-n"), Some("ls".into()))));
+        assert_eq!(c.lifecycle_view(), InputState::Submitted);
+        c.feed(&tagged("633;E", CHILD, ";ls"));
+        c.feed(&tagged("133;C", CHILD, ""));
+        assert_eq!(c.lifecycle_view(), InputState::Running);
+        assert_eq!(status(&c, "run-n"), "pending Running");
+        c.feed(&tagged("133;D", CHILD, ";exit=0;ps=0"));
+        c.feed(&tagged("133;A", CHILD, ""));
+        assert_eq!(c.lifecycle_view(), InputState::Prompt);
+        assert_eq!(status(&c, "run-n"), "finished");
+        assert_eq!(c.depth(), 2, "the remote level is still the top");
+    }
+
+    /// The local shell reports while the remote one is on top: the remote shell has gone, so its level is popped. Its
+    /// open record closes Incomplete, the local record resumes as Running, and the local A then makes it Prompt.
+    #[test]
+    fn an_event_from_a_level_below_the_top_pops_the_levels_above_it() {
+        let mut c = nested_at_prompt();
+        remote_running(&mut c, "sleep 9");
+        c.feed(&tagged("133;D", LOCAL, ";exit=0;ps=0"));
+        assert_eq!(c.depth(), 1);
+        assert_eq!(c.lifecycle_view(), InputState::Running, "the local shell resumes Running, never Prompt");
+        let recs = c.records();
+        assert_eq!(recs.len(), 2, "{recs:?}");
+        assert_eq!((recs[0].command.as_str(), recs[0].level, recs[0].status), ("sleep 9", 1, RecordStatus::Incomplete));
+        assert_eq!(recs[1].command, "ssh ubuntu@lidia");
+        assert_eq!(recs[1].level, 0);
+        assert_eq!(recs[1].status, RecordStatus::Approximate, "its output while the remote shell was on top is missing");
+        c.feed(&tagged("133;A", LOCAL, ""));
+        assert_eq!(c.lifecycle_view(), InputState::Prompt);
+    }
+
+    /// Once popped, the remote shell's nonce is retired: its late events count as stale, not forged.
+    #[test]
+    fn late_events_from_a_popped_level_are_stale_not_forged() {
+        let mut c = nested_at_prompt();
+        c.feed(&tagged("133;D", LOCAL, ";exit=0;ps=0"));
+        assert_eq!(c.depth(), 1);
+        c.feed(&tagged("133;A", CHILD, ""));
+        c.feed(&tagged("633;E", CHILD, ";ls"));
+        assert_eq!(c.stale_events(), 2);
+        assert_eq!(c.forged_events(), 0);
+        assert_eq!(c.lifecycle_view(), InputState::Running, "a stale event changes nothing");
+    }
+
+    #[test]
+    fn a_push_is_refused_while_the_local_shell_is_not_running_and_the_pending_level_waits() {
+        let mut c = running("ssh ubuntu@lidia");
+        c.lifecycle = Lifecycle::Prompt;
+        c.expect_level(CHILD, "ssh ubuntu@lidia");
+        c.feed(&tagged("633;Hello", CHILD, ";v=1;pid=3"));
+        assert_eq!(c.depth(), 1);
+        assert_eq!(c.refused_levels(), 1);
+        c.lifecycle = Lifecycle::Running;
+        c.feed(&tagged("633;Hello", CHILD, ";v=1;pid=3"));
+        assert_eq!(c.depth(), 2, "the pending level still takes its Hello once the local shell is Running");
+    }
+
+    #[test]
+    fn a_hello_with_a_nonce_nobody_expected_is_forged_and_pushes_nothing() {
+        let mut c = running("ssh ubuntu@lidia");
+        c.expect_level(CHILD, "ssh ubuntu@lidia");
+        c.feed(&tagged("633;Hello", "some-other-nonce", ";v=1;pid=3"));
+        assert_eq!(c.depth(), 1);
+        assert_eq!(c.forged_events(), 1);
+        assert_eq!(c.refused_levels(), 0);
+    }
+
+    #[test]
+    fn the_depth_cap_refuses_the_push_that_would_pass_it() {
+        let mut c = running("ssh h");
+        for i in 1..MAX_DEPTH {
+            let nonce = format!("nested-{i}");
+            c.expect_level(&nonce, "ssh h");
+            c.feed(&tagged("633;Hello", &nonce, ";v=1;pid=1"));
+            assert_eq!(c.depth(), i + 1);
+            c.feed(&tagged("133;A", &nonce, ""));
+            c.feed(&tagged("633;E", &nonce, ";sleep 1"));
+            c.feed(&tagged("133;C", &nonce, ""));
+        }
+        assert_eq!(c.depth(), MAX_DEPTH);
+        c.expect_level("one-too-many", "ssh h");
+        c.feed(&tagged("633;Hello", "one-too-many", ";v=1;pid=1"));
+        assert_eq!(c.depth(), MAX_DEPTH);
+        assert_eq!(c.refused_levels(), 1);
+    }
+
+    #[test]
+    fn a_pending_level_that_waits_too_long_is_dropped_and_its_nonce_is_stale() {
+        let mut c = running("ssh h");
+        c.expect_level(CHILD, "ssh h");
+        c.pending_level.as_mut().expect("a pending level").since = Instant::now() - PENDING_TIMEOUT - Duration::from_secs(1);
+        c.take_events(true);
+        c.feed(&tagged("633;Hello", CHILD, ";v=1;pid=1"));
+        assert_eq!(c.depth(), 1);
+        assert_eq!((c.stale_events(), c.forged_events()), (1, 0));
+    }
+
+    #[test]
+    fn a_new_expect_replaces_the_pending_level_and_retires_its_nonce() {
+        let mut c = running("ssh h");
+        c.expect_level("first", "ssh a");
+        let second = c.expect_level("second", "ssh b");
+        c.feed(&tagged("633;Hello", "first", ";v=1;pid=1"));
+        assert_eq!(c.depth(), 1);
+        assert_eq!(c.stale_events(), 1);
+        c.feed(&tagged("633;Hello", "second", ";v=1;pid=2"));
+        assert_eq!(c.depth(), 2);
+        assert_eq!(c.levels()[1].key, second);
+    }
+
+    /// The Levels event carries the level count and every accepted nonce, so the frontend can check OSC against them.
+    #[test]
+    fn push_and_pop_emit_the_levels_and_the_nonces_to_accept() {
+        let mut c = running("ssh h");
+        c.take_events(true);
+        c.expect_level(CHILD, "ssh h");
+        let announced = levels_events(&c.take_events(true));
+        assert_eq!(announced.len(), 1);
+        assert_eq!(announced[0].0, 1, "only the local level exists until the Hello");
+        assert!(announced[0].1.contains(&CHILD.to_string()), "the pending nonce is announced before its shell says Hello");
+
+        c.feed(&tagged("633;Hello", CHILD, ";v=1;pid=1"));
+        let pushed = levels_events(&c.take_events(true));
+        assert_eq!(pushed.len(), 1);
+        assert_eq!(pushed[0].0, 2);
+        assert!(pushed[0].1.contains(&LOCAL.to_string()) && pushed[0].1.contains(&CHILD.to_string()));
+
+        c.feed(&tagged("133;A", LOCAL, ""));
+        let popped = levels_events(&c.take_events(true));
+        assert_eq!(popped.len(), 1);
+        assert_eq!(popped[0].0, 1);
+        assert!(!popped[0].1.contains(&CHILD.to_string()), "a popped nonce is no longer accepted");
+    }
+
+    /// `user_typed` is reset by a push and by a pop, so text typed under the parent is not carried into the child.
+    #[test]
+    fn typed_text_is_reset_on_push_and_on_pop() {
+        let mut c = running("sleep 30");
+        c.note_user_bytes(b"zqx");
+        assert!(c.user_typed_since_prompt());
+        c.expect_level(CHILD, "ssh h");
+        c.feed(&tagged("633;Hello", CHILD, ";v=1;pid=5"));
+        assert_eq!(c.depth(), 2);
+        assert!(!c.user_typed_since_prompt(), "a push reset the flag");
+        c.feed(&tagged("133;A", CHILD, ""));
+        c.note_user_bytes(b"abc");
+        assert!(c.user_typed_since_prompt());
+        c.feed(&tagged("133;A", LOCAL, ""));
+        assert_eq!(c.depth(), 1);
+        assert!(!c.user_typed_since_prompt(), "a pop reset the flag");
+    }
+
+    /// One capture target: while the remote level is on top, its output goes to its own record and not the parked one.
+    #[test]
+    fn output_while_a_nested_level_is_on_top_is_not_attributed_to_the_parent() {
+        let mut c = nested_at_prompt();
+        remote_running(&mut c, "seq 40");
+        let mut out = Vec::new();
+        for i in 0..40 {
+            out.extend(format!("remote-{i}\r\n").into_bytes());
+        }
+        c.feed(&out);
+        let parked = c.stack[0].parked.as_ref().and_then(|p| p.open.as_ref()).expect("the parent's record is parked");
+        assert!(!format!("{:?}", parked.builder).contains("remote-"), "the parent's record took the child's output");
+        c.feed(&tagged("133;D", CHILD, ";exit=0;ps=0"));
+        let child = c.get_record(2).expect("the remote record");
+        assert_eq!(child.level, 1);
+        assert!(child.output.contains("remote-0"), "{:?}", child.output);
+    }
+
+    /// The foreground hint is the top level's: the parked ssh hint is not reported while the remote shell is on top.
+    #[test]
+    fn foreground_answers_for_the_top_level_only() {
+        let mut c = nested();
+        assert_eq!(c.foreground(), None, "the remote shell is Booting");
+        c.feed(&tagged("133;A", CHILD, ""));
+        assert_eq!(c.foreground(), None, "the remote shell is at its prompt");
+        remote_running(&mut c, "ls -la");
+        let fg = c.foreground().expect("the remote command is the hint");
+        assert_eq!((fg.kind, fg.command.as_str()), (ForegroundKind::Other, "ls -la"));
+        c.feed(&tagged("133;D", CHILD, ";exit=0;ps=0"));
+        c.feed(&tagged("133;A", CHILD, ""));
+        remote_running(&mut c, "ssh deeper");
+        assert_eq!(c.foreground().map(|f| f.kind), Some(ForegroundKind::Ssh));
+    }
+
+    /// Submitted at a nested level that is not answering becomes Unresponsive. Its own C or A ends that.
+    #[test]
+    fn a_submit_that_times_out_at_a_nested_level_is_unresponsive_until_its_own_a_or_c() {
+        let mut c = nested_at_prompt();
+        c.begin_submit(None);
+        c.lifecycle = Lifecycle::Submitted { since: Instant::now() - Duration::from_secs(5) };
+        assert_eq!(c.lifecycle_view(), InputState::Unresponsive);
+        c.note_user_bytes(b"x");
+        assert!(c.user_typed_since_prompt(), "typed text counts while the line may still be in the tty");
+        c.feed(&tagged("133;A", CHILD, ""));
+        assert_eq!(c.lifecycle_view(), InputState::Prompt, "its own A recovers it");
+
+        c.begin_submit(None);
+        c.lifecycle = Lifecycle::Submitted { since: Instant::now() - Duration::from_secs(5) };
+        c.feed(&tagged("133;C", CHILD, ""));
+        assert_eq!(c.lifecycle_view(), InputState::Running, "its own C recovers it too");
+    }
+
+    #[test]
+    fn the_local_shell_still_reverts_a_timed_out_submit_to_prompt() {
+        let mut c = core();
+        c.lifecycle = Lifecycle::Submitted { since: Instant::now() - Duration::from_secs(5) };
+        assert_eq!(c.lifecycle_view(), InputState::Prompt);
+    }
+
+    #[test]
+    fn the_alternate_screen_overrides_a_nested_level() {
+        let mut c = nested_at_prompt();
+        c.feed(b"\x1b[?1049h");
+        assert_eq!(c.lifecycle_view(), InputState::Alt);
+        c.note_user_bytes(b"x");
+        assert!(!c.user_typed_since_prompt());
+    }
+
+    /// After a desync only a prompt is trusted: the next A from a live level, here the local one below the remote, resumes.
+    #[test]
+    fn after_a_desync_the_next_prompt_from_any_live_level_is_trusted() {
+        let mut c = nested_at_prompt();
+        remote_running(&mut c, "sleep 9");
+        c.apply(ObsMsg::Resync);
+        assert!(c.desynced());
+        c.feed(&tagged("133;D", CHILD, ";exit=0;ps=0"));
+        assert_eq!(c.depth(), 2, "a non-prompt event is ignored while desynced");
+        c.feed(&tagged("133;A", LOCAL, ""));
+        assert!(!c.desynced());
+        assert_eq!(c.depth(), 1);
+        assert_eq!(c.lifecycle_view(), InputState::Prompt);
+    }
+
+    #[test]
+    fn after_a_desync_the_next_prompt_of_the_top_level_is_trusted() {
+        let mut c = nested_at_prompt();
+        c.apply(ObsMsg::Resync);
+        c.feed(&tagged("133;A", CHILD, ""));
+        assert!(!c.desynced());
+        assert_eq!(c.depth(), 2);
+        assert_eq!(c.lifecycle_view(), InputState::Prompt);
+    }
+
+    /// The end of the session closes the remote record and the local one, both Incomplete.
+    #[test]
+    fn the_end_of_the_session_closes_every_open_record() {
+        let mut c = nested_at_prompt();
+        remote_running(&mut c, "sleep 9");
+        c.apply(ObsMsg::Eof);
+        assert_eq!(c.lifecycle_view(), InputState::Exited);
+        assert_eq!(c.depth(), 1);
+        let recs = c.records();
+        assert_eq!(recs.len(), 2, "{recs:?}");
+        assert!(recs.iter().all(|r| r.status == RecordStatus::Incomplete), "{recs:?}");
+    }
+
+    /// A remote level reports its own cwd (tagged 633;Cwd), records take it, and untagged OSC 7 is ignored while it is on top.
+    #[test]
+    fn a_nested_level_reports_its_own_cwd_and_the_local_osc7_is_ignored_on_top() {
+        let mut c = nested_at_prompt();
+        c.feed(&tagged("633;Cwd", CHILD, ";/srv/app"));
+        c.feed(&osc("7;file://lidia/tmp/elsewhere"));
+        assert_eq!(c.cwd(), None, "untagged OSC 7 is the local shell's only");
+        remote_running(&mut c, "ls");
+        c.feed(&tagged("133;D", CHILD, ";exit=0;ps=0"));
+        let rec = c.get_record(2).expect("the remote record");
+        assert_eq!(rec.cwd, Some(Cwd { host: "lidia".into(), path: "/srv/app".into() }));
+        assert_eq!(rec.location.as_deref(), Some("ssh ubuntu@lidia"));
+    }
+
+    /// Output on the local shell's own cwd still works with no nested level, as before.
+    #[test]
+    fn the_local_cwd_is_untouched_without_a_nested_level() {
+        let mut c = core();
+        c.feed(&osc("7;file://mac.local/tmp/x"));
+        assert_eq!(c.cwd(), Some(Cwd { host: "mac.local".into(), path: "/tmp/x".into() }));
     }
 }

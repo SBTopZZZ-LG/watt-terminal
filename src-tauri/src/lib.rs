@@ -28,7 +28,7 @@ use crate::core::chat::redact::Redactor;
 use crate::core::chat::todo::{Todo, TodoList};
 use crate::core::foreground::Foreground;
 use crate::core::llm::TurnCancel;
-use crate::core::observer::{EventSink, InputState, IntegrationStatus, ObserverStatus, SessionEvent};
+use crate::core::observer::{EventSink, InputState, IntegrationStatus, LevelInfo, ObserverStatus, SessionEvent};
 use crate::core::persist::conversations::ConversationMeta;
 use crate::core::persist::turn::{FinishedTurn, TurnEnv, resume, save_turn};
 use crate::core::persist::ui_state::{UiState, UiStatePatch};
@@ -526,6 +526,10 @@ struct Status {
     /// The foreground program hint while a command runs (core/foreground.rs). Left out when there is none.
     #[serde(skip_serializing_if = "Option::is_none")]
     foreground: Option<Foreground>,
+    /// The nested shell levels, outermost first. The local shell is not listed. Empty when there is none.
+    levels: Vec<LevelInfo>,
+    /// How many shell levels the session holds, the local one included. 1 means no nested shell.
+    depth: usize,
     integration: IntegrationStatus,
     observer: ObserverStatus,
     cwd: Option<Cwd>,
@@ -564,9 +568,13 @@ fn get_status(session_id: String, reg: State<'_, Reg>, settings: State<'_, Setti
         }
         None => (env_llm(), None),
     };
+    let levels = att.session.levels();
+    let depth = levels.len();
     Ok(Status {
         state: att.session.state(),
         foreground: att.session.foreground(),
+        levels: levels.into_iter().skip(1).collect(),
+        depth,
         integration: att.session.integration_status(),
         observer: att.session.observer_status(),
         cwd: att.session.cwd(),
