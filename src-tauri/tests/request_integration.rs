@@ -31,6 +31,7 @@ fn nested_zsh_session() -> Harness {
     wait_prompt(&s);
     s.submit(Source::User, NESTED_ZSH).expect("submit the nested shell");
     assert!(wait_foreground(&s, ForegroundKind::Shell), "state {:?}", s.state());
+    assert!(wait_program_up(&s, NESTED_ZSH), "the nested shell never drew its prompt");
     s
 }
 
@@ -168,6 +169,29 @@ fn at_a_prompt_the_request_is_refused_without_a_question() {
     let err = ctx.call_tool("request_integration", json!({})).expect_err("refused");
     assert!(err.starts_with("cannot integrate the shell now: no command is running in this shell"), "{err}");
     assert!(phases(&events).is_empty(), "no dialog for a refusal");
+}
+
+/// While the shell is still starting (it has printed nothing since its command began) the request is refused before any
+/// question: the text says to wait or look at the screen first, and no dialog opens. (The integration itself after the
+/// shell is up is tested in integrate_session.rs.)
+#[test]
+fn a_request_is_refused_while_the_shell_is_still_starting() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let cmd = "sh -c 'sleep 2; exec zsh -f -i'";
+    s.submit(Source::User, cmd).expect("submit");
+    assert!(wait_foreground(&s, ForegroundKind::Shell), "state {:?}", s.state());
+    let tools = SessionTools::new(&s);
+    let gate = ApprovalGate::with_timeout(Duration::from_secs(5));
+    let events = Mutex::new(Vec::new());
+    let emit = |ev: AgentEvent| events.lock().unwrap().push(ev);
+    let ctx = AgentCtx::new(&tools, &gate, &emit);
+    let err = ctx.call_tool("request_integration", json!({})).expect_err("refused while the shell starts");
+    assert!(err.starts_with("cannot integrate the shell yet: it is still starting"), "{err}");
+    assert!(err.contains("Wait a few seconds") && err.contains("get_screen"), "{err}");
+    assert!(phases(&events).is_empty(), "no dialog for a refusal");
+    assert!(wait_program_up(&s, cmd), "the shell never drew its prompt: {:?}", s.screen_snapshot().rows);
 }
 
 /// A program that is not a shell is refused, and the command it runs is not disturbed.

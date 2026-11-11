@@ -291,12 +291,76 @@ struct Reported {
 
 // ---------- vt100 callbacks ----------
 
-/// Owned by the vt100 parser. Counts rows that scroll off the normal screen, and renders the open record's output as it goes.
-#[derive(Default)]
+/// How many scrolled-off normal-screen rows are kept for `get_screen` with `lines`. The oldest go first.
+pub const HISTORY_ROWS: usize = 1000;
+/// The most text `get_screen` with `lines` returns, in bytes. The newest lines win.
+pub const SCREEN_HISTORY_CAP: usize = 12 << 10;
+
+/// One scrolled-off row, kept as vt100 writes it. It is rendered to plain text only when it is read (`plain`).
+struct HistoryRow {
+    /// The row's formatted capture (SGR codes included). May start with the newline vt100 writes before a row that follows
+    /// a hard line end; `start` skips it.
+    raw: String,
+    start: usize,
+    /// True when the row soft-wrapped into the next one. Set when the next row arrives. The newest row has no next row yet:
+    /// `Collector::newest_wrapped` reads it instead.
+    wrapped: bool,
+}
+
+impl HistoryRow {
+    fn plain(&self) -> String {
+        basic_formatted_to_plain(&self.raw[self.start..]).collect()
+    }
+}
+
+/// Owned by the vt100 parser. Counts rows that scroll off the normal screen, keeps the newest of them (the history ring, as
+/// raw captures), and renders the open record's output as it goes (`row_text`, separately from the ring).
 pub struct Collector {
     /// Normal-screen rows scrolled off since the parser was created. Row N of the scrollback has absolute index N.
     scrolled_total: u64,
+    /// The newest scrolled-off rows, oldest first, at most `ring_capacity`. Ring row i has absolute index
+    /// `scrolled_total - ring.len() + i`.
+    ring: VecDeque<HistoryRow>,
+    /// `HISTORY_ROWS`. Zero turns the ring off (the benchmark measures that).
+    ring_capacity: usize,
+    /// True while an agent's command is open at any level (set by `Core` before each parser write). Rows scrolled off are
+    /// kept in the ring only then, so a user's own commands cost nothing. When it turns off the ring stays as it is.
+    recording: bool,
+    /// One capture state for every ring row, in order. vt100 writes a newline before a row when the row before it ended a
+    /// line, so each row says whether the one before it wrapped. Its pending newline says whether the newest row wrapped.
+    capture: BasicFormattedCaptureState,
     open: Option<OpenRecord>,
+}
+
+impl Default for Collector {
+    fn default() -> Self {
+        Collector {
+            scrolled_total: 0,
+            ring: VecDeque::new(),
+            ring_capacity: HISTORY_ROWS,
+            recording: false,
+            capture: BasicFormattedCaptureState::new(),
+            open: None,
+        }
+    }
+}
+
+impl Collector {
+    /// Turns the ring's recording on or off. Turning it on starts a fresh ring: the rows kept by an earlier agent command
+    /// are dropped, so one command's history never shows another's. Turning it off keeps what was captured.
+    fn set_recording(&mut self, on: bool) {
+        if on && !self.recording {
+            self.ring.clear();
+            self.capture = BasicFormattedCaptureState::new();
+        }
+        self.recording = on;
+    }
+
+    /// Whether the newest ring row soft-wrapped into the next row. Read from the capture state (its Debug output is the only
+    /// public view of it, as in `row_text`). False when the ring is empty.
+    fn newest_wrapped(&self) -> bool {
+        !format!("{:?}", self.capture).contains("newline_pending: true")
+    }
 }
 
 impl Callbacks for Collector {
@@ -306,12 +370,25 @@ impl Callbacks for Collector {
         }
         let index = self.scrolled_total;
         self.scrolled_total += 1;
-        if let Some(open) = self.open.as_mut()
-            && index >= open.start_abs
-            && !open.builder.is_full()
-        {
+        let in_open_record = self.open.as_ref().is_some_and(|open| index >= open.start_abs && !open.builder.is_full());
+        if in_open_record && let Some(open) = self.open.as_mut() {
             let (text, wrapped) = row_text(&contents);
             open.builder.push_row(&text, wrapped);
+        }
+        if self.recording && self.ring_capacity > 0 {
+            // The oldest row's buffer is reused, so a full ring costs no allocation per row.
+            let mut raw = if self.ring.len() == self.ring_capacity {
+                self.ring.pop_front().map(|row| row.raw).unwrap_or_default()
+            } else {
+                String::new()
+            };
+            raw.clear();
+            let _ = contents.write_formatted_basic(&mut raw, &mut self.capture);
+            let start = usize::from(raw.starts_with('\n'));
+            if let Some(previous) = self.ring.back_mut() {
+                previous.wrapped = start == 0;
+            }
+            self.ring.push_back(HistoryRow { raw, start, wrapped: false });
         }
     }
 }
@@ -337,6 +414,30 @@ struct OpenRecord {
     start_abs: u64,
     used_alt: bool,
     approximate: bool,
+    /// When C started the command. The age in the notes is read from it.
+    started: Instant,
+}
+
+/// One of the agent's own commands that is still open: its record id, the call that started it, its command text, how
+/// long it has run, and whether it is on the top level (false: it is parked under a nested shell that is on top).
+#[derive(Debug, Clone)]
+pub struct OpenAgentRecord {
+    pub id: u64,
+    pub call_id: String,
+    pub command: String,
+    pub age: Duration,
+    pub on_top: bool,
+}
+
+/// The rows `get_screen` returns with `lines` (see `Core::screen_lines`).
+#[derive(Debug, Clone)]
+pub struct ScreenLines {
+    /// Logical lines, oldest first: soft-wrapped rows are joined.
+    pub rows: Vec<String>,
+    /// True when older lines were left out to stay under `SCREEN_HISTORY_CAP`.
+    pub truncated: bool,
+    /// True on the alternate screen, which has no history: `rows` are the visible rows.
+    pub no_history: bool,
 }
 
 // ---------- observer core ----------
@@ -363,8 +464,9 @@ pub enum CallStatus {
     Abandoned,
     /// The shell has been waiting for the rest of the line (PS2) for at least the requested time.
     WaitingForInput,
-    /// Nothing is known yet. Carries the shell state now.
-    Pending(InputState),
+    /// Nothing is known yet. Carries the shell state now, and the id of the call's record when the shell has started it
+    /// (the record is open). Both are read under the same lock.
+    Pending { state: InputState, record_id: Option<u64> },
 }
 
 fn nz(n: u16) -> NonZeroU16 {
@@ -464,6 +566,13 @@ pub struct Core {
     screen_hash: u64,
     /// Counts visible-screen changes. Waits compare it between polls.
     screen_gen: u64,
+    /// When the screen last changed, and when any output last arrived. `integration_starting` reads them.
+    screen_changed_at: Option<Instant>,
+    output_at: Option<Instant>,
+    /// Set when an agent's record closes, and cleared at the next command start. While it is set the history ring keeps
+    /// recording: the rows still on screen when the command ends scroll off during the prompt that follows, and they are
+    /// part of the command's output.
+    settling_history: bool,
     size: (u16, u16),
     scanner: Scanner,
     /// The shell levels, outermost (local) first. Never empty; the last one is the top.
@@ -508,6 +617,8 @@ pub struct Core {
 
 /// Keeps at most this many completed records in memory. The oldest are dropped first.
 pub const MAX_RECORDS: usize = 1000;
+/// How long the screen must be still before a shell counts as started for an integration (see `integration_starting`).
+pub const STARTING_QUIET: Duration = Duration::from_millis(300);
 
 impl Core {
     pub fn new(nonce: &str, size: (u16, u16)) -> Self {
@@ -515,6 +626,9 @@ impl Core {
         Core {
             screen_hash: screen_fingerprint(parser.screen()),
             screen_gen: 0,
+            screen_changed_at: None,
+            output_at: None,
+            settling_history: false,
             parser,
             size,
             scanner: Scanner::new(nonce),
@@ -769,6 +883,18 @@ impl Core {
         Ok(())
     }
 
+    /// True while the program in the foreground is still starting, so the Ctrl-C an integration types first could stop it
+    /// (a `zsh -f -i` that has not drawn its prompt is killed by SIGINT). That is so when no output has arrived since its
+    /// command started, or when the screen changed less than `STARTING_QUIET` ago. Writes nothing.
+    pub fn integration_starting(&self, now: Instant) -> bool {
+        let Some(open) = self.parser.callbacks().open.as_ref() else {
+            return false;
+        };
+        let no_output_since_start = self.output_at.is_none_or(|t| t < open.started);
+        let screen_moving = self.screen_changed_at.is_some_and(|t| now.saturating_duration_since(t) < STARTING_QUIET);
+        no_output_since_start || screen_moving
+    }
+
     /// Why `begin_injection` would refuse now, or None. The same checks, changing nothing: the agent asks this before it
     /// asks the user.
     pub fn injection_refusal(&self) -> Option<InjectRefusal> {
@@ -838,6 +964,8 @@ impl Core {
         if seg.is_empty() {
             return;
         }
+        self.output_at = Some(Instant::now());
+        self.sync_history();
         let open = self.parser.callbacks_mut().open.as_mut();
         if let Some(open) = open {
             open.raw.push(seg);
@@ -907,6 +1035,7 @@ impl Core {
             Event::CommandStart => {
                 // C while a record is open: the previous command ended without a D we could trust.
                 self.close_open(RecordStatus::Incomplete);
+                self.settling_history = false;
                 let (command, source) = self.command_for_c();
                 self.pending = None;
                 // The line the user typed has run (or is running): the prompt is no longer holding their text.
@@ -941,6 +1070,7 @@ impl Core {
             // vt100 may push rows through on_scroll or reflow the cursor during a resize; the output is then approximate.
             open.approximate = true;
         }
+        self.sync_history();
         self.parser.set_size(nz(size.0), nz(size.1));
         self.size = size;
     }
@@ -949,6 +1079,7 @@ impl Core {
     fn resync(&mut self) {
         self.close_open(RecordStatus::Incomplete);
         self.parser = new_parser(self.size);
+        self.settling_history = false;
         self.scanner.reset();
         self.desynced = true;
         self.last_e = None;
@@ -1013,6 +1144,7 @@ impl Core {
             start_abs,
             used_alt: alt,
             approximate: false,
+            started: Instant::now(),
         });
     }
 
@@ -1025,7 +1157,10 @@ impl Core {
 
     /// Adds the rows still on screen (from the command's first row to the cursor) and stores the record.
     fn finish_record(&mut self, open: OpenRecord, exit: Option<i32>, pipestatus: Vec<i32>, status: RecordStatus) {
-        let OpenRecord { mut record, mut builder, raw, start_abs, used_alt, approximate } = open;
+        let OpenRecord { mut record, mut builder, raw, start_abs, used_alt, approximate, .. } = open;
+        if matches!(record.source, Source::Agent { .. }) {
+            self.settling_history = true;
+        }
         let (screen, cb) = self.parser.screen_and_callbacks_mut();
         if !screen.alternate_screen() && !used_alt {
             let (crow, _) = screen.cursor_position();
@@ -1158,7 +1293,123 @@ impl Core {
         {
             return CallStatus::WaitingForInput;
         }
-        CallStatus::Pending(self.lifecycle_view())
+        let record_id = self.open_records().find(|(open, _)| matches!(&open.record.source, Source::Agent { call_id: c } if c == call_id)).map(|(open, _)| open.record.id);
+        CallStatus::Pending { state: self.lifecycle_view(), record_id }
+    }
+
+    /// Every open record, the top level's first and then the parked levels', outermost first. The flag is true for the top
+    /// level's record. A parked record is the command that started a nested shell (for example ssh), still running.
+    fn open_records(&self) -> impl Iterator<Item = (&OpenRecord, bool)> + '_ {
+        let top = self.parser.callbacks().open.as_ref().map(|open| (open, true));
+        let parked = self.stack.iter().filter_map(|level| level.parked.as_ref()?.open.as_ref()).map(|open| (open, false));
+        top.into_iter().chain(parked)
+    }
+
+    /// The agent's own open commands (see `OpenAgentRecord`).
+    pub fn open_agent_records(&self) -> Vec<OpenAgentRecord> {
+        let now = Instant::now();
+        self.open_records()
+            .filter_map(|(open, on_top)| match &open.record.source {
+                Source::Agent { call_id } => Some(OpenAgentRecord {
+                    id: open.record.id,
+                    call_id: call_id.clone(),
+                    command: open.record.command.clone(),
+                    age: now.saturating_duration_since(open.started),
+                    on_top,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Tells the history ring whether it records: an agent's command is open at any level, or one has just closed and the
+    /// prompt after it is still being drawn (`settling_history`). A command the user runs costs nothing. Called before each
+    /// write to the parser, so the events that open or close a record take effect for the bytes after them.
+    fn sync_history(&mut self) {
+        let on = self.settling_history
+            || self.open_records().any(|(open, _)| matches!(open.record.source, Source::Agent { .. }));
+        self.parser.callbacks_mut().set_recording(on);
+    }
+
+    /// True while a record with this id is open (any source, any level).
+    pub fn record_is_open(&self, id: u64) -> bool {
+        self.open_records().any(|(open, _)| open.record.id == id)
+    }
+
+    /// True once the record with this id has finished (and it is still kept).
+    pub fn has_finished_record(&self, id: u64) -> bool {
+        self.records.iter().any(|r| r.id == id)
+    }
+
+    /// The summary of a finished record, by id.
+    pub fn record_summary(&self, id: u64) -> Option<RecordSummary> {
+        self.records.iter().find(|r| r.id == id).map(RecordSummary::from)
+    }
+
+    /// `get_screen` with `lines`: the last `n` logical lines, from the history ring and the visible rows. A soft-wrapped
+    /// row continues the line before it. Trailing blank rows below the cursor are not output and are left out. On the
+    /// alternate screen there is no history, so the visible rows are returned and `no_history` is set. The newest lines
+    /// are kept when the text is over `SCREEN_HISTORY_CAP`.
+    pub fn screen_lines(&self, n: usize) -> ScreenLines {
+        let screen = self.parser.screen();
+        if screen.alternate_screen() {
+            return ScreenLines { rows: self.screen_snapshot().rows, truncated: false, no_history: true };
+        }
+        let (rows_visible, cols) = screen.size();
+        let cursor_row = usize::from(screen.cursor_position().0);
+        let collector = self.parser.callbacks();
+        let newest = collector.ring.len().saturating_sub(1);
+        let newest_wrapped = collector.newest_wrapped();
+        let mut physical: Vec<(String, bool)> = collector
+            .ring
+            .iter()
+            .enumerate()
+            .map(|(i, row)| (row.plain(), if i == newest { newest_wrapped } else { row.wrapped }))
+            .collect();
+        let visible_start = physical.len();
+        for (r, text) in screen.rows(0, cols.get()).enumerate().take(usize::from(rows_visible.get())) {
+            physical.push((text, screen.row_wrapped(r as u16)));
+        }
+        while physical.len() > visible_start + cursor_row + 1 {
+            match physical.last() {
+                Some((text, false)) if text.trim().is_empty() => {
+                    physical.pop();
+                }
+                _ => break,
+            }
+        }
+        let mut logical: Vec<String> = Vec::new();
+        let mut continues = false;
+        for (text, wrapped) in physical {
+            let piece = if wrapped { text } else { text.trim_end().to_string() };
+            match logical.last_mut() {
+                Some(last) if continues => last.push_str(&piece),
+                _ => logical.push(piece),
+            }
+            continues = wrapped;
+        }
+        let kept = &logical[logical.len().saturating_sub(n)..];
+        let mut used = 0;
+        let mut first = kept.len();
+        for (i, line) in kept.iter().enumerate().rev() {
+            if used + line.len() + 1 > SCREEN_HISTORY_CAP {
+                break;
+            }
+            used += line.len() + 1;
+            first = i;
+        }
+        let mut rows: Vec<String> = kept[first..].to_vec();
+        let mut truncated = first > 0;
+        if rows.is_empty() && let Some(last) = kept.last() {
+            // The newest line alone is over the cap: its end is kept, cut at a character boundary.
+            let mut cut = last.len() - SCREEN_HISTORY_CAP.min(last.len());
+            while !last.is_char_boundary(cut) {
+                cut += 1;
+            }
+            rows.push(last[cut..].to_string());
+            truncated = true;
+        }
+        ScreenLines { rows, truncated, no_history: false }
     }
 
     // TODO: `exec zsh` and nested shells are undetected. They have no AGENTTERM_NONCE, so they emit no events:
@@ -1315,6 +1566,7 @@ impl Core {
         if hash != self.screen_hash {
             self.screen_hash = hash;
             self.screen_gen += 1;
+            self.screen_changed_at = Some(Instant::now());
         }
     }
 
@@ -1534,12 +1786,26 @@ mod tests {
         c.handle(Event::Continuation);
     }
 
+    /// An agent command submitted at the prompt and started (its C seen), as `run_command` leaves it while it runs. Output
+    /// after this is what the history ring records.
+    fn agent_command_open(c: &mut Core, call_id: &str, command: &str) {
+        c.lifecycle = Lifecycle::Prompt;
+        c.begin_submit(Some((agent(call_id), Some(command.into()))));
+        c.handle(Event::CommandLine(command.into()));
+        c.handle(Event::CommandStart);
+    }
+
+    /// The lines `from..=to` as `prefix-N`, each ending in a line feed.
+    fn numbered_lines(prefix: &str, from: usize, to: usize) -> Vec<u8> {
+        (from..=to).map(|i| format!("{prefix}-{i}\r\n")).collect::<String>().into_bytes()
+    }
+
     fn status(c: &Core, call_id: &str) -> String {
         match c.call_status(call_id, WAIT) {
             CallStatus::Finished(_) => "finished".into(),
             CallStatus::Abandoned => "abandoned".into(),
             CallStatus::WaitingForInput => "waiting".into(),
-            CallStatus::Pending(state) => format!("pending {state:?}"),
+            CallStatus::Pending { state, .. } => format!("pending {state:?}"),
         }
     }
 
@@ -1583,7 +1849,7 @@ mod tests {
         assert_eq!(status(&c, "run-4"), "waiting");
         assert_eq!(
             match c.call_status("run-4", Duration::from_secs(10)) {
-                CallStatus::Pending(state) => format!("{state:?}"),
+                CallStatus::Pending { state, .. } => format!("{state:?}"),
                 other => format!("{other:?}"),
             },
             "Continuation",
@@ -2298,5 +2564,251 @@ mod tests {
         c.feed(&tagged("133;A", &local, ""));
         assert_eq!(c.top_key(), 0);
         assert_eq!(c.accepted_nonces(), vec![local]);
+    }
+
+    /// Lines that scrolled off during an agent command are kept (newest 1000). `screen_lines` reads them with the visible
+    /// rows, in order.
+    #[test]
+    fn the_history_ring_keeps_the_newest_scrolled_rows() {
+        let mut c = Core::new("test-nonce", (5, 20));
+        agent_command_open(&mut c, "run-h", "seq 1 301");
+        let text: String = (1..=300).map(|i| format!("{i}\r\n")).collect::<String>() + "301";
+        c.apply(ObsMsg::Bytes(text.into_bytes()));
+        let three = c.screen_lines(3);
+        assert_eq!(three.rows, ["299", "300", "301"]);
+        assert!(!three.truncated && !three.no_history);
+        let all = c.screen_lines(1000);
+        assert_eq!(all.rows.len(), 301, "296 scrolled rows and the 5 visible ones");
+        assert_eq!(all.rows[0], "1");
+
+        let mut long = Core::new("test-nonce", (5, 20));
+        agent_command_open(&mut long, "run-long", "seq 1 1500");
+        let text: String = (1..=1499).map(|i| format!("{i}\r\n")).collect::<String>() + "1500";
+        long.apply(ObsMsg::Bytes(text.into_bytes()));
+        let rows = long.screen_lines(1000).rows;
+        assert_eq!(rows.len(), 1000, "the ring holds 1000 rows");
+        assert_eq!((rows[0].as_str(), rows[999].as_str()), ("501", "1500"));
+    }
+
+    /// A taller resize leaves the scrolled-off rows in the history. (vt100 also inserts blank rows at the top of a taller
+    /// screen; that is unchanged from before the history existed, and is not asserted here.)
+    #[test]
+    fn a_taller_resize_keeps_the_history() {
+        let mut c = Core::new("test-nonce", (4, 20));
+        agent_command_open(&mut c, "run-r", "seq 1 10");
+        c.apply(ObsMsg::Bytes("1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\r\n8\r\n9\r\n10".as_bytes().to_vec()));
+        assert_eq!(c.screen_snapshot().rows, ["7", "8", "9", "10"]);
+        c.resize(8, 20);
+        let lines = c.screen_lines(100).rows;
+        assert_eq!(lines.first().map(String::as_str), Some("1"), "{lines:?}");
+        assert!(lines.iter().any(|r| r == "6") && lines.last().map(String::as_str) == Some("10"), "{lines:?}");
+    }
+
+    /// A soft-wrapped row continues the line before it, so the logical line is whole.
+    #[test]
+    fn screen_lines_joins_soft_wraps_into_one_logical_line() {
+        let mut c = Core::new("test-nonce", (3, 10));
+        agent_command_open(&mut c, "run-w", "wrap");
+        let text = format!("{}\r\nxyz", "a".repeat(29));
+        c.apply(ObsMsg::Bytes(text.into_bytes()));
+        let rows = c.screen_lines(10).rows;
+        assert!(rows.contains(&"a".repeat(29)), "{rows:?}");
+        assert_eq!(rows.last().map(String::as_str), Some("xyz"));
+    }
+
+    /// The alternate screen has no history: the visible rows come back, and the flag says so.
+    #[test]
+    fn the_alternate_screen_gives_the_visible_rows_and_no_history() {
+        let mut c = Core::new("test-nonce", (4, 20));
+        c.apply(ObsMsg::Bytes(b"1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n\x1b[?1049halt-row".to_vec()));
+        let lines = c.screen_lines(10);
+        assert!(lines.no_history, "{lines:?}");
+        assert!(!lines.truncated);
+        assert_eq!(lines.rows.iter().filter(|r| !r.is_empty()).collect::<Vec<_>>(), [&"alt-row".to_string()]);
+    }
+
+    /// Over the byte cap the oldest lines go, and the answer says so.
+    #[test]
+    fn screen_lines_stay_under_the_cap_and_keep_the_newest_lines() {
+        let mut c = Core::new("test-nonce", (5, 120));
+        agent_command_open(&mut c, "run-c", "cap");
+        let text: String = (0..250).map(|i| format!("{i:03}{}\r\n", "x".repeat(100))).collect::<String>() + "last";
+        c.apply(ObsMsg::Bytes(text.into_bytes()));
+        let lines = c.screen_lines(200);
+        assert!(lines.truncated, "{} rows", lines.rows.len());
+        let bytes: usize = lines.rows.iter().map(|r| r.len() + 1).sum();
+        assert!(bytes <= SCREEN_HISTORY_CAP, "{bytes} bytes");
+        assert_eq!(lines.rows.last().map(String::as_str), Some("last"));
+    }
+
+    /// A command the user runs records nothing: its scrolled rows are not kept. The agent's command records while it is
+    /// open. When it ends its history stays as captured and a later user command adds nothing. The next agent command
+    /// starts a fresh ring.
+    #[test]
+    fn the_ring_records_only_while_an_agent_record_is_open() {
+        let mut c = Core::new("test-nonce", (5, 20));
+        c.lifecycle = Lifecycle::Prompt;
+        c.handle(Event::CommandStart);
+        assert!(c.open_agent_records().is_empty(), "a user command is open, not an agent one");
+        c.apply(ObsMsg::Bytes(numbered_lines("user", 1, 50)));
+        c.handle(Event::CommandEnd { exit: 0, pipestatus: vec![0] });
+        let user_only = c.screen_lines(1000).rows;
+        assert!(!user_only.iter().any(|r| r == "user-1" || r == "user-20"), "a user command kept history: {user_only:?}");
+
+        agent_command_open(&mut c, "run-a", "make");
+        c.apply(ObsMsg::Bytes(numbered_lines("agent", 1, 50)));
+        let during = c.screen_lines(1000).rows;
+        assert!(during.contains(&"agent-1".to_string()), "{during:?}");
+        c.handle(Event::CommandEnd { exit: 0, pipestatus: vec![0] });
+        // The shell draws its prompt, then the user starts a command: the ring records nothing of that command.
+        c.handle(Event::PromptStart);
+        c.handle(Event::CommandStart);
+        c.apply(ObsMsg::Bytes(numbered_lines("later", 1, 50)));
+        let after = c.screen_lines(1000).rows;
+        assert!(after.contains(&"agent-1".to_string()), "the captured history is kept: {after:?}");
+        assert!(!after.iter().any(|r| r == "later-1"), "the ring kept recording for a user command: {after:?}");
+        c.handle(Event::CommandEnd { exit: 0, pipestatus: vec![0] });
+
+        agent_command_open(&mut c, "run-b", "ls");
+        c.apply(ObsMsg::Bytes(numbered_lines("second", 1, 3)));
+        let fresh = c.screen_lines(1000).rows;
+        assert!(!fresh.iter().any(|r| r == "agent-1"), "the next agent record starts a fresh ring: {fresh:?}");
+    }
+
+    /// The rows still on screen when an agent command ends scroll off while the prompt is drawn. They are part of the
+    /// command's output, so the history keeps them.
+    #[test]
+    fn the_rows_still_on_screen_when_an_agent_command_ends_are_kept() {
+        let mut c = Core::new("test-nonce", (5, 20));
+        agent_command_open(&mut c, "run-t", "seq 1 5");
+        c.apply(ObsMsg::Bytes(numbered_lines("out", 1, 5)));
+        c.handle(Event::CommandEnd { exit: 0, pipestatus: vec![0] });
+        c.handle(Event::PromptStart);
+        c.apply(ObsMsg::Bytes(b"\r\n\r\n\r\n$ ".to_vec()));
+        let rows = c.screen_lines(100).rows;
+        for n in 1..=4 {
+            assert!(rows.contains(&format!("out-{n}")), "out-{n} scrolled off during the prompt and was lost: {rows:?}");
+        }
+    }
+
+    /// The history of an agent command that yielded (still running) is there after more output, and by its record id.
+    #[test]
+    fn history_from_a_yielded_command_is_readable_after_more_output() {
+        let mut c = Core::new("test-nonce", (5, 20));
+        agent_command_open(&mut c, "run-y", "seq 1 400");
+        c.apply(ObsMsg::Bytes(numbered_lines("early", 1, 300)));
+        // run_command returns here, while the command runs. Its record id is what wait and get_command use.
+        let id = match c.call_status("run-y", WAIT) {
+            CallStatus::Pending { record_id: Some(id), .. } => id,
+            other => panic!("the yielded command has no record id: {other:?}"),
+        };
+        c.apply(ObsMsg::Bytes(numbered_lines("late", 1, 60)));
+        assert!(c.record_is_open(id), "the command is still open after more output");
+        let rows = c.screen_lines(400).rows;
+        assert!(rows.contains(&"early-1".to_string()), "the first line of the yielded output is gone: {rows:?}");
+        assert!(rows.contains(&"early-300".to_string()) && rows.contains(&"late-60".to_string()), "{rows:?}");
+    }
+
+    /// The agent's command still records while a nested shell is on top of it (the record is parked, and still open).
+    #[test]
+    fn the_ring_keeps_recording_while_an_agent_record_is_parked() {
+        let mut c = core();
+        agent_command_open(&mut c, "run-p", "ssh h");
+        c.expect_level(CHILD, "ssh h");
+        c.feed(&tagged("633;Hello", CHILD, ";v=1;sh=bash;user=u;host=h;pid=77"));
+        assert_eq!(c.top_key(), 1, "the nested shell is on top");
+        assert_eq!(c.open_agent_records().len(), 1, "the agent record is parked, still open");
+        c.apply(ObsMsg::Bytes(numbered_lines("nested", 1, 60)));
+        let rows = c.screen_lines(100).rows;
+        assert!(rows.contains(&"nested-1".to_string()), "{rows:?}");
+    }
+
+    /// A shell is still starting until output has come since its command began, and then the screen has been still for
+    /// STARTING_QUIET. Until then an integration would not type its Ctrl-C.
+    #[test]
+    fn a_shell_is_starting_until_output_has_come_and_the_screen_is_still() {
+        let mut c = core();
+        c.lifecycle = Lifecycle::Prompt;
+        c.handle(Event::CommandStart);
+        assert!(c.integration_starting(Instant::now()), "no output since its command began");
+        c.apply(ObsMsg::Bytes(b"host% ".to_vec()));
+        c.note_screen(); // the observer loop does this after every message
+        assert!(c.integration_starting(Instant::now()), "the screen changed just now");
+        std::thread::sleep(STARTING_QUIET + Duration::from_millis(50));
+        assert!(!c.integration_starting(Instant::now()), "output came and the screen has been still");
+    }
+
+    /// The agent's open command is found while it runs, through the alternate screen, and while a nested shell is on top of
+    /// it (parked). Its call status carries the record id under the same lock.
+    #[test]
+    fn open_agent_records_follow_the_command_into_alt_and_a_nested_shell() {
+        let mut c = core();
+        c.lifecycle = Lifecycle::Prompt;
+        c.begin_submit(Some((agent("run-9"), Some("ssh h".into()))));
+        c.handle(Event::CommandLine("ssh h".into()));
+        c.handle(Event::CommandStart);
+        let open = c.open_agent_records();
+        assert_eq!(open.len(), 1, "{open:?}");
+        assert_eq!((open[0].id, open[0].call_id.as_str(), open[0].on_top), (1, "run-9", true));
+        assert!(matches!(c.call_status("run-9", WAIT), CallStatus::Pending { state: InputState::Running, record_id: Some(1) }));
+
+        c.feed(b"\x1b[?1049h");
+        assert_eq!(c.lifecycle_view(), InputState::Alt);
+        assert_eq!(c.open_agent_records().len(), 1, "the record survives the alternate screen");
+        c.feed(b"\x1b[?1049l");
+
+        c.expect_level(CHILD, "ssh h");
+        c.feed(&tagged("633;Hello", CHILD, ";v=1;sh=bash;user=u;host=h;pid=77"));
+        assert_eq!(c.top_key(), 1);
+        let parked = c.open_agent_records();
+        assert_eq!(parked.len(), 1, "{parked:?}");
+        assert!(!parked[0].on_top, "the record is parked under the nested shell");
+        assert!(c.record_is_open(1));
+        assert!(!c.has_finished_record(1));
+    }
+
+    /// Throughput of the observer path (`Core::apply`) on ~50 MB of `seq` output, in four settings:
+    /// ring off (no ring, no agent record); ring gated off (the ring is on but no agent record is open, a user's command
+    /// flood: it should match ring off); ring on (an agent's command open, so every scrolled row is recorded); and agent
+    /// record with the ring off, which shows the open record's own rendering apart from the ring's.
+    /// Run it with `cargo test --lib bench_history_ring_cost -- --ignored --nocapture`. Prints MB/s for each setting.
+    #[test]
+    #[ignore]
+    fn bench_history_ring_cost() {
+        use std::io::Write;
+        let mut data: Vec<u8> = Vec::with_capacity(50 << 20);
+        let mut n = 1u64;
+        while data.len() < 50 << 20 {
+            write!(data, "{n}\r\n").expect("in-memory write");
+            n += 1;
+        }
+        let run = |ring: usize, agent: bool| -> f64 {
+            let mut c = Core::new("bench-nonce", (30, 120));
+            c.parser.callbacks_mut().ring_capacity = ring;
+            if agent {
+                agent_command_open(&mut c, "bench", "seq 1 50000000");
+            } else {
+                c.lifecycle = Lifecycle::Prompt;
+                c.handle(Event::CommandStart);
+            }
+            let start = Instant::now();
+            for chunk in data.chunks(64 << 10) {
+                c.apply(ObsMsg::Bytes(chunk.to_vec()));
+            }
+            let secs = start.elapsed().as_secs_f64();
+            (data.len() as f64 / (1 << 20) as f64) / secs
+        };
+        for round in 1..=2 {
+            let off = run(0, false);
+            let gated_off = run(HISTORY_ROWS, false);
+            let on = run(HISTORY_ROWS, true);
+            let record_only = run(0, true);
+            println!(
+                "round {round}: ring off {off:.1} MB/s; ring gated off (user flood) {gated_off:.1} MB/s ({:+.1}% vs off); \
+                 ring on (agent flood) {on:.1} MB/s ({:+.1}% vs off); agent record with ring off {record_only:.1} MB/s",
+                (gated_off - off) / off * 100.0,
+                (on - off) / off * 100.0,
+            );
+        }
     }
 }

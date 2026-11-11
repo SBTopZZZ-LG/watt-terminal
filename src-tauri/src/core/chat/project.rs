@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use crate::core::chat::redact::Redactor;
 use crate::core::chat::todo;
 use crate::core::foreground::{Foreground, ForegroundKind};
+use crate::core::observer::SCREEN_HISTORY_CAP;
 use crate::core::tools::INTEGRATE_HINT;
 
 /// `run_command` output longer than this is cut to a head and tail. Output at or under it is sent whole.
@@ -19,8 +20,10 @@ const RUN_OUTPUT_LIMIT: usize = 4500;
 const GET_OUTPUT_LIMIT: usize = 6000;
 const HEAD_BYTES: usize = 1500;
 const TAIL_BYTES: usize = 3000;
-/// Screen and command-list text keep their most recent bytes up to these limits.
+/// Screen and command-list text keep their most recent bytes up to these limits. `get_screen` with `lines` keeps up to
+/// HISTORY_LIMIT: it is the answer the agent asked for, and the observer caps it at the same size.
 const SCREEN_LIMIT: usize = 6000;
+const HISTORY_LIMIT: usize = SCREEN_HISTORY_CAP;
 const LIST_LIMIT: usize = 6000;
 /// The output tail of a command that a `wait` finished. The screen gets the rest of `SCREEN_LIMIT`.
 const WAIT_OUTPUT_LIMIT: usize = SCREEN_LIMIT / 2;
@@ -55,7 +58,7 @@ pub fn project(name: &str, ok: bool, result: &Value, redactor: &Redactor) -> Str
 fn run_command_text(v: &Value, r: &Redactor) -> String {
     let text = match v.get("outcome").and_then(Value::as_str) {
         Some("finished") => finished_text(v.get("record"), r),
-        Some("timed_out") => timed_out_text(v),
+        Some("running") => running_text(v),
         Some("not_run") => not_run_text(v),
         _ => compact_json(v),
     };
@@ -90,14 +93,18 @@ fn finished_text(record: Option<&Value>, r: &Redactor) -> String {
     Value::Object(fields).to_string()
 }
 
-fn timed_out_text(v: &Value) -> String {
-    let state = scalar(v.get("state"));
-    if state == "running" {
-        "timed out after the wait; shell state: running; the command may still be running in the terminal".to_string()
-    } else {
-        // Only `running` means the command may still be going. Any other state is reported as it is.
-        format!("timed out after the wait; shell state: {state}")
+/// A run whose wait ended with the command still going. It is JSON, like a finished command, so the record id stays
+/// readable in the history (the agent loop reads it for the finished note). The screen tail is redacted with the rest.
+fn running_text(v: &Value) -> String {
+    const FIELDS: [&str; 9] =
+        ["outcome", "reason", "record_id", "call_id", "state", "foreground", "waited_ms", "screen_tail", "hint"];
+    let mut fields = serde_json::Map::new();
+    for key in FIELDS {
+        if let Some(value) = v.get(key) {
+            fields.insert(key.into(), value.clone());
+        }
     }
+    Value::Object(fields).to_string()
 }
 
 fn not_run_text(v: &Value) -> String {
@@ -107,7 +114,8 @@ fn not_run_text(v: &Value) -> String {
             "not run: the shell is waiting for the rest of the line, so the command is incomplete. Nothing was sent to cancel it."
                 .to_string()
         }
-        "cancelled" => "not run: the turn was cancelled before the command ran".to_string(),
+        "cancelled" => "cancelled while waiting; the command may still be running".to_string(),
+        "cancelled_before_send" => "not run: the turn was cancelled before the command was sent. Nothing ran.".to_string(),
         _ => compact_json(v),
     }
 }
@@ -128,7 +136,14 @@ fn get_command_text(v: &Value, r: &Redactor) -> String {
 }
 
 fn get_screen_text(v: &Value, r: &Redactor) -> String {
-    format!("{}\n{}", screen_header(v, r), screen_body(v, r, SCREEN_LIMIT))
+    // With `lines` the rows are the history the agent asked for, so they keep the larger limit.
+    let limit = if v.get("history").is_some() { HISTORY_LIMIT } else { SCREEN_LIMIT };
+    let mut lines = vec![screen_header(v, r)];
+    if let Some(note) = v.get("note").and_then(Value::as_str) {
+        lines.push(note.to_string());
+    }
+    lines.push(screen_body(v, r, limit));
+    lines.join("\n")
 }
 
 /// The rows of a screen, trailing blank rows dropped, redacted, keeping the most recent `limit` bytes.
@@ -224,6 +239,16 @@ fn screen_header(v: &Value, r: &Redactor) -> String {
     let integration = scalar(v.get("integration_status"));
     if integration != "live" && integration != "?" {
         header.push_str(&format!(" integration={integration}"));
+    }
+    // Set only by `get_screen` with `lines`: how many logical lines the rows are, and what was left out.
+    if let Some(history) = v.get("history").filter(|h| h.is_object()) {
+        header.push_str(&format!(" lines={}", scalar(history.get("lines"))));
+        if history.get("truncated") == Some(&Value::Bool(true)) {
+            header.push_str(" truncated=true");
+        }
+        if history.get("no_history") == Some(&Value::Bool(true)) {
+            header.push_str(" no_history=true (the alternate screen has no history)");
+        }
     }
     if let Some(location) = v.get("location").and_then(Value::as_str) {
         header.push_str(&format!("\nlocation: {} (a nested shell, not the local machine)", escape_controls(&r.redact(location))));
@@ -531,22 +556,36 @@ mod tests {
         assert_eq!(shown, "token [REDACTED] and [REDACTED:api_key]");
     }
 
+    /// A running command is JSON with its record id, state, tail and the next step. The id is what the agent waits on.
     #[test]
-    fn timed_out_while_running_may_still_be_running() {
-        let v = json!({"outcome": "timed_out", "state": "running"});
-        let out = project("run_command", true, &v, &none());
-        assert_eq!(
-            out,
-            "timed out after the wait; shell state: running; the command may still be running in the terminal"
-        );
+    fn a_running_command_gives_its_record_id_tail_and_next_step() {
+        let v = json!({
+            "outcome": "running", "reason": "timeout", "record_id": 4, "call_id": "run-9", "state": "running",
+            "foreground": {"kind": "other", "command": "sleep 3"}, "waited_ms": 1003,
+            "screen_tail": ["$ sleep 3"], "hint": "Still running. Call wait with id 4 to wait for it to finish.",
+            "private_field": "not shown",
+        });
+        let out = run_text(&v);
+        assert_eq!(out["outcome"], "running");
+        assert_eq!(out["record_id"], 4);
+        assert_eq!(out["state"], "running");
+        assert_eq!(out["screen_tail"], json!(["$ sleep 3"]));
+        assert!(out["hint"].as_str().is_some_and(|h| h.contains("wait with id 4")));
+        assert!(out.get("private_field").is_none(), "only the model's fields are shown: {out}");
     }
 
+    /// Before the shell has started the command there is no record id: it is null, and the state says so.
     #[test]
-    fn timed_out_in_another_state_does_not_claim_running() {
-        let v = json!({"outcome": "timed_out", "state": "alt"});
-        let out = project("run_command", true, &v, &none());
-        assert_eq!(out, "timed out after the wait; shell state: alt");
-        assert!(!out.contains("still be running"));
+    fn a_running_command_without_a_record_id_says_null() {
+        let v = json!({"outcome": "running", "reason": "timeout", "record_id": null, "state": "submitted",
+                       "call_id": "run-1", "waited_ms": 5000, "screen_tail": [], "hint": "not started"});
+        let out = run_text(&v);
+        assert!(out["record_id"].is_null(), "{out}");
+        assert_eq!(out["state"], "submitted");
+    }
+
+    fn run_text(v: &Value) -> Value {
+        serde_json::from_str(&project("run_command", true, v, &none())).expect("a running result is JSON")
     }
 
     #[test]
@@ -558,7 +597,11 @@ mod tests {
             project("run_command", true, &json!({"outcome": "not_run", "reason": "waiting_for_input"}), &r);
         assert!(waiting.contains("waiting for the rest of the line"));
         let cancelled = project("run_command", true, &json!({"outcome": "not_run", "reason": "cancelled"}), &r);
-        assert!(cancelled.contains("cancelled before the command ran"));
+        assert!(cancelled.contains("cancelled while waiting; the command may still be running"), "{cancelled}");
+        // Before the line was sent nothing runs, so the text must not say the command may still be running.
+        let before = project("run_command", true, &json!({"outcome": "not_run", "reason": "cancelled_before_send"}), &r);
+        assert!(before.contains("cancelled before the command was sent") && before.contains("Nothing ran"), "{before}");
+        assert!(!before.contains("may still be running"), "{before}");
         let other = project("run_command", true, &json!({"outcome": "not_run", "reason": "later"}), &r);
         assert!(other.starts_with("{"), "unknown reason falls back to JSON: {other}");
     }
@@ -817,7 +860,7 @@ mod tests {
             json!({"outcome": "finished"}),
             json!({"outcome": "finished", "record": "nope"}),
             json!({"outcome": "finished", "record": {"output": 3, "pipestatus": "x", "cwd": 9}}),
-            json!({"outcome": "timed_out", "state": {"a": 1}}),
+            json!({"outcome": "running", "record_id": {"a": 1}, "state": {"a": 1}}),
             json!({"outcome": "not_run"}),
             json!({"rows": "x", "size": [1], "cursor": "y"}),
             json!({"rows": [1, null, {}], "size": [1, 2, 3], "observer_status": 1}),
@@ -919,11 +962,42 @@ mod tests {
     /// A run result that carries the input-wait note says so after the outcome. Without the note nothing is added.
     #[test]
     fn a_run_note_follows_the_outcome() {
-        let timed = json!({"outcome": "timed_out", "state": "running", "note": "The shell appears to be waiting for a password or other input. Do not type it. Ask the user to handle it, then use get_screen."});
+        let timed = json!({"outcome": "running", "record_id": 3, "state": "running", "note": "The shell appears to be waiting for a password or other input. Do not type it. Ask the user to handle it, then use get_screen."});
         let text = project("run_command", true, &timed, &none());
-        assert!(text.starts_with("timed out after the wait; shell state: running;"), "{text}");
+        assert!(text.starts_with("{\"outcome\":\"running\""), "{text}");
         assert!(text.ends_with("\nThe shell appears to be waiting for a password or other input. Do not type it. Ask the user to handle it, then use get_screen."), "{text}");
-        let plain = project("run_command", true, &json!({"outcome": "timed_out", "state": "running"}), &none());
+        let plain = project("run_command", true, &json!({"outcome": "running", "record_id": 3, "state": "running"}), &none());
         assert!(!plain.contains("password"), "{plain}");
+    }
+
+    /// `get_screen` with `lines` says how many lines it has, and keeps the larger limit. The plain screen does not change.
+    #[test]
+    fn get_screen_with_lines_names_the_history_and_keeps_more_of_it() {
+        // 200 rows of 42 bytes: about 8 KB, over the screen limit (6000) and under the history limit (12 KB).
+        let rows: Vec<String> = (0..200).map(|i| format!("line {i:05} {}", "x".repeat(30))).collect();
+        let mut v = json!({
+            "rows": rows, "cursor": [0, 0], "alternate_screen": false, "size": [24, 80],
+            "state": "prompt", "observer_status": "ok", "integration_status": "live",
+            "history": {"lines": 200, "truncated": false, "no_history": false},
+        });
+        let text = project("get_screen", true, &v, &none());
+        assert!(text.lines().next().unwrap().ends_with(" lines=200"), "{text}");
+        assert!(text.contains("line 00000 "), "the first line is kept under the history limit");
+        assert!(text.len() > SCREEN_LIMIT, "{} bytes", text.len());
+        let plain = json!({
+            "rows": v["rows"].clone(), "cursor": [0, 0], "alternate_screen": false, "size": [24, 80],
+            "state": "prompt", "observer_status": "ok", "integration_status": "live",
+        });
+        assert!(project("get_screen", true, &plain, &none()).contains("bytes above omitted"), "the screen limit cuts the same rows");
+
+        v["history"] = json!({"lines": 3, "truncated": true, "no_history": true});
+        v["note"] = json!("lines 900 is outside 1 to 200; showing 200 lines instead");
+        let text = project("get_screen", true, &v, &none());
+        let header = text.lines().next().unwrap();
+        assert!(header.contains(" lines=3 truncated=true no_history=true"), "{header}");
+        assert_eq!(text.lines().nth(1), Some("lines 900 is outside 1 to 200; showing 200 lines instead"), "{text}");
+
+        let plain = project("get_screen", true, &screen(&["$ ls"]), &none());
+        assert!(!plain.contains("lines="), "{plain}");
     }
 }

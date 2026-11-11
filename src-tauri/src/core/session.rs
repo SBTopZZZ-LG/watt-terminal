@@ -19,8 +19,8 @@ use serde::Serialize;
 use crate::core::foreground::Foreground;
 use crate::core::inject::{self, END_MARKER};
 use crate::core::observer::{
-    run_observer, Activity, CallStatus, Core, EventSink, InjectRefusal, InputState, IntegrationStatus, LevelInfo, ObsMsg,
-    ObsQueue, ObserverStatus, ScreenSnapshot, Shared,
+    run_observer, Activity, CallStatus, Core, EventSink, InjectRefusal, InputState, IntegrationStatus, LevelInfo,
+    ObsMsg, ObsQueue, ObserverStatus, OpenAgentRecord, ScreenLines, ScreenSnapshot, Shared,
 };
 use crate::core::pty::{self, Gate, OutputSink};
 use crate::core::record::{Cwd, Record, RecordSummary, Source};
@@ -35,6 +35,9 @@ const PUSH_WAIT: Duration = Duration::from_secs(5);
 const INJECT_POLL: Duration = Duration::from_millis(20);
 /// The line the loader prints (alone on its row) when it refuses the shell.
 const UNSUPPORTED_LINE: &str = "Unsupported shell";
+/// The outcome text when the shell in the foreground is still starting. Ctrl-C would stop it, so nothing is typed.
+pub const STARTING_HINT: &str = "the shell is still starting, so Ctrl-C could stop it: nothing was typed. Wait a few seconds \
+     (get_screen shows what it is doing), then call request_integration again";
 
 #[derive(Debug, Clone)]
 pub struct SpawnConfig {
@@ -299,6 +302,12 @@ impl Session {
         self.shared.lock().injection_refusal()
     }
 
+    /// True while the program in the foreground is still starting, so `integrate_shell` would not type yet (see
+    /// `Core::integration_starting`). Writes nothing.
+    pub fn integration_starting(&self) -> bool {
+        self.shared.lock().integration_starting(Instant::now())
+    }
+
     /// Integrates the shell that runs in the foreground (ssh, a nested shell, su, a container exec) as a new level. It
     /// types Ctrl-C and the loader, waits for the shell's Ready, then writes the blob with a fresh nonce and waits for the
     /// new level's Hello. Blocking: call it from a blocking thread. One at a time; a second call is refused as Busy.
@@ -310,6 +319,10 @@ impl Session {
         };
         let label = {
             let mut core = self.shared.lock();
+            // Checked after the refusals, so a shell that is not there at all still gets its own reason.
+            if core.injection_refusal().is_none() && core.integration_starting(Instant::now()) {
+                return IntegrateOutcome::Failed { hint: STARTING_HINT.into() };
+            }
             if let Err(reason) = core.begin_injection(&token) {
                 return IntegrateOutcome::Refused { reason };
             }
@@ -470,6 +483,31 @@ impl Session {
 
     pub fn get_record(&self, id: u64) -> Option<Record> {
         self.shared.lock().get_record(id)
+    }
+
+    /// The summary of a finished record, by id.
+    pub fn record_summary(&self, id: u64) -> Option<RecordSummary> {
+        self.shared.lock().record_summary(id)
+    }
+
+    /// True once the record with this id has finished (and it is still kept).
+    pub fn has_finished_record(&self, id: u64) -> bool {
+        self.shared.lock().has_finished_record(id)
+    }
+
+    /// True while a record with this id is open (any source, any level).
+    pub fn record_is_open(&self, id: u64) -> bool {
+        self.shared.lock().record_is_open(id)
+    }
+
+    /// The agent's own open commands, the top level's and the parked ones (see `OpenAgentRecord`).
+    pub fn open_agent_records(&self) -> Vec<OpenAgentRecord> {
+        self.shared.lock().open_agent_records()
+    }
+
+    /// The last `n` logical lines of the screen and its history (see `Core::screen_lines`).
+    pub fn screen_lines(&self, n: usize) -> ScreenLines {
+        self.shared.lock().screen_lines(n)
     }
 
     pub fn screen_snapshot(&self) -> ScreenSnapshot {

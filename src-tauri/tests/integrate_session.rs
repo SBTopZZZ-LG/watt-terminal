@@ -67,6 +67,7 @@ fn zsh_inside_zsh_is_integrated_and_its_commands_are_attributed() {
     wait_prompt(&s);
     s.submit(Source::User, NESTED_ZSH).expect("submit the nested shell");
     assert!(wait_foreground(&s, ForegroundKind::Shell), "state {:?}", s.state());
+    assert!(wait_program_up(&s, NESTED_ZSH), "the nested shell never drew its prompt: {:?}", s.screen_snapshot().rows);
 
     let (key, sh) = integrate_ok(&s);
     assert_eq!((key, sh.as_str()), (1, "zsh"));
@@ -124,6 +125,27 @@ fn integrate_is_refused_at_a_prompt_and_for_a_program_that_is_not_a_shell() {
     assert!(wait_state(&s, InputState::Prompt, WAIT));
 }
 
+/// A shell that has printed nothing since its command began is still starting, and the Ctrl-C an integration types would
+/// stop it. Here the command sleeps before it execs zsh, so integrating at once is refused as still starting, and nothing
+/// is typed: the command is still running afterwards. Once zsh has drawn its prompt, the same session integrates.
+#[test]
+fn integrate_waits_while_a_shell_is_still_starting() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let cmd = "sh -c 'sleep 2; exec zsh -f -i'";
+    s.submit(Source::User, cmd).expect("submit");
+    assert!(wait_foreground(&s, ForegroundKind::Shell), "state {:?}", s.state());
+    match s.integrate_shell() {
+        IntegrateOutcome::Failed { hint } => assert!(hint.contains("still starting"), "{hint}"),
+        other => panic!("expected the still-starting refusal, got {other:?}"),
+    }
+    assert!(s.records().iter().all(|r| r.exit_code.is_none()), "the refused call stopped the command: {:?}", s.records());
+    assert!(wait_program_up(&s, cmd), "the shell never drew its prompt: {:?}", s.screen_snapshot().rows);
+    let (key, sh) = integrate_ok(&s);
+    assert_eq!((key, sh.as_str()), (1, "zsh"));
+}
+
 /// bash 3.2 (macOS /bin/bash) is refused by the loader: UnsupportedShell, nothing installed, and the session still works
 /// once the user leaves it. Skipped with a note where /bin/bash is 4.4 or newer (or cannot run).
 #[test]
@@ -138,6 +160,7 @@ fn bash_32_is_refused_as_unsupported_and_the_session_goes_on() {
     wait_prompt(&s);
     s.submit(Source::User, "/bin/bash --noprofile --norc -i").expect("submit");
     assert!(wait_foreground(&s, ForegroundKind::Shell));
+    assert!(wait_program_up(&s, "/bin/bash --noprofile --norc -i"), "bash never drew its prompt");
 
     assert_eq!(s.integrate_shell(), IntegrateOutcome::UnsupportedShell);
     assert_eq!(s.levels().len(), 1, "a refused shell adds no level");
@@ -160,6 +183,7 @@ fn a_forged_prompt_while_a_level_is_on_top_only_counts() {
     wait_prompt(&s);
     s.submit(Source::User, NESTED_ZSH).expect("submit");
     assert!(wait_foreground(&s, ForegroundKind::Shell));
+    assert!(wait_program_up(&s, NESTED_ZSH), "the nested shell never drew its prompt");
     integrate_ok(&s);
     assert!(wait_state(&s, InputState::Prompt, WAIT));
     let before = s.stats().forged_events;
@@ -196,6 +220,7 @@ fn docker_bash_flow(name_tag: &str, skel: bool) {
         assert!(wait_until(WAIT, || at_container_prompt(&s).then_some(())).is_some(), "no prompt after the skel rc");
     }
 
+    assert!(wait_program_up(&s, &docker), "the container shell never drew its prompt");
     let (key, sh) = integrate_ok(&s);
     assert_eq!((key, sh.as_str()), (1, "bash"), "{image}");
     assert!(wait_state(&s, InputState::Prompt, WAIT), "state {:?}", s.state());

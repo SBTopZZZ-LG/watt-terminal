@@ -9,14 +9,16 @@ use std::time::{Duration, Instant};
 
 use agent_term_lib::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate, DENIED, MockAgent, user_input};
 use agent_term_lib::core::approval::RegexPolicy;
+use agent_term_lib::core::chat::project::project;
+use agent_term_lib::core::chat::redact::Redactor;
 use agent_term_lib::core::llm::TurnCancel;
 use agent_term_lib::core::foreground::ForegroundKind;
 use agent_term_lib::core::observer::{EventSink, InputState, IntegrationStatus, ObserverStatus, SessionEvent};
 use agent_term_lib::core::record::Source;
 use agent_term_lib::core::session::{Session, USER_TEXT_CODE};
 use agent_term_lib::core::settings::{ApprovalMode, ApprovalSettings};
-use agent_term_lib::core::tools::{schemas, AgentTools, NotRunReason, RunOutcome, SessionTools, WaitReason, DEFAULT_RUN_TIMEOUT};
-use serde_json::json;
+use agent_term_lib::core::tools::{schemas, AgentTools, NotRunReason, RunOutcome, SessionTools, WaitReason, DEFAULT_RUN_WAIT};
+use serde_json::{json, Value};
 
 use common::*;
 
@@ -206,7 +208,7 @@ fn run_command_when_idle_returns_record_with_exit_code_and_output() {
     let s = start();
     run(&s, &format!("cd '{}'", dir.display()));
     let tools = SessionTools::new(&s);
-    let outcome = tools.run_command("pwd", DEFAULT_RUN_TIMEOUT, None).expect("run_command");
+    let outcome = tools.run_command("pwd", DEFAULT_RUN_WAIT, None).expect("run_command");
     let RunOutcome::Finished { record } = outcome else { panic!("expected a finished record, got {outcome:?}") };
     assert_eq!(record.exit_code, Some(0));
     assert_eq!(record.output, dir.display().to_string());
@@ -223,21 +225,21 @@ fn run_command_is_refused_while_running_and_in_alt_screen() {
     s.submit(Source::User, "sleep 3").expect("submit");
     assert!(wait_state(&s, InputState::Running, Duration::from_secs(3)), "state={:?}", s.state());
     let tools = SessionTools::new(&s);
-    let err = tools.run_command("echo refused-running", DEFAULT_RUN_TIMEOUT, None).expect_err("refused while running");
+    let err = tools.run_command("echo refused-running", DEFAULT_RUN_WAIT, None).expect_err("refused while running");
     assert!(err.contains("Running"), "error: {err}");
     run_finish(&s, "sleep 3");
 
     let cmd = r"printf '\033[?1049h'; sleep 2; printf '\033[?1049l'";
     s.submit(Source::User, cmd).expect("submit");
     assert!(wait_state(&s, InputState::Alt, Duration::from_secs(5)), "state={:?}", s.state());
-    let err = tools.run_command("echo refused-alt", DEFAULT_RUN_TIMEOUT, None).expect_err("refused in alt screen");
+    let err = tools.run_command("echo refused-alt", DEFAULT_RUN_WAIT, None).expect_err("refused in alt screen");
     assert!(err.contains("Alt"), "error: {err}");
     run_finish(&s, cmd);
     assert!(!s.records().iter().any(|r| r.command.starts_with("echo refused")), "a refused command ran");
 }
 
 #[test]
-fn run_command_times_out_cleanly_and_session_stays_usable() {
+fn run_command_returns_running_at_its_wait_and_the_session_stays_usable() {
     let _g = serial();
     let s = start();
     wait_prompt(&s);
@@ -245,8 +247,8 @@ fn run_command_times_out_cleanly_and_session_stays_usable() {
     let outcome = tools.run_command("sleep 30", Duration::from_millis(500), None).expect("run_command");
     match outcome {
         // Usually Running; Submitted if the C event had not arrived yet when the timeout expired.
-        RunOutcome::TimedOut { state: InputState::Running | InputState::Submitted } => {}
-        other => panic!("expected a timeout, got {other:?}"),
+        RunOutcome::Running { state: InputState::Running | InputState::Submitted, .. } => {}
+        other => panic!("expected a running command, got {other:?}"),
     }
     s.write_user(&[0x03]).expect("ctrl-c");
     wait_prompt(&s);
@@ -285,7 +287,7 @@ fn wait_returns_at_once_when_a_command_finishes_and_carries_its_record() {
     wait_prompt(&s);
     start_running(&s, "sleep 1");
     let started = Instant::now();
-    let view = SessionTools::new(&s).wait(20, false).expect("wait");
+    let view = SessionTools::new(&s).wait(20, false, None).expect("wait");
     let took = started.elapsed();
     assert_eq!(view.reason, WaitReason::CommandFinished, "{view:?}");
     assert!(took < Duration::from_secs(10), "the wait took {took:?}");
@@ -303,7 +305,7 @@ fn wait_returns_early_when_output_appears_while_the_command_still_runs() {
     let cmd = r"sleep 1; printf 'marker-out\n'; sleep 4";
     start_running(&s, cmd);
     let started = Instant::now();
-    let view = SessionTools::new(&s).wait(20, false).expect("wait");
+    let view = SessionTools::new(&s).wait(20, false, None).expect("wait");
     assert_eq!(view.reason, WaitReason::ScreenChanged, "{view:?}");
     assert!(started.elapsed() < Duration::from_secs(10), "the wait took {:?}", started.elapsed());
     assert_eq!(view.state, InputState::Running, "the command was still running");
@@ -320,7 +322,7 @@ fn wait_with_ignore_updates_ignores_output_and_ends_at_the_command_finish() {
     wait_prompt(&s);
     let cmd = r"printf 'noise\n'; sleep 2; printf 'more\n'; sleep 2";
     start_running(&s, cmd);
-    let view = SessionTools::new(&s).wait(20, true).expect("wait");
+    let view = SessionTools::new(&s).wait(20, true, None).expect("wait");
     assert_eq!(view.reason, WaitReason::CommandFinished, "{view:?}");
     assert!(view.waited_ms >= 2500, "the wait returned on output, after {} ms", view.waited_ms);
     let record = view.record.expect("the record");
@@ -334,7 +336,7 @@ fn wait_times_out_on_a_quiet_command_and_the_session_stays_usable() {
     let s = start();
     wait_prompt(&s);
     start_running(&s, "sleep 5");
-    let view = SessionTools::new(&s).wait(1, false).expect("wait");
+    let view = SessionTools::new(&s).wait(1, false, None).expect("wait");
     assert_eq!(view.reason, WaitReason::Timeout, "{view:?}");
     assert!((900..3000).contains(&view.waited_ms), "waited {} ms", view.waited_ms);
     assert_eq!(view.state, InputState::Running, "the timeout must not touch the command");
@@ -342,7 +344,7 @@ fn wait_times_out_on_a_quiet_command_and_the_session_stays_usable() {
 
     s.write_user(&[0x03]).expect("ctrl-c");
     wait_prompt(&s);
-    let idle = SessionTools::new(&s).wait(10, false).expect("wait after the timeout");
+    let idle = SessionTools::new(&s).wait(10, false, None).expect("wait after the timeout");
     assert_eq!(idle.reason, WaitReason::Idle);
     let r = run(&s, "echo alive-after-wait");
     assert_eq!(r.output, "alive-after-wait");
@@ -355,7 +357,7 @@ fn wait_at_an_idle_prompt_returns_at_once_with_or_without_ignore_updates() {
     wait_prompt(&s);
     for ignore in [false, true] {
         let started = Instant::now();
-        let view = SessionTools::new(&s).wait(10, ignore).expect("wait");
+        let view = SessionTools::new(&s).wait(10, ignore, None).expect("wait");
         assert_eq!(view.reason, WaitReason::Idle, "ignore_updates={ignore}");
         assert!(started.elapsed() < Duration::from_secs(1), "ignore_updates={ignore} took {:?}", started.elapsed());
         assert!(view.record.is_none());
@@ -370,7 +372,7 @@ fn cancel_ends_a_wait_within_a_second_and_leaves_the_command_alone() {
     start_running(&s, "sleep 5");
     let cancel = Arc::new(TurnCancel::new());
     let (s1, c1) = (s.arc(), cancel.clone());
-    let call = thread::spawn(move || SessionTools::new(&s1).with_cancel(c1).wait(60, false));
+    let call = thread::spawn(move || SessionTools::new(&s1).with_cancel(c1).wait(60, false, None));
     thread::sleep(Duration::from_millis(300));
     let cancelled_at = Instant::now();
     cancel.cancel();
@@ -427,7 +429,7 @@ fn wait_budget_is_per_turn_and_refuses_a_wait_started_after_it_is_used_up() {
     assert_eq!(s.state(), InputState::Running);
 
     // A new turn (a new SessionTools) has its own budget.
-    let next = SessionTools::new(&s).wait(1, true).expect("a new turn waits again");
+    let next = SessionTools::new(&s).wait(1, true, None).expect("a new turn waits again");
     assert_eq!(next.reason, WaitReason::Timeout);
     s.write_user(&[0x03]).expect("ctrl-c");
     wait_prompt(&s);
@@ -449,7 +451,7 @@ fn user_submit_and_agent_run_command_race_exactly_one_proceeds() {
     let (s2, b2) = (s.arc(), barrier.clone());
     let agent = thread::spawn(move || {
         b2.wait();
-        SessionTools::new(&s2).run_command("echo AGENT", DEFAULT_RUN_TIMEOUT, None)
+        SessionTools::new(&s2).run_command("echo AGENT", DEFAULT_RUN_WAIT, None)
     });
     let user_res = user.join().expect("user thread");
     let agent_res = agent.join().expect("agent thread");
@@ -609,13 +611,16 @@ fn cancel_while_run_command_waits_returns_at_once_and_the_command_keeps_running(
     wait_prompt(&s);
     let cancel = Arc::new(TurnCancel::new());
     let (s1, c1) = (s.arc(), cancel.clone());
-    let call = thread::spawn(move || SessionTools::new(&s1).with_cancel(c1).run_command("sleep 2; echo cancel-kept", DEFAULT_RUN_TIMEOUT, None));
+    let call = thread::spawn(move || SessionTools::new(&s1).with_cancel(c1).run_command("sleep 2; echo cancel-kept", DEFAULT_RUN_WAIT, None));
     assert!(wait_state(&s, InputState::Running, Duration::from_secs(10)), "state={:?}", s.state());
     let cancelled_at = Instant::now();
     cancel.cancel();
     let outcome = call.join().expect("call thread").expect("run_command");
     let took = cancelled_at.elapsed();
     assert!(matches!(outcome, RunOutcome::NotRun { reason: NotRunReason::Cancelled }), "got {outcome:?}");
+    // What the model reads says the command may still be running, which is true: the line was sent before the cancel.
+    let said = project("run_command", true, &serde_json::to_value(&outcome).expect("json"), &Redactor::new(Vec::new()));
+    assert_eq!(said, "cancelled while waiting; the command may still be running", "{said}");
     assert!(took < Duration::from_secs(1), "the cancelled call took {took:?}");
     assert_eq!(s.state(), InputState::Running, "the cancel must not touch the running command");
 
@@ -633,8 +638,11 @@ fn cancel_before_run_command_sends_nothing() {
     wait_prompt(&s);
     let cancel = Arc::new(TurnCancel::new());
     cancel.cancel();
-    let outcome = SessionTools::new(&s).with_cancel(cancel).run_command("echo never-sent", DEFAULT_RUN_TIMEOUT, None).expect("run_command");
-    assert!(matches!(outcome, RunOutcome::NotRun { reason: NotRunReason::Cancelled }), "got {outcome:?}");
+    let outcome = SessionTools::new(&s).with_cancel(cancel).run_command("echo never-sent", DEFAULT_RUN_WAIT, None).expect("run_command");
+    assert!(matches!(outcome, RunOutcome::NotRun { reason: NotRunReason::CancelledBeforeSend }), "got {outcome:?}");
+    // The line never reached the shell, so the text must not say the command may still be running.
+    let said = project("run_command", true, &serde_json::to_value(&outcome).expect("json"), &Redactor::new(Vec::new()));
+    assert!(said.contains("cancelled before the command was sent") && !said.contains("may still be running"), "{said}");
     assert_eq!(s.state(), InputState::Prompt, "the line reached the shell");
     run(&s, "echo after-cancel");
     assert!(!s.records().iter().any(|r| r.command.contains("never-sent")), "a cancelled call sent its command");
@@ -791,7 +799,7 @@ fn user_text_at_the_prompt_refuses_run_command_and_writes_nothing() {
 
     let tools = SessionTools::new(&s);
     assert!(tools.run_command_precheck().is_err(), "the precheck let the command through");
-    let err = tools.run_command("echo agent-marker", DEFAULT_RUN_TIMEOUT, None).expect_err("refused while text is typed");
+    let err = tools.run_command("echo agent-marker", DEFAULT_RUN_WAIT, None).expect_err("refused while text is typed");
     assert!(err.starts_with(USER_TEXT_CODE), "error: {err}");
     assert!(!s.records().iter().any(|r| r.command.contains("agent-marker")), "the refused command ran");
     assert!(!screen_has(&s, "agent-marker"), "the refused command reached the screen");
@@ -800,7 +808,7 @@ fn user_text_at_the_prompt_refuses_run_command_and_writes_nothing() {
     s.write_user(&[0x03]).expect("ctrl-c");
     assert!(wait_until(Duration::from_secs(5), || (!prompt_line(&s).contains("typed-by-user")).then_some(())).is_some(), "ctrl-c did not clear the prompt line");
     wait_prompt(&s);
-    let outcome = tools.run_command("echo after-ctrl-c", DEFAULT_RUN_TIMEOUT, None).expect("runs after ctrl-c");
+    let outcome = tools.run_command("echo after-ctrl-c", DEFAULT_RUN_WAIT, None).expect("runs after ctrl-c");
     let RunOutcome::Finished { record } = outcome else { panic!("expected a finished record, got {outcome:?}") };
     assert_eq!(record.output, "after-ctrl-c");
 }
@@ -862,7 +870,7 @@ fn run_command_works_when_the_user_has_typed_nothing() {
     wait_prompt(&s);
     let tools = SessionTools::new(&s);
     assert!(tools.run_command_precheck().is_ok());
-    let RunOutcome::Finished { record } = tools.run_command("echo untouched", DEFAULT_RUN_TIMEOUT, None).expect("run") else {
+    let RunOutcome::Finished { record } = tools.run_command("echo untouched", DEFAULT_RUN_WAIT, None).expect("run") else {
         panic!("expected a finished record");
     };
     assert_eq!(record.output, "untouched");
@@ -878,7 +886,7 @@ fn a_line_the_user_submits_leaves_the_prompt_clean() {
     run_finish(&s, "echo user-line");
     wait_prompt(&s);
     let tools = SessionTools::new(&s);
-    let RunOutcome::Finished { record } = tools.run_command("echo agent-next", DEFAULT_RUN_TIMEOUT, None).expect("run") else {
+    let RunOutcome::Finished { record } = tools.run_command("echo agent-next", DEFAULT_RUN_WAIT, None).expect("run") else {
         panic!("expected a finished record");
     };
     assert_eq!(record.output, "agent-next");
@@ -897,7 +905,7 @@ fn keys_typed_while_a_command_runs_do_not_block_the_next_agent_command() {
     run_finish(&s, "sleep 1");
     wait_prompt(&s);
     let RunOutcome::Finished { record } =
-        SessionTools::new(&s).run_command("echo next-ok", DEFAULT_RUN_TIMEOUT, None).expect("not refused")
+        SessionTools::new(&s).run_command("echo next-ok", DEFAULT_RUN_WAIT, None).expect("not refused")
     else {
         panic!("expected a finished record");
     };
@@ -936,7 +944,7 @@ fn type_ahead_during_a_command_refuses_the_next_agent_command() {
 
     let tools = SessionTools::new(&s);
     assert!(tools.run_command_precheck().is_err(), "the precheck let the command through");
-    let err = tools.run_command("echo type-ahead-marker", DEFAULT_RUN_TIMEOUT, None).expect_err("refused over type-ahead");
+    let err = tools.run_command("echo type-ahead-marker", DEFAULT_RUN_WAIT, None).expect_err("refused over type-ahead");
     assert!(err.starts_with(USER_TEXT_CODE), "error: {err}");
     assert!(!s.records().iter().any(|r| r.command.contains("type-ahead-marker")), "the refused command ran");
     assert!(!screen_has(&s, "type-ahead-marker"), "the refused command reached the screen");
@@ -944,7 +952,7 @@ fn type_ahead_during_a_command_refuses_the_next_agent_command() {
     s.write_user(&[0x03]).expect("ctrl-c at the prompt");
     assert!(wait_until(Duration::from_secs(5), || (!prompt_line(&s).contains("zqx")).then_some(())).is_some(), "ctrl-c did not clear the prompt line");
     wait_prompt(&s);
-    let RunOutcome::Finished { record } = tools.run_command("echo after-type-ahead", DEFAULT_RUN_TIMEOUT, None).expect("runs after ctrl-c") else {
+    let RunOutcome::Finished { record } = tools.run_command("echo after-type-ahead", DEFAULT_RUN_WAIT, None).expect("runs after ctrl-c") else {
         panic!("expected a finished record");
     };
     assert_eq!(record.output, "after-type-ahead");
@@ -980,7 +988,7 @@ fn keys_typed_in_the_alt_screen_do_not_refuse_run_command() {
     run_finish(&s, cmd);
     let tools = SessionTools::new(&s);
     assert!(tools.run_command_precheck().is_ok(), "alt-screen keys refused the agent");
-    let RunOutcome::Finished { record } = tools.run_command("echo after-alt", DEFAULT_RUN_TIMEOUT, None).expect("runs after the alt screen") else {
+    let RunOutcome::Finished { record } = tools.run_command("echo after-alt", DEFAULT_RUN_WAIT, None).expect("runs after the alt screen") else {
         panic!("expected a finished record");
     };
     assert_eq!(record.output, "after-alt");
@@ -996,7 +1004,7 @@ fn unclosed_quote_waits_for_input_then_ctrl_c_recovers() {
     wait_prompt(&s);
     let tools = SessionTools::new(&s);
     let began = std::time::Instant::now();
-    let outcome = tools.run_command("echo `x", DEFAULT_RUN_TIMEOUT, None).expect("run_command");
+    let outcome = tools.run_command("echo `x", DEFAULT_RUN_WAIT, None).expect("run_command");
     let waited = began.elapsed();
     assert!(matches!(outcome, RunOutcome::NotRun { reason: NotRunReason::WaitingForInput }), "got {outcome:?}");
     assert!(waited >= Duration::from_secs(2) && waited < Duration::from_secs(8), "returned after {waited:?}");
@@ -1005,7 +1013,7 @@ fn unclosed_quote_waits_for_input_then_ctrl_c_recovers() {
     s.write_user(&[0x03]).expect("ctrl-c");
     wait_prompt(&s);
     assert!(!s.records().iter().any(|r| r.command.contains("echo `x")), "the unfinished line became a record");
-    let RunOutcome::Finished { record } = tools.run_command("echo ok", DEFAULT_RUN_TIMEOUT, None).expect("run after ctrl-c") else {
+    let RunOutcome::Finished { record } = tools.run_command("echo ok", DEFAULT_RUN_WAIT, None).expect("run after ctrl-c") else {
         panic!("expected a finished record");
     };
     assert_eq!(record.output, "ok");
@@ -1043,7 +1051,7 @@ fn ctrl_c_in_continuation_abandons_the_call_promptly() {
     wait_prompt(&s);
     let (s1, t1) = (s.arc(), std::time::Instant::now());
     let call = thread::spawn(move || {
-        let outcome = SessionTools::new(&s1).run_command("echo `x", DEFAULT_RUN_TIMEOUT, None);
+        let outcome = SessionTools::new(&s1).run_command("echo `x", DEFAULT_RUN_WAIT, None);
         (outcome, t1.elapsed())
     });
     assert!(wait_state(&s, InputState::Continuation, Duration::from_secs(10)), "state={:?}", s.state());
@@ -1053,7 +1061,7 @@ fn ctrl_c_in_continuation_abandons_the_call_promptly() {
     assert!(matches!(outcome, RunOutcome::NotRun { reason: NotRunReason::Abandoned }), "got {outcome:?}");
     assert!(took < Duration::from_secs(2), "the abandoned call took {took:?}");
     wait_prompt(&s);
-    let RunOutcome::Finished { record } = SessionTools::new(&s).run_command("echo after-abandon", DEFAULT_RUN_TIMEOUT, None).expect("run")
+    let RunOutcome::Finished { record } = SessionTools::new(&s).run_command("echo after-abandon", DEFAULT_RUN_WAIT, None).expect("run")
     else {
         panic!("expected a finished record");
     };
@@ -1069,7 +1077,7 @@ fn user_finishing_the_agent_line_abandons_the_call() {
     wait_prompt(&s);
     let (s1, t1) = (s.arc(), std::time::Instant::now());
     let call = thread::spawn(move || {
-        let outcome = SessionTools::new(&s1).run_command("echo `x", DEFAULT_RUN_TIMEOUT, None);
+        let outcome = SessionTools::new(&s1).run_command("echo `x", DEFAULT_RUN_WAIT, None);
         (outcome, t1.elapsed())
     });
     assert!(wait_state(&s, InputState::Continuation, Duration::from_secs(10)), "state={:?}", s.state());
@@ -1174,7 +1182,7 @@ fn a_nested_shell_is_the_foreground_hint_and_refuses_run_command_without_a_card(
     let err = tools.run_command_precheck().expect_err("refused while a nested shell runs");
     assert!(err.starts_with("cannot run a command now: the session is Running, not at an idle prompt"), "{err}");
     assert!(err.contains("`zsh -f -i`") && err.contains("without shell integration"), "{err}");
-    let err = tools.run_command("echo nested-refused", DEFAULT_RUN_TIMEOUT, None).expect_err("refused in the nested shell");
+    let err = tools.run_command("echo nested-refused", DEFAULT_RUN_WAIT, None).expect_err("refused in the nested shell");
     assert!(err.starts_with("cannot run a command now"), "{err}");
 
     let approvals = ApprovalGate::with_timeout(Duration::from_millis(300));
@@ -1214,7 +1222,7 @@ fn a_nested_shell_is_the_foreground_hint_and_refuses_run_command_without_a_card(
     // command runs straight away, with no Ctrl-C at the prompt.
     assert!(tools.run_command_precheck().is_ok(), "the nested shell's typed text refused the agent after it exited");
     let RunOutcome::Finished { record } =
-        tools.run_command("echo after-nested", DEFAULT_RUN_TIMEOUT, None).expect("runs right after the nested shell exits")
+        tools.run_command("echo after-nested", DEFAULT_RUN_WAIT, None).expect("runs right after the nested shell exits")
     else {
         panic!("expected a finished record");
     };
@@ -1235,7 +1243,7 @@ fn an_ordinary_running_command_is_the_hint_and_refuses_without_a_card() {
     let fg = tools.get_screen().foreground.expect("the running command is the hint");
     assert_eq!(fg.kind, ForegroundKind::Other);
     assert_eq!(fg.command, "sleep 2");
-    let err = tools.run_command("echo during-sleep", DEFAULT_RUN_TIMEOUT, None).expect_err("refused while sleep runs");
+    let err = tools.run_command("echo during-sleep", DEFAULT_RUN_WAIT, None).expect_err("refused while sleep runs");
     assert!(err.contains("`sleep 2` is still running"), "{err}");
     assert!(!err.contains("without shell integration"), "{err}");
 
@@ -1247,7 +1255,7 @@ fn an_ordinary_running_command_is_the_hint_and_refuses_without_a_card() {
     wait_prompt(&s);
     assert!(tools.get_screen().foreground.is_none(), "the hint outlived the command");
     let RunOutcome::Finished { record } =
-        tools.run_command("echo after-sleep", DEFAULT_RUN_TIMEOUT, None).expect("runs after the command finished")
+        tools.run_command("echo after-sleep", DEFAULT_RUN_WAIT, None).expect("runs after the command finished")
     else {
         panic!("expected a finished record");
     };
@@ -1286,8 +1294,185 @@ fn back_to_back_run_commands_both_run_with_a_slow_precmd_hook() {
     let h = start_with_zshrc("precmd() { sleep 0.4 }\n");
     wait_prompt(&h);
     let tools = SessionTools::new(&h);
-    let first = tools.run_command("echo first-slow", DEFAULT_RUN_TIMEOUT, None).expect("the first run_command");
-    let second = tools.run_command("echo second-slow", DEFAULT_RUN_TIMEOUT, None).expect("the second run_command");
+    let first = tools.run_command("echo first-slow", DEFAULT_RUN_WAIT, None).expect("the first run_command");
+    let second = tools.run_command("echo second-slow", DEFAULT_RUN_WAIT, None).expect("the second run_command");
     assert!(matches!(first, RunOutcome::Finished { .. }), "{first:?}");
     assert!(matches!(second, RunOutcome::Finished { .. }), "{second:?}");
+}
+
+/// A command that outlives its wait is returned `running`, with its record id, the call id, the screen tail and the next step.
+/// `wait` with that id then returns the finished record, and `get_command` reads it afterwards.
+#[test]
+fn a_run_that_outlives_its_wait_is_returned_running_and_wait_by_id_finishes_it() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let tools = SessionTools::new(&s);
+    let v = tools
+        .call("run_command", &json!({"command": "sleep 3; echo yield-done", "wait_seconds": 1}), None)
+        .expect("run_command");
+    assert_eq!(v["outcome"], "running", "{v}");
+    assert_eq!(v["reason"], "timeout", "{v}");
+    assert_eq!(v["state"], "running", "{v}");
+    let id = v["record_id"].as_u64().expect("the record id");
+    assert!(v["call_id"].as_str().is_some_and(|c| c.starts_with("run-")), "{v}");
+    assert!(v["waited_ms"].as_u64().is_some_and(|ms| (900..2500).contains(&ms)), "waited {v}");
+    let tail: Vec<&str> = v["screen_tail"].as_array().expect("tail").iter().filter_map(|r| r.as_str()).collect();
+    assert!(tail.iter().any(|r| r.contains("yield-done")), "the command line is on the tail: {tail:?}");
+    let hint = v["hint"].as_str().expect("hint");
+    assert!(hint.contains(&format!("wait with id {id}")), "{hint}");
+    assert!(hint.contains("get_screen with lines") && hint.contains("run_command is unavailable until it ends"), "{hint}");
+    assert!(!hint.contains("send_keys"), "{hint}");
+    assert!(!v.to_string().contains("send_keys"), "{v}");
+
+    let w = tools.call("wait", &json!({"id": id, "seconds": 20}), None).expect("wait by id");
+    assert_eq!(w["reason"], "command_finished", "{w}");
+    assert_eq!(w["record"]["id"], id);
+    assert_eq!(w["record"]["exit_code"], 0);
+    assert_eq!(w["record"]["output"], "yield-done");
+    assert_eq!(w["state"], "prompt", "the wait returns once the shell is back at its prompt");
+    assert!(tools.open_agent_records().is_empty(), "the record is closed");
+
+    let c = tools.get_command(id, 0, 1000).expect("get_command after the finish");
+    assert_eq!(c.output, "yield-done");
+    assert_eq!(c.record.exit_code, Some(0));
+    assert!(matches!(&c.record.source, Source::Agent { call_id } if Some(call_id.as_str()) == v["call_id"].as_str()));
+}
+
+/// A quick command finishes within the default wait. A `wait_seconds` past the cap is clamped, and the result says so.
+#[test]
+fn a_quick_command_finishes_within_the_default_wait_and_a_big_wait_seconds_is_clamped() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let tools = SessionTools::new(&s);
+    let v = tools.call("run_command", &json!({"command": "echo quick-one"}), None).expect("run_command");
+    assert_eq!(v["outcome"], "finished", "{v}");
+    assert_eq!(v["record"]["output"], "quick-one");
+    assert!(v.get("note").is_none(), "no clamp, no note: {v}");
+    let v = tools
+        .call("run_command", &json!({"command": "echo clamped-one", "wait_seconds": 500}), None)
+        .expect("clamped run_command");
+    assert_eq!(v["outcome"], "finished", "{v}");
+    assert!(v["note"].as_str().is_some_and(|n| n.contains("500") && n.contains("120")), "{v}");
+}
+
+/// `get_screen` with `lines` reaches back past the visible rows. Without it the answer is the visible screen, as before.
+/// The history is recorded for the agent's own commands only, so the command runs through run_command.
+#[test]
+fn get_screen_lines_returns_the_scrolled_history_and_the_default_is_unchanged() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let tools = SessionTools::new(&s);
+    let v = tools.call("run_command", &json!({"command": "seq 1 200", "wait_seconds": 20}), None).expect("run_command");
+    assert_eq!(v["outcome"], "finished", "{v}");
+    wait_prompt(&s);
+
+    let view = tools.get_screen_lines(150);
+    assert_eq!(view.rows.len(), 150, "{:?}", &view.rows[..3.min(view.rows.len())]);
+    // The prompt rows that scrolled off while the command's prompt was drawn are history too, so the window is a few
+    // lines later than the 150 numbers alone: the newest line is there, and the oldest numbers are not.
+    assert!(view.rows.iter().any(|r| r == "200") && view.rows.iter().any(|r| r == "100"), "the history is there");
+    assert!(!view.rows.iter().any(|r| r == "40"), "150 lines cannot reach back that far");
+    let h = view.history.clone().expect("history is set with lines");
+    assert_eq!((h.lines, h.truncated, h.no_history), (150, false, false));
+
+    let v = tools.call("get_screen", &json!({"lines": 150}), None).expect("get_screen with lines");
+    assert_eq!(v["history"]["lines"], 150, "{v}");
+    assert_eq!(v["rows"].as_array().map(Vec::len), Some(150));
+    let text = project("get_screen", true, &v, &Redactor::new(Vec::new()));
+    assert!(text.lines().next().is_some_and(|h| h.contains(" lines=150")), "{text}");
+
+    let plain = tools.call("get_screen", &json!({}), None).expect("get_screen");
+    assert!(plain.get("history").is_none(), "the default has no history key: {plain}");
+    assert!(plain["rows"].as_array().is_some_and(|r| r.len() <= 30), "the visible screen only");
+}
+
+/// A command that yielded keeps its history: after more output, `get_screen` with `lines` still reads the early lines, and
+/// `wait` by its id finishes it.
+#[test]
+fn a_yielded_commands_history_is_readable_after_more_output() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let tools = SessionTools::new(&s);
+    let v = tools
+        .call("run_command", &json!({"command": "seq 1 300; sleep 2; seq 301 330", "wait_seconds": 1}), None)
+        .expect("run_command");
+    assert_eq!(v["outcome"], "running", "{v}");
+    let id = v["record_id"].as_u64().expect("the record id");
+    let w = tools.call("wait", &json!({"id": id, "seconds": 20, "ignore_updates": true}), None).expect("wait by id");
+    assert_eq!(w["reason"], "command_finished", "{w}");
+    let view = tools.call("get_screen", &json!({"lines": 200}), None).expect("get_screen with lines");
+    let rows: Vec<&str> = view["rows"].as_array().expect("rows").iter().filter_map(Value::as_str).collect();
+    // 200 logical lines reach back past the 30 visible rows and the prompt rows that scrolled off after the command.
+    assert!(rows.contains(&"140") && rows.contains(&"330"), "the last 200 lines are not all there: {rows:?}");
+}
+
+/// The agent's own command is the open record while it runs, through the alternate screen, where the foreground hint is gone.
+/// The refusal names its id, and `wait` by that id finishes it.
+#[test]
+fn the_agents_open_command_is_visible_through_the_alternate_screen_and_refusals_name_it() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let tools = SessionTools::new(&s);
+    let cmd = r"printf '\033[?1049h'; sleep 3; printf '\033[?1049l'; echo alt-done";
+    let v = tools.call("run_command", &json!({"command": cmd, "wait_seconds": 1}), None).expect("run_command");
+    assert_eq!(v["outcome"], "running", "{v}");
+    let id = v["record_id"].as_u64().expect("the record id");
+    assert!(wait_state(&s, InputState::Alt, Duration::from_secs(5)), "state={:?}", s.state());
+
+    assert_eq!(tools.get_screen().foreground, None, "no hint in the alt screen");
+    let open = tools.open_agent_records();
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert_eq!((open[0].id, open[0].on_top), (id, true));
+    assert_eq!(open[0].command, cmd);
+
+    let err = tools.run_command_precheck().expect_err("refused in the alt screen");
+    assert!(err.contains(&format!("Your command id {id} ")) && err.contains("Wait for it"), "{err}");
+    let err = tools.run_command("echo refused-named", DEFAULT_RUN_WAIT, None).expect_err("refused while the agent's command runs");
+    assert!(err.contains(&format!("command id {id}")), "{err}");
+
+    let lines = tools.get_screen_lines(10);
+    assert!(lines.history.as_ref().is_some_and(|h| h.no_history), "the alternate screen has no history");
+
+    let w = tools.call("wait", &json!({"id": id, "seconds": 20, "ignore_updates": true}), None).expect("wait by id");
+    assert_eq!(w["reason"], "command_finished", "{w}");
+    assert!(tools.open_agent_records().is_empty());
+    // A command that used the alternate screen is finished without its on-screen rows, so its stored output is not
+    // checked here. What is true after it exits: the record is finished and marked as used_alt_screen, and the
+    // visible screen shows what the program printed.
+    let done = tools.get_command(id, 0, 1000).expect("finished");
+    assert!(done.record.used_alt_screen, "{done:?}");
+    assert!(tools.get_screen().rows.iter().any(|r| r == "alt-done"), "rows: {:?}", tools.get_screen().rows);
+}
+
+/// `wait` without an id is keyed to the one agent command open at the start, so it returns when that command finishes.
+#[test]
+fn a_wait_without_an_id_is_keyed_to_the_only_open_agent_command() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let tools = SessionTools::new(&s);
+    let v = tools
+        .call("run_command", &json!({"command": "sleep 2; echo keyed-done", "wait_seconds": 1}), None)
+        .expect("run_command");
+    assert_eq!(v["outcome"], "running", "{v}");
+    let id = v["record_id"].as_u64().expect("the record id");
+    let w = tools.call("wait", &json!({"seconds": 20, "ignore_updates": true}), None).expect("wait");
+    assert_eq!(w["reason"], "command_finished", "{w}");
+    assert_eq!(w["record"]["id"], id, "{w}");
+    assert_eq!(w["record"]["output"], "keyed-done");
+}
+
+/// An id that is neither running nor finished is refused, and the refusal says so.
+#[test]
+fn wait_refuses_an_id_that_is_not_running_or_finished() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let err = SessionTools::new(&s).call("wait", &json!({"id": 999_999}), None).expect_err("no such command");
+    assert!(err.contains("no command with id 999999"), "{err}");
 }

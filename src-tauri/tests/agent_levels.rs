@@ -35,6 +35,7 @@ fn nested_zsh(s: &Session) {
     wait_prompt(s);
     s.submit(Source::User, NESTED_ZSH).expect("submit the nested shell");
     assert!(wait_foreground(s, ForegroundKind::Shell), "state {:?}", s.state());
+    assert!(wait_program_up(s, NESTED_ZSH), "the nested shell never drew its prompt");
     match s.integrate_shell() {
         IntegrateOutcome::Integrated { key: 1, .. } => {}
         other => panic!("integration did not succeed: {other:?}; screen: {:?}", s.screen_snapshot().rows),

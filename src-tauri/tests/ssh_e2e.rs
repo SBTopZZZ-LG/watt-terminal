@@ -235,6 +235,8 @@ fn connect(h: &Harness, remote: &Remote, user: &str) -> String {
     assert!(wait_foreground(h, ForegroundKind::Ssh), "ssh did not start: state {:?}", h.state());
     let prompt = wait_until(SSH_WAIT, || at_remote_prompt(h).then_some(())).is_some();
     assert!(prompt, "no remote prompt: foreground {:?}, screen {:?}", h.foreground(), h.screen_snapshot().rows);
+    // Integration types Ctrl-C first: the remote prompt must also have been still for a moment.
+    assert!(wait_program_up(h, &cmd), "the remote prompt did not settle: screen {:?}", h.screen_snapshot().rows);
     cmd
 }
 

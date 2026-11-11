@@ -155,6 +155,35 @@ pub fn wait_prompt(s: &Session) {
     assert!(wait_state(s, InputState::Prompt, Duration::from_secs(20)), "never reached prompt; state={:?}", s.state());
 }
 
+/// How long the screen must be still before a started program counts as up in `wait_program_up`.
+pub const PROGRAM_QUIET: Duration = Duration::from_millis(500);
+
+/// Waits until the program `command` started is up: it holds the foreground, the last non-blank row is not the echo of
+/// the command (so something new was drawn after it), and the screen has been still for `PROGRAM_QUIET`. An integration
+/// types Ctrl-C first, which kills a shell that has not drawn its prompt yet, so the tests that integrate wait for this.
+/// False on timeout.
+pub fn wait_program_up(s: &Session, command: &str) -> bool {
+    let end = Instant::now() + Duration::from_secs(20);
+    let mut seen = s.activity().screen_gen;
+    let mut still_since = Instant::now();
+    loop {
+        thread::sleep(Duration::from_millis(20));
+        let generation = s.activity().screen_gen;
+        if generation != seen {
+            seen = generation;
+            still_since = Instant::now();
+        }
+        let rows = s.screen_snapshot().rows;
+        let fresh_prompt = rows.iter().rev().find(|r| !r.trim().is_empty()).is_some_and(|r| !r.contains(command));
+        if s.foreground().is_some() && fresh_prompt && still_since.elapsed() >= PROGRAM_QUIET {
+            return true;
+        }
+        if Instant::now() >= end {
+            return false;
+        }
+    }
+}
+
 /// Submits `cmd` at a prompt, waits for its D, then for the next prompt. Returns the completed record.
 pub fn run(s: &Session, cmd: &str) -> Record {
     wait_prompt(s);

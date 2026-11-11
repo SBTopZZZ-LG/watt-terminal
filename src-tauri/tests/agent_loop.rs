@@ -9,12 +9,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use agent_term_lib::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate};
-use agent_term_lib::core::chat::agent_loop::{Conversation, LlmAgent, LlmSettings, MAX_COMMANDS_PER_TURN, MAX_MODEL_CALLS};
+use agent_term_lib::core::chat::agent_loop::{agent_record_note, Conversation, LlmAgent, LlmSettings, MAX_COMMANDS_PER_TURN, MAX_MODEL_CALLS};
 use agent_term_lib::core::chat::history::History;
 use agent_term_lib::core::chat::prompt;
+use agent_term_lib::core::chat::redact::Redactor;
 use agent_term_lib::core::chat::todo;
+use agent_term_lib::core::foreground::{Foreground, ForegroundKind};
 use agent_term_lib::core::llm::{TurnCancel, http_client};
-use agent_term_lib::core::record::{Cwd, RecordSummary};
+use agent_term_lib::core::observer::OpenAgentRecord;
+use agent_term_lib::core::record::{Cwd, RecordStatus, RecordSummary, Source};
 use agent_term_lib::core::session::IntegrateOutcome;
 use agent_term_lib::core::tools::{AgentTools, CommandView, RunOutcome, ScreenView, WaitView};
 use serde_json::{Value, json};
@@ -187,11 +190,39 @@ struct FakeTools {
     command_output: Option<String>,
     /// How many times the handshake was run (`integrate_shell`). It never is in these tests: the user declines or does not answer.
     integrations: Mutex<usize>,
+    /// The agent's open commands, as `open_agent_records` reports them.
+    open: Mutex<Vec<OpenAgentRecord>>,
+    /// The finished command that `finished_summary` reports, when its id is asked for.
+    finished: Mutex<Option<RecordSummary>>,
+    /// When set, `run_command` answers "still running" with this record id instead of a finished record.
+    running_record: Option<u64>,
 }
 
 impl FakeTools {
     fn reached(&self) -> Vec<String> {
         self.reached.lock().unwrap().clone()
+    }
+}
+
+/// An auto-approving gate: `run_command` runs without a card.
+fn auto_gate() -> ApprovalGate {
+    let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+    gate.set_auto_approve(true, 0);
+    gate
+}
+
+/// A finished record summary for `id`, as the observer reports one.
+fn finished_record(id: u64, exit: i32) -> RecordSummary {
+    RecordSummary {
+        id,
+        command: "sleep 3".into(),
+        source: Source::Agent { call_id: "run-1".into() },
+        level: 0,
+        location: None,
+        exit_code: Some(exit),
+        status: RecordStatus::Complete,
+        used_alt_screen: false,
+        output_bytes: 0,
     }
 }
 
@@ -209,14 +240,20 @@ impl AgentTools for FakeTools {
     fn get_cwd(&self) -> Option<Cwd> {
         panic!("the loop calls tools by name through `call`")
     }
-    fn run_command(&self, _command: &str, _timeout: Duration, _expected: Option<u64>) -> Result<RunOutcome, String> {
+    fn run_command(&self, _command: &str, _wait: Duration, _expected: Option<u64>) -> Result<RunOutcome, String> {
         panic!("the loop calls tools by name through `call`")
     }
-    fn wait(&self, _seconds: u64, _ignore_updates: bool) -> Result<WaitView, String> {
+    fn wait(&self, _seconds: u64, _ignore_updates: bool, _record: Option<u64>) -> Result<WaitView, String> {
         panic!("the loop calls tools by name through `call`")
     }
     fn send_keys(&self, _bytes: &[u8]) -> Result<(), String> {
         panic!("the loop calls tools by name through `call`")
+    }
+    fn open_agent_records(&self) -> Vec<OpenAgentRecord> {
+        self.open.lock().unwrap().clone()
+    }
+    fn finished_summary(&self, id: u64) -> Option<RecordSummary> {
+        self.finished.lock().unwrap().clone().filter(|r| r.id == id)
     }
     fn integration_precheck(&self) -> Result<String, String> {
         Ok("ssh h".to_string())
@@ -239,6 +276,11 @@ impl AgentTools for FakeTools {
                 "reason": "timeout", "waited_ms": 5000, "state": "running",
                 "screen": {"rows": ["sleep 30"], "cursor": [1, 0], "alternate_screen": false, "size": [24, 80],
                            "state": "running", "observer_status": "ok", "integration_status": "live"},
+            })),
+            "run_command" if self.running_record.is_some() => Ok(json!({
+                "outcome": "running", "reason": "timeout", "record_id": self.running_record, "call_id": "run-1",
+                "state": "running", "waited_ms": 1000, "screen_tail": ["$ sleep 3"],
+                "hint": "Still running. Call wait with id 7 to wait for it to finish.",
             })),
             "run_command" => {
                 let output = self.command_output.clone().unwrap_or_else(|| "hello\n".to_string());
@@ -884,4 +926,108 @@ fn an_invalid_todo_write_changes_nothing_and_the_model_reads_why() {
     assert_paired(&msgs);
     let text = tool_content(&msgs, "call_bad");
     assert!(text.starts_with("error: ") && text.contains("exactly one in_progress"), "{text}");
+}
+
+/// The agent's own open command is described in every model call of the turn, with its id, command and age.
+#[test]
+fn an_open_agent_command_is_described_in_every_model_call() {
+    let provider = serve(vec![
+        Script::json(tool_reply(&[("call_c1", "get_cwd", "{}")])),
+        Script::json(text_reply("still waiting")),
+    ]);
+    let conv = Conversation::new().unwrap();
+    let tools = FakeTools::default();
+    tools.open.lock().unwrap().push(OpenAgentRecord {
+        id: 7,
+        call_id: "run-1".into(),
+        command: "sleep 30".into(),
+        age: Duration::from_secs(190),
+        on_top: true,
+    });
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
+    turn(&mut agent, &tools, &auto_gate(), "how is it going");
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    for raw in &requests {
+        let system = system_of(raw);
+        assert!(system.contains("your command id 7 `sleep 30` is still running (3m)"), "{system}");
+        assert!(system.contains("Use wait with id 7") && system.contains("run_command is unavailable until it ends"), "{system}");
+    }
+}
+
+/// A command parked under a nested shell is still running, but run_command is not unavailable: it works in that shell.
+#[test]
+fn a_parked_agent_command_says_the_nested_shell_on_top_takes_the_commands() {
+    let provider = serve(vec![Script::json(text_reply("ok"))]);
+    let conv = Conversation::new().unwrap();
+    let tools = FakeTools::default();
+    tools.open.lock().unwrap().push(OpenAgentRecord {
+        id: 4,
+        call_id: "run-1".into(),
+        command: "ssh h".into(),
+        age: Duration::from_secs(12),
+        on_top: false,
+    });
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
+    turn(&mut agent, &tools, &auto_gate(), "hello");
+    let system = system_of(&provider.requests()[0]);
+    assert!(system.contains("your command id 4 `ssh h` is still running (12s)"), "{system}");
+    assert!(system.contains("under the nested shell on top of it") && !system.contains("run_command is unavailable"), "{system}");
+}
+
+/// A command that a run_command yielded, and that has since finished, is announced in the first model call of a turn. It is
+/// announced until a get_command or wait names its id, and then not again.
+#[test]
+fn a_finished_command_is_announced_in_the_first_call_of_a_turn_until_it_is_read() {
+    let provider = serve(vec![
+        // Turn 1: the run comes back still running.
+        Script::json(tool_reply(&[("call_r1", "run_command", r#"{"command":"sleep 3"}"#)])),
+        Script::json(text_reply("it is running")),
+        // Turn 2: it has finished. Two model calls: the note is in the first only.
+        Script::json(tool_reply(&[("call_c2", "get_cwd", "{}")])),
+        Script::json(text_reply("it finished")),
+        // Turn 3: the note is still there at the start, and get_command reads the output.
+        Script::json(tool_reply(&[("call_g3", "get_command", r#"{"id":7}"#)])),
+        Script::json(text_reply("read it")),
+        // Turn 4: read in turn 3, so no note.
+        Script::json(text_reply("all done")),
+    ]);
+    let conv = Conversation::new().unwrap();
+    let tools = FakeTools { running_record: Some(7), ..Default::default() };
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
+    let gate = auto_gate();
+    turn(&mut agent, &tools, &gate, "sleep 3 please");
+    *tools.finished.lock().unwrap() = Some(finished_record(7, 0));
+    turn(&mut agent, &tools, &gate, "is it done?");
+    turn(&mut agent, &tools, &gate, "show me the output");
+    turn(&mut agent, &tools, &gate, "thanks");
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 7, "two calls in turns 1 to 3, one in turn 4");
+    let announced = "finished since your last turn: id 7 exit 0, use get_command with id 7 to read it.";
+    assert!(!system_of(&requests[0]).contains("finished since"), "nothing had finished in turn 1");
+    assert!(system_of(&requests[2]).contains(announced), "{}", system_of(&requests[2]));
+    assert!(!system_of(&requests[3]).contains("finished since"), "announced once per turn, not in every call");
+    assert!(system_of(&requests[4]).contains(announced), "still unread at the start of turn 3");
+    assert!(!system_of(&requests[5]).contains("finished since"), "not repeated within the turn");
+    assert!(!system_of(&requests[6]).contains("finished since"), "get_command in turn 3 resolved it");
+}
+
+/// The note text: the command on top is named with its id, and an ssh session that the command holds gets the
+/// integration hint once, not the command again.
+#[test]
+fn the_agent_note_names_the_command_and_offers_integration_for_an_ssh_session() {
+    let r = Redactor::new(Vec::new());
+    let ssh = Foreground { kind: ForegroundKind::Ssh, command: "ssh h".into() };
+    let rec = OpenAgentRecord { id: 3, call_id: "run-2".into(), command: "ssh h".into(), age: Duration::from_secs(4), on_top: true };
+    let note = agent_record_note(std::slice::from_ref(&rec), Some(&ssh), &r).expect("a note");
+    assert!(note.contains("your command id 3 `ssh h` is still running (4s)"), "{note}");
+    assert!(note.contains("request_integration"), "{note}");
+    assert_eq!(note.matches("ssh h").count(), 1, "the command is named once: {note}");
+
+    let sleep = Foreground { kind: ForegroundKind::Other, command: "sleep 9".into() };
+    let rec = OpenAgentRecord { id: 5, call_id: "run-3".into(), command: "sleep 9".into(), age: Duration::from_secs(70), on_top: true };
+    let note = agent_record_note(std::slice::from_ref(&rec), Some(&sleep), &r).expect("a note");
+    assert!(note.contains("(1m)") && !note.contains("request_integration"), "{note}");
+    assert_eq!(agent_record_note(&[], None, &r), None);
 }

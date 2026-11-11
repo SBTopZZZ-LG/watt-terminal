@@ -20,6 +20,8 @@ use crate::core::approval::{ApprovalPolicy, ManualPolicy, Reason, Verdict};
 use crate::core::chat::todo::Todo;
 use crate::core::foreground::Foreground;
 use crate::core::llm::TurnCancel;
+use crate::core::observer::OpenAgentRecord;
+use crate::core::record::RecordSummary;
 use crate::core::session::{Session, USER_TEXT_CODE};
 use crate::core::tools::{AgentTools, TopLevel, integration_result};
 
@@ -349,6 +351,16 @@ impl<'a> AgentCtx<'a> {
         self.tools.top_level()
     }
 
+    /// The agent's own open commands at this moment (see `AgentTools::open_agent_records`). Read per model call.
+    pub fn open_agent_records(&self) -> Vec<OpenAgentRecord> {
+        self.tools.open_agent_records()
+    }
+
+    /// A finished command's summary, by id (see `AgentTools::finished_summary`).
+    pub fn finished_summary(&self, id: u64) -> Option<RecordSummary> {
+        self.tools.finished_summary(id)
+    }
+
     /// Calls a read-only tool (`list_commands`, `get_command`, `get_screen`, `get_cwd`, `wait`) and reports the call
     /// and its result. Never asks for approval. Any other name is refused without running.
     pub fn read_tool(&self, name: &str, args: Value) -> Result<Value, String> {
@@ -635,11 +647,11 @@ fn outcome_text(cmd: &str, v: &Value) -> String {
                 output_text(r["output"].as_str().unwrap_or_default())
             )
         }
-        Some("timed_out") if v["state"] == "running" => format!(
-            "`{cmd}` is still running after the 30 s wait. It keeps running in the terminal; ask for the last command once it finishes."
+        Some("running") if !v["record_id"].is_null() => format!(
+            "`{cmd}` is still running after the wait. It keeps running in the terminal; ask for the last command once it finishes."
         ),
-        Some("timed_out") => format!(
-            "`{cmd}` got no result within the 30 s wait, and the shell is not running it (shell state: {}). Ask for the last command to see whether it ran.",
+        Some("running") => format!(
+            "`{cmd}` has not started after the wait (shell state: {}). Ask for the last command to see whether it ran.",
             v["state"].as_str().unwrap_or("unknown")
         ),
         Some("not_run") if v["reason"] == "abandoned" => format!(
@@ -787,15 +799,16 @@ mod tests {
                 integration_status: IntegrationStatus::Live,
                 foreground: None,
                 location: None,
+                history: None,
             }
         }
         fn get_cwd(&self) -> Option<Cwd> {
             None
         }
-        fn run_command(&self, _command: &str, _timeout: Duration, _expected: Option<u64>) -> Result<RunOutcome, String> {
+        fn run_command(&self, _command: &str, _wait: Duration, _expected: Option<u64>) -> Result<RunOutcome, String> {
             Err("not used".into())
         }
-        fn wait(&self, _seconds: u64, _ignore_updates: bool) -> Result<WaitView, String> {
+        fn wait(&self, _seconds: u64, _ignore_updates: bool, _record: Option<u64>) -> Result<WaitView, String> {
             Err("not used".into())
         }
         fn send_keys(&self, _bytes: &[u8]) -> Result<(), String> {
@@ -1256,15 +1269,16 @@ mod tests {
         assert_eq!(tools.reached().len(), MAX_AUTO_PER_TURN + 1);
     }
 
-    /// "still running" only when the shell really is Running. Other timeouts name the state; not-run outcomes say why.
+    /// "still running" only for a command that has started (it has a record id). Otherwise the state is named; not-run
+    /// outcomes say why.
     #[test]
     fn run_command_outcomes_are_described_truthfully() {
         let text = |v: Value| outcome_text("sleep 30", &v);
         assert_eq!(
-            text(json!({"outcome": "timed_out", "state": "running"})),
-            "`sleep 30` is still running after the 30 s wait. It keeps running in the terminal; ask for the last command once it finishes."
+            text(json!({"outcome": "running", "record_id": 4, "state": "running"})),
+            "`sleep 30` is still running after the wait. It keeps running in the terminal; ask for the last command once it finishes."
         );
-        let submitted = text(json!({"outcome": "timed_out", "state": "submitted"}));
+        let submitted = text(json!({"outcome": "running", "record_id": null, "state": "submitted"}));
         assert!(!submitted.contains("still running"), "{submitted}");
         assert!(submitted.contains("shell state: submitted"), "{submitted}");
         let abandoned = text(json!({"outcome": "not_run", "reason": "abandoned"}));
