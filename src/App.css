@@ -29,6 +29,8 @@
   --warn-tint: rgba(229, 192, 123, 0.1);
   --ok-glow: rgba(152, 195, 121, 0.35);
   --shadow: rgba(0, 0, 0, 0.35);
+  /* The dimming behind a modal (.modal-backdrop). Darker than --shadow, so a dialog stands out on the navy background. */
+  --scrim: rgba(0, 0, 0, 0.6);
   --code-bg: #04131d;
   /* The terminal's background. Keep in step with the fallback in src/lib/terminal.ts. */
   --term-bg: #061823;
@@ -1968,10 +1970,11 @@ input {
   margin-left: auto;
 }
 
-/* ---------- AI settings dialog ---------- */
+/* ---------- Modals ---------- */
 
-/* A modal over the whole window. Above the find bar (7). Clicking the backdrop closes the dialog (see SettingsDialog). */
-.settings-backdrop {
+/* The shared backdrop of a modal over the whole window: it dims everything behind the dialog. Above the find bar (7). A modal
+   that uses it decides what a click on the backdrop does (the AI settings dialog closes). */
+.modal-backdrop {
   position: fixed;
   inset: 0;
   z-index: 10;
@@ -1979,8 +1982,10 @@ input {
   align-items: center;
   justify-content: center;
   padding: 16px;
-  background: var(--shadow);
+  background: var(--scrim);
 }
+
+/* ---------- AI settings dialog ---------- */
 
 /* The card. Its height is fixed (up to the window), so switching tabs does not resize it. The tab panel scrolls inside it, so
    the header, the notices and the footer stay in view. */

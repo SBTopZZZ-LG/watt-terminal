@@ -1,6 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { NO_RECOVERY, SETTINGS_TABS, SettingsBody, SettingsNotices, storeNote } from './SettingsDialog';
+import { NO_RECOVERY, SETTINGS_TABS, SettingsBody, SettingsDialog, SettingsNotices, storeNote } from './SettingsDialog';
 import type { LoadState, SettingsBodyProps, SettingsNoticesProps } from './SettingsDialog';
 import { modelRefKey } from '../lib/settingsForm';
 import type { Provider, ProviderPreset, Settings, SettingsView } from '../lib/types';
@@ -348,5 +348,19 @@ describe('SettingsBody: recovery panel (settings.json cannot be used)', () => {
     const out = withState(BROKEN_STATE, { recovery: { busy: null, confirming: false, error: 'there are no last working settings' } });
     expect(out).toContain('there are no last working settings');
     expect(out.match(/role="alert"/g)?.length ?? 0).toBeGreaterThanOrEqual(2);
+  });
+});
+
+describe('SettingsDialog: backdrop', () => {
+  it('the dialog sits in the shared modal backdrop, which dims the window behind it', () => {
+    // The dialog reads document.activeElement when it first renders, and the test environment is node, so stub it.
+    vi.stubGlobal('document', { activeElement: null });
+    try {
+      const out = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} />);
+      expect(out).toMatch(/^<div class="modal-backdrop"><div class="settings-dialog" role="dialog"/);
+      expect(out).not.toContain('settings-backdrop');
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

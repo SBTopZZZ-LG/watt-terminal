@@ -945,7 +945,7 @@ export function SettingsDialog({ onClose, onChanged, onViewLoaded }: SettingsDia
 
   return (
     <div
-      className="settings-backdrop"
+      className="modal-backdrop"
       onMouseDown={(e) => {
         backdropPressed.current = e.target === e.currentTarget;
       }}
