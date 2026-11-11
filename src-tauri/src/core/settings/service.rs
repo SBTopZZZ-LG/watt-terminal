@@ -35,8 +35,8 @@ use super::models::{FetchedModel, merge_fetched, models_url_for};
 use super::resolve::{self, api_key_for, headers_for};
 use super::secrets::{SecretMap, Secrets, api_key_name, header_secret_name, provider_prefix};
 use super::{
-    ModelRef, ModelSource, Provider, SETTINGS_FILE, Settings, SettingsError, last_good_path, read_checked, save,
-    settings_path, write_private_atomic,
+    ApprovalSettings, ModelRef, ModelSource, Provider, SETTINGS_FILE, Settings, SettingsError, last_good_path,
+    read_checked, save, settings_path, write_private_atomic,
 };
 use crate::core::chat::agent_loop::{LlmSettings, USER_AGENT, new_conversation_id};
 use crate::core::chat::redact::Redactor;
@@ -540,6 +540,17 @@ impl SettingsService {
         self.change_settings(|settings| settings.global_context_limit = limit)
     }
 
+    /// Saves the approval rules. Refused while settings.json is broken or in last-good mode, like every change.
+    pub fn set_approval(&self, approval: ApprovalSettings) -> Result<SettingsView, String> {
+        self.change_settings(|settings| settings.approval = approval)
+    }
+
+    /// The approval settings in use: the saved ones, or the last working copy's in last-good mode. Fails while
+    /// settings.json is broken, so the caller falls back to manual approval.
+    pub fn approval_settings(&self) -> Result<ApprovalSettings, String> {
+        Ok(self.usable()?.approval)
+    }
+
     /// What a model-list request for `id` needs: the list URL, the key and the resolved headers.
     pub fn provider_for_fetch(&self, id: &str) -> Result<FetchPlan, String> {
         let settings = self.usable()?;
@@ -734,7 +745,7 @@ mod tests {
 
     use super::super::secrets::MemoryStore;
     use super::super::test_support::TempDir;
-    use super::super::{HeaderEntry, Model, last_good_path, load, save as save_file};
+    use super::super::{ApprovalMode, ApprovalSettings, HeaderEntry, Model, last_good_path, load, save as save_file};
     use super::*;
 
     const KEY: &str = "DUMMY-key-0123456789abcdef";
@@ -991,6 +1002,40 @@ mod tests {
         assert_eq!(view.settings.global_context_limit, Some(8_000));
         let view = f.service.set_default_model(None).unwrap();
         assert_eq!(view.settings.default_model, None);
+    }
+
+    #[test]
+    fn approval_rules_are_saved_validated_and_read_back() {
+        let f = fixture();
+        assert_eq!(f.service.approval_settings(), Ok(ApprovalSettings::default()), "no file: manual, no rules");
+
+        let bad = ApprovalSettings { mode: ApprovalMode::Regex, allow: vec!["a(".into()], deny: Vec::new() };
+        let err = f.service.set_approval(bad).unwrap_err();
+        assert!(err.contains("approval allow rule 1"), "{err}");
+        assert_eq!(f.service.approval_settings(), Ok(ApprovalSettings::default()), "a refused change saved nothing");
+
+        let regex = ApprovalSettings { mode: ApprovalMode::Regex, allow: vec!["git status".into()], deny: Vec::new() };
+        let view = f.service.set_approval(regex.clone()).unwrap();
+        assert_eq!(view.settings.approval, regex);
+        assert_eq!(f.service.approval_settings(), Ok(regex.clone()));
+        assert_eq!(service_on(&f.dir, &f.store).approval_settings(), Ok(regex), "a new service reads the saved rules");
+    }
+
+    #[test]
+    fn last_good_mode_runs_the_saved_approval_rules_and_refuses_changes() {
+        let f = fixture();
+        f.service.save_provider(with_key(provider("acme"), KEY)).unwrap();
+        f.service.set_default_model(Some(model_ref("acme", "big"))).unwrap();
+        let regex = ApprovalSettings { mode: ApprovalMode::Regex, allow: vec!["echo .*".into()], deny: Vec::new() };
+        f.service.set_approval(regex.clone()).unwrap();
+        let _launch = service_on(&f.dir, &f.store);
+        break_settings(&f);
+
+        let service = service_on(&f.dir, &f.store);
+        assert!(service.approval_settings().is_err(), "a broken file runs no approval rules");
+        service.use_last_good().unwrap();
+        assert_eq!(service.approval_settings(), Ok(regex), "last-good mode runs the last working rules");
+        assert!(service.set_approval(ApprovalSettings::default()).unwrap_err().contains("broken"));
     }
 
     #[test]

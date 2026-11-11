@@ -20,6 +20,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 
+use crate::core::approval;
+
 pub const SETTINGS_VERSION: u32 = 1;
 const SETTINGS_FILE: &str = "settings.json";
 /// The hidden copy of the last settings that checked out at a launch. Written by the app only, with the same mode.
@@ -46,6 +48,9 @@ pub struct Settings {
     /// Tokens. `None` means no cap.
     #[serde(default)]
     pub global_context_limit: Option<u32>,
+    /// How `run_command` is approved (core/approval). Missing in older files: manual.
+    #[serde(default)]
+    pub approval: ApprovalSettings,
 }
 
 fn current_version() -> u32 {
@@ -59,8 +64,32 @@ impl Default for Settings {
             providers: Vec::new(),
             default_model: None,
             global_context_limit: None,
+            approval: ApprovalSettings::default(),
         }
     }
+}
+
+/// Whether `run_command` calls wait for the user. Approve-all is not here: it is session-only and never saved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalMode {
+    /// Every call waits for the user.
+    #[default]
+    Manual,
+    /// The hard gate, then the deny and allow rules, decide (see core/approval).
+    Regex,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ApprovalSettings {
+    #[serde(default)]
+    pub mode: ApprovalMode,
+    /// Regular expressions. A command is allowed when one matches the whole command. Used in regex mode.
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// Regular expressions, matched the same way. A deny match wins over an allow match.
+    #[serde(default)]
+    pub deny: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,6 +197,8 @@ impl Settings {
         if self.global_context_limit == Some(0) {
             problems.push("global context limit must be at least 1".into());
         }
+
+        problems.extend(approval::validate_settings(&self.approval));
 
         if problems.is_empty() { Ok(()) } else { Err(problems) }
     }
@@ -502,6 +533,7 @@ mod tests {
             providers: vec![provider("example")],
             default_model: Some(ModelRef { provider_id: "example".into(), model_id: "big-1".into() }),
             global_context_limit: Some(32_000),
+            approval: ApprovalSettings::default(),
         }
     }
 
@@ -629,6 +661,16 @@ mod tests {
                     s.default_model = Some(ModelRef { provider_id: "example".into(), model_id: "nope".into() })
                 }),
                 "not listed",
+            ),
+            (
+                "approval allow rule that does not compile",
+                Box::new(|s| s.approval.allow = vec!["git status".into(), "a(".into()]),
+                "approval allow rule 2",
+            ),
+            (
+                "approval deny rule with a line break",
+                Box::new(|s| s.approval.deny = vec!["rm\n.*".into()]),
+                "approval deny rule 1",
             ),
         ];
         for (label, change, fragment) in cases {
@@ -832,5 +874,50 @@ mod tests {
         let names: Vec<String> =
             fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
         assert_eq!(names, vec![SETTINGS_FILE.to_string()]);
+    }
+
+    #[test]
+    fn approval_settings_round_trip_through_the_file() {
+        let dir = TempDir::new();
+        let mut settings = valid();
+        settings.approval = ApprovalSettings {
+            mode: ApprovalMode::Regex,
+            allow: vec!["git status".into(), "cargo (test|check)( .*)?".into()],
+            deny: vec!["cargo publish.*".into()],
+        };
+        save(dir.path(), &settings).unwrap();
+        let text = fs::read_to_string(settings_path(dir.path())).unwrap();
+        assert!(text.contains(r#""mode": "regex""#), "{text}");
+        assert_eq!(load(dir.path()).unwrap(), settings);
+    }
+
+    #[test]
+    fn a_file_without_approval_loads_as_manual_with_no_rules() {
+        let dir = TempDir::new();
+        fs::create_dir_all(dir.path()).unwrap();
+        fs::write(settings_path(dir.path()), br#"{"version":1,"providers":[],"global_context_limit":4000}"#).unwrap();
+        let loaded = load(dir.path()).unwrap();
+        assert_eq!(loaded.approval, ApprovalSettings::default());
+        assert_eq!(loaded.approval.mode, ApprovalMode::Manual);
+        assert!(loaded.approval.allow.is_empty() && loaded.approval.deny.is_empty());
+    }
+
+    #[test]
+    fn approve_all_is_not_a_saved_mode() {
+        let dir = TempDir::new();
+        fs::create_dir_all(dir.path()).unwrap();
+        let json = br#"{"version":1,"approval":{"mode":"approve_all"}}"#;
+        fs::write(settings_path(dir.path()), json).unwrap();
+        assert!(matches!(load(dir.path()), Err(SettingsError::Invalid(_))));
+    }
+
+    #[test]
+    fn an_invalid_approval_rule_makes_the_whole_file_invalid_and_is_left_alone() {
+        let dir = TempDir::new();
+        fs::create_dir_all(dir.path()).unwrap();
+        let json = br#"{"version":1,"approval":{"mode":"regex","allow":["a)|(b"]}}"#;
+        fs::write(settings_path(dir.path()), json).unwrap();
+        assert!(matches!(load(dir.path()), Err(SettingsError::Invalid(msg)) if msg.contains("approval allow rule 1")));
+        assert_eq!(fs::read(settings_path(dir.path())).unwrap(), json);
     }
 }

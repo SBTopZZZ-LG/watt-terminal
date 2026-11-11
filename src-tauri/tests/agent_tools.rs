@@ -8,10 +8,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use agent_term_lib::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate, DENIED, MockAgent, user_input};
+use agent_term_lib::core::approval::RegexPolicy;
 use agent_term_lib::core::llm::TurnCancel;
 use agent_term_lib::core::observer::{InputState, IntegrationStatus, ObserverStatus};
 use agent_term_lib::core::record::Source;
 use agent_term_lib::core::session::{Session, USER_TEXT_CODE};
+use agent_term_lib::core::settings::{ApprovalMode, ApprovalSettings};
 use agent_term_lib::core::tools::{schemas, AgentTools, NotRunReason, RunOutcome, SessionTools, WaitReason, DEFAULT_RUN_TIMEOUT};
 use serde_json::json;
 
@@ -1041,4 +1043,48 @@ fn user_finishing_the_agent_line_abandons_the_call() {
     wait_prompt(&s);
     assert!(s.records().iter().any(|r| r.source == Source::User), "the user's completed line has no record");
     assert!(!s.records().iter().any(|r| matches!(r.source, Source::Agent { .. })), "the abandoned line got a record");
+}
+
+/// A regex rule runs a matching command without a card, through the real shell, and the result says it was a rule. A
+/// command the hard gate refuses still asks, even though a rule would match it.
+#[test]
+fn a_regex_rule_runs_an_allowed_command_without_a_card_and_a_gated_one_still_asks() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let approval = ApprovalSettings { mode: ApprovalMode::Regex, allow: vec![".*".into()], deny: Vec::new() };
+    let policy = RegexPolicy::new(&approval).expect("the rules compile");
+    let approvals = ApprovalGate::with_timeout(Duration::from_millis(200));
+    let log: Log = Arc::default();
+    let sink = log.clone();
+    let emit = move |ev: AgentEvent| sink.lock().unwrap().push(ev);
+    let tools = SessionTools::new(&s);
+    let ctx = AgentCtx::new(&tools, &approvals, &emit).with_policy(&policy);
+
+    let out = ctx.call_tool("run_command", json!({"command": "echo rule-ran"})).expect("the rule allows it");
+    assert_eq!(out["record"]["output"], "rule-ran", "{out}");
+    assert!(!has_approval(&log.lock().unwrap()), "an allowed command showed a card");
+
+    // The pipe is refused by the hard gate. Nobody answers, so the card times out as a denial and nothing runs.
+    let err = ctx.call_tool("run_command", json!({"command": "echo gated | wc -c"})).expect_err("gated, not answered");
+    assert!(err.starts_with(DENIED), "{err}");
+    let events = log.lock().unwrap();
+    let reasons: Vec<(String, Option<&'static str>)> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ApprovalRequest { name, reason, .. } => Some((name.clone(), *reason)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reasons, [("run_command".to_string(), Some("gate_chars"))]);
+    let decisions: Vec<(&'static str, Option<&'static str>)> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolResult { name, decision, reason, .. } if name == "run_command" => Some((*decision, *reason)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(decisions, [("auto", Some("rule")), ("denied", Some("gate_chars"))]);
+    drop(events);
+    assert!(!s.records().iter().any(|r| r.command.contains("gated")), "the gated command ran");
 }

@@ -16,6 +16,7 @@ use std::time::Duration;
 use serde::Serialize;
 use serde_json::{json, Value};
 
+use crate::core::approval::{ApprovalPolicy, ManualPolicy, Reason, Verdict};
 use crate::core::chat::todo::Todo;
 use crate::core::llm::TurnCancel;
 use crate::core::session::{Session, USER_TEXT_CODE};
@@ -128,11 +129,28 @@ pub enum AgentEvent {
     Text { text: String },
     ToolCall { call_id: String, name: String, args: Value },
     /// `decision` says how the call was allowed or stopped: "read" (a read tool, or `todo_write`: no approval), "manual"
-    /// (the user approved), "auto" (auto-approve skipped the card), "denied" (not approved: denied, cancelled or timed out),
-    /// or "refused" (refused before it ran, without asking, or by the tool when auto-approve skipped the card).
-    ToolResult { call_id: String, name: String, ok: bool, decision: &'static str, result: Value },
-    /// A call waits for the user. `name` is the tool name, so the card can say what is being asked.
-    ApprovalRequest { call_id: String, name: String, text: String },
+    /// (the user approved), "auto" (run without a card), "denied" (not approved: denied, cancelled or timed out),
+    /// or "refused" (refused before it ran, without asking, or by the tool when it was run without a card).
+    /// `reason` is why the call asked or ran without asking (core/approval codes). Absent for read tools, `todo_write`
+    /// and calls refused before the policy.
+    ToolResult {
+        call_id: String,
+        name: String,
+        ok: bool,
+        decision: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<&'static str>,
+        result: Value,
+    },
+    /// A call waits for the user. `name` is the tool name, so the card can say what is being asked. `reason` is why it
+    /// asks (a core/approval code).
+    ApprovalRequest {
+        call_id: String,
+        name: String,
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<&'static str>,
+    },
     /// Streamed assistant text. `Text` is still used for whole messages.
     TextDelta { text: String },
     /// The model is working on a reply (true) or has produced its first output (false).
@@ -155,17 +173,27 @@ fn new_call_id() -> String {
 /// Tools that never change the shell. `read_tool` accepts only these. Must match `READ_NAMES` in core/chat/agent_loop.rs.
 const READ_TOOLS: [&str; 5] = ["list_commands", "get_command", "get_screen", "get_cwd", "wait"];
 
-/// What an agent may use during one turn: the approval gate and a way to report events. The tools are
-/// private: the only route to them is `call_tool` (approval-gated) or `read_tool` (read-only names).
+/// What an agent may use during one turn: the approval gate, the approval policy, and a way to report events. The tools
+/// are private: the only route to them is `call_tool` (approval-gated) or `read_tool` (read-only names).
 pub struct AgentCtx<'a> {
     tools: &'a dyn AgentTools,
     approvals: &'a ApprovalGate,
+    policy: &'a dyn ApprovalPolicy,
     emit: &'a dyn Fn(AgentEvent),
 }
 
+/// The policy when none is given: every `run_command` asks. Safe by default.
+static MANUAL: ManualPolicy = ManualPolicy;
+
 impl<'a> AgentCtx<'a> {
     pub fn new(tools: &'a dyn AgentTools, approvals: &'a ApprovalGate, emit: &'a dyn Fn(AgentEvent)) -> Self {
-        AgentCtx { tools, approvals, emit }
+        AgentCtx { tools, approvals, policy: &MANUAL, emit }
+    }
+
+    /// Uses `policy` for the calls that are not approve-all (core/approval). lib.rs builds one per user message.
+    pub fn with_policy(mut self, policy: &'a dyn ApprovalPolicy) -> Self {
+        self.policy = policy;
+        self
     }
 
     pub fn emit(&self, ev: AgentEvent) {
@@ -206,63 +234,85 @@ impl<'a> AgentCtx<'a> {
             Ok(v) => (true, v.clone()),
             Err(e) => (false, json!({"error": e})),
         };
-        self.emit(AgentEvent::ToolResult { call_id, name: name.to_string(), ok, decision: "read", result: value });
+        self.emit(AgentEvent::ToolResult {
+            call_id,
+            name: name.to_string(),
+            ok,
+            decision: "read",
+            reason: None,
+            result: value,
+        });
         result
     }
 
     fn run(&self, name: &str, args: Value, gated: bool) -> Result<Value, String> {
         let call_id = new_call_id();
         self.emit(AgentEvent::ToolCall { call_id: call_id.clone(), name: name.to_string(), args: args.clone() });
-        let (decision, result) = self.gate_and_execute(&call_id, name, &args, gated);
+        let (decision, reason, result) = self.gate_and_execute(&call_id, name, &args, gated);
         let (ok, value) = match &result {
             Ok(v) => (true, v.clone()),
             Err(e) => (false, json!({"error": e})),
         };
-        self.emit(AgentEvent::ToolResult { call_id, name: name.to_string(), ok, decision, result: value });
+        self.emit(AgentEvent::ToolResult { call_id, name: name.to_string(), ok, decision, reason, result: value });
         result
     }
 
-    /// Applies the gate to one call and runs it if allowed. Returns the decision label with the result.
+    /// Applies the gate to one call and runs it if allowed. Returns the decision label, the reason (see
+    /// `AgentEvent::ToolResult`) and the result.
     fn gate_and_execute(
         &self,
         call_id: &str,
         name: &str,
         args: &Value,
         gated: bool,
-    ) -> (&'static str, Result<Value, String>) {
+    ) -> (&'static str, Option<&'static str>, Result<Value, String>) {
         if !gated || READ_TOOLS.contains(&name) {
-            return ("read", self.execute(name, args, false));
+            return ("read", None, self.execute(name, args, false));
         }
         // A run_command the user's typed text would block is refused before the approval card: the user is not asked to
         // approve it. The tool checks again when it injects, in case the user types while the card waits.
         if name == "run_command"
             && let Err(e) = self.tools.run_command_precheck()
         {
-            return ("refused", Err(e));
+            return ("refused", None, Err(e));
         }
-        let needs_approval = match name {
-            "send_keys" => true,
-            "run_command" => !self.approvals.auto_approve(),
-            _ => false,
+        // Approve-all skips the policy for run_command. send_keys always goes to the policy, which always asks.
+        let verdict = match name {
+            "run_command" if self.approvals.auto_approve() => Verdict::Auto(Reason::ApproveAll),
+            "run_command" | "send_keys" => self.policy.decide(name, args),
+            // Nothing else is gated: it runs as it always did, without a card.
+            _ => return self.run_ungated(name, args),
         };
-        if !needs_approval {
-            // Auto-approve skipped the card. A tool that refuses here did not run and the user was never asked.
-            let result = self.execute(name, args, true);
-            return (if result.is_ok() { "auto" } else { "refused" }, result);
+        match verdict {
+            Verdict::Auto(reason) => {
+                // The gate skipped the card. A tool that refuses here did not run and the user was never asked.
+                let result = self.execute(name, args, true);
+                (if result.is_ok() { "auto" } else { "refused" }, Some(reason.code()), result)
+            }
+            Verdict::Ask(reason) => {
+                let text = args.get("command").and_then(Value::as_str).map_or_else(|| args.to_string(), str::to_string);
+                let approved = self.approvals.ask(call_id, || {
+                    self.emit(AgentEvent::ApprovalRequest {
+                        call_id: call_id.to_string(),
+                        name: name.to_string(),
+                        text: text.clone(),
+                        reason: Some(reason.code()),
+                    })
+                });
+                if !approved {
+                    let err = format!("{DENIED}: the user did not approve this call (denied, cancelled, or timed out)");
+                    return ("denied", Some(reason.code()), Err(err));
+                }
+                // The user approved, so the decision stays "manual" even if the tool then refuses.
+                ("manual", Some(reason.code()), self.execute(name, args, true))
+            }
         }
-        let text = args.get("command").and_then(Value::as_str).map_or_else(|| args.to_string(), str::to_string);
-        let approved = self.approvals.ask(call_id, || {
-            self.emit(AgentEvent::ApprovalRequest {
-                call_id: call_id.to_string(),
-                name: name.to_string(),
-                text: text.clone(),
-            })
-        });
-        if !approved {
-            return ("denied", Err(format!("{DENIED}: the user did not approve this call (denied, cancelled, or timed out)")));
-        }
-        // The user approved, so the decision stays "manual" even if the tool then refuses.
-        ("manual", self.execute(name, args, true))
+    }
+
+    /// A gated name the gate does not know: no card and no policy. Runs as it did before the policy existed.
+    fn run_ungated(&self, name: &str, args: &Value) -> (&'static str, Option<&'static str>, Result<Value, String>) {
+        let result = self.execute(name, args, true);
+        (if result.is_ok() { "auto" } else { "refused" }, None, result)
     }
 
     /// Calls the tool. For the calls that act on the shell, the agent is in control from before the call until after it.
@@ -449,8 +499,10 @@ mod tests {
     use std::thread;
 
     use super::*;
+    use crate::core::approval::{MAX_AUTO_PER_TURN, RegexPolicy};
     use crate::core::observer::{InputState, IntegrationStatus, ObserverStatus};
     use crate::core::record::{Cwd, RecordSummary};
+    use crate::core::settings::{ApprovalMode, ApprovalSettings};
     use crate::core::tools::{CommandView, RunOutcome, ScreenView, WaitView};
 
     /// Records every tool call the agent manages to reach. Nothing here touches a shell.
@@ -531,7 +583,12 @@ mod tests {
     fn serialized_events_use_the_wire_names() {
         let wire = |e: AgentEvent| serde_json::to_value(&e).unwrap();
         assert_eq!(
-            wire(AgentEvent::ApprovalRequest { call_id: "c1".into(), name: "run_command".into(), text: "pwd".into() }),
+            wire(AgentEvent::ApprovalRequest {
+                call_id: "c1".into(),
+                name: "run_command".into(),
+                text: "pwd".into(),
+                reason: None,
+            }),
             json!({"type": "approval_request", "call_id": "c1", "name": "run_command", "text": "pwd"})
         );
         assert_eq!(
@@ -540,9 +597,31 @@ mod tests {
                 name: "run_command".into(),
                 ok: false,
                 decision: "denied",
+                reason: None,
                 result: json!({"error": "x"}),
             }),
             json!({"type": "tool_result", "call_id": "c1", "name": "run_command", "ok": false, "decision": "denied", "result": {"error": "x"}})
+        );
+        // A reason is sent as its code, next to the decision.
+        assert_eq!(
+            wire(AgentEvent::ApprovalRequest {
+                call_id: "c1".into(),
+                name: "run_command".into(),
+                text: "ls | wc".into(),
+                reason: Some("gate_chars"),
+            }),
+            json!({"type": "approval_request", "call_id": "c1", "name": "run_command", "text": "ls | wc", "reason": "gate_chars"})
+        );
+        assert_eq!(
+            wire(AgentEvent::ToolResult {
+                call_id: "c1".into(),
+                name: "run_command".into(),
+                ok: true,
+                decision: "auto",
+                reason: Some("rule"),
+                result: json!({"ok": true}),
+            }),
+            json!({"type": "tool_result", "call_id": "c1", "name": "run_command", "ok": true, "decision": "auto", "reason": "rule", "result": {"ok": true}})
         );
         assert_eq!(wire(AgentEvent::TextDelta { text: "Hel".into() }), json!({"type": "text_delta", "text": "Hel"}));
         assert_eq!(wire(AgentEvent::Thinking { active: true }), json!({"type": "thinking", "active": true}));
@@ -769,6 +848,129 @@ mod tests {
         assert!(ctx.call_tool("run_command", json!({"command": "pwd"})).is_err());
         assert!(labels(&log).iter().all(|l| !l.starts_with("control")), "{:?}", labels(&log));
         assert_eq!(tools.reached(), vec!["get_screen".to_string(), "get_cwd".to_string()]);
+    }
+
+    /// `(name, decision, reason)` of every ToolResult, in order.
+    fn reasons(log: &Mutex<Vec<AgentEvent>>) -> Vec<(String, &'static str, Option<&'static str>)> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ToolResult { name, decision, reason, .. } => Some((name.clone(), *decision, *reason)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn regex_policy(allow: &[&str]) -> RegexPolicy {
+        let approval = ApprovalSettings {
+            mode: ApprovalMode::Regex,
+            allow: allow.iter().map(|s| s.to_string()).collect(),
+            deny: Vec::new(),
+        };
+        RegexPolicy::new(&approval).expect("the rules compile")
+    }
+
+    #[test]
+    fn a_regex_rule_runs_a_call_without_a_card_and_the_result_says_why() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let policy = regex_policy(&["echo .*"]);
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+        let ctx = AgentCtx::new(&tools, &gate, &emit).with_policy(&policy);
+        assert!(ctx.call_tool("run_command", json!({"command": "echo hi"})).is_ok());
+        assert!(ctx.read_tool("get_screen", json!({})).is_ok());
+        assert_eq!(
+            reasons(&log),
+            [("run_command".to_string(), "auto", Some("rule")), ("get_screen".to_string(), "read", None)]
+        );
+        assert!(!log.lock().unwrap().iter().any(|e| matches!(e, AgentEvent::ApprovalRequest { .. })));
+        assert_eq!(tools.reached(), ["run_command", "get_screen"]);
+    }
+
+    #[test]
+    fn a_gated_command_asks_with_the_gate_reason_and_is_manual_when_approved() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        // The rule would match, but the hard gate refuses the pipe first.
+        let policy = regex_policy(&[".*"]);
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| {
+            if let AgentEvent::ApprovalRequest { call_id, reason, .. } = &ev {
+                assert_eq!(*reason, Some("gate_chars"));
+                assert!(gate.decide(call_id, true));
+            }
+            log.lock().unwrap().push(ev);
+        };
+        let ctx = AgentCtx::new(&tools, &gate, &emit).with_policy(&policy);
+        assert!(ctx.call_tool("run_command", json!({"command": "ls | wc"})).is_ok());
+        assert_eq!(reasons(&log), [("run_command".to_string(), "manual", Some("gate_chars"))]);
+        assert_eq!(tools.reached(), ["run_command"]);
+    }
+
+    #[test]
+    fn a_call_nobody_answers_is_denied_with_its_reason_and_never_reaches_the_tools() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let policy = regex_policy(&["echo .*"]);
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+        let ctx = AgentCtx::new(&tools, &gate, &emit).with_policy(&policy);
+        let err = ctx.call_tool("run_command", json!({"command": "git status"})).expect_err("timed out");
+        assert!(err.starts_with(DENIED), "{err}");
+        assert_eq!(reasons(&log), [("run_command".to_string(), "denied", Some("no_rule"))]);
+        assert!(tools.reached().is_empty());
+    }
+
+    #[test]
+    fn approve_all_skips_the_policy_and_says_approve_all_but_send_keys_still_asks() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        gate.set_auto_approve(true);
+        // No rules: the policy would ask for everything, and the gate would refuse the pipe.
+        let policy = regex_policy(&[]);
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+        let ctx = AgentCtx::new(&tools, &gate, &emit).with_policy(&policy);
+        assert!(ctx.call_tool("run_command", json!({"command": "ls | wc"})).is_ok());
+        assert!(ctx.call_tool("send_keys", json!({"bytes": [13]})).is_err());
+        assert_eq!(
+            reasons(&log),
+            [("run_command".to_string(), "auto", Some("approve_all")), ("send_keys".to_string(), "denied", Some("send_keys"))]
+        );
+        let asked_for_run_command = log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ApprovalRequest { name, .. } if name == "run_command"));
+        assert!(!asked_for_run_command, "approve-all showed a card for run_command");
+        assert_eq!(tools.reached(), ["run_command"]);
+    }
+
+    #[test]
+    fn the_ninth_automatic_call_in_a_turn_asks_with_auto_cap() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let policy = regex_policy(&["echo .*"]);
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| {
+            if let AgentEvent::ApprovalRequest { call_id, reason, .. } = &ev {
+                assert_eq!(*reason, Some("auto_cap"));
+                assert!(gate.decide(call_id, true));
+            }
+            log.lock().unwrap().push(ev);
+        };
+        let ctx = AgentCtx::new(&tools, &gate, &emit).with_policy(&policy);
+        for n in 0..MAX_AUTO_PER_TURN {
+            assert!(ctx.call_tool("run_command", json!({"command": format!("echo {n}")})).is_ok());
+        }
+        assert!(ctx.call_tool("run_command", json!({"command": "echo over"})).is_ok());
+        let got = reasons(&log);
+        assert_eq!(got.len(), MAX_AUTO_PER_TURN + 1);
+        assert!(got[..MAX_AUTO_PER_TURN].iter().all(|(_, d, r)| *d == "auto" && *r == Some("rule")), "{got:?}");
+        assert_eq!(got[MAX_AUTO_PER_TURN], ("run_command".to_string(), "manual", Some("auto_cap")));
+        assert_eq!(tools.reached().len(), MAX_AUTO_PER_TURN + 1);
     }
 
     /// "still running" only when the shell really is Running. Other timeouts name the state; not-run outcomes say why.
