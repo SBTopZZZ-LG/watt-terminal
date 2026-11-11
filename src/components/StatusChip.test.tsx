@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { StatusChip } from './StatusChip';
-import type { LlmStatus, SettingsStateView } from '../lib/types';
+import type { Foreground, InputState, LlmStatus, SettingsStateView } from '../lib/types';
 
 const LLM_ON: LlmStatus = { enabled: true, model: 'big', provider: 'Acme' };
 const LLM_OFF: LlmStatus = { enabled: false, model: null, provider: null };
@@ -106,5 +106,66 @@ describe('StatusChip: the AI settings button', () => {
     expect(out.indexOf('auto-approve')).toBeLessThan(gearAt);
     // The gear's own <button opens at the last <button in the strip.
     expect(out.lastIndexOf('<button', gearAt)).toBe(out.lastIndexOf('<button'));
+  });
+});
+
+function strip(input: InputState, foreground: Foreground | null | undefined) {
+  return renderToStaticMarkup(
+    <StatusChip
+      integration="live"
+      observer="ok"
+      input={input}
+      foreground={foreground}
+      cwd={null}
+      autoApprove={false}
+      onToggleAutoApprove={() => {}}
+      llm={LLM_ON}
+      settingsState={OK}
+      onOpenSettings={() => {}}
+    />,
+  );
+}
+
+/** The state chip's opening tag and text, as markup, or ''. It is the chip that holds the input state's word. */
+function stateChip(out: string): string {
+  return out.match(/<span class="chip[^"]*"[^>]*>(?:RUNNING|running|prompt|full-screen app)[^<]*<\/span>/)?.[0] ?? '';
+}
+
+describe('StatusChip: the state chip names a program without shell integration', () => {
+  const SSH: Foreground = { kind: 'ssh', command: 'ssh ubuntu@lidia' };
+
+  it('running an ssh: RUNNING · the command, in the neutral foreground style, with the title', () => {
+    const tag = stateChip(strip('running', SSH));
+    expect(tag).toContain('chip-foreground');
+    expect(tag).toContain('RUNNING · ssh ubuntu@lidia');
+    expect(tag).toContain(
+      'title="ssh ubuntu@lidia: a shell on another machine. It has no shell integration, so the agent can read the screen but cannot run commands here."',
+    );
+    expect(tag).not.toContain('chip-warn');
+  });
+
+  it('a long command is cut in the label', () => {
+    const tag = stateChip(strip('running', { kind: 'container_exec', command: 'docker exec -it some-container-name /bin/bash -l' }));
+    expect(tag).toContain('RUNNING · docker exec -it some-contai…');
+  });
+
+  it('an ordinary running command keeps the plain running chip, with no title', () => {
+    const tag = stateChip(strip('running', { kind: 'other', command: 'sleep 2' }));
+    expect(tag).toBe('<span class="chip">running</span>');
+  });
+
+  it('no hint keeps the plain running chip too', () => {
+    expect(stateChip(strip('running', null))).toBe('<span class="chip">running</span>');
+    expect(stateChip(strip('running', undefined))).toBe('<span class="chip">running</span>');
+  });
+
+  it('at the prompt, the chip reads prompt even if a stale hint is passed', () => {
+    expect(stateChip(strip('prompt', SSH))).toBe('<span class="chip">prompt</span>');
+  });
+
+  it('the hint does not change the strip around the state chip', () => {
+    const plain = strip('running', null);
+    const named = strip('running', SSH);
+    expect(named.replace(/<span class="chip chip-foreground"[^>]*>[^<]*<\/span>/, '<span class="chip">running</span>')).toBe(plain);
   });
 });

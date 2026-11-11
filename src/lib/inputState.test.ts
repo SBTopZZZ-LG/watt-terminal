@@ -9,7 +9,7 @@ import {
   routeFor,
 } from './inputState';
 import type { InputModel } from './inputState';
-import type { InputState } from './types';
+import type { Foreground, InputState } from './types';
 
 const ALL_STATES: InputState[] = [
   'booting',
@@ -23,12 +23,14 @@ const ALL_STATES: InputState[] = [
 ];
 
 function model(rust: InputState, alt = false): InputModel {
-  return { rust, alt };
+  return { rust, alt, foreground: null };
 }
+
+const SSH: Foreground = { kind: 'ssh', command: 'ssh ubuntu@lidia' };
 
 describe('inputReducer and effectiveState', () => {
   it('starts booting with no alt screen', () => {
-    expect(INITIAL_INPUT).toEqual({ rust: 'booting', alt: false });
+    expect(INITIAL_INPUT).toEqual({ rust: 'booting', alt: false, foreground: null });
     expect(effectiveState(INITIAL_INPUT)).toBe('booting');
   });
 
@@ -43,7 +45,39 @@ describe('inputReducer and effectiveState', () => {
   it('returns the same object when nothing changed', () => {
     const m = model('prompt');
     expect(inputReducer(m, { type: 'rust_state', state: 'prompt' })).toBe(m);
+    expect(inputReducer(m, { type: 'rust_state', state: 'prompt', foreground: null })).toBe(m);
     expect(inputReducer(m, { type: 'alt', active: false })).toBe(m);
+  });
+
+  it('takes the foreground hint with the running state, and a state event without one clears it', () => {
+    let m = model('prompt');
+    m = inputReducer(m, { type: 'rust_state', state: 'running', foreground: SSH });
+    expect(m.foreground).toEqual(SSH);
+    expect(routeFor(effectiveState(m), m.foreground).hint).toBe(
+      'ssh ubuntu@lidia is running without shell integration. The agent can read the screen but cannot run commands here.',
+    );
+    // The same state and the same hint: nothing changes, so the same object comes back.
+    expect(inputReducer(m, { type: 'rust_state', state: 'running', foreground: { ...SSH } })).toBe(m);
+    // Back at the prompt the state event carries no hint, and the hint goes with it.
+    m = inputReducer(m, { type: 'rust_state', state: 'prompt' });
+    expect(m.foreground).toBeNull();
+    expect(effectiveState(m)).toBe('prompt');
+  });
+
+  it('a changed command with the same state is a change of the hint', () => {
+    const m = inputReducer(model('running'), { type: 'rust_state', state: 'running', foreground: SSH });
+    const next = inputReducer(m, { type: 'rust_state', state: 'running', foreground: { kind: 'shell', command: 'zsh -f -i' } });
+    expect(next).not.toBe(m);
+    expect(next.foreground).toEqual({ kind: 'shell', command: 'zsh -f -i' });
+  });
+
+  it('the alt screen keeps the hint in the model, and the alt route does not show it', () => {
+    const alt = inputReducer(inputReducer(model('running'), { type: 'rust_state', state: 'running', foreground: SSH }), {
+      type: 'alt',
+      active: true,
+    });
+    expect(effectiveState(alt)).toBe('alt');
+    expect(routeFor(effectiveState(alt), alt.foreground).hint).not.toContain('without shell integration');
   });
 
   it('the alt screen overrides every Rust state, immediately, and leaving it restores the Rust state', () => {
@@ -93,6 +127,21 @@ describe('routeFor: the input routing table', () => {
     for (const s of ALL_STATES) {
       expect(routeFor(s).hint === null, s).toBe(s === 'prompt');
     }
+  });
+
+  it('a program without shell integration changes the running hint, and nothing else', () => {
+    const generic = 'A command is running. The agent cannot run another until it finishes.';
+    expect(routeFor('running').hint).toBe(generic);
+    expect(routeFor('running', null).hint).toBe(generic);
+    expect(routeFor('running', { kind: 'other', command: 'sleep 2' }).hint).toBe(generic);
+    expect(routeFor('running', SSH).hint).toContain('is running without shell integration');
+    // Only the running state has the hint: the others are the same with or without one.
+    for (const s of ALL_STATES.filter((s) => s !== 'running')) {
+      expect(routeFor(s, SSH), s).toEqual(routeFor(s));
+    }
+    // Still inline, so the bar keeps its height, and the keys still go to the PTY.
+    expect(routeFor('running', SSH).hintInline).toBe(true);
+    expect(routeFor('running', SSH).keys).toBe('pty');
   });
 
   it('shows the hint inline (as the placeholder) only while a command is starting or running', () => {

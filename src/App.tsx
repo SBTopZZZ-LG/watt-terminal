@@ -40,7 +40,7 @@ const uiSaver = createPatchSaver((patch: UiStatePatch) => {
 export default function App() {
   const [input, dispatchInput] = useReducer(inputReducer, INITIAL_INPUT);
   const effective = effectiveState(input);
-  const route = routeFor(effective);
+  const route = routeFor(effective, input.foreground);
 
   // The bar counts as open while its input has focus, or the hotkey asked for it. Only the alternate screen cares: an
   // open bar stays as the chat there, so a program starting or ending never takes the input's focus away.
@@ -123,7 +123,7 @@ export default function App() {
   const prevEffective = useRef<InputState>(effective);
 
   const applyStatus = useCallback((s: Status) => {
-    dispatchInput({ type: 'rust_state', state: s.state });
+    dispatchInput({ type: 'rust_state', state: s.state, foreground: s.foreground ?? null });
     setIntegration(s.integration);
     setObserver(s.observer);
     setCwd(s.cwd);
@@ -275,7 +275,7 @@ export default function App() {
       setAgentControl((c) => agentControlAfter(c, ev));
       switch (ev.type) {
         case 'state':
-          dispatchInput({ type: 'rust_state', state: ev.state });
+          dispatchInput({ type: 'rust_state', state: ev.state, foreground: ev.foreground ?? null });
           return;
         case 'integration':
           setIntegration(ev.status);
@@ -618,6 +618,7 @@ export default function App() {
         integration={integration}
         observer={observer}
         input={effective}
+        foreground={input.foreground}
         cwd={cwd}
         autoApprove={autoApprove}
         onToggleAutoApprove={toggleAutoApprove}

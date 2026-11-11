@@ -385,6 +385,20 @@ input {
   text-transform: none;
 }
 
+/* A program without shell integration is in the foreground: the state chip names it. Neutral accent, not a warning. The
+   command is cut in the label, and the chip keeps its width (flex 0 0 auto) and ellipses what does not fit it. It must
+   not shrink to nothing: a shrunk box hides its text. */
+.chip-foreground {
+  color: var(--accent);
+  font-family: var(--mono);
+  flex: 0 0 auto;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
 .chip-button {
   cursor: pointer;
   background: var(--panel);

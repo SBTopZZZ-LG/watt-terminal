@@ -4,21 +4,36 @@
 // Inputs: the InputState that Rust reports, and the alternate-screen flag from xterm's buffer. The alt flag is
 // an immediate local override, so vim and friends take over the keyboard without waiting for a round trip.
 
-import type { InputState } from './types';
+import { foregroundHint, isUnintegrated } from './foreground';
+import type { Foreground, InputState } from './types';
 
 export interface InputModel {
   rust: InputState;
   alt: boolean;
+  /** The foreground hint Rust reports with the state. Null when there is none (see foreground.ts). */
+  foreground: Foreground | null;
 }
 
-export const INITIAL_INPUT: InputModel = { rust: 'booting', alt: false };
+export const INITIAL_INPUT: InputModel = { rust: 'booting', alt: false, foreground: null };
 
-export type InputAction = { type: 'rust_state'; state: InputState } | { type: 'alt'; active: boolean };
+export type InputAction =
+  | { type: 'rust_state'; state: InputState; foreground?: Foreground | null }
+  | { type: 'alt'; active: boolean };
+
+function sameForeground(a: Foreground | null, b: Foreground | null): boolean {
+  return a === b || (a !== null && b !== null && a.kind === b.kind && a.command === b.command);
+}
 
 export function inputReducer(m: InputModel, a: InputAction): InputModel {
   switch (a.type) {
-    case 'rust_state':
-      return m.rust === a.state ? m : { ...m, rust: a.state };
+    case 'rust_state': {
+      // The hint travels with the state: a state event without one (a prompt, or any state after a command) clears it.
+      const foreground = a.foreground ?? null;
+      if (m.rust === a.state && sameForeground(m.foreground, foreground)) {
+        return m;
+      }
+      return { ...m, rust: a.state, foreground };
+    }
     case 'alt':
       return m.alt === a.active ? m : { ...m, alt: a.active };
   }
@@ -59,7 +74,11 @@ export interface Route {
   hintInline: boolean;
 }
 
-export function routeFor(state: InputState): Route {
+/**
+ * The route for a state. `foreground` only matters while a command runs: a program without shell integration (ssh, a
+ * nested shell...) names itself in the hint. An ordinary command keeps the generic hint.
+ */
+export function routeFor(state: InputState, foreground: Foreground | null = null): Route {
   switch (state) {
     case 'booting':
       return {
@@ -88,7 +107,9 @@ export function routeFor(state: InputState): Route {
       return {
         keys: 'pty',
         bar: 'chat',
-        hint: 'A command is running. The agent cannot run another until it finishes.',
+        hint: isUnintegrated(foreground)
+          ? foregroundHint(foreground)
+          : 'A command is running. The agent cannot run another until it finishes.',
         hintInline: true,
       };
     case 'alt':

@@ -16,7 +16,7 @@ use serde::Serialize;
 use vt100::capture::{basic_formatted_to_plain, BasicFormattedCaptureState, RowContents};
 use vt100::{Callbacks, Parser};
 
-use crate::core::foreground::{self, Foreground};
+use crate::core::foreground::{self, Foreground, ForegroundKind};
 use crate::core::record::{Cwd, OutputBuilder, RawCapture, Record, RecordStatus, RecordSummary, Source};
 use crate::core::scanner::{Event, Found, Scanner};
 
@@ -694,6 +694,12 @@ impl Core {
         (!fg.command.is_empty()).then_some(fg)
     }
 
+    /// True while the foreground hint names a program that takes the typed keys itself: anything but `other`. An ordinary
+    /// command (`sleep`, `make`) reads the tty too, but its type-ahead still lands on the prompt line, so it does not count.
+    fn foreground_holds_the_keys(&self) -> bool {
+        self.foreground().is_some_and(|fg| fg.kind != ForegroundKind::Other)
+    }
+
     pub fn integration_status(&self) -> IntegrationStatus {
         if self.lifecycle != Lifecycle::Booting {
             IntegrationStatus::Live
@@ -741,9 +747,16 @@ impl Core {
     /// Ctrl-L clears the screen and redraws the same line, so it changes nothing. A CR does not set the flag: a CR at the
     /// prompt submits the line (`begin_submit`). Any other byte, arrow keys included (history recall puts text on the
     /// line), sets it.
+    ///
+    /// While a program that holds the keys runs in the foreground (ssh, a nested shell, su, a container exec, a
+    /// multiplexer: see `foreground_holds_the_keys`), the bytes belong to it and never reach the prompt line, so they do
+    /// not count. Nothing clears the flag when that program exits, so the bytes must not set it in the first place.
     pub fn note_user_bytes(&mut self, bytes: &[u8]) {
         let state = self.lifecycle_view();
         if !matches!(state, InputState::Prompt | InputState::Submitted | InputState::Continuation | InputState::Running) {
+            return;
+        }
+        if state == InputState::Running && self.foreground_holds_the_keys() {
             return;
         }
         let running = state == InputState::Running;
@@ -1212,5 +1225,50 @@ mod tests {
         c.handle(Event::CommandEnd { exit: 0, pipestatus: vec![0] });
         c.handle(Event::PromptStart);
         assert_eq!(wire(&c.take_events(true)), vec![serde_json::json!({"type": "state", "state": "prompt"})]);
+    }
+
+    /// Keys typed while ssh, a nested shell, su, a container exec or a multiplexer runs belong to that program: they do not
+    /// set the flag, so the prompt after it is clean. Ctrl-C too: it does not clear anything that was not set.
+    #[test]
+    fn keys_typed_into_a_program_that_holds_the_keys_do_not_set_the_flag() {
+        for command in ["ssh ubuntu@lidia", "zsh -f -i", "su -", "docker exec -it app sh", "tmux attach"] {
+            let mut c = running(command);
+            assert_eq!(c.lifecycle_view(), InputState::Running, "{command}");
+            c.note_user_bytes(b"echo hi\r");
+            c.note_user_bytes(b"exit\r");
+            c.note_user_bytes(&[0x03]);
+            assert!(!c.user_typed_since_prompt(), "keys typed into `{command}` set the flag");
+            c.handle(Event::CommandEnd { exit: 0, pipestatus: vec![0] });
+            c.handle(Event::PromptStart);
+            assert_eq!(c.lifecycle_view(), InputState::Prompt, "{command}");
+            assert!(!c.user_typed_since_prompt(), "`{command}` left the flag behind at the prompt");
+            c.note_user_bytes(b"x");
+            assert!(c.user_typed_since_prompt(), "the prompt after `{command}` does not count typed text");
+        }
+    }
+
+    /// An ordinary command keeps the type-ahead rule: its keys land on the prompt line, so they set the flag.
+    #[test]
+    fn keys_typed_during_an_ordinary_command_still_set_the_flag() {
+        let mut c = running("sleep 2");
+        assert_eq!(c.foreground().map(|f| f.kind), Some(ForegroundKind::Other));
+        c.note_user_bytes(b"zqx");
+        assert!(c.user_typed_since_prompt());
+    }
+
+    /// The exemption is only while the program runs. Typed text at the prompt, and an alt-screen program that the hint does
+    /// not name, follow the rules they always had.
+    #[test]
+    fn the_exemption_ends_with_the_program_and_never_applies_at_the_prompt() {
+        let mut prompt = core();
+        prompt.lifecycle = Lifecycle::Prompt;
+        prompt.note_user_bytes(b"x");
+        assert!(prompt.user_typed_since_prompt(), "typed text at the prompt no longer counts");
+
+        let mut alt = running("ssh ubuntu@lidia");
+        alt.parser.process(b"\x1b[?1049h");
+        assert_eq!(alt.lifecycle_view(), InputState::Alt);
+        alt.note_user_bytes(b"x");
+        assert!(!alt.user_typed_since_prompt(), "alt screen rule changed");
     }
 }

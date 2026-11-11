@@ -19,6 +19,18 @@ export interface Cwd {
   path: string;
 }
 
+/**
+ * What the command line says is running in the foreground (core/foreground.rs). A hint, guessed from the words: `other` is
+ * an ordinary program. The others (ssh, a nested shell, su, a container exec, a multiplexer) have no shell integration, so
+ * the agent cannot run commands in them.
+ */
+export type ForegroundKind = 'ssh' | 'shell' | 'su' | 'container_exec' | 'multiplexer' | 'other';
+
+export interface Foreground {
+  kind: ForegroundKind;
+  command: string;
+}
+
 export type Source =
   | { kind: 'user' }
   | { kind: 'agent'; call_id: string }
@@ -38,7 +50,8 @@ export interface RecordSummary {
 }
 
 export type SessionEvent =
-  | { type: 'state'; state: InputState }
+  /** `foreground` is left out when there is no hint: not Running, or a blank command. An ordinary command is kind `other`. */
+  | { type: 'state'; state: InputState; foreground?: Foreground }
   | { type: 'integration'; status: IntegrationStatus }
   | { type: 'observer'; status: ObserverStatus }
   | { type: 'cwd'; cwd: Cwd | null }
@@ -109,6 +122,8 @@ export interface LlmStatus {
 
 export interface Status {
   state: InputState;
+  /** The foreground hint while a command runs. Left out otherwise. */
+  foreground?: Foreground;
   integration: IntegrationStatus;
   observer: ObserverStatus;
   cwd: Cwd | null;

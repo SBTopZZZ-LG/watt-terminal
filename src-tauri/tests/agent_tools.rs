@@ -1149,6 +1149,14 @@ fn a_nested_shell_is_the_foreground_hint_and_refuses_run_command_without_a_card(
     assert!(said.contains("cannot run a command now") && said.contains("`zsh -f -i`"), "{said}");
     assert!(!s.records().iter().any(|r| r.command.contains("nested-card-check")), "the refused command ran");
 
+    // The user types into the nested shell: the command runs there, and the agent stays refused while it is nested.
+    s.write_user(b"echo hi\r").expect("typed into the nested shell");
+    assert!(
+        wait_until(Duration::from_secs(5), || snapshot(&s).rows.iter().any(|r| r.trim() == "hi").then_some(())).is_some(),
+        "the nested shell did not run echo hi"
+    );
+    assert!(tools.run_command_precheck().is_err(), "the agent ran while the nested shell was still up");
+
     // The nested shell exits (typed at the nested prompt). The hint goes away, and the state event says so.
     s.write_user(b"exit\r").expect("exit the nested shell");
     wait_prompt(&s);
@@ -1165,12 +1173,11 @@ fn a_nested_shell_is_the_foreground_hint_and_refuses_run_command_without_a_card(
         events.0.lock().unwrap()
     );
 
-    // The text typed into the nested shell still counts as typed text at the outer prompt (see Core::note_user_bytes), so
-    // Ctrl-C at the prompt clears it, and then the agent's command runs.
-    s.write_user(&[0x03]).expect("ctrl-c at the prompt");
-    wait_prompt(&s);
+    // The keys typed into the nested shell were its input, not the prompt line (see Core::note_user_bytes): the agent's
+    // command runs straight away, with no Ctrl-C at the prompt.
+    assert!(tools.run_command_precheck().is_ok(), "the nested shell's typed text refused the agent after it exited");
     let RunOutcome::Finished { record } =
-        tools.run_command("echo after-nested", DEFAULT_RUN_TIMEOUT).expect("runs after the nested shell exits")
+        tools.run_command("echo after-nested", DEFAULT_RUN_TIMEOUT).expect("runs right after the nested shell exits")
     else {
         panic!("expected a finished record");
     };

@@ -1,12 +1,15 @@
+import { foregroundChip } from '../lib/foreground';
 import { formatCwd } from '../lib/format';
 import { chipBrokenTitle, chipLabel, recoveryKind } from '../lib/settingsRecovery';
 import { GridChip } from './GridChip';
-import type { Cwd, InputState, IntegrationStatus, LlmStatus, ObserverStatus, SettingsStateView } from '../lib/types';
+import type { Cwd, Foreground, InputState, IntegrationStatus, LlmStatus, ObserverStatus, SettingsStateView } from '../lib/types';
 
 interface Props {
   integration: IntegrationStatus;
   observer: ObserverStatus;
   input: InputState;
+  /** The foreground hint while a command runs. A program without shell integration replaces the state chip's label. */
+  foreground?: Foreground | null;
   cwd: Cwd | null;
   autoApprove: boolean;
   onToggleAutoApprove: () => void;
@@ -36,7 +39,8 @@ const INTEGRATION_LABEL: Record<IntegrationStatus, string> = {
 
 /** Slim status strip above the terminal, in normal flow. */
 export function StatusChip(props: Props) {
-  const { integration, observer, input, cwd, autoApprove, onToggleAutoApprove, llm, settingsState = null, onOpenSettings } = props;
+  const { integration, observer, input, foreground = null, cwd, autoApprove, onToggleAutoApprove, llm, settingsState = null, onOpenSettings } = props;
+  const fgChip = foregroundChip(input, foreground);
   const modelLabel = chipLabel(settingsState, llm);
   const broken = recoveryKind(settingsState) !== 'ok';
   const modelTitle = chipBrokenTitle(settingsState) ?? `${llm.provider ? `${llm.provider} · ` : ''}${modelLabel}`;
@@ -44,7 +48,13 @@ export function StatusChip(props: Props) {
     <div className="status-chip" role="status">
       <span className={`chip chip-${integration}`}>{INTEGRATION_LABEL[integration]}</span>
       <span className={`chip chip-${observer}`}>{observer === 'ok' ? 'observer ok' : 'observer desynced'}</span>
-      <span className="chip">{INPUT_LABEL[input]}</span>
+      {fgChip ? (
+        <span className="chip chip-foreground" title={fgChip.title}>
+          {fgChip.label}
+        </span>
+      ) : (
+        <span className="chip">{INPUT_LABEL[input]}</span>
+      )}
       <GridChip />
       <span className={`chip chip-model${broken ? ' chip-warn' : ''}`} title={modelTitle}>
         {modelLabel}
