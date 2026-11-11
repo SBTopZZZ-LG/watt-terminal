@@ -22,6 +22,8 @@ import type { ProviderPreset, RecoverAction, SettingsStateView, SettingsView } f
 import { ApprovalSection } from './ApprovalSection';
 import { ProviderEditor } from './ProviderEditor';
 import type { TestState } from './ProviderEditor';
+import { SettingsTabs } from './SettingsTabs';
+import type { TabDef } from './SettingsTabs';
 
 /** The recovery actions in flight or waiting for their confirm step. `busy` names the action that is running. */
 export interface RecoveryState {
@@ -52,6 +54,15 @@ export interface EditorState {
   askDelete: boolean;
   askDiscard: boolean;
 }
+
+/**
+ * The tabs of the AI settings, in order. Models holds the default model, the context limit, the providers and the editor;
+ * Approvals holds the approval rules. A new tab is one entry here and one panel in the dialog's render.
+ */
+export const SETTINGS_TABS: readonly TabDef[] = [
+  { id: 'models', label: 'Models' },
+  { id: 'approvals', label: 'Approvals' },
+];
 
 /** The select value for "None" (default model) and "Blank provider" (add provider). Preset keys are never empty. */
 const BLANK_PRESET = '';
@@ -163,6 +174,46 @@ function RecoveryPanel({ state, recovery, onAskRevert, onRecover, onReload }: Re
   );
 }
 
+export interface SettingsNoticesProps {
+  /** The settings as loaded, or null while they load (or after a failed load): nothing is shown then. */
+  view: SettingsView | null;
+  /** The recovery panel's state: which action runs, the revert confirm step, and the last error. */
+  recovery: RecoveryState;
+  onCheckAgain(): void;
+  onAskRevert(ask: boolean): void;
+  onRecover(action: RecoverAction): void;
+  onReload(): void;
+}
+
+/**
+ * What the dialog says about settings.json, above the tabs so it stays in view on every tab: the recovery panel while the
+ * file cannot be used, or the banner when it cannot be read. Nothing when the file is in use.
+ */
+export function SettingsNotices({ view, recovery, onCheckAgain, onAskRevert, onRecover, onReload }: SettingsNoticesProps) {
+  if (view === null) {
+    return null;
+  }
+  const recovering = recoveryKind(view.settings_state) !== 'ok';
+  if (!recovering && view.load_error === null) {
+    return null;
+  }
+  return (
+    <div className="settings-notices">
+      {recovering && (
+        <RecoveryPanel state={view.settings_state} recovery={recovery} onAskRevert={onAskRevert} onRecover={onRecover} onReload={onReload} />
+      )}
+      {!recovering && view.load_error !== null && (
+        <div className="settings-banner" role="alert">
+          <span>{`settings.json could not be read: ${view.load_error}. Changes are disabled until it is fixed or removed.`}</span>
+          <button type="button" onClick={onCheckAgain}>
+            Check again
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export interface SettingsBodyProps {
   load: LoadState;
   /** The settings file is broken: every change is disabled. */
@@ -170,17 +221,11 @@ export interface SettingsBodyProps {
   presets: ProviderPreset[];
   defaults: { busy: boolean; error: string | null };
   limit: { text: string; error: string | null; busy: boolean };
-  /** The recovery panel's state: which action runs, the revert confirm step, and the last error. */
-  recovery: RecoveryState;
   /** A message about the providers, such as "Save or cancel the open provider first." */
   notice: string | null;
   /** The open editor, drawn under its row, or at the end of the list when `forId` is null. */
   editor: { forId: string | null; node: ReactNode } | null;
   onRetry(): void;
-  onCheckAgain(): void;
-  onAskRevert(ask: boolean): void;
-  onRecover(action: RecoverAction): void;
-  onReload(): void;
   onDefault(key: string): void;
   onLimitText(text: string): void;
   onLimitCommit(): void;
@@ -218,27 +263,9 @@ export function SettingsBody(p: SettingsBodyProps) {
   const defaultKey = settings.default_model ? modelRefKey(settings.default_model) : BLANK_PRESET;
   const defaultProviderId = settings.default_model?.provider_id ?? null;
   const off = p.locked;
-  const recovering = recoveryKind(view.settings_state) !== 'ok';
 
   return (
     <>
-      {recovering && (
-        <RecoveryPanel
-          state={view.settings_state}
-          recovery={p.recovery}
-          onAskRevert={p.onAskRevert}
-          onRecover={p.onRecover}
-          onReload={p.onReload}
-        />
-      )}
-      {!recovering && view.load_error !== null && (
-        <div className="settings-banner" role="alert">
-          <span>{`settings.json could not be read: ${view.load_error}. Changes are disabled until it is fixed or removed.`}</span>
-          <button type="button" onClick={p.onCheckAgain}>
-            Check again
-          </button>
-        </div>
-      )}
       <p className="settings-note">{storeNote(view.store_kind)}</p>
 
       <section className="settings-section" aria-labelledby={`${uid}-default-title`}>
@@ -385,8 +412,10 @@ export interface SettingsDialogProps {
 
 /**
  * The AI settings dialog: a modal over the window. It loads the settings, and holds the state of the default model, the
- * context limit and the provider editor. Focus moves in on open, stays in while open, and goes back to where it was on
- * close. Esc closes; a click on the backdrop closes. Unsaved provider changes are asked about before they are dropped.
+ * context limit, the provider editor and the approval draft. The notices about settings.json stay above a tab strip
+ * (Models, Approvals); every tab stays mounted, so a switch keeps the drafts. Focus moves in on open, stays in while open,
+ * and goes back to where it was on close. Esc closes; a click on the backdrop closes. Unsaved changes are asked about
+ * before they are dropped.
  */
 export function SettingsDialog({ onClose, onChanged, onViewLoaded }: SettingsDialogProps) {
   const titleId = useId();
@@ -408,6 +437,8 @@ export function SettingsDialog({ onClose, onChanged, onViewLoaded }: SettingsDia
   const [approvalError, setApprovalError] = useState<string | null>(null);
   // undefined while the built-in list loads; null when it could not be read.
   const [builtinDeny, setBuiltinDeny] = useState<string[] | null | undefined>(undefined);
+  // The active tab. The dialog opens on the first one, and a closed dialog forgets it.
+  const [tab, setTab] = useState(SETTINGS_TABS[0].id);
 
   const view = load.kind === 'ready' ? load.view : null;
   const dirty = editor !== null && isDirty(editor.draft, editor.saved);
@@ -551,8 +582,11 @@ export function SettingsDialog({ onClose, onChanged, onViewLoaded }: SettingsDia
       return;
     }
     if (e.key === 'Tab') {
-      // Tab moves within the dialog: from the last control to the first, and back.
-      const items = Array.from(dialogRef.current?.querySelectorAll<HTMLElement>(FOCUSABLE) ?? []);
+      // Tab moves within the dialog: from the last control to the first, and back. Controls in a hidden tab panel, and the
+      // inactive tabs (tabindex -1), are not on the Tab order, so they are not the first or last stop.
+      const items = Array.from(dialogRef.current?.querySelectorAll<HTMLElement>(FOCUSABLE) ?? []).filter(
+        (el) => el.closest('[hidden]') === null && el.getAttribute('tabindex') !== '-1',
+      );
       if (items.length === 0) {
         e.preventDefault();
         return;
@@ -854,6 +888,61 @@ export function SettingsDialog({ onClose, onChanged, onViewLoaded }: SettingsDia
     };
   }
 
+  // The tabs whose draft is dirty: a dot on the tab, and the close guard's question.
+  const dirtyTabs: string[] = [];
+  if (dirty) {
+    dirtyTabs.push('models');
+  }
+  if (approvalDirty) {
+    dirtyTabs.push('approvals');
+  }
+
+  const modelsPanel = (
+    <SettingsBody
+      load={load}
+      locked={locked}
+      presets={presets}
+      defaults={defaults}
+      limit={limit}
+      notice={notice}
+      editor={editorSlot}
+      onRetry={() => {
+        setLoad({ kind: 'loading' });
+        setAttempt((a) => a + 1);
+      }}
+      onDefault={setDefault}
+      onLimitText={(text) => setLimit((l) => ({ ...l, text, error: null }))}
+      onLimitCommit={() => commitLimit(limit.text)}
+      onLimitClear={() => {
+        setLimit((l) => ({ ...l, text: '' }));
+        commitLimit('');
+      }}
+      onOpenProvider={openProvider}
+      onAddProvider={addProvider}
+    />
+  );
+
+  const approvalsPanel =
+    view !== null && approvalShown !== null ? (
+      <ApprovalSection
+        draft={approvalShown}
+        dirty={approvalDirty}
+        locked={approvalLocked}
+        saving={approvalSaving}
+        saveError={approvalError}
+        builtinDeny={builtinDeny}
+        onChange={(draft) => {
+          setApprovalDraft(draft);
+          setApprovalError(null);
+        }}
+        onSave={saveApproval}
+        onUndo={() => {
+          setApprovalDraft(null);
+          setApprovalError(null);
+        }}
+      />
+    ) : null;
+
   return (
     <div
       className="settings-backdrop"
@@ -881,57 +970,25 @@ export function SettingsDialog({ onClose, onChanged, onViewLoaded }: SettingsDia
             AI settings
           </h2>
         </header>
-        <div className="settings-body">
-          <SettingsBody
-            load={load}
-            locked={locked}
-            presets={presets}
-            defaults={defaults}
-            limit={limit}
-            notice={notice}
-            editor={editorSlot}
-            onRetry={() => {
-              setLoad({ kind: 'loading' });
-              setAttempt((a) => a + 1);
-            }}
-            onCheckAgain={() => {
-              setLoad({ kind: 'loading' });
-              setAttempt((a) => a + 1);
-            }}
-            recovery={recovery}
-            onAskRevert={(ask) => setRecovery((r) => ({ ...r, confirming: ask, error: null }))}
-            onRecover={runRecovery}
-            onReload={() => runRecovery('reload')}
-            onDefault={setDefault}
-            onLimitText={(text) => setLimit((l) => ({ ...l, text, error: null }))}
-            onLimitCommit={() => commitLimit(limit.text)}
-            onLimitClear={() => {
-              setLimit((l) => ({ ...l, text: '' }));
-              commitLimit('');
-            }}
-            onOpenProvider={openProvider}
-            onAddProvider={addProvider}
-          />
-          {view !== null && approvalShown !== null && (
-            <ApprovalSection
-              draft={approvalShown}
-              dirty={approvalDirty}
-              locked={approvalLocked}
-              saving={approvalSaving}
-              saveError={approvalError}
-              builtinDeny={builtinDeny}
-              onChange={(draft) => {
-                setApprovalDraft(draft);
-                setApprovalError(null);
-              }}
-              onSave={saveApproval}
-              onUndo={() => {
-                setApprovalDraft(null);
-                setApprovalError(null);
-              }}
-            />
-          )}
-        </div>
+        <SettingsNotices
+          view={view}
+          recovery={recovery}
+          onCheckAgain={() => {
+            setLoad({ kind: 'loading' });
+            setAttempt((a) => a + 1);
+          }}
+          onAskRevert={(ask) => setRecovery((r) => ({ ...r, confirming: ask, error: null }))}
+          onRecover={runRecovery}
+          onReload={() => runRecovery('reload')}
+        />
+        <SettingsTabs
+          label="AI settings sections"
+          tabs={SETTINGS_TABS}
+          selected={tab}
+          dirty={dirtyTabs}
+          onSelect={setTab}
+          panel={(id) => (id === 'approvals' ? approvalsPanel : modelsPanel)}
+        />
         <footer className="settings-foot">
           {askClose ? (
             <>

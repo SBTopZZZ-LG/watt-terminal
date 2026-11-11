@@ -70,7 +70,7 @@ export default function App() {
   // The find bar is mounted while open. Its token moves focus into it when Cmd+F is pressed again.
   const [findOpen, setFindOpen] = useState(false);
   const [findToken, setFindToken] = useState(0);
-  // The AI settings dialog (Cmd+, / Ctrl+, or the model chip).
+  // The AI settings dialog (Cmd+, / Ctrl+, or the gear button in the status strip).
   const [settingsOpen, setSettingsOpen] = useState(false);
   // The state of settings.json, from the status. The banner in the chat view can be dismissed until the next status says so again.
   const [settingsState, setSettingsState] = useState<SettingsStateView | null>(null);

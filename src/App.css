@@ -394,6 +394,28 @@ input {
   background: var(--warn-tint);
 }
 
+/* The settings button: the gear in the chip's dashed box. */
+.chip-icon {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+  padding: 2px 6px;
+}
+
+.chip-icon svg {
+  display: block;
+  flex: 0 0 auto;
+}
+
+/* Marks the settings button when settings.json cannot be used. */
+.chip-dot {
+  flex: 0 0 auto;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
 /*
  * ---------- workspace: the terminal and the agent panel ----------
  * The DOM order is fixed (terminal, divider, panel). The dock only sets the direction, so the terminal is never remounted.
@@ -1960,11 +1982,13 @@ input {
   background: var(--shadow);
 }
 
-/* The card. Its body scrolls inside it, so the header and footer stay in view. */
+/* The card. Its height is fixed (up to the window), so switching tabs does not resize it. The tab panel scrolls inside it, so
+   the header, the notices and the footer stay in view. */
 .settings-dialog {
   display: flex;
   flex-direction: column;
   width: min(760px, 100vw - 32px);
+  height: min(640px, calc(100vh - 32px));
   max-height: calc(100vh - 32px);
   min-height: 0;
   border: 1px solid var(--rule-strong);
@@ -1992,11 +2016,97 @@ input {
   text-transform: uppercase;
 }
 
-.settings-body {
+/* Above the tabs, where it stays in view on every tab: the recovery panel and the load banner. It keeps its height (it does not
+   shrink into the tab panel) and is capped, so a very tall notice cannot push the tab panel out. */
+.settings-notices {
+  flex: 0 0 auto;
+  min-height: 0;
+  max-height: 45%;
+  overflow-y: auto;
+  padding: 0 14px 6px;
+}
+
+/* The tabs: the strip, then the panels. Only the selected panel is shown, and it scrolls. */
+.tabs {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.tab-panel {
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
   padding: 0 14px 6px;
+}
+
+/* The tab strip: one row. The selected tab has accent text and a solid rule under it; the others are muted. Labels shrink
+   with an ellipsis, so the row fits a narrow window. */
+.tab-strip {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 2px;
+  min-width: 0;
+  padding: 0 14px;
+  border-bottom: 1px dashed var(--rule);
+}
+
+.tab-strip > .tab {
+  position: relative;
+  display: flex;
+  flex: 1 1 0;
+  gap: 5px;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  margin: 0 0 -1px;
+  padding: 6px 8px 5px;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  box-shadow: inset 0 -2px 0 transparent;
+  color: var(--muted);
+  font-family: var(--ui-font);
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.tab-strip > .tab.is-active {
+  color: var(--accent);
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+
+.tab-strip > .tab:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.tab-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* A tab whose draft has unsaved changes. */
+.tab-dot {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--warn);
+}
+
+/* "unsaved changes": the tab's label for screen readers. The dot is hidden from them. */
+.tab-unsaved {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
 }
 
 .settings-foot {
@@ -2470,7 +2580,7 @@ input {
   flex: 1 1 160px;
 }
 
-/* The model chip is a button, so it takes the same focus ring as the other chip buttons. */
+/* The chip buttons (auto-approve and the settings gear) take the same focus ring. */
 .chip-button:focus-visible {
   outline: 1px solid var(--accent);
   outline-offset: 1px;

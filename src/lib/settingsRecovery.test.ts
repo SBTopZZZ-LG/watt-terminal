@@ -63,8 +63,8 @@ describe('chipLabel', () => {
 describe('chipBrokenTitle and recoveryExplanation', () => {
   it('the title names the state and the reason, and is null while ok', () => {
     expect(chipBrokenTitle(OK)).toBeNull();
-    expect(chipBrokenTitle(BROKEN)).toBe('settings.json is broken: settings are invalid: not valid JSON. Open AI settings');
-    expect(chipBrokenTitle(LAST_GOOD)).toContain('Running on the last working settings');
+    expect(chipBrokenTitle(BROKEN)).toBe('settings.json is broken: settings are invalid: not valid JSON');
+    expect(chipBrokenTitle(LAST_GOOD)).toBe('Running on the last working settings: settings.json is broken (settings are invalid: not valid JSON)');
   });
 
   it('the explanation differs by state', () => {

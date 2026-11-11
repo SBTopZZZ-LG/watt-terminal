@@ -42,15 +42,15 @@ export function chipLabel(state: SettingsStateView | null | undefined, llm: LlmS
   return llm.enabled ? `model: ${llm.model ?? 'unknown'}` : 'mock agent';
 }
 
-/** The chip's hover text while the settings are broken; null otherwise, and the caller keeps its own. */
+/** The model chip's hover text while the settings are broken; null otherwise, and the caller keeps its own. */
 export function chipBrokenTitle(state: SettingsStateView | null | undefined): string | null {
   if (state === null || state === undefined || state.kind === 'ok') {
     return null;
   }
   const reason = reasonText(state);
   return state.kind === 'broken'
-    ? `settings.json is broken: ${reason}. Open AI settings`
-    : `Running on the last working settings: settings.json is broken (${reason}). Open AI settings`;
+    ? `settings.json is broken: ${reason}`
+    : `Running on the last working settings: settings.json is broken (${reason})`;
 }
 
 /** What the dialog says under the broken file's error, for each state. */

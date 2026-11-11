@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { NO_RECOVERY, SettingsBody, storeNote } from './SettingsDialog';
-import type { LoadState, SettingsBodyProps } from './SettingsDialog';
+import { NO_RECOVERY, SETTINGS_TABS, SettingsBody, SettingsNotices, storeNote } from './SettingsDialog';
+import type { LoadState, SettingsBodyProps, SettingsNoticesProps } from './SettingsDialog';
 import { modelRefKey } from '../lib/settingsForm';
 import type { Provider, ProviderPreset, Settings, SettingsView } from '../lib/types';
 
@@ -73,14 +73,24 @@ function props(over: Partial<SettingsBodyProps> = {}): SettingsBodyProps {
     notice: null,
     editor: null,
     onRetry: NOOP,
-    onCheckAgain: NOOP,
     onDefault: NOOP,
     onLimitText: NOOP,
     onLimitCommit: NOOP,
     onLimitClear: NOOP,
     onOpenProvider: NOOP,
     onAddProvider: NOOP,
+    ...over,
+  };
+}
+
+const html = (over: Partial<SettingsBodyProps> = {}) => renderToStaticMarkup(<SettingsBody {...props(over)} />);
+
+/** The notices above the tabs (the recovery panel, the load banner), for a view. Empty when there is nothing to say. */
+function noticesProps(over: Partial<SettingsNoticesProps> = {}): SettingsNoticesProps {
+  return {
+    view: view(),
     recovery: NO_RECOVERY,
+    onCheckAgain: NOOP,
     onAskRevert: NOOP,
     onRecover: NOOP,
     onReload: NOOP,
@@ -88,7 +98,16 @@ function props(over: Partial<SettingsBodyProps> = {}): SettingsBodyProps {
   };
 }
 
-const html = (over: Partial<SettingsBodyProps> = {}) => renderToStaticMarkup(<SettingsBody {...props(over)} />);
+const notices = (over: Partial<SettingsNoticesProps> = {}) => renderToStaticMarkup(<SettingsNotices {...noticesProps(over)} />);
+
+describe('SETTINGS_TABS', () => {
+  it('Models first, then Approvals, each with its label', () => {
+    expect(SETTINGS_TABS.map((t) => [t.id, t.label])).toEqual([
+      ['models', 'Models'],
+      ['approvals', 'Approvals'],
+    ]);
+  });
+});
 
 /** The opening tag of the option with this value, or ''. */
 function optionTag(out: string, value: string): string {
@@ -115,7 +134,7 @@ describe('SettingsBody: broken settings file', () => {
   const broken = view({ load_error: 'settings are invalid: not valid JSON', settings: { ...SETTINGS, providers: [] } });
 
   it('shows the banner with the reason, and says changes are disabled', () => {
-    const out = html({ load: { kind: 'ready', view: broken }, locked: true });
+    const out = notices({ view: broken });
     expect(out).toContain(
       'settings.json could not be read: settings are invalid: not valid JSON. Changes are disabled until it is fixed or removed.',
     );
@@ -132,6 +151,7 @@ describe('SettingsBody: broken settings file', () => {
 
   it('a readable file has no banner', () => {
     expect(html()).not.toContain('could not be read');
+    expect(notices()).toBe('');
   });
 });
 
@@ -259,15 +279,14 @@ describe('SettingsBody: recovery panel (settings.json cannot be used)', () => {
   const BROKEN_STATE = { kind: 'broken' as const, reason: REASON, last_good_available: true, path: '/config/settings.json' };
   const LAST_GOOD_STATE = { kind: 'last_good' as const, reason: REASON, last_good_available: true, path: '/config/settings.json' };
   const NO_LAST_GOOD_STATE = { kind: 'broken' as const, reason: REASON, last_good_available: false, path: '/config/settings.json' };
-  const withState = (settings_state: SettingsView['settings_state'], over: Partial<SettingsBodyProps> = {}) =>
-    html({
-      load: { kind: 'ready', view: view({ settings_state, load_error: settings_state.kind === 'ok' ? null : REASON }) },
-      locked: settings_state.kind !== 'ok',
+  const withState = (settings_state: SettingsView['settings_state'], over: Partial<SettingsNoticesProps> = {}) =>
+    notices({
+      view: view({ settings_state, load_error: settings_state.kind === 'ok' ? null : REASON }),
       ...over,
     });
 
   it('ok: no recovery panel and no recovery buttons', () => {
-    const out = html();
+    const out = notices();
     expect(out).not.toContain('settings-recovery');
     expect(out).not.toContain('Reload settings file');
     expect(out).not.toContain('Revert to last working settings');
@@ -305,7 +324,7 @@ describe('SettingsBody: recovery panel (settings.json cannot be used)', () => {
   });
 
   it('the rest of the dialog is read-only while the file is broken', () => {
-    const out = withState(BROKEN_STATE);
+    const out = html({ load: { kind: 'ready', view: view({ settings_state: BROKEN_STATE, load_error: REASON }) }, locked: true });
     expect(out).toMatch(/<select[^>]*id="[^"]*-default"[^>]*disabled=""/);
     expect(out).toMatch(/<button[^>]*disabled=""[^>]*>Add provider<\/button>/);
   });
