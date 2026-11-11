@@ -183,6 +183,7 @@ describe('ApprovalSection: Remote shells', () => {
     const html = render();
     expect(html).toContain('Remote aliases, PATH and users differ from this machine');
     expect(html).toContain('The hard gate and the deny rules still apply everywhere.');
+    expect(html).toContain('Applies when you save approvals.');
     expect(html).toContain('the agent can type the integration loader into whatever shell is in');
     expect(html).toContain('It refuses at password and other prompts.');
   });

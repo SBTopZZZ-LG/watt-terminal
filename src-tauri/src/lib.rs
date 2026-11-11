@@ -892,8 +892,6 @@ async fn set_approval_settings(
     blocking(move || service.set_approval(input)).await
 }
 
-/// What the saved approval settings would decide for `command`, without running it. Approve-all is not included: it is
-/// session-only and is not saved.
 /// Saves the shell integration settings: whether the agent's integration requests ask the user. Refused while settings.json
 /// is broken or in last-good mode.
 #[tauri::command]
@@ -905,6 +903,8 @@ async fn set_integration_settings(
     blocking(move || service.set_integration(input)).await
 }
 
+/// What the saved approval settings would decide for `command`, without running it. Approve-all is not included: it is
+/// session-only and is not saved.
 #[tauri::command]
 async fn test_approval(command: String, settings: State<'_, SettingsState>) -> Result<approval::Preview, String> {
     let service = settings.get()?;

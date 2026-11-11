@@ -153,7 +153,8 @@ export function ApprovalSection(p: ApprovalSectionProps) {
         </label>
         <p className="settings-warn" id={`${uid}-nested-note`}>
           Off by default. Remote aliases, PATH and users differ from this machine, so with this on, allow rules and approve-all
-          apply in SSH and nested shells too. The hard gate and the deny rules still apply everywhere.
+          apply in SSH and nested shells too. The hard gate and the deny rules still apply everywhere. Applies when you save
+          approvals.
         </p>
 
         <label className="settings-check">
