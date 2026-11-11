@@ -5,9 +5,11 @@ import { Channel, invoke } from '@tauri-apps/api/core';
 import type {
   ApprovalPreview,
   ApprovalSettings,
+  AutoApproveState,
   ConversationMeta,
   DeleteResult,
   FetchOutcome,
+  IntegrateOutcome,
   LoadedConversation,
   ModelRef,
   ProviderPreset,
@@ -68,6 +70,17 @@ export const api = {
   },
   setAutoApprove(on: boolean) {
     return invoke<void>('set_auto_approve', { sessionId: SESSION_ID, on });
+  },
+  /** Approve-all as the shell on top sees it. Read again after a levels event or a toggle. */
+  autoApproveState() {
+    return invoke<AutoApproveState>('auto_approve_state', { sessionId: SESSION_ID });
+  },
+  /**
+   * Integrates the shell in the foreground (ssh, a nested shell, su, a container exec) as a new level. Slow: it waits for the
+   * remote shell. While it runs, the terminal and the input bar take no keys.
+   */
+  integrateShell() {
+    return invoke<IntegrateOutcome>('integrate_shell', { sessionId: SESSION_ID });
   },
   getStatus() {
     return invoke<Status>('get_status', { sessionId: SESSION_ID });

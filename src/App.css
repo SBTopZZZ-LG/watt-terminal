@@ -399,6 +399,33 @@ input {
   text-transform: none;
 }
 
+/* The nested shell on top: its label, in the accent colour like the foreground chip, cut to the chip's width. */
+.chip-location {
+  color: var(--accent);
+  font-family: var(--mono);
+  flex: 0 1 auto;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+/* Offers the shell integration. Accent, so it reads as the action of the strip. Its own class, not chip-button: the other
+   strip buttons are found by that class. */
+.chip-integrate {
+  border-style: solid;
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--panel);
+  cursor: pointer;
+}
+
+.chip-integrate:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
 .chip-button {
   cursor: pointer;
   background: var(--panel);
@@ -1469,6 +1496,14 @@ input {
 .approval-reason {
   margin-top: 4px;
   color: var(--muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+/* The nested shell an approval is for: the label of the level, under the title. */
+.approval-location {
+  margin-top: 2px;
+  color: var(--accent);
   font-size: 11px;
   overflow-wrap: anywhere;
 }
@@ -2603,4 +2638,104 @@ input {
 .chip-button:focus-visible {
   outline: 1px solid var(--accent);
   outline-offset: 1px;
+}
+
+/* ---------- shell integration dialog ---------- */
+
+/* The card: a fixed width (up to the window), its height the content's. Same family as the AI settings dialog. */
+.integrate-dialog {
+  display: flex;
+  flex-direction: column;
+  width: min(440px, 100vw - 32px);
+  max-height: calc(100vh - 32px);
+  border: 1px solid var(--rule-strong);
+  border-radius: 2px;
+  background: var(--panel);
+  box-shadow: 0 8px 24px var(--shadow);
+}
+
+.integrate-dialog:focus {
+  outline: none;
+}
+
+.integrate-head {
+  flex: 0 0 auto;
+  padding: 10px 14px;
+  border-bottom: 1px dashed var(--rule);
+}
+
+.integrate-title {
+  margin: 0;
+  color: var(--ink-strong);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.integrate-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.integrate-body p {
+  margin: 0;
+  color: var(--ink);
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.integrate-body .integrate-note {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.integrate-result.is-ok {
+  color: var(--ok);
+}
+
+.integrate-result.is-fail {
+  color: var(--fail);
+}
+
+.integrate-foot {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+  padding: 8px 14px;
+  border-top: 1px dashed var(--rule);
+}
+
+.integrate-dialog button {
+  padding: 2px 8px;
+  border: 1px dashed var(--rule);
+  border-radius: 2px;
+  background: var(--bg);
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  cursor: pointer;
+}
+
+.integrate-dialog button:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.integrate-dialog button:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.integrate-dialog .integrate-primary {
+  border-style: solid;
+  border-color: var(--accent);
+  color: var(--accent);
 }

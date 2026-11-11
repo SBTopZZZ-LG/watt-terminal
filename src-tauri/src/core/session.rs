@@ -287,6 +287,11 @@ impl Session {
         self.shared.lock().location()
     }
 
+    /// Every nonce the observer accepts now (the local shell's and the live levels'). The UI checks OSC events against them.
+    pub fn nonces(&self) -> Vec<String> {
+        self.shared.lock().accepted_nonces()
+    }
+
     /// Integrates the shell that runs in the foreground (ssh, a nested shell, su, a container exec) as a new level. It
     /// types Ctrl-C and the loader, waits for the shell's Ready, then writes the blob with a fresh nonce and waits for the
     /// new level's Hello. Blocking: call it from a blocking thread. One at a time; a second call is refused as Busy.

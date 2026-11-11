@@ -1,8 +1,9 @@
 import { foregroundChip } from '../lib/foreground';
 import { formatCwd } from '../lib/format';
+import { locationChip } from '../lib/integrate';
 import { chipBrokenTitle, chipLabel, recoveryKind } from '../lib/settingsRecovery';
 import { GridChip } from './GridChip';
-import type { Cwd, Foreground, InputState, IntegrationStatus, LlmStatus, ObserverStatus, SettingsStateView } from '../lib/types';
+import type { Cwd, Foreground, InputState, IntegrationStatus, LevelInfo, LlmStatus, ObserverStatus, SettingsStateView } from '../lib/types';
 
 interface Props {
   integration: IntegrationStatus;
@@ -12,7 +13,14 @@ interface Props {
   foreground?: Foreground | null;
   cwd: Cwd | null;
   autoApprove: boolean;
+  /** Approve-all is on in another shell level, so it is off in the shell on top. The chip says so. */
+  autoSuspended?: boolean;
   onToggleAutoApprove: () => void;
+  /** The nested level on top, when there is one. Its label is the location chip. */
+  location?: LevelInfo | null;
+  /** Offers the Integrate button in the right-hand group, just before the gear, so it stays visible in a narrow strip. */
+  canIntegrate?: boolean;
+  onIntegrate?: () => void;
   llm: LlmStatus;
   /** The state of settings.json. While it cannot be used, the model chip says so, and the settings button is in warning colour. */
   settingsState?: SettingsStateView | null;
@@ -40,8 +48,26 @@ const INTEGRATION_LABEL: Record<IntegrationStatus, string> = {
 
 /** Slim status strip above the terminal, in normal flow. */
 export function StatusChip(props: Props) {
-  const { integration, observer, input, foreground = null, cwd, autoApprove, onToggleAutoApprove, llm, settingsState = null, onOpenSettings } = props;
+  const {
+    integration,
+    observer,
+    input,
+    foreground = null,
+    cwd,
+    autoApprove,
+    autoSuspended = false,
+    onToggleAutoApprove,
+    location = null,
+    canIntegrate = false,
+    onIntegrate,
+    llm,
+    settingsState = null,
+    onOpenSettings,
+  } = props;
   const fgChip = foregroundChip(input, foreground);
+  const loc = location === null ? null : locationChip(location);
+  // Approve-all is on in this shell only when it was switched on here: a suspended one is off for the shell on top.
+  const autoOn = autoApprove && !autoSuspended;
   const modelLabel = chipLabel(settingsState, llm);
   const broken = recoveryKind(settingsState) !== 'ok';
   const modelTitle = chipBrokenTitle(settingsState) ?? `${llm.provider ? `${llm.provider} · ` : ''}${modelLabel}`;
@@ -56,6 +82,11 @@ export function StatusChip(props: Props) {
       ) : (
         <span className="chip">{INPUT_LABEL[input]}</span>
       )}
+      {loc !== null && (
+        <span className="chip chip-location" title={loc.title}>
+          {loc.label}
+        </span>
+      )}
       <GridChip />
       <span className={`chip chip-model${broken ? ' chip-warn' : ''}`} title={modelTitle}>
         {modelLabel}
@@ -65,12 +96,27 @@ export function StatusChip(props: Props) {
       </span>
       <button
         type="button"
-        className={`chip chip-button${autoApprove ? ' chip-warn' : ''}`}
+        className={`chip chip-button${autoOn ? ' chip-warn' : ''}`}
         onClick={onToggleAutoApprove}
-        title="Lets the agent run commands without asking. Commands still run only at an idle prompt. Off by default."
+        title={
+          autoSuspended
+            ? 'Approve-all was turned on in another shell, so it does not apply here. Click to turn it on for this shell.'
+            : 'Lets the agent run commands without asking. Commands still run only at an idle prompt. Off by default.'
+        }
       >
-        auto-approve: {autoApprove ? 'ON' : 'off'}
+        {autoSuspended ? 'auto-approve: off in this shell' : `auto-approve: ${autoOn ? 'ON' : 'off'}`}
       </button>
+      {canIntegrate && onIntegrate && (
+        <button
+          type="button"
+          className="chip chip-integrate"
+          aria-label="Integrate this shell"
+          title="Integrate this shell: the agent can then run commands in it. It asks first."
+          onClick={onIntegrate}
+        >
+          Integrate
+        </button>
+      )}
       <button
         type="button"
         className={`chip chip-button chip-icon${broken ? ' chip-warn' : ''}`}

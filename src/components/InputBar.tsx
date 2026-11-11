@@ -11,6 +11,8 @@ interface Props {
   /** Show the hint as the input's placeholder instead of a row under it, so the bar's height does not change. */
   hintInline: boolean;
   hasPendingApproval: boolean;
+  /** An integration is running: the input takes no text and sends nothing until it answers. */
+  locked: boolean;
   /** Bumped by the parent to move focus into the input (or the restart button, when the shell exited). */
   focusToken: number;
   /** Reports when the input gains or loses focus. */
@@ -69,7 +71,7 @@ export function InputBar(props: Props) {
 
   async function submit() {
     const message = messageFor(text);
-    if (message === null) {
+    if (message === null || props.locked) {
       return;
     }
     setSending(true);
@@ -113,7 +115,7 @@ export function InputBar(props: Props) {
         return;
       case 'submit':
         e.preventDefault();
-        if (!sending) {
+        if (!sending && !props.locked) {
           void submit();
         }
         return;
@@ -152,6 +154,7 @@ export function InputBar(props: Props) {
         placeholder={inlineHint ?? 'Ask the agent…  (Ctrl/Cmd+Shift+A to focus, Esc to return)'}
         spellCheck={false}
         autoComplete="off"
+        disabled={props.locked}
         onChange={(e) => {
           setText(e.currentTarget.value);
           setError(null);

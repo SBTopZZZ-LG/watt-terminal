@@ -21,6 +21,16 @@ describe('AutoApproveNotice', () => {
   });
 });
 
+describe('AutoApproveNotice: suspended in this shell', () => {
+  it('says it was turned on in another shell, and offers to turn it on here', () => {
+    const html = renderToStaticMarkup(<AutoApproveNotice suspended onTurnOff={NOOP} onTurnOnHere={NOOP} />);
+    expect(html).toContain('Auto-approve was turned on in another shell, so it is off in this one');
+    expect(html).toContain('>Turn on here</button>');
+    expect(html).not.toContain('Turn off');
+    expect(html).not.toContain('runs every command without asking');
+  });
+});
+
 describe('Transcript: the auto-approve notice sits above the banner, in the chat view only', () => {
   const warning = <div data-part="warning">WARNING</div>;
   const banner = <div data-part="banner">BANNER</div>;

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { StatusChip } from './StatusChip';
-import type { Foreground, InputState, LlmStatus, SettingsStateView } from '../lib/types';
+import type { Foreground, InputState, LevelInfo, LlmStatus, SettingsStateView } from '../lib/types';
 
 const LLM_ON: LlmStatus = { enabled: true, model: 'big', provider: 'Acme' };
 const LLM_OFF: LlmStatus = { enabled: false, model: null, provider: null };
@@ -167,5 +167,74 @@ describe('StatusChip: the state chip names a program without shell integration',
     const plain = strip('running', null);
     const named = strip('running', SSH);
     expect(named.replace(/<span class="chip chip-foreground"[^>]*>[^<]*<\/span>/, '<span class="chip">running</span>')).toBe(plain);
+  });
+});
+
+/** The strip with the nested-shell props: the location, the Integrate offer and approve-all's suspended state. */
+function nestedStrip(over: { location?: LevelInfo | null; canIntegrate?: boolean; autoApprove?: boolean; autoSuspended?: boolean }) {
+  return renderToStaticMarkup(
+    <StatusChip
+      integration="live"
+      observer="ok"
+      input="prompt"
+      cwd={null}
+      autoApprove={over.autoApprove ?? false}
+      autoSuspended={over.autoSuspended}
+      onToggleAutoApprove={() => {}}
+      location={over.location ?? null}
+      canIntegrate={over.canIntegrate ?? false}
+      onIntegrate={() => {}}
+      llm={LLM_ON}
+      settingsState={OK}
+      onOpenSettings={() => {}}
+    />,
+  );
+}
+
+const REMOTE: LevelInfo = { key: 1, kind: 'remote', label: 'ssh ubuntu@lidia', sh: 'zsh', host: 'lidia', user: 'ubuntu', state: 'prompt' };
+
+describe('StatusChip: the location chip, the Integrate button, approve-all in another shell', () => {
+  it('no nested level: no location chip', () => {
+    expect(nestedStrip({})).not.toContain('chip-location');
+  });
+
+  it('a nested level on top: its label in the location chip, with the full label in the title', () => {
+    const out = nestedStrip({ location: REMOTE });
+    expect(out).toMatch(/<span class="chip chip-location" title="ssh ubuntu@lidia: zsh as ubuntu@lidia\. [^"]*">ssh ubuntu@lidia<\/span>/);
+  });
+
+  it('Integrate is a labelled button only when it is offered', () => {
+    expect(nestedStrip({ canIntegrate: false })).not.toContain('Integrate');
+    const out = nestedStrip({ canIntegrate: true });
+    expect(out).toMatch(/<button[^>]*chip-integrate[^>]*aria-label="Integrate this shell"[^>]*>Integrate<\/button>/);
+  });
+
+  it('Integrate is in the right-hand group: after the auto-approve button, just before the gear', () => {
+    const out = nestedStrip({ canIntegrate: true });
+    const integrateAt = out.indexOf('chip-integrate');
+    expect(out.indexOf('auto-approve')).toBeLessThan(integrateAt);
+    expect(integrateAt).toBeLessThan(out.indexOf('aria-label="AI settings"'));
+    // Nothing but the gear's own button comes between Integrate and the gear.
+    expect(out.slice(integrateAt, out.indexOf('aria-label="AI settings"'))).not.toContain('chip-location');
+  });
+
+  it('with no Integrate offer, the location chip keeps the full label in its title', () => {
+    const out = nestedStrip({ location: REMOTE, canIntegrate: false });
+    expect(out).not.toContain('Integrate');
+    expect(out).toMatch(/<span class="chip chip-location" title="ssh ubuntu@lidia: zsh as ubuntu@lidia\. [^"]*">ssh ubuntu@lidia<\/span>/);
+  });
+
+  it('approve-all on in this shell: ON, in the warning colour', () => {
+    const out = nestedStrip({ autoApprove: true, autoSuspended: false });
+    expect(out).toContain('auto-approve: ON');
+    expect(out).toContain('chip-warn');
+  });
+
+  it('approve-all on in another shell: off in this shell, with a title that says why', () => {
+    const out = nestedStrip({ autoApprove: true, autoSuspended: true });
+    expect(out).toContain('auto-approve: off in this shell');
+    expect(out).not.toContain('auto-approve: ON');
+    expect(out).toContain('Approve-all was turned on in another shell');
+    expect(out).not.toMatch(/chip-button chip-warn/);
   });
 });

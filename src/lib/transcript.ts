@@ -14,8 +14,8 @@ export type TranscriptItem =
   | { id: number; kind: 'agent'; text: string; streaming: boolean }
   /** `reason` is why the call asked or ran without asking. Null for read tools and calls refused before the policy. */
   | { id: number; kind: 'tool'; callId: string; name: string; args: unknown; status: ToolStatus; result: unknown; decision: ToolDecision | null; reason: ApprovalReasonCode | null }
-  /** `reason` is why the card asks. */
-  | { id: number; kind: 'approval'; callId: string; name: string; text: string; state: ApprovalState; approve: boolean | null; reason: ApprovalReasonCode | null }
+  /** `reason` is why the card asks. `location` is the nested shell the command is for (its label), or null on the local shell. */
+  | { id: number; kind: 'approval'; callId: string; name: string; text: string; state: ApprovalState; approve: boolean | null; reason: ApprovalReasonCode | null; location: string | null }
   | { id: number; kind: 'notice'; text: string };
 
 /** A transcript item before the reducer gives it an id. `Omit` over the union would lose the variants, so it is distributed. */
@@ -192,6 +192,7 @@ function applyAgentEvent(t: Transcript, ev: AgentEvent): Transcript {
         state: 'pending',
         approve: null,
         reason: ev.reason ?? null,
+        location: ev.location ?? null,
       }));
     case 'done':
       // The turn is over: the streamed message (if any) is closed, and so is the thinking state.

@@ -50,6 +50,23 @@ export interface RecordSummary {
   output_bytes: number;
 }
 
+/** Why a nested shell could not be integrated (core/observer.rs InjectRefusal). */
+export type InjectRefusal = 'not_running' | 'alt_screen' | 'no_shell_program' | 'too_deep' | 'busy';
+
+/** What `integrate_shell` reports (core/session.rs IntegrateOutcome). */
+export type IntegrateOutcome =
+  | { outcome: 'integrated'; key: number; label: string; sh: string; user: string | null; host: string | null }
+  | { outcome: 'unsupported_shell' }
+  | { outcome: 'timeout' }
+  | { outcome: 'failed'; hint: string }
+  | { outcome: 'refused'; reason: InjectRefusal };
+
+/** Approve-all as the shell on top sees it (`auto_approve_state`). `suspended` means it is on in another shell level. */
+export interface AutoApproveState {
+  auto: boolean;
+  suspended: boolean;
+}
+
 /** One shell level (core/observer.rs). `key` 0 is the local shell. Nested levels are integrated shells inside another program. */
 export interface LevelInfo {
   key: number;
@@ -140,11 +157,19 @@ export interface Status {
   state: InputState;
   /** The foreground hint while a command runs. Left out otherwise. */
   foreground?: Foreground;
+  /** The nested shell levels, outermost first. The local shell is not listed. */
+  levels: LevelInfo[];
+  /** How many shell levels there are, the local one included. 1 means no nested shell. */
+  depth: number;
+  /** Every accepted OSC nonce (the local shell's and the live levels'). Checked against the events. */
+  nonces: string[];
   integration: IntegrationStatus;
   observer: ObserverStatus;
   cwd: Cwd | null;
   stats: SessionStats;
   auto_approve: boolean;
+  /** Approve-all is on but was switched on in another shell level, so it does not apply to the shell on top. */
+  auto_approve_suspended: boolean;
   agent_busy: boolean;
   agent_control: boolean;
   llm: LlmStatus;

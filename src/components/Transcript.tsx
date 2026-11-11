@@ -272,6 +272,7 @@ function Entry({ item, onApprove }: { item: TranscriptItem; onApprove: Props['on
       return (
         <div className={`approval approval-${item.state}`}>
           <div className="approval-title">{approvalTitle(item.name)}</div>
+          {item.location !== null && <div className="approval-location">on {item.location}</div>}
           <code className="approval-text">{visibleEscapes(item.text)}</code>
           {why !== null && <div className="approval-reason">{why}</div>}
           {item.state === 'pending' && (

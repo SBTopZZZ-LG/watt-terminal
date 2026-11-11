@@ -14,7 +14,7 @@ import { api, errorText } from './api';
 import { Coalescer } from './coalescer';
 import { CommandMarks } from './commandMarks';
 import { StripeLayer } from './stripeLayer';
-import { getNonce, reportError } from './session';
+import { getNonces, reportError } from './session';
 import { parseShellPayload } from './osc';
 import { createFitter } from './fitter';
 import type { GridMeasure } from './gridFit';
@@ -136,7 +136,7 @@ export function mountTerminal(host: HTMLElement): void {
  * Other payloads are dropped without being logged.
  */
 function onShellOsc(ident: 133 | 633, data: string): boolean {
-  const ev = parseShellPayload(ident, data, getNonce());
+  const ev = parseShellPayload(ident, data, getNonces());
   if (ev === null) {
     return true;
   }

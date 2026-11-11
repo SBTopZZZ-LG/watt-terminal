@@ -104,6 +104,15 @@ describe('transcriptReducer: local actions', () => {
     expect(back.items[1]).toMatchObject({ kind: 'notice', text: 'no pending approval a1' });
   });
 
+  it('an approval card for a nested shell carries its location; a local one has none', () => {
+    const t = run([
+      { type: 'agent_event', event: { type: 'approval_request', call_id: 'a1', name: 'run_command', text: 'pwd', level: 1, location: 'ssh ubuntu@lidia' } },
+      { type: 'agent_event', event: { type: 'approval_request', call_id: 'a2', name: 'run_command', text: 'pwd', level: 0 } },
+    ]);
+    expect(t.items[0]).toMatchObject({ kind: 'approval', location: 'ssh ubuntu@lidia' });
+    expect(t.items[1]).toMatchObject({ kind: 'approval', location: null });
+  });
+
   it('the first pending approval is the oldest one', () => {
     const t = run([
       { type: 'agent_event', event: { type: 'approval_request', call_id: 'a1', name: 'run_command', text: 'x' } },

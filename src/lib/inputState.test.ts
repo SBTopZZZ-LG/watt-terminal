@@ -152,6 +152,16 @@ describe('routeFor: the input routing table', () => {
   });
 });
 
+describe('routeFor: unresponsive', () => {
+  it('keys still go to the shell (so Ctrl-C reaches it), and the bar says the shell is not answering', () => {
+    const route = routeFor('unresponsive', null);
+    expect(route.keys).toBe('pty');
+    expect(route.bar).toBe('chat');
+    expect(route.hint).toBe('The shell is not answering. Ctrl-C to interrupt, or wait.');
+    expect(route.hintInline).toBe(false);
+  });
+});
+
 describe('focusAfter', () => {
   it('never moves focus for a state change between live states', () => {
     // The bar keeps focus while commands start, run, finish and while programs take the keyboard.

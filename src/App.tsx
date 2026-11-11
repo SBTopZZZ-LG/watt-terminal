@@ -2,12 +2,14 @@ import { useCallback, useEffect, useLayoutEffect, useReducer, useRef, useState }
 import type { RefObject } from 'react';
 import './App.css';
 import { api, errorText } from './lib/api';
-import { connect, reportError, restart, subscribe } from './lib/session';
+import { connect, reportError, restart, setSessionNonces, subscribe } from './lib/session';
 import type { Incoming } from './lib/session';
 import { clearTerminal, currentFontSize, fitToContainer, markConnected, marks, onFontSizeChange, receiveBytes, resetForNewSession, setFontSize, term, terminalSize, zoomFont } from './lib/terminal';
 import { appHotkeyFor } from './lib/appHotkeys';
 import { effectiveState, focusAfter, inputReducer, INITIAL_INPUT, isFocusBarHotkey, routeFor } from './lib/inputState';
-import type { BarMode } from './lib/inputState';
+import type { BarMode, Route } from './lib/inputState';
+import { canIntegrate, nestedLevels } from './lib/integrate';
+import type { IntegratePhase } from './lib/integrate';
 import { agentControlAfter, borderLevel, NO_CONTROL } from './lib/agentControl';
 import type { AgentControl, BorderLevel } from './lib/agentControl';
 import { EMPTY_TRANSCRIPT, firstPendingApproval, isBusy, transcriptReducer } from './lib/transcript';
@@ -16,7 +18,7 @@ import type { Container } from './lib/panelLayout';
 import { defaultSizeStorage } from './lib/zoom';
 import { itemsFromMessages } from './lib/historyView';
 import { createPatchSaver, fontPatch, panelPatch, reconcileFont, reconcileGroupBy, reconcilePanel, shouldRestoreLast } from './lib/uiState';
-import type { Cwd, HistoryGroupBy, InputState, IntegrationStatus, LlmStatus, LoadedConversation, ObserverStatus, SettingsStateView, Status, UiState, UiStatePatch, WireEvent } from './lib/types';
+import type { Cwd, HistoryGroupBy, InputState, IntegrationStatus, LevelInfo, LlmStatus, LoadedConversation, ObserverStatus, SettingsStateView, Status, UiState, UiStatePatch, WireEvent } from './lib/types';
 import { recoveryKind } from './lib/settingsRecovery';
 import { TerminalView } from './components/TerminalView';
 import { InputBar } from './components/InputBar';
@@ -29,6 +31,7 @@ import { HistoryView } from './components/HistoryView';
 import { SettingsDialog } from './components/SettingsDialog';
 import { SettingsBanner } from './components/SettingsBanner';
 import { AutoApproveNotice } from './components/AutoApproveNotice';
+import { IntegrateDialog } from './components/IntegrateDialog';
 
 const CTRL_C = '\u0003';
 
@@ -41,6 +44,15 @@ export default function App() {
   const [input, dispatchInput] = useReducer(inputReducer, INITIAL_INPUT);
   const effective = effectiveState(input);
   const route = routeFor(effective, input.foreground);
+  // The Integrate dialog's phase. While the handshake runs (`running`) no key goes to the shell and the bar takes none: the
+  // backend is typing the loader and the blob, and a key typed then would land in the middle of them.
+  const [integrate, setIntegrate] = useState<IntegratePhase>({ kind: 'closed' });
+  const locked = integrate.kind === 'running';
+  const keyRoute: Route = locked ? { ...route, keys: 'drop' } : route;
+  // The nested shell levels, outermost first (the local one is not listed). The last is the shell on top.
+  const [levels, setLevels] = useState<LevelInfo[]>([]);
+  // Approve-all is on, but it was switched on in another shell level, so it is off in the shell on top.
+  const [autoSuspended, setAutoSuspended] = useState(false);
 
   // The bar counts as open while its input has focus, or the hotkey asked for it. Only the alternate screen cares: an
   // open bar stays as the chat there, so a program starting or ending never takes the input's focus away.
@@ -95,9 +107,9 @@ export default function App() {
   };
 
   // Read by long-lived listeners (keystrokes, hotkey), so they always see the current route.
-  const routeRef = useRef(route);
+  const routeRef = useRef(keyRoute);
   useEffect(() => {
-    routeRef.current = route;
+    routeRef.current = keyRoute;
   });
   // Read by the Cmd+K listener, which is registered once.
   const effectiveRef = useRef(effective);
@@ -128,6 +140,9 @@ export default function App() {
     setObserver(s.observer);
     setCwd(s.cwd);
     setAutoApprove(s.auto_approve);
+    setAutoSuspended(s.auto_approve_suspended);
+    setLevels(s.levels);
+    setSessionNonces(s.nonces);
     setLlm(s.llm);
     setSettingsState(s.settings_state ?? null);
     if (recoveryKind(s.settings_state) !== 'ok') {
@@ -145,6 +160,20 @@ export default function App() {
   const refreshStatus = () => {
     api.getStatus().then(applyStatus).catch(reportError);
   };
+
+  /**
+   * Reads approve-all as the shell on top sees it. Only its two fields change: a levels event is not a full status read (see
+   * applyStatus, and the busy state it would reset).
+   */
+  const refreshAutoState = useCallback(() => {
+    api.autoApproveState().then(
+      (s) => {
+        setAutoApprove(s.auto);
+        setAutoSuspended(s.suspended);
+      },
+      () => undefined,
+    );
+  }, []);
 
   /** Reads only the live conversation's id again. The busy state stays the transcript's own, so a send still in transit is not lost. */
   const syncConversationId = () => {
@@ -295,7 +324,11 @@ export default function App() {
         case 'record_finished':
           return;
         case 'levels':
-          // Nested shell levels are not shown yet. Without this case the event would reach the transcript reducer.
+          // Rust pushed, popped or pending-ed a level. The nonces are taken first, so the bytes after this event are checked
+          // against them. The location and approve-all follow the new top level.
+          setSessionNonces(ev.nonces);
+          setLevels(nestedLevels(ev.levels));
+          refreshAutoState();
           return;
         default:
           dispatchTranscript({ type: 'agent_event', event: ev });
@@ -324,7 +357,7 @@ export default function App() {
       .then(() => fitToContainer())
       .catch(reportError);
     return unsubscribe;
-  }, [applyStatus]);
+  }, [applyStatus, refreshAutoState]);
 
   // Focus follows the shell's end, not its commands (see focusAfter): the bar takes it when the shell exits, the
   // terminal when a new one starts.
@@ -561,10 +594,28 @@ export default function App() {
     control: 'agent-control is-active',
   };
 
+  // On turns it off. Off, or on in another shell (suspended), turns it on for this shell: the backend ties it to the top level.
   const toggleAutoApprove = () => {
-    const next = !autoApprove;
-    api.setAutoApprove(next).then(() => setAutoApprove(next), reportError);
+    const next = !(autoApprove && !autoSuspended);
+    api.setAutoApprove(next).then(() => {
+      setAutoApprove(next);
+      refreshAutoState();
+    }, reportError);
   };
+
+  /** Opens the consent dialog. Nothing is sent to the shell until the user confirms it there. */
+  const openIntegrate = () => setIntegrate({ kind: 'consent' });
+
+  /** Runs the integration, and shows its result in the dialog. The keys stay locked until it answers. */
+  const startIntegrate = () => {
+    setIntegrate({ kind: 'running' });
+    api.integrateShell().then(
+      (outcome) => setIntegrate({ kind: 'result', outcome }),
+      (e: unknown) => setIntegrate({ kind: 'result', outcome: { outcome: 'failed', hint: errorText(e) } }),
+    );
+  };
+
+  const closeIntegrate = () => setIntegrate({ kind: 'closed' });
 
   // Escape in the bar gives the keyboard back to the terminal. On the alternate screen it also closes the strip.
   const closeBar = () => {
@@ -624,7 +675,11 @@ export default function App() {
         foreground={input.foreground}
         cwd={cwd}
         autoApprove={autoApprove}
+        autoSuspended={autoSuspended}
         onToggleAutoApprove={toggleAutoApprove}
+        location={levels.length > 0 ? levels[levels.length - 1] : null}
+        canIntegrate={integrate.kind === 'closed' && canIntegrate(effective, input.foreground)}
+        onIntegrate={openIntegrate}
         llm={llm}
         settingsState={settingsState}
         onOpenSettings={openSettings}
@@ -636,7 +691,7 @@ export default function App() {
         terminal={
           <div className="terminal-area">
             <TerminalView
-              keysToPty={route.keys === 'pty'}
+              keysToPty={keyRoute.keys === 'pty'}
               inputState={effective}
               onInput={handleTerminalInput}
               onAltChange={(active) => dispatchInput({ type: 'alt', active })}
@@ -672,7 +727,11 @@ export default function App() {
               onToggle={() => dispatchPanel({ type: 'toggle' })}
               onApprove={answer}
               onNewConversation={newConversation}
-              warning={autoApprove ? <AutoApproveNotice onTurnOff={toggleAutoApprove} /> : null}
+              warning={
+                autoApprove ? (
+                  <AutoApproveNotice suspended={autoSuspended} onTurnOff={toggleAutoApprove} onTurnOnHere={toggleAutoApprove} />
+                ) : null
+              }
               banner={
                 settingsState !== null && recoveryKind(settingsState) !== 'ok' && !settingsBannerHidden ? (
                   <SettingsBanner
@@ -706,15 +765,20 @@ export default function App() {
             />
             <InputBar
               mode={barMode}
-              hint={route.hint}
-              hintInline={route.hintInline}
+              hint={locked ? 'Integrating this shell. Keys are not sent until it is done.' : route.hint}
+              hintInline={locked ? false : route.hintInline}
+              locked={locked}
               hasPendingApproval={pendingApproval !== null}
               focusToken={focusToken}
               onFocusChange={setBarOpen}
               onRestart={restartShell}
               restarting={restarting}
               onAgent={onAgent}
-              onInterrupt={() => sendRaw(CTRL_C)}
+              onInterrupt={() => {
+                if (!locked) {
+                  sendRaw(CTRL_C);
+                }
+              }}
               onApproveFirst={approveFirst}
               onDenyFirst={denyFirst}
               onClose={closeBar}
@@ -723,6 +787,7 @@ export default function App() {
         }
       />
       {settingsOpen && <SettingsDialog onClose={closeSettings} onChanged={refreshStatus} onViewLoaded={refreshSettingsState} />}
+      {integrate.kind !== 'closed' && <IntegrateDialog phase={integrate} onStart={startIntegrate} onClose={closeIntegrate} />}
     </div>
   );
 }

@@ -1,6 +1,9 @@
 // Parses OSC 133/633 payloads (the text after "133;" or "633;"). The shell tags every event with its nonce as
 // field 2 (`n=<nonce>`). Rust is the authority for records and gating. The frontend uses these events only to
-// place markers and gutter decorations, so a payload without the right nonce is ignored, never acted on.
+// place markers and gutter decorations, so a payload without an accepted nonce is ignored, never acted on.
+//
+// The accepted nonces are the local shell's and one per nested level (see session.ts). A nested level's nonce is added
+// when Rust announces the level, and removed when the level is popped.
 //
 // Payload shapes (from src-tauri/src/core/shim/integration.zsh and scanner.rs):
 //   A;n=N                  prompt start
@@ -17,15 +20,16 @@ export type ShellEvent =
   | { kind: 'hello' };
 
 /**
- * Returns the event, or null when the payload is not from this shell: no nonce yet, a wrong or missing `n=`,
- * or an event kind this UI does not use. The nonce is compared exactly and is never logged.
+ * Returns the event, or null when the payload is not from one of the accepted shells: no nonce yet, a `n=` that is not in
+ * the set, or a missing one, or an event kind this UI does not use. Each nonce is compared exactly and is never logged.
  */
-export function parseShellPayload(ident: 133 | 633, payload: string, nonce: string | null): ShellEvent | null {
-  if (!nonce) {
+export function parseShellPayload(ident: 133 | 633, payload: string, nonces: ReadonlySet<string>): ShellEvent | null {
+  const fields = payload.split(';');
+  if (fields.length < 2 || !fields[1].startsWith('n=')) {
     return null;
   }
-  const fields = payload.split(';');
-  if (fields.length < 2 || fields[1] !== `n=${nonce}`) {
+  const nonce = fields[1].slice(2);
+  if (nonce === '' || !nonces.has(nonce)) {
     return null;
   }
   const kind = fields[0];

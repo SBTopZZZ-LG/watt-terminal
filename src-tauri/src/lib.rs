@@ -513,6 +513,21 @@ fn set_auto_approve(session_id: String, on: bool, reg: State<'_, Reg>) -> Result
     Ok(())
 }
 
+/// Approve-all as the shell on top sees it: `auto` is on (in whichever shell), `suspended` is on but was switched on in
+/// another shell level, so it does not apply here.
+#[derive(Serialize)]
+struct AutoApproveState {
+    auto: bool,
+    suspended: bool,
+}
+
+#[tauri::command]
+fn auto_approve_state(session_id: String, reg: State<'_, Reg>) -> Result<AutoApproveState, String> {
+    let att = session(&reg, &session_id)?;
+    let state = att.approvals.auto_state(att.session.top_key());
+    Ok(AutoApproveState { auto: state != AutoState::Off, suspended: state == AutoState::Suspended })
+}
+
 /// Whether the LLM agent is configured, which model, and from which saved provider. `provider` is null for the
 /// environment settings. Never the key or the URL.
 #[derive(Serialize)]
@@ -539,6 +554,8 @@ struct Status {
     auto_approve: bool,
     /// Approve-all is on but was switched on in another shell level, so it does not apply to the shell on top.
     auto_approve_suspended: bool,
+    /// Every nonce the observer accepts (the local shell's and the live levels'), so a reloaded window can check OSC events.
+    nonces: Vec<String>,
     agent_busy: bool,
     agent_control: bool,
     llm: LlmStatus,
@@ -585,6 +602,7 @@ fn get_status(session_id: String, reg: State<'_, Reg>, settings: State<'_, Setti
         stats: att.session.stats(),
         auto_approve: att.approvals.auto_approve(),
         auto_approve_suspended: att.approvals.auto_state(att.session.top_key()) == AutoState::Suspended,
+        nonces: att.session.nonces(),
         agent_busy: att.agent_busy.load(Ordering::SeqCst),
         agent_control: att.agent_control.load(Ordering::SeqCst),
         llm,
@@ -940,6 +958,7 @@ pub fn run() {
             new_conversation,
             approve_tool,
             set_auto_approve,
+            auto_approve_state,
             get_status,
             integrate_shell,
             kill_session,

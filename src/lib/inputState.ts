@@ -108,7 +108,7 @@ export function routeFor(state: InputState, foreground: Foreground | null = null
       return {
         keys: 'pty',
         bar: 'chat',
-        hint: 'The shell is not answering. Press Ctrl-C or wait.',
+        hint: 'The shell is not answering. Ctrl-C to interrupt, or wait.',
         hintInline: false,
       };
     case 'running':

@@ -13,7 +13,8 @@ export type Listener = (msg: Incoming) => void;
 
 const listeners = new Set<Listener>();
 let connection: Promise<StartResult> | null = null;
-let nonce: string | null = null;
+/** The nonces the OSC events may carry: the local shell's, and one per live nested level (see setSessionNonces). */
+let nonces: ReadonlySet<string> = new Set();
 let byteSink: ((buf: ArrayBuffer) => void) | null = null;
 /** Bumped on every connect and restart. Callbacks from an older channel check it and drop their input. */
 let generation = 0;
@@ -37,9 +38,17 @@ export function reportError(e: unknown): void {
   emit({ kind: 'error', message: errorText(e) });
 }
 
-/** The integration nonce, or null until the session has started. Used only to filter OSC payloads. */
-export function getNonce(): string | null {
-  return nonce;
+/** The nonces the OSC events are checked against. Empty until the session has started. Used only to filter OSC payloads. */
+export function getNonces(): ReadonlySet<string> {
+  return nonces;
+}
+
+/**
+ * Replaces the accepted nonces with the list Rust sends: on the levels event (every push, pop and pending level) and in the
+ * status. Rust has already decided which nonces are live, so the list is taken as it is.
+ */
+export function setSessionNonces(list: readonly string[]): void {
+  nonces = new Set(list.filter((n) => n !== ''));
 }
 
 /**
@@ -82,7 +91,8 @@ function open(
   });
   return call(rows, cols, data, events).then((result) => {
     if (gen === generation) {
-      nonce = result.nonce;
+      // A new shell has only its own nonce. The status read after the connect adds any nested levels still alive.
+      setSessionNonces([result.nonce]);
     }
     return result;
   });

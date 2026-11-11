@@ -816,6 +816,11 @@ impl Core {
         self.stack.last().map_or(LOCAL_KEY, |l| l.key)
     }
 
+    /// Every nonce the scanner accepts now (the local one included). The UI checks OSC events against them.
+    pub fn accepted_nonces(&self) -> Vec<String> {
+        self.scanner.accepted_nonces()
+    }
+
     fn top_is_local(&self) -> bool {
         self.stack.len() <= 1
     }
@@ -2267,5 +2272,22 @@ mod tests {
         let rec = c.get_record(1).expect("the local record");
         assert_eq!(rec.command, "");
         assert!(matches!(rec.source, Source::Unknown));
+    }
+
+    #[test]
+    fn accepted_nonces_follow_the_levels() {
+        // The local nonce is always accepted. A pending level's nonce is accepted, and stays once it is on top. A parent event
+        // pops the child, and its nonce is no longer accepted.
+        let local = "test-nonce".to_string();
+        let mut c = running("ssh ubuntu@lidia");
+        assert_eq!(c.accepted_nonces(), vec![local.clone()]);
+        c.expect_level(CHILD, "ssh ubuntu@lidia");
+        assert_eq!(c.accepted_nonces(), vec![local.clone(), CHILD.to_string()]);
+        c.feed(&tagged("633;Hello", CHILD, ";v=1;sh=bash;user=ubuntu;host=lidia;pid=77"));
+        assert_eq!(c.top_key(), 1);
+        assert_eq!(c.accepted_nonces(), vec![local.clone(), CHILD.to_string()]);
+        c.feed(&tagged("133;A", &local, ""));
+        assert_eq!(c.top_key(), 0);
+        assert_eq!(c.accepted_nonces(), vec![local]);
     }
 }
