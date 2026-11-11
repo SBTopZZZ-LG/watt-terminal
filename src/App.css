@@ -1631,13 +1631,41 @@ input {
  */
 .bar-field {
   position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
   flex: 1 1 0;
   min-width: 0;
 }
 
-/* A textarea that grows with its text (InputBar sets the height). The max-height caps it, and then it scrolls. */
+/*
+ * The field grows with its text without any script measuring it: the mirror (InputBar's hidden copy of the text) and the
+ * textarea share one grid cell, so the row is as tall as the mirror. The mirror is capped at the max-height, and the
+ * textarea, stretched to that row, scrolls past it. The font size is set, not left to the UA: WebKit gives a textarea
+ * its system control size (11px) and Chrome 13.33px, and the mirror has to wrap the text exactly as the textarea does.
+ */
+.bar-field > .bar-mirror,
+.bar-field > .bar-input {
+  grid-area: 1 / 1;
+}
+
+.bar-mirror {
+  visibility: hidden;
+  box-sizing: border-box;
+  max-height: 160px;
+  overflow: hidden;
+  padding: 6px 8px;
+  border: 1px solid transparent;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: normal;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* The textarea. The max-height caps it, and then it scrolls. */
 .bar-input {
   display: block;
+  align-self: stretch;
   box-sizing: border-box;
   width: 100%;
   max-height: 160px;
@@ -1648,6 +1676,10 @@ input {
   border-radius: 2px;
   background: var(--panel);
   font-family: var(--mono);
+  font-size: 11px;
+  line-height: normal;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .bar-input:focus {

@@ -1,8 +1,10 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { barKeyIntent } from '../lib/inputState';
 import type { BarMode } from '../lib/inputState';
 import { History, historyKeyTakesLine, messageFor, sendButtonFor } from '../lib/barInput';
+
+const DEFAULT_PLACEHOLDER = 'Ask the agent…  (Ctrl/Cmd+Shift+A to focus, Esc to return)';
 
 interface Props {
   mode: BarMode;
@@ -31,21 +33,6 @@ interface Props {
   onClose: () => void;
 }
 
-/**
- * Sets the textarea's height to fit its text. The CSS max-height caps it, and the field scrolls past that. scrollHeight
- * leaves out the border, so the border's height is added back (the box is border-box). An empty field goes back to its
- * one-row height: the placeholder can wrap to several lines in a narrow dock, and scrollHeight counts those.
- */
-function fitHeight(el: HTMLTextAreaElement) {
-  if (el.value === '') {
-    el.style.height = '';
-    return;
-  }
-  el.style.height = 'auto';
-  const border = el.offsetHeight - el.clientHeight;
-  el.style.height = `${el.scrollHeight + border}px`;
-}
-
 export function InputBar(props: Props) {
   const { mode, hint, hintInline, hasPendingApproval, busy, focusToken } = props;
   const [text, setText] = useState('');
@@ -66,31 +53,6 @@ export function InputBar(props: Props) {
       inputRef.current?.focus();
     }
   }, [focusToken]);
-
-  // The field grows with its text. Runs before paint, so a cleared field shrinks back without a flash.
-  useLayoutEffect(() => {
-    if (inputRef.current) {
-      fitHeight(inputRef.current);
-    }
-  }, [text, mode]);
-
-  // A narrower or wider dock rewraps the text, so the height is fitted again. Only a width change counts, so the
-  // height this sets does not start another round.
-  useEffect(() => {
-    const el = inputRef.current;
-    if (!el || typeof ResizeObserver === 'undefined') {
-      return;
-    }
-    let width = el.clientWidth;
-    const observer = new ResizeObserver(() => {
-      if (el.clientWidth !== width) {
-        width = el.clientWidth;
-        fitHeight(el);
-      }
-    });
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, [mode]);
 
   if (mode === 'exited') {
     return (
@@ -207,16 +169,25 @@ export function InputBar(props: Props) {
   // The inline hint is the placeholder, so it shows only while the input is empty. An error takes the row instead,
   // and the placeholder goes back to the normal text.
   const inlineHint = hintInline && hint !== null && error === null ? hint : null;
+  const placeholder = inlineHint ?? DEFAULT_PLACEHOLDER;
 
   return (
     <div className={`bar bar-${mode}`}>
       <div className={busy ? 'bar-field is-busy' : 'bar-field'}>
+        {/*
+         * Sizes the field. It holds the text the textarea shows (or the placeholder, when empty) in the same box, so the
+         * row is as tall as the text, up to the max-height. The trailing space keeps a final newline on its own line.
+         * Hidden, and not read by assistive tech: the textarea is the control.
+         */}
+        <div className="bar-mirror" aria-hidden="true">
+          {`${text === '' ? placeholder : text} `}
+        </div>
         <textarea
           ref={inputRef}
           className="bar-input"
           rows={1}
           value={text}
-          placeholder={inlineHint ?? 'Ask the agent…  (Ctrl/Cmd+Shift+A to focus, Esc to return)'}
+          placeholder={placeholder}
           spellCheck={false}
           autoComplete="off"
           disabled={props.locked}

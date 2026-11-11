@@ -7,7 +7,7 @@ const NOOP = () => undefined;
 
 const BASE = {
   mode: 'chat' as BarMode,
-  hint: null,
+  hint: null as string | null,
   hintInline: false,
   hasPendingApproval: false,
   busy: false,
@@ -42,6 +42,26 @@ describe('InputBar: the agent label', () => {
     expect(html).not.toContain('mode-agent');
     expect(html).not.toContain('bar-mode');
     expect(html).not.toMatch(/>agent</);
+  });
+});
+
+describe('InputBar: the field sizes to its text', () => {
+  it('has a hidden mirror that holds the placeholder while the input is empty', () => {
+    const html = render();
+    const tag = tagHolding(html, 'div', 'bar-mirror');
+    expect(tag).toContain('aria-hidden="true"');
+    expect(html).toContain('bar-mirror" aria-hidden="true">Ask the agent…  (Ctrl/Cmd+Shift+A to focus, Esc to return) </div>');
+  });
+
+  it('the mirror holds the inline hint when the hint is the placeholder', () => {
+    const html = render({ hint: 'Starting a command…', hintInline: true });
+    expect(html).toContain('bar-mirror" aria-hidden="true">Starting a command… </div>');
+    expect(html).not.toContain('Ask the agent');
+  });
+
+  it('the mirror is not used for the exited or collapsed modes', () => {
+    expect(render({ mode: 'exited' })).not.toContain('bar-mirror');
+    expect(render({ mode: 'collapsed' })).not.toContain('bar-mirror');
   });
 });
 
