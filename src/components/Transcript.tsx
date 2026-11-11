@@ -247,9 +247,19 @@ function renderEntries(entries: TranscriptEntry[], onApprove: Props['onApprove']
 function InteractiveGroupView({ group, onApprove }: { group: InteractiveGroup; onApprove: Props['onApprove'] }) {
   const running = group.ended === null;
   const now = useNow(running);
+  const header = interactiveHeader(group, now);
   return (
     <section className={`interactive ${running ? 'interactive-running' : 'interactive-ended'}`}>
-      <div className="interactive-header">{interactiveHeader(group, now)}</div>
+      <div className="interactive-header" role="group" aria-label={header.label}>
+        <span className="interactive-state" aria-hidden="true">
+          {header.state}
+        </span>
+        {header.command !== '' && (
+          <span className="interactive-command" aria-hidden="true">
+            {` · ${header.command}`}
+          </span>
+        )}
+      </div>
       <div className="interactive-items">{renderEntries(group.entries, onApprove)}</div>
     </section>
   );

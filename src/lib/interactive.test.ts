@@ -203,7 +203,11 @@ describe('a level pushed above a group ends it as integrated', () => {
     expect(t.items[t.items.length - 1]).toMatchObject({ kind: 'record_end', recordId: 7, exit: null, integrated: true });
     const frame = frameOf(t.items, 7);
     expect(frame?.ended).toEqual({ exit: null, integrated: true });
-    expect(frame && interactiveHeader(frame, T0 + 9_000)).toBe('Interactive · ssh ubuntu@lidia · integrated');
+    expect(frame && interactiveHeader(frame, T0 + 9_000)).toEqual({
+      state: 'Interactive · integrated',
+      command: 'ssh ubuntu@lidia',
+      label: 'Interactive · integrated · ssh ubuntu@lidia',
+    });
   });
 
   it('a record_finished after the integration adds no item: the command ends later, the group does not', () => {
@@ -278,7 +282,11 @@ describe('a level pushed above a group ends it as integrated', () => {
     const closed = run([finished(9, 0)], t);
     expect(openRecordIds(closed.items).size).toBe(0);
     const inner = frameOf(closed.items, 9);
-    expect(inner && interactiveHeader(inner, T0 + 5_000)).toBe('Interactive · sleep 60 · finished · exit 0');
+    expect(inner && interactiveHeader(inner, T0 + 5_000)).toEqual({
+      state: 'Interactive · finished · exit 0',
+      command: 'sleep 60',
+      label: 'Interactive · finished · exit 0 · sleep 60',
+    });
     expect(frameOf(closed.items, 7)?.ended).toEqual({ exit: null, integrated: true });
   });
 });
@@ -325,31 +333,55 @@ describe('formatElapsed', () => {
 
 describe('interactiveHeader', () => {
   it('is running with the elapsed time while the command runs', () => {
-    expect(interactiveHeader({ command: 'ssh ubuntu@lidia', startedAt: T0, ended: null }, T0 + 185_000)).toBe(
-      'Interactive · ssh ubuntu@lidia · running 3m 05s',
-    );
+    expect(interactiveHeader({ command: 'ssh ubuntu@lidia', startedAt: T0, ended: null }, T0 + 185_000)).toEqual({
+      state: 'Interactive · running 3m 05s',
+      command: 'ssh ubuntu@lidia',
+      label: 'Interactive · running 3m 05s · ssh ubuntu@lidia',
+    });
   });
 
   it('says finished with the exit code, or ended when there is none', () => {
-    expect(interactiveHeader({ command: 'ssh host', startedAt: T0, ended: { exit: 0 } }, T0 + 9_000)).toBe(
-      'Interactive · ssh host · finished · exit 0',
-    );
-    expect(interactiveHeader({ command: 'ssh host', startedAt: T0, ended: { exit: null } }, T0 + 9_000)).toBe('Interactive · ssh host · ended');
+    expect(interactiveHeader({ command: 'ssh host', startedAt: T0, ended: { exit: 0 } }, T0 + 9_000)).toEqual({
+      state: 'Interactive · finished · exit 0',
+      command: 'ssh host',
+      label: 'Interactive · finished · exit 0 · ssh host',
+    });
+    expect(interactiveHeader({ command: 'ssh host', startedAt: T0, ended: { exit: null } }, T0 + 9_000)).toEqual({
+      state: 'Interactive · ended',
+      command: 'ssh host',
+      label: 'Interactive · ended · ssh host',
+    });
   });
 
-  it('caps a long command and shows a newline as \\n, so the header stays on one line', () => {
-    const header = interactiveHeader({ command: `a\n${'x'.repeat(200)}`, startedAt: null, ended: null }, T0);
-    expect(header).toMatch(/^Interactive · a\\nx+… · running$/);
-    expect(header.length).toBeLessThan(120);
+  it('caps a long command in the visible part and shows a newline as \\n, but the label keeps the whole command', () => {
+    const command = `a\n${'x'.repeat(200)}`;
+    const header = interactiveHeader({ command, startedAt: null, ended: null }, T0);
+    expect(header.state).toBe('Interactive · running');
+    expect(header.command).toMatch(/^a\\nx+…$/);
+    expect(header.label).toBe(`Interactive · running · ${command}`);
   });
 
   it('says integrated when a shell level was pushed above the command, and not finished', () => {
-    expect(interactiveHeader({ command: 'ssh ubuntu@lidia', startedAt: T0, ended: { exit: null, integrated: true } }, T0 + 9_000)).toBe(
-      'Interactive · ssh ubuntu@lidia · integrated',
-    );
+    expect(interactiveHeader({ command: 'ssh ubuntu@lidia', startedAt: T0, ended: { exit: null, integrated: true } }, T0 + 9_000)).toEqual({
+      state: 'Interactive · integrated',
+      command: 'ssh ubuntu@lidia',
+      label: 'Interactive · integrated · ssh ubuntu@lidia',
+    });
   });
 
   it('shows running without a time when the start is not known', () => {
-    expect(interactiveHeader({ command: 'top', startedAt: null, ended: null }, T0)).toBe('Interactive · top · running');
+    expect(interactiveHeader({ command: 'top', startedAt: null, ended: null }, T0)).toEqual({
+      state: 'Interactive · running',
+      command: 'top',
+      label: 'Interactive · running · top',
+    });
+  });
+
+  it('has no command part when the group has no command, and the label is the state alone', () => {
+    expect(interactiveHeader({ command: '', startedAt: null, ended: null }, T0)).toEqual({
+      state: 'Interactive · running',
+      command: '',
+      label: 'Interactive · running',
+    });
   });
 });

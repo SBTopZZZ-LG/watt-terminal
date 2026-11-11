@@ -1542,13 +1542,27 @@ input {
   background: var(--accent);
 }
 
+/* The state ("Interactive · running 3m 05s") never shrinks; the command after it is what gets cut, with an ellipsis. */
 .interactive-header {
+  display: flex;
+  min-width: 0;
   margin-bottom: 4px;
   overflow: hidden;
   color: var(--muted);
   font-family: var(--mono);
   font-size: 11px;
   white-space: nowrap;
+}
+
+.interactive-state {
+  flex: none;
+}
+
+/* The span's text starts with the separator's space, which the line start drops; the padding stands in for it. */
+.interactive-command {
+  min-width: 0;
+  overflow: hidden;
+  padding-left: 1ch;
   text-overflow: ellipsis;
 }
 

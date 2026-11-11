@@ -195,18 +195,31 @@ export function formatElapsed(ms: number): string {
 }
 
 /**
- * The header of a group: "Interactive · <command> · running 3m 05s", then "finished · exit N", or "ended" when the exit code is
- * not known, or "integrated" when a shell level was pushed above the command. The command is escaped and capped; a newline in
- * it shows as \n so the header stays one line.
+ * A group's header, in parts. The state ("Interactive · running 3m 05s", "Interactive · finished · exit N", "Interactive · ended"
+ * when the exit code is not known, "Interactive · integrated" when a shell level was pushed above the command) is what the
+ * header must always show, so the view keeps it whole. The command is shown after it and may be cut. `command` is escaped and
+ * capped, a newline in it shows as \n, and it is '' when the group has no command. `label` is the whole header in words with the
+ * full command, for the group's accessible name.
  */
-export function interactiveHeader(group: { command: string; startedAt: number | null; ended: GroupEnd | null }, now: number): string {
-  const command = capDisplay(group.command, HEADER_COMMAND_CHARS).replace(/\n/g, '\\n');
-  const prefix = command === '' ? 'Interactive' : `Interactive · ${command}`;
+export interface InteractiveHeader {
+  state: string;
+  command: string;
+  label: string;
+}
+
+export function interactiveHeader(group: { command: string; startedAt: number | null; ended: GroupEnd | null }, now: number): InteractiveHeader {
+  let word: string;
   if (group.ended !== null) {
     if (group.ended.integrated === true) {
-      return `${prefix} · integrated`;
+      word = 'integrated';
+    } else {
+      word = group.ended.exit === null ? 'ended' : `finished · exit ${group.ended.exit}`;
     }
-    return group.ended.exit === null ? `${prefix} · ended` : `${prefix} · finished · exit ${group.ended.exit}`;
+  } else {
+    word = group.startedAt === null ? 'running' : `running ${formatElapsed(now - group.startedAt)}`;
   }
-  return group.startedAt === null ? `${prefix} · running` : `${prefix} · running ${formatElapsed(now - group.startedAt)}`;
+  const state = `Interactive · ${word}`;
+  const command = capDisplay(group.command, HEADER_COMMAND_CHARS).replace(/\n/g, '\\n');
+  const label = group.command === '' ? state : `${state} · ${group.command}`;
+  return { state, command, label };
 }

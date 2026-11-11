@@ -236,7 +236,9 @@ describe('Transcript: interactive command groups', () => {
   it('a running command is a wrapper with the accent rail and a header that says running', () => {
     const html = render([...started(Date.now()), ...wait]);
     expect(html).toContain('class="interactive interactive-running"');
-    expect(html).toMatch(/Interactive · ssh ubuntu@lidia · running \d+s/);
+    expect(html).toMatch(/<span class="interactive-state" aria-hidden="true">Interactive · running \d+s<\/span>/);
+    expect(html).toContain('<span class="interactive-command" aria-hidden="true"> · ssh ubuntu@lidia</span>');
+    expect(html).toMatch(/<div class="interactive-header" role="group" aria-label="Interactive · running \d+s · ssh ubuntu@lidia">/);
     expect(html).toContain('class="interactive-items"');
     // The run_command row is the header, not a row inside the group.
     expect(html).not.toContain('>run_command');
@@ -246,7 +248,8 @@ describe('Transcript: interactive command groups', () => {
     const html = render([...started(Date.now()), ...wait, endOf7]);
     expect(html).toContain('class="interactive interactive-ended"');
     expect(html).not.toContain('interactive-running');
-    expect(html).toContain('Interactive · ssh ubuntu@lidia · finished · exit 0');
+    expect(html).toContain('<span class="interactive-state" aria-hidden="true">Interactive · finished · exit 0</span>');
+    expect(html).toContain('aria-label="Interactive · finished · exit 0 · ssh ubuntu@lidia"');
   });
 
   it('an item after the end is outside the wrapper', () => {
