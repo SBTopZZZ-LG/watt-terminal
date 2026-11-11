@@ -1,7 +1,7 @@
 //! Where secret values live: API keys and secret header values, kept out of `settings.json`.
 //!
 //! All secrets sit in one blob, a JSON object `{key: value}`, behind a `SecretStore`. The production store is one
-//! Keychain item, so the OS asks at most once. `FileStore` is an explicit opt-in (`AGENT_TERM_SECRETS_FILE`) for
+//! Keychain item, so the OS asks at most once. `FileStore` is an explicit opt-in (`WATT_SECRETS_FILE`) for
 //! development. `Secrets` reads the blob lazily on first use and keeps it cached. Nothing here prints or formats a
 //! value: errors and `Debug` output carry names and kinds only.
 
@@ -19,10 +19,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::write_private_atomic;
+use crate::core::env::env_setting;
 
+// KEEP: the service name is the app's original identifier, not its display name. Changing it would point the app at a
+// different Keychain item, and the user's saved API keys live under the old name. Do not rename it with the app.
 const KEYCHAIN_SERVICE: &str = "dev.agentterm.app";
 const KEYCHAIN_ACCOUNT: &str = "secrets";
-const SECRETS_FILE_ENV: &str = "AGENT_TERM_SECRETS_FILE";
+const SECRETS_FILE_ENV: &str = "WATT_SECRETS_FILE";
+const LEGACY_SECRETS_FILE_ENV: &str = "AGENT_TERM_SECRETS_FILE";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SecretError {
@@ -89,7 +93,7 @@ impl SecretStore for KeychainStore {
     }
 }
 
-/// A file holding the blob, mode 0600. Used only when `AGENT_TERM_SECRETS_FILE` is set.
+/// A file holding the blob, mode 0600. Used only when `WATT_SECRETS_FILE` is set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileStore {
     pub path: PathBuf,
@@ -190,12 +194,13 @@ impl Secrets {
         Self { store, cache: Mutex::new(None) }
     }
 
-    /// `AGENT_TERM_SECRETS_FILE` (a non-empty path) selects a `FileStore`. Otherwise the macOS Keychain is used. There
-    /// is no automatic fallback from the Keychain to a file. `config_dir` is not used yet.
+    /// `WATT_SECRETS_FILE` (or the old `AGENT_TERM_SECRETS_FILE`), a non-empty path, selects a `FileStore`. Otherwise
+    /// the macOS Keychain is used. There is no automatic fallback from the Keychain to a file. `config_dir` is not
+    /// used yet.
     pub fn from_env(_config_dir: &Path) -> Self {
-        match std::env::var(SECRETS_FILE_ENV) {
-            Ok(path) if !path.is_empty() => Self::new(Box::new(FileStore { path: PathBuf::from(path) })),
-            _ => Self::new(Box::new(KeychainStore {
+        match env_setting(SECRETS_FILE_ENV, LEGACY_SECRETS_FILE_ENV) {
+            Some(path) => Self::new(Box::new(FileStore { path: PathBuf::from(path) })),
+            None => Self::new(Box::new(KeychainStore {
                 service: KEYCHAIN_SERVICE.into(),
                 account: KEYCHAIN_ACCOUNT.into(),
             })),
@@ -481,7 +486,7 @@ mod tests {
         }
 
         let store = KeychainStore {
-            service: format!("agent-term-test-{}", std::process::id()),
+            service: format!("watt-terminal-test-{}", std::process::id()),
             account: "secrets".into(),
         };
         let _cleanup = Cleanup(store.clone());

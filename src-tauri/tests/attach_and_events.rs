@@ -9,9 +9,9 @@ use std::sync::{mpsc, Arc, Barrier, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use agent_term_lib::core::observer::{EventSink, InputState, IntegrationStatus, SessionEvent};
-use agent_term_lib::core::registry::Registry;
-use agent_term_lib::core::session::{Session, SpawnConfig};
+use watt_terminal_lib::core::observer::{EventSink, InputState, IntegrationStatus, SessionEvent};
+use watt_terminal_lib::core::registry::Registry;
+use watt_terminal_lib::core::session::{Session, SpawnConfig};
 
 use common::*;
 
@@ -151,5 +151,5 @@ fn user_typed_command_is_reported_with_user_source() {
             _ => None,
         })
     });
-    assert_eq!(started, Some(agent_term_lib::core::record::Source::User));
+    assert_eq!(started, Some(watt_terminal_lib::core::record::Source::User));
 }

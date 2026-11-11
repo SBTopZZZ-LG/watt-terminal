@@ -14,10 +14,10 @@ const FILES: &[(&str, &str)] = &[
     ("integration.zsh", include_str!("shim/integration.zsh")),
 ];
 
-/// `<tmp>/agent-term-<pid>-<session>`. Any leftover directory with that name is removed first.
+/// `<tmp>/watt-terminal-<pid>-<session>`. Any leftover directory with that name is removed first.
 pub fn dir_for(session_id: &str) -> PathBuf {
     let safe: String = session_id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect();
-    std::env::temp_dir().join(format!("agent-term-{}-{}", std::process::id(), safe))
+    std::env::temp_dir().join(format!("watt-terminal-{}-{}", std::process::id(), safe))
 }
 
 /// Creates the directory with mode 0700 (zsh sources files from it, so other users must not be able to write there) and writes the files.

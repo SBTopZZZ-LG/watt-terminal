@@ -93,9 +93,9 @@ describe('outcomeView', () => {
   });
 
   it('failed: quotes the shell hint, and does not double a full stop', () => {
-    expect(outcomeView({ outcome: 'failed', hint: 'agentterm: Unsupported shell (promptvars off)' })).toEqual({
+    expect(outcomeView({ outcome: 'failed', hint: 'watt: Unsupported shell (promptvars off)' })).toEqual({
       tone: 'fail',
-      text: 'Integration did not complete: agentterm: Unsupported shell (promptvars off).',
+      text: 'Integration did not complete: watt: Unsupported shell (promptvars off).',
     });
     expect(outcomeView({ outcome: 'failed', hint: 'no level appeared.' }).text).toBe(
       'Integration did not complete: no level appeared.',
@@ -178,7 +178,7 @@ describe('agentRequestAfter: asked, accepted, finished', () => {
   });
 
   it('a failed handshake is a result too, with its outcome', () => {
-    const failed = { outcome: 'failed' as const, hint: 'agentterm: Unsupported shell' };
+    const failed = { outcome: 'failed' as const, hint: 'watt: Unsupported shell' };
     expect(after([asked(), running(), finished('c1', failed)])).toEqual({ kind: 'result', callId: 'c1', outcome: failed });
   });
 });

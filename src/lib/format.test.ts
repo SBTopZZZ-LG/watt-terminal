@@ -4,7 +4,7 @@ import { formatCwd, previewJson, shortenPath } from './format';
 describe('shortenPath', () => {
   it('replaces a macOS or Linux home with ~', () => {
     expect(shortenPath('/Users/sbtopzzz')).toBe('~');
-    expect(shortenPath('/Users/sbtopzzz/Developer/agent-term')).toBe('~/Developer/agent-term');
+    expect(shortenPath('/Users/sbtopzzz/Developer/watt-terminal')).toBe('~/Developer/watt-terminal');
     expect(shortenPath('/home/me/src')).toBe('~/src');
   });
 

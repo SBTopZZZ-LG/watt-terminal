@@ -161,9 +161,9 @@ describe('SettingsBody: broken settings file', () => {
 describe('SettingsBody: store note', () => {
   it('keychain and file each have their sentence', () => {
     expect(storeNote('keychain')).toBe('API keys are stored in the macOS Keychain.');
-    expect(storeNote('file')).toBe('API keys are stored in the file named by AGENT_TERM_SECRETS_FILE.');
+    expect(storeNote('file')).toBe('API keys are stored in the file named by WATT_SECRETS_FILE.');
     expect(html()).toContain('API keys are stored in the macOS Keychain.');
-    expect(html({ load: { kind: 'ready', view: view({ store_kind: 'file' }) } })).toContain('AGENT_TERM_SECRETS_FILE');
+    expect(html({ load: { kind: 'ready', view: view({ store_kind: 'file' }) } })).toContain('WATT_SECRETS_FILE');
   });
 });
 

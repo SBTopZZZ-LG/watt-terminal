@@ -8,12 +8,12 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
-use agent_term_lib::core::agent::{AgentCtx, AgentEvent, ApprovalGate, DENIED, TurnRules};
-use agent_term_lib::core::foreground::ForegroundKind;
-use agent_term_lib::core::observer::InputState;
-use agent_term_lib::core::record::Source;
-use agent_term_lib::core::session::Session;
-use agent_term_lib::core::tools::{INTEGRATE_PASSWORD_REFUSAL, SessionTools};
+use watt_terminal_lib::core::agent::{AgentCtx, AgentEvent, ApprovalGate, DENIED, TurnRules};
+use watt_terminal_lib::core::foreground::ForegroundKind;
+use watt_terminal_lib::core::observer::InputState;
+use watt_terminal_lib::core::record::Source;
+use watt_terminal_lib::core::session::Session;
+use watt_terminal_lib::core::tools::{INTEGRATE_PASSWORD_REFUSAL, SessionTools};
 use common::*;
 use serde_json::{Value, json};
 

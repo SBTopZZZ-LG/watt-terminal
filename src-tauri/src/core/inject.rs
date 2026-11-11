@@ -78,7 +78,7 @@ pub fn loader_line(token: &str) -> String {
 }
 
 /// The blob for `sh` (`zsh` or `bash`), one string per line, without END_MARKER (the writer sends that after the lines).
-/// Line 1 is `_agentterm_inject_nonce=<nonce>`. Then the integration script with comments and blank lines removed, tabs
+/// Line 1 is `_watt_inject_nonce=<nonce>`. Then the integration script with comments and blank lines removed, tabs
 /// turned into spaces and trailing spaces dropped. For bash, the history cleanup line. Last, the loader cleanup.
 /// The nonce is only ever on line 1, and nothing in the blob is exported.
 pub fn blob_lines(nonce: &str, sh: &str) -> Result<Vec<String>, InjectError> {
@@ -90,7 +90,7 @@ pub fn blob_lines(nonce: &str, sh: &str) -> Result<Vec<String>, InjectError> {
         "bash" => (BASH_SCRIPT, true),
         other => return Err(InjectError::UnknownShell(other.to_string())),
     };
-    let mut lines = vec![format!("_agentterm_inject_nonce={nonce}")];
+    let mut lines = vec![format!("_watt_inject_nonce={nonce}")];
     lines.extend(script_lines(script));
     if bash {
         lines.push(BASH_HISTORY_CLEANUP.replace("@TAG@", LOADER_TAG));
@@ -178,7 +178,7 @@ mod tests {
     fn blob_for_each_shell_is_valid_and_has_the_nonce_only_on_line_one() {
         for sh in ["zsh", "bash"] {
             let lines = blob_lines(NONCE, sh).unwrap_or_else(|e| panic!("{sh}: {e}"));
-            assert_eq!(lines[0], format!("_agentterm_inject_nonce={NONCE}"));
+            assert_eq!(lines[0], format!("_watt_inject_nonce={NONCE}"));
             assert!(lines[1..].iter().all(|l| !l.contains(NONCE)), "{sh}: nonce leaked past line 1");
             assert!(lines.iter().all(|l| l != END_MARKER), "{sh}: end marker inside the blob");
             assert!(lines.iter().all(|l| !l.contains("export") && !l.contains("-x ")), "{sh}: nothing exported");

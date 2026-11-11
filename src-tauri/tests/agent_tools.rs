@@ -7,17 +7,17 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use agent_term_lib::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate, DENIED, MockAgent, user_input};
-use agent_term_lib::core::approval::RegexPolicy;
-use agent_term_lib::core::chat::project::project;
-use agent_term_lib::core::chat::redact::Redactor;
-use agent_term_lib::core::llm::TurnCancel;
-use agent_term_lib::core::foreground::ForegroundKind;
-use agent_term_lib::core::observer::{EventSink, InputState, IntegrationStatus, ObserverStatus, SessionEvent};
-use agent_term_lib::core::record::Source;
-use agent_term_lib::core::session::{Session, USER_TEXT_CODE};
-use agent_term_lib::core::settings::{ApprovalMode, ApprovalSettings};
-use agent_term_lib::core::tools::{schemas, AgentTools, NotRunReason, RunOutcome, SessionTools, WaitReason, DEFAULT_RUN_WAIT};
+use watt_terminal_lib::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate, DENIED, MockAgent, user_input};
+use watt_terminal_lib::core::approval::RegexPolicy;
+use watt_terminal_lib::core::chat::project::project;
+use watt_terminal_lib::core::chat::redact::Redactor;
+use watt_terminal_lib::core::llm::TurnCancel;
+use watt_terminal_lib::core::foreground::ForegroundKind;
+use watt_terminal_lib::core::observer::{EventSink, InputState, IntegrationStatus, ObserverStatus, SessionEvent};
+use watt_terminal_lib::core::record::Source;
+use watt_terminal_lib::core::session::{Session, USER_TEXT_CODE};
+use watt_terminal_lib::core::settings::{ApprovalMode, ApprovalSettings};
+use watt_terminal_lib::core::tools::{schemas, AgentTools, NotRunReason, RunOutcome, SessionTools, WaitReason, DEFAULT_RUN_WAIT};
 use serde_json::{json, Value};
 
 use common::*;
@@ -1566,7 +1566,7 @@ fn request_integration_is_refused_while_an_ssh_runs_a_remote_command() {
         "cannot integrate the shell now: that command runs a program on the remote host, not a shell; wait for it with wait or stop it.",
         "{err}"
     );
-    assert_eq!(err, agent_term_lib::core::tools::REMOTE_PROGRAM_REFUSAL);
+    assert_eq!(err, watt_terminal_lib::core::tools::REMOTE_PROGRAM_REFUSAL);
 
     let w = tools.call("wait", &json!({"id": v["record_id"], "seconds": 20, "ignore_updates": true}), None).expect("wait");
     assert_eq!(w["reason"], "command_finished", "{w}");

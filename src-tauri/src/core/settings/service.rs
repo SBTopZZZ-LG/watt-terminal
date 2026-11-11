@@ -205,7 +205,7 @@ impl SettingsService {
             Ok(None) => (Settings::default(), Mode::Ok),
             Err(e) => {
                 let reason = load_error_text(config_dir, &e);
-                eprintln!("agent-term: the AI settings are not loaded: {reason}");
+                eprintln!("watt: the AI settings are not loaded: {reason}");
                 (Settings::default(), Mode::Broken { reason })
             }
         };
@@ -732,7 +732,7 @@ fn load_error_text(config_dir: &Path, e: &SettingsError) -> String {
 /// launch goes on: the previous copy, if any, is still there.
 fn copy_last_good(config_dir: &Path, bytes: &[u8]) {
     if let Err(e) = write_private_atomic(&last_good_path(config_dir), bytes) {
-        eprintln!("agent-term: the last working AI settings were not kept ({e})");
+        eprintln!("watt: the last working AI settings were not kept ({e})");
     }
 }
 

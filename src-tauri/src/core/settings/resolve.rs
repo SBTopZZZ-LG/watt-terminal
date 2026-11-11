@@ -284,11 +284,11 @@ mod tests {
     fn fetch_headers_get_a_fresh_session_id_and_keep_the_rest() {
         let templates = vec![
             ("x-opencode-session".to_string(), "{session_id}".to_string()),
-            ("X-Title".to_string(), "agent term".to_string()),
+            ("X-Title".to_string(), "Watt Terminal".to_string()),
         ];
         let first = resolve_headers_for_fetch(&templates).unwrap();
         let second = resolve_headers_for_fetch(&templates).unwrap();
-        assert_eq!(first[1], ("X-Title".to_string(), "agent term".to_string()));
+        assert_eq!(first[1], ("X-Title".to_string(), "Watt Terminal".to_string()));
         let id = &first[0].1;
         assert_eq!(id.len(), 36, "{id}");
         assert!(id.starts_with("ses_") && id[4..].chars().all(|c| c.is_ascii_hexdigit()), "{id}");

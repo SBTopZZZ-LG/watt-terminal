@@ -9,7 +9,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use agent_term_lib::core::llm::{
+use watt_terminal_lib::core::llm::{
     AssistantReply, ChatRequest, Delta, LlmError, ProviderConfig, TurnCancel, complete, http_client, stream,
 };
 use serde_json::json;
@@ -118,7 +118,7 @@ fn cfg(url: String) -> ProviderConfig {
         chat_url: url,
         api_key: "test-key-not-real".to_string(),
         headers: Vec::new(),
-        user_agent: "agent-term-test/1.0".to_string(),
+        user_agent: "watt-terminal-test/1.0".to_string(),
     }
 }
 
@@ -293,7 +293,7 @@ async fn request_has_no_authorization_header_when_the_key_is_empty() {
 
     let lower = rx.recv().unwrap().to_ascii_lowercase();
     assert!(!lower.contains("authorization:"), "an empty key must send no Authorization header: {lower}");
-    assert!(lower.contains("user-agent: agent-term-test/1.0"));
+    assert!(lower.contains("user-agent: watt-terminal-test/1.0"));
 }
 
 #[tokio::test]
@@ -301,7 +301,7 @@ async fn request_carries_authorization_user_agent_and_the_custom_header() {
     let (url, rx) = serve(Script::ok(OPENCODE_TOOLS));
     let mut config = cfg(url);
     config.headers.push(("x-opencode-session".to_string(), "ses_0123456789abcdef0123456789abcdef".to_string()));
-    config.headers.push(("User-Agent".to_string(), "agent-term-test/2.0".to_string()));
+    config.headers.push(("User-Agent".to_string(), "watt-terminal-test/2.0".to_string()));
     complete(&http_client().unwrap(), &config, &request(), &TurnCancel::new()).await.unwrap();
 
     let raw = rx.recv().unwrap();
@@ -311,8 +311,8 @@ async fn request_carries_authorization_user_agent_and_the_custom_header() {
     assert!(lower.contains("content-type: application/json"));
     assert!(lower.contains("x-opencode-session: ses_0123456789abcdef0123456789abcdef"));
     assert_eq!(lower.matches("user-agent:").count(), 1, "a caller User-Agent replaces the built-in one");
-    assert!(lower.contains("user-agent: agent-term-test/2.0"));
-    assert!(!lower.contains("agent-term-test/1.0"));
+    assert!(lower.contains("user-agent: watt-terminal-test/2.0"));
+    assert!(!lower.contains("watt-terminal-test/1.0"));
 }
 
 #[tokio::test]
@@ -527,7 +527,7 @@ async fn a_redirect_to_another_port_is_not_followed_and_the_other_server_gets_no
 #[tokio::test]
 async fn redirects_past_the_limit_fail_with_a_clear_message() {
     // The original request and ten followed redirects are eleven connections. The eleventh redirect is refused.
-    let (base, _rx) = serve_each(agent_term_lib::core::llm::MAX_REDIRECTS + 1, |base, _, _| {
+    let (base, _rx) = serve_each(watt_terminal_lib::core::llm::MAX_REDIRECTS + 1, |base, _, _| {
         http_reply("302 Found", &format!("Location: {base}/again\r\n"), "")
     });
     let err = complete(&http_client().unwrap(), &cfg(format!("{base}/chat")), &request(), &TurnCancel::new())

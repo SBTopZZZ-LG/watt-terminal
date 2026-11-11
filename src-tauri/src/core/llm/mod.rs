@@ -528,7 +528,7 @@ mod tests {
             chat_url: url.to_string(),
             api_key: "test-key-123".to_string(),
             headers: Vec::new(),
-            user_agent: "agent-term-test/0".to_string(),
+            user_agent: "watt-terminal-test/0".to_string(),
         }
     }
 

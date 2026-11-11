@@ -8,20 +8,20 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use agent_term_lib::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate};
-use agent_term_lib::core::chat::agent_loop::{agent_record_note, Conversation, LlmAgent, LlmSettings};
-use agent_term_lib::core::settings::LimitsSettings;
-use agent_term_lib::core::chat::history::History;
-use agent_term_lib::core::chat::prompt;
-use agent_term_lib::core::chat::redact::Redactor;
-use agent_term_lib::core::chat::todo;
-use agent_term_lib::core::foreground::{Foreground, ForegroundKind};
-use agent_term_lib::core::llm::{TurnCancel, http_client};
-use agent_term_lib::core::keys::KeyPlan;
-use agent_term_lib::core::observer::OpenAgentRecord;
-use agent_term_lib::core::record::{Cwd, RecordStatus, RecordSummary, Source};
-use agent_term_lib::core::session::IntegrateOutcome;
-use agent_term_lib::core::tools::{AgentTools, CommandView, RunOutcome, ScreenView, SendKeysOutcome, WaitView};
+use watt_terminal_lib::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate};
+use watt_terminal_lib::core::chat::agent_loop::{agent_record_note, Conversation, LlmAgent, LlmSettings};
+use watt_terminal_lib::core::settings::LimitsSettings;
+use watt_terminal_lib::core::chat::history::History;
+use watt_terminal_lib::core::chat::prompt;
+use watt_terminal_lib::core::chat::redact::Redactor;
+use watt_terminal_lib::core::chat::todo;
+use watt_terminal_lib::core::foreground::{Foreground, ForegroundKind};
+use watt_terminal_lib::core::llm::{TurnCancel, http_client};
+use watt_terminal_lib::core::keys::KeyPlan;
+use watt_terminal_lib::core::observer::OpenAgentRecord;
+use watt_terminal_lib::core::record::{Cwd, RecordStatus, RecordSummary, Source};
+use watt_terminal_lib::core::session::IntegrateOutcome;
+use watt_terminal_lib::core::tools::{AgentTools, CommandView, RunOutcome, ScreenView, SendKeysOutcome, WaitView};
 use serde_json::{Value, json};
 
 const KEY: &str = "sk-or-test-SECRETVALUE-0123456789";
@@ -942,7 +942,7 @@ fn the_request_carries_the_system_prompt_tools_auth_session_header_and_history()
     assert_eq!(header_of(&requests[1], "authorization"), Some(format!("Bearer {KEY}")));
     assert_eq!(header_of(&requests[1], "x-opencode-session"), Some(conv.id()), "the placeholder is the conversation id");
     assert!(conv.id().starts_with("ses_") && conv.id().len() == 36);
-    assert!(header_of(&requests[1], "user-agent").is_some_and(|ua| ua.starts_with("agent-term/")));
+    assert!(header_of(&requests[1], "user-agent").is_some_and(|ua| ua.starts_with("watt-terminal/")));
 
     let first = body_of(&requests[0]);
     assert_eq!(first["model"], MODEL);

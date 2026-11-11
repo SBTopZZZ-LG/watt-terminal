@@ -8,10 +8,11 @@
 //! The caller can ask for a save at each checkpoint (`LlmAgent::with_checkpoint`): after the user message is recorded
 //! and after each completed round of tool calls, when the history is paired.
 //!
-//! Dev configuration (replaced by a config file later): `AGENT_TERM_LLM_URL` (full chat-completions URL),
-//! `AGENT_TERM_LLM_KEY` and `AGENT_TERM_LLM_MODEL` must all be set, or the mock agent is used. Optional:
-//! `AGENT_TERM_LLM_HEADERS` (`Name: value` lines or `;`-separated, where `{session_id}` is the conversation id),
-//! `AGENT_TERM_LLM_STREAM=0` for one non-streamed reply per call, and `AGENT_TERM_LLM_MAX_TOKENS`.
+//! Dev configuration (replaced by a config file later): `WATT_LLM_URL` (full chat-completions URL),
+//! `WATT_LLM_KEY` and `WATT_LLM_MODEL` must all be set, or the mock agent is used. Optional:
+//! `WATT_LLM_HEADERS` (`Name: value` lines or `;`-separated, where `{session_id}` is the conversation id),
+//! `WATT_LLM_STREAM=0` for one non-streamed reply per call, and `WATT_LLM_MAX_TOKENS`. The old `AGENT_TERM_LLM_*`
+//! names are still read when the `WATT_LLM_*` one is unset.
 //! Nothing here logs the key or a header value.
 
 use std::cell::Cell;
@@ -26,6 +27,7 @@ use reqwest::header::{HeaderName, HeaderValue};
 use serde_json::{Value, json};
 
 use crate::core::agent::{Agent, AgentCtx, AgentEvent, DENIED};
+use crate::core::env::env_setting;
 use crate::core::foreground::{Foreground, ForegroundKind};
 use crate::core::chat::history::History;
 use crate::core::chat::project::project;
@@ -38,13 +40,13 @@ use crate::core::settings::LimitsSettings;
 use crate::core::tools::{age_text, foreground_next_step, TopLevel};
 
 const SESSION_PLACEHOLDER: &str = "{session_id}";
-pub const USER_AGENT: &str = concat!("agent-term/", env!("CARGO_PKG_VERSION"));
-const ENV_URL: &str = "AGENT_TERM_LLM_URL";
-const ENV_KEY: &str = "AGENT_TERM_LLM_KEY";
-const ENV_MODEL: &str = "AGENT_TERM_LLM_MODEL";
-const ENV_HEADERS: &str = "AGENT_TERM_LLM_HEADERS";
-const ENV_STREAM: &str = "AGENT_TERM_LLM_STREAM";
-const ENV_MAX_TOKENS: &str = "AGENT_TERM_LLM_MAX_TOKENS";
+pub const USER_AGENT: &str = concat!("watt-terminal/", env!("CARGO_PKG_VERSION"));
+const ENV_URL: &str = "WATT_LLM_URL";
+const ENV_KEY: &str = "WATT_LLM_KEY";
+const ENV_MODEL: &str = "WATT_LLM_MODEL";
+const ENV_HEADERS: &str = "WATT_LLM_HEADERS";
+const ENV_STREAM: &str = "WATT_LLM_STREAM";
+const ENV_MAX_TOKENS: &str = "WATT_LLM_MAX_TOKENS";
 
 /// Tool names the model may call that the loop routes by name. Anything else is an unknown tool. Must match `READ_TOOLS`
 /// in core/agent.rs.
@@ -149,7 +151,15 @@ fn parse_headers(text: &str) -> Result<Vec<(String, String)>, String> {
 /// agent is used. `run()` calls this at startup so the warning shows at launch.
 pub fn settings() -> Option<&'static LlmSettings> {
     static SETTINGS: OnceLock<Option<LlmSettings>> = OnceLock::new();
-    SETTINGS.get_or_init(|| settings_or_warn(|name| std::env::var(name).ok())).as_ref()
+    // Each `WATT_LLM_*` name also reads its old `AGENT_TERM_LLM_*` name (core/env.rs); WATT_* wins when both are set.
+    SETTINGS
+        .get_or_init(|| {
+            settings_or_warn(|name| {
+                let legacy = name.replacen("WATT_", "AGENT_TERM_", 1);
+                env_setting(name, &legacy).and_then(|v| v.into_string().ok())
+            })
+        })
+        .as_ref()
 }
 
 /// An owned copy of `settings()`, for callers that keep the settings past the turn (the agent takes ownership).
@@ -161,7 +171,7 @@ fn settings_or_warn(lookup: impl Fn(&str) -> Option<String>) -> Option<LlmSettin
     match settings_from_env(lookup) {
         Ok(settings) => settings,
         Err(problem) => {
-            eprintln!("agent-term: {problem}. The mock agent is used instead.");
+            eprintln!("watt: {problem}. The mock agent is used instead.");
             None
         }
     }
@@ -883,7 +893,7 @@ mod tests {
         assert!(!settings_from_env(with_env(&[(ENV_STREAM, "0")])).unwrap().unwrap().stream);
         assert!(settings_from_env(with_env(&[(ENV_STREAM, "1")])).unwrap().unwrap().stream);
         let err = settings_from_env(with_env(&[(ENV_STREAM, "yes")])).unwrap_err();
-        assert_eq!(err, "AGENT_TERM_LLM_STREAM must be 0 or 1");
+        assert_eq!(err, "WATT_LLM_STREAM must be 0 or 1");
         assert_eq!(settings_from_env(with_env(&[(ENV_MAX_TOKENS, "512")])).unwrap().unwrap().max_tokens, Some(512));
         assert!(settings_from_env(with_env(&[(ENV_MAX_TOKENS, "0")])).is_err());
         assert!(settings_from_env(with_env(&[(ENV_MAX_TOKENS, "lots")])).is_err());
@@ -897,14 +907,14 @@ mod tests {
             (ENV_MODEL, "m"),
         ]))
         .unwrap_err();
-        assert_eq!(err, "AGENT_TERM_LLM_URL must start with https:// or http://");
+        assert_eq!(err, "WATT_LLM_URL must start with https:// or http://");
     }
 
     #[test]
     fn headers_are_split_by_line_and_semicolon_and_the_placeholder_is_resolved() {
         let s = settings_from_env(with_env(&[(
             ENV_HEADERS,
-            "x-opencode-session: {session_id}\nX-Title:  agent term ; X-Extra: a-{session_id}-b",
+            "x-opencode-session: {session_id}\nX-Title:  Watt Terminal ; X-Extra: a-{session_id}-b",
         )]))
         .unwrap()
         .unwrap();
@@ -912,7 +922,7 @@ mod tests {
             s.headers,
             vec![
                 ("x-opencode-session".to_string(), "{session_id}".to_string()),
-                ("X-Title".to_string(), "agent term".to_string()),
+                ("X-Title".to_string(), "Watt Terminal".to_string()),
                 ("X-Extra".to_string(), "a-{session_id}-b".to_string()),
             ]
         );
@@ -928,7 +938,7 @@ mod tests {
             "X-Good: 1\nthis line has the value secret-value-xyz but no colon",
         )]))
         .unwrap_err();
-        assert_eq!(err, "AGENT_TERM_LLM_HEADERS entry 2 is not `Name: value`");
+        assert_eq!(err, "WATT_LLM_HEADERS entry 2 is not `Name: value`");
         assert!(!err.contains("secret-value-xyz"));
 
         let bad_name = settings_from_env(with_env(&[(ENV_HEADERS, "bad name: v")])).unwrap_err();

@@ -71,7 +71,7 @@ export const SETTINGS_TABS: readonly TabDef[] = [
 
 /** The select value for "None" (default model) and "Blank provider" (add provider). Preset keys are never empty. */
 const BLANK_PRESET = '';
-const NO_KEY_TEXT = 'API keys are stored in the file named by AGENT_TERM_SECRETS_FILE.';
+const NO_KEY_TEXT = 'API keys are stored in the file named by WATT_SECRETS_FILE.';
 const KEYCHAIN_TEXT = 'API keys are stored in the macOS Keychain.';
 const LIMIT_ERROR = 'Enter a whole number of at least 1, or clear the field.';
 

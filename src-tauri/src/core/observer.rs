@@ -1499,7 +1499,7 @@ impl Core {
         ScreenLines { rows, truncated, no_history: false }
     }
 
-    // TODO: `exec zsh` and nested shells are undetected. They have no AGENTTERM_NONCE, so they emit no events:
+    // TODO: `exec zsh` and nested shells are undetected. They have no WATT_NONCE, so they emit no events:
     // this stays Live and the lifecycle stays Running until the session exits. Needs an "integration lost" status.
     /// The foreground program hint: only while the shell is Running (not Alt, not Raw) with a command open, and the
     /// command text is not blank. Derived from the open record each time, so it cannot go stale.

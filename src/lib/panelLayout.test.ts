@@ -3,6 +3,7 @@ import {
   DEFAULT_SIZES,
   DIVIDER_PX,
   PANEL_KEY,
+  PANEL_LEGACY_KEY,
   PANEL_MIN,
   STORED_SIZE_MAX,
   TERMINAL_MIN,
@@ -322,7 +323,7 @@ describe('loadPanelLayout and savePanelLayout', () => {
     savePanelLayout(defaultLayout(), storage);
     const written = JSON.parse(storage.data.get(PANEL_KEY) ?? 'null');
     expect(written).toEqual({ dock: 'bottom', sizes: { left: 380, right: 380, top: null, bottom: null }, open: true });
-    expect(PANEL_KEY).toBe('agent-term.panel');
+    expect(PANEL_KEY).toBe('watt.panel');
   });
 
   it('loads the default when nothing is saved', () => {
@@ -335,6 +336,22 @@ describe('loadPanelLayout and savePanelLayout', () => {
 
   it('loads the default when storage throws', () => {
     expect(loadPanelLayout(fakeStorage({ [PANEL_KEY]: '{"dock":"left"}' }, true))).toEqual(defaultLayout());
+  });
+
+  it('reads the layout from the old agent-term key when the new key is absent, and copies it', () => {
+    const old = { dock: 'left', sizes: { left: 300, right: 380, top: null, bottom: null }, open: false };
+    const storage = fakeStorage({ [PANEL_LEGACY_KEY]: JSON.stringify(old) });
+    expect(loadPanelLayout(storage)).toEqual(old);
+    expect(JSON.parse(storage.data.get(PANEL_KEY) ?? 'null')).toEqual(old);
+    expect(storage.data.get(PANEL_LEGACY_KEY)).toBe(JSON.stringify(old));
+  });
+
+  it('prefers the new key when both keys are set', () => {
+    const storage = fakeStorage({
+      [PANEL_KEY]: '{"dock":"top"}',
+      [PANEL_LEGACY_KEY]: '{"dock":"left"}',
+    });
+    expect(loadPanelLayout(storage).dock).toBe('top');
   });
 
   it('does nothing without storage, and does not throw when storage throws', () => {

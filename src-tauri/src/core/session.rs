@@ -49,7 +49,7 @@ pub struct SpawnConfig {
     /// Tests use this to keep the user's history file out of reach (zsh appends every command to HISTFILE).
     pub real_zdotdir: Option<PathBuf>,
     /// Dev only: a file to use as HISTFILE instead of the real one (the Tauri layer sets this from
-    /// AGENT_TERM_HISTFILE). None keeps the user's own history file.
+    /// WATT_HISTFILE). None keeps the user's own history file.
     pub histfile: Option<PathBuf>,
 }
 
@@ -175,16 +175,16 @@ impl Session {
         cmd.arg("-l");
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
-        cmd.env("AGENTTERM_NONCE", &nonce);
+        cmd.env("WATT_NONCE", &nonce);
         cmd.env("ZDOTDIR", &shim_dir);
         // The user's real ZDOTDIR. Empty means $HOME.
         let real = match &cfg.real_zdotdir {
             Some(dir) => dir.clone().into_os_string(),
             None => std::env::var_os("ZDOTDIR").unwrap_or_default(),
         };
-        cmd.env("AGENTTERM_REAL_ZDOTDIR", real);
+        cmd.env("WATT_REAL_ZDOTDIR", real);
         if let Some(histfile) = &cfg.histfile {
-            cmd.env("AGENTTERM_HISTFILE", histfile);
+            cmd.env("WATT_HISTFILE", histfile);
         }
         let child = pair.slave.spawn_command(cmd).map_err(to_io)?;
         // The parent must drop the slave, or EOF is never seen on the master.
@@ -481,10 +481,10 @@ impl Session {
         self.screen_snapshot().rows.iter().any(|row| row.trim() == text)
     }
 
-    /// The shell's last message for a failed handshake: the last row that starts with `agentterm:`, else the last non-blank row.
+    /// The shell's last message for a failed handshake: the last row that starts with `watt:`, else the last non-blank row.
     fn last_message(&self) -> String {
         let rows = self.screen_snapshot().rows;
-        let tagged = rows.iter().rev().find(|r| r.contains("agentterm:"));
+        let tagged = rows.iter().rev().find(|r| r.contains("watt:"));
         let any = rows.iter().rev().find(|r| !r.trim().is_empty());
         tagged.or(any).map(|r| r.trim().to_string()).unwrap_or_default()
     }

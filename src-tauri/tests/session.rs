@@ -12,10 +12,10 @@ use std::sync::{mpsc, Arc, Barrier, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use agent_term_lib::core::observer::{EventSink, InputState, IntegrationStatus, ObserverStatus, SessionEvent};
-use agent_term_lib::core::record::{Cwd, RecordStatus, Source};
-use agent_term_lib::core::session::{Session, SpawnConfig, SubmitError};
-use agent_term_lib::core::shim;
+use watt_terminal_lib::core::observer::{EventSink, InputState, IntegrationStatus, ObserverStatus, SessionEvent};
+use watt_terminal_lib::core::record::{Cwd, RecordStatus, Source};
+use watt_terminal_lib::core::session::{Session, SpawnConfig, SubmitError};
+use watt_terminal_lib::core::shim;
 
 use common::*;
 
@@ -417,8 +417,8 @@ fn histfile_repair_points_at_real_dir_when_etc_zshrc_sets_the_shim_path() {
         .env("PATH", std::env::var("PATH").expect("PATH"))
         .env("TERM", "xterm-256color")
         .env("ZDOTDIR", &shim_dir)
-        .env("AGENTTERM_REAL_ZDOTDIR", &real)
-        .env("AGENTTERM_NONCE", "00112233445566778899aabbccddeeff")
+        .env("WATT_REAL_ZDOTDIR", &real)
+        .env("WATT_NONCE", "00112233445566778899aabbccddeeff")
         .stdin(Stdio::null())
         .output()
         .expect("run zsh");
@@ -549,7 +549,7 @@ fn drop_while_in_flight(cycle: usize, stalled: bool) {
     assert!(!shim_dir.exists(), "cycle {cycle}: shim dir left behind");
 }
 
-/// AGENT_TERM_HISTFILE (dev only): the shell's HISTFILE is the requested path, and nothing reaches the real history.
+/// WATT_HISTFILE (dev only): the shell's HISTFILE is the requested path, and nothing reaches the real history.
 #[test]
 fn histfile_override_is_applied_and_real_history_untouched() {
     let _g = serial();
@@ -641,7 +641,7 @@ impl Drop for TempFile {
 fn overflow_desyncs_renderer_stays_exact_and_recovers_at_next_prompt() {
     let _g = serial();
     const TOTAL: usize = 100 * 1024 * 1024;
-    let path = std::env::temp_dir().join(format!("agent-term-test-{}-100mb.txt", std::process::id()));
+    let path = std::env::temp_dir().join(format!("watt-terminal-test-{}-100mb.txt", std::process::id()));
     let _cleanup = TempFile(path.clone());
     {
         let mut w = BufWriter::new(File::create(&path).expect("create"));

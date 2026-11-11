@@ -9,10 +9,10 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
-use agent_term_lib::core::foreground::ForegroundKind;
-use agent_term_lib::core::observer::{InjectRefusal, InputState};
-use agent_term_lib::core::record::{Record, RecordStatus, RecordSummary, Source};
-use agent_term_lib::core::session::{IntegrateOutcome, Session, SubmitError};
+use watt_terminal_lib::core::foreground::ForegroundKind;
+use watt_terminal_lib::core::observer::{InjectRefusal, InputState};
+use watt_terminal_lib::core::record::{Record, RecordStatus, RecordSummary, Source};
+use watt_terminal_lib::core::session::{IntegrateOutcome, Session, SubmitError};
 use common::*;
 
 const WAIT: Duration = Duration::from_secs(20);

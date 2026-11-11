@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use agent_term_lib::core::inject::{blob_lines, loader_line, new_token, END_MARKER};
-use agent_term_lib::core::scanner::{Event, Scanner};
+use watt_terminal_lib::core::inject::{blob_lines, loader_line, new_token, END_MARKER};
+use watt_terminal_lib::core::scanner::{Event, Scanner};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
 const PROMPT_WAIT: Duration = Duration::from_secs(10);
@@ -196,7 +196,7 @@ fn local_command(program: &str, args: &[&str], home: &Path) -> CommandBuilder {
     cmd.env("TERM", "xterm-256color");
     cmd.env("HISTFILE", home.join(".history"));
     cmd.env_remove("ZDOTDIR");
-    cmd.env_remove("AGENTTERM_NONCE");
+    cmd.env_remove("WATT_NONCE");
     cmd.env_remove("ENV");
     cmd.env_remove("BASH_ENV");
     cmd
@@ -291,7 +291,7 @@ fn check_flow(sh: &mut Shell, home: Option<&Path>) {
 
     let visible = String::from_utf8_lossy(&strip_osc(&sh.raw())).into_owned();
     assert!(!visible.contains(&sh.nonce), "the nonce is not printed outside OSC events");
-    assert!(!visible.contains("_agentterm_inject_nonce"), "the blob is not echoed to the screen");
+    assert!(!visible.contains("_watt_inject_nonce"), "the blob is not echoed to the screen");
 
     assert!(sh.echo_is_on(), "the tty echo is back on after the blob (stty -a)");
 }
@@ -341,7 +341,7 @@ fn zsh_second_integration_is_refused_without_a_second_hello() {
     }
     sh.send(&format!("{END_MARKER}\r"));
     assert!(
-        sh.wait_output(HELLO_WAIT, |b| String::from_utf8_lossy(b).contains("agentterm: already integrated")),
+        sh.wait_output(HELLO_WAIT, |b| String::from_utf8_lossy(b).contains("watt: already integrated")),
         "the second blob is refused; output: {}",
         sh.dump()
     );

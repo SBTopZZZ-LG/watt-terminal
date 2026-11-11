@@ -5,6 +5,7 @@
 // Dock geometry: left and right are side docks, the panel is a column beside the terminal and its size is a width.
 // Top and bottom are the vertical docks, the panel is a row above or below the terminal and its size is a height.
 
+import { readWithLegacyKey } from './zoom';
 import type { SizeStorage } from './zoom';
 
 export type Dock = 'left' | 'right' | 'top' | 'bottom';
@@ -30,7 +31,9 @@ export interface PanelLayout {
 }
 
 /** The localStorage key. */
-export const PANEL_KEY = 'agent-term.panel';
+export const PANEL_KEY = 'watt.panel';
+/** The key before the rename to Watt. Read only while PANEL_KEY is absent (see loadPanelLayout). */
+export const PANEL_LEGACY_KEY = 'agent-term.panel';
 
 /** The panel's minimum size on its axis. */
 export const PANEL_MIN = { side: 240, vertical: 140 } as const;
@@ -225,7 +228,7 @@ export function loadPanelLayout(storage: SizeStorage | null): PanelLayout {
     return defaultLayout();
   }
   try {
-    return parsePanelLayout(storage.getItem(PANEL_KEY));
+    return parsePanelLayout(readWithLegacyKey(storage, PANEL_KEY, PANEL_LEGACY_KEY));
   } catch {
     return defaultLayout();
   }

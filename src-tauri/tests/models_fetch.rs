@@ -6,11 +6,11 @@ use std::net::TcpListener;
 use std::sync::mpsc;
 use std::thread;
 
-use agent_term_lib::core::llm::http_client;
-use agent_term_lib::core::settings::models::{FetchedModel, ModelsError, fetch_models};
+use watt_terminal_lib::core::llm::http_client;
+use watt_terminal_lib::core::settings::models::{FetchedModel, ModelsError, fetch_models};
 
 const KEY: &str = "sk-or-test-DUMMY-fetch-key-0123456789";
-const USER_AGENT: &str = "agent-term-test/3.0";
+const USER_AGENT: &str = "watt-terminal-test/3.0";
 
 /// Starts a one-shot fake server that answers with `status` and `body`. Returns the models URL and a receiver for
 /// the raw request it got.

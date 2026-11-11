@@ -592,7 +592,7 @@ pub(crate) mod test_support {
     impl TempDir {
         pub fn new() -> Self {
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!("agent-term-test-{}-{n}", std::process::id()));
+            let path = std::env::temp_dir().join(format!("watt-terminal-test-{}-{n}", std::process::id()));
             let _ = fs::remove_dir_all(&path);
             Self(path)
         }

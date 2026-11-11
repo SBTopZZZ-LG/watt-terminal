@@ -3,10 +3,12 @@ import {
   clampFontSize,
   FONT_SIZE_DEFAULT,
   FONT_SIZE_KEY,
+  FONT_SIZE_LEGACY_KEY,
   FONT_SIZE_MAX,
   FONT_SIZE_MIN,
   loadFontSize,
   parseFontSize,
+  readWithLegacyKey,
   saveFontSize,
   stepFontSize,
 } from './zoom';
@@ -37,7 +39,8 @@ describe('zoom constants', () => {
     expect(FONT_SIZE_DEFAULT).toBe(13);
     expect(FONT_SIZE_MIN).toBe(8);
     expect(FONT_SIZE_MAX).toBe(32);
-    expect(FONT_SIZE_KEY).toBe('agent-term.fontSize');
+    expect(FONT_SIZE_KEY).toBe('watt.fontSize');
+    expect(FONT_SIZE_LEGACY_KEY).toBe('agent-term.fontSize');
   });
 });
 
@@ -128,6 +131,41 @@ describe('loadFontSize', () => {
 
   it('gives the default when storage throws', () => {
     expect(loadFontSize(fakeStorage({ [FONT_SIZE_KEY]: '20' }, true))).toBe(13);
+  });
+
+  it('reads the size from the old agent-term key when the new key is absent, and copies it', () => {
+    const storage = fakeStorage({ [FONT_SIZE_LEGACY_KEY]: '19' });
+    expect(loadFontSize(storage)).toBe(19);
+    expect(storage.data.get(FONT_SIZE_KEY)).toBe('19');
+    expect(storage.data.get(FONT_SIZE_LEGACY_KEY)).toBe('19');
+  });
+
+  it('prefers the new key when both keys are set', () => {
+    const storage = fakeStorage({ [FONT_SIZE_KEY]: '18', [FONT_SIZE_LEGACY_KEY]: '24' });
+    expect(loadFontSize(storage)).toBe(18);
+    expect(storage.data.get(FONT_SIZE_KEY)).toBe('18');
+  });
+
+  it('still reads the old value when copying it fails', () => {
+    const storage: SizeStorage = {
+      getItem: (key) => (key === FONT_SIZE_LEGACY_KEY ? '22' : null),
+      setItem: () => {
+        throw new Error('quota');
+      },
+    };
+    expect(loadFontSize(storage)).toBe(22);
+  });
+});
+
+describe('readWithLegacyKey', () => {
+  it('returns the new key value without touching the legacy key', () => {
+    const storage = fakeStorage({ new: 'a', old: 'b' });
+    expect(readWithLegacyKey(storage, 'new', 'old')).toBe('a');
+    expect(storage.data.get('old')).toBe('b');
+  });
+
+  it('returns null when neither key is set', () => {
+    expect(readWithLegacyKey(fakeStorage(), 'new', 'old')).toBeNull();
   });
 });
 

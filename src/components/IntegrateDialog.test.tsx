@@ -62,9 +62,9 @@ describe('IntegrateDialog: the result', () => {
   });
 
   it('a failure is shown as fail, with the reason in plain text', () => {
-    const html = dialog({ kind: 'result', outcome: { outcome: 'failed', hint: 'agentterm: Unsupported shell (promptvars off)' } });
+    const html = dialog({ kind: 'result', outcome: { outcome: 'failed', hint: 'watt: Unsupported shell (promptvars off)' } });
     expect(html).toContain('integrate-result is-fail');
-    expect(html).toContain('Integration did not complete: agentterm: Unsupported shell (promptvars off).');
+    expect(html).toContain('Integration did not complete: watt: Unsupported shell (promptvars off).');
   });
 
   it('a refusal says why, with the same Close button', () => {

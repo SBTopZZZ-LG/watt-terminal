@@ -21,14 +21,14 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use agent_term_lib::core::agent::{AgentCtx, AgentEvent, ApprovalGate, DENIED, TurnRules};
-use agent_term_lib::core::approval::RegexPolicy;
-use agent_term_lib::core::foreground::ForegroundKind;
-use agent_term_lib::core::observer::{InputState, LevelKind};
-use agent_term_lib::core::record::{Record, RecordStatus, RecordSummary, Source};
-use agent_term_lib::core::session::{IntegrateOutcome, Session, SubmitError};
-use agent_term_lib::core::settings::{ApprovalMode, ApprovalSettings};
-use agent_term_lib::core::tools::{AgentTools, SessionTools};
+use watt_terminal_lib::core::agent::{AgentCtx, AgentEvent, ApprovalGate, DENIED, TurnRules};
+use watt_terminal_lib::core::approval::RegexPolicy;
+use watt_terminal_lib::core::foreground::ForegroundKind;
+use watt_terminal_lib::core::observer::{InputState, LevelKind};
+use watt_terminal_lib::core::record::{Record, RecordStatus, RecordSummary, Source};
+use watt_terminal_lib::core::session::{IntegrateOutcome, Session, SubmitError};
+use watt_terminal_lib::core::settings::{ApprovalMode, ApprovalSettings};
+use watt_terminal_lib::core::tools::{AgentTools, SessionTools};
 use common::*;
 use serde_json::{json, Value};
 

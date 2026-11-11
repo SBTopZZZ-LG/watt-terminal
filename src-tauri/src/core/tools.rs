@@ -1468,9 +1468,9 @@ mod tests {
         assert!(unsupported.contains("not supported") && unsupported.contains("stay read-only"), "{unsupported}");
         let timeout = integration_result(&IntegrateOutcome::Timeout).unwrap_err();
         assert!(timeout.contains("timed out") && timeout.contains("at its prompt"), "{timeout}");
-        let failed = integration_result(&IntegrateOutcome::Failed { hint: "agentterm: Unsupported shell (promptvars off)".into() })
+        let failed = integration_result(&IntegrateOutcome::Failed { hint: "watt: Unsupported shell (promptvars off)".into() })
             .unwrap_err();
-        assert!(failed.starts_with("integration did not complete: agentterm: Unsupported shell (promptvars off)."), "{failed}");
+        assert!(failed.starts_with("integration did not complete: watt: Unsupported shell (promptvars off)."), "{failed}");
         let refused = integration_result(&IntegrateOutcome::Refused { reason: InjectRefusal::Busy }).unwrap_err();
         assert!(refused.starts_with("cannot integrate the shell now: another shell integration"), "{refused}");
     }

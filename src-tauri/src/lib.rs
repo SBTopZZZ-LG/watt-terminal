@@ -21,6 +21,7 @@ use tauri_plugin_window_state::StateFlags;
 pub mod core;
 
 use crate::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate, AutoState, MockAgent, OnDrop, TurnRules};
+use crate::core::env::env_setting;
 use crate::core::approval::{self, ApprovalPolicy, ManualPolicy};
 use crate::core::chat::agent_loop::{self, Conversation, LlmAgent, LlmSettings, USER_AGENT};
 use crate::core::chat::history::History;
@@ -161,28 +162,29 @@ impl PersistState {
     }
 }
 
-/// The AI settings and the UI state live here. AGENT_TERM_CONFIG_DIR wins when it is set and not empty; otherwise the
-/// Tauri app config folder is used. Nothing is created here.
+/// The AI settings and the UI state live here. WATT_CONFIG_DIR (or the old AGENT_TERM_CONFIG_DIR) wins when it is set and
+/// not empty; otherwise the Tauri app config folder is used. Nothing is created here.
 fn resolve_config_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
-    dir_override("AGENT_TERM_CONFIG_DIR").or_else(|| app.path().app_config_dir().ok())
+    dir_override("WATT_CONFIG_DIR", "AGENT_TERM_CONFIG_DIR").or_else(|| app.path().app_config_dir().ok())
 }
 
-/// Resolves the config and data folders. AGENT_TERM_CONFIG_DIR and AGENT_TERM_DATA_DIR win when they are set and not
-/// empty; otherwise the Tauri app folders are used. Nothing is created here: the stores create their folders on write.
+/// Resolves the config and data folders. WATT_CONFIG_DIR and WATT_DATA_DIR (or the old AGENT_TERM_* names) win when
+/// they are set and not empty; otherwise the Tauri app folders are used. Nothing is created here: the stores create
+/// their folders on write.
 fn resolve_persist(app: &tauri::AppHandle) -> Option<Persist> {
     let config = resolve_config_dir(app);
-    let data = dir_override("AGENT_TERM_DATA_DIR").or_else(|| app.path().app_data_dir().ok());
+    let data = dir_override("WATT_DATA_DIR", "AGENT_TERM_DATA_DIR").or_else(|| app.path().app_data_dir().ok());
     match (config, data) {
         (Some(config), Some(data)) => Some(Persist::new(&config, &data)),
         _ => {
-            eprintln!("agent-term: the app folders could not be resolved; conversations and UI state are not saved");
+            eprintln!("watt: the app folders could not be resolved; conversations and UI state are not saved");
             None
         }
     }
 }
 
-fn dir_override(name: &str) -> Option<PathBuf> {
-    std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from)
+fn dir_override(name: &str, legacy: &str) -> Option<PathBuf> {
+    env_setting(name, legacy).map(PathBuf::from)
 }
 
 /// The AI provider settings. `None` when the app folders could not be resolved: the settings commands then return an
@@ -235,7 +237,7 @@ fn save_conversation(store: &Persist, session: &Session, state: &SavedState, red
     let home = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
     let env = TurnEnv { local_host: local_host(), home: home.as_deref() };
     if let Err(e) = save_turn(store, turn, redactor, env, now_secs()) {
-        eprintln!("agent-term: the conversation was not saved ({e})");
+        eprintln!("watt: the conversation was not saved ({e})");
     }
 }
 
@@ -258,10 +260,10 @@ async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T, String> + 
     tauri::async_runtime::spawn_blocking(work).await.map_err(|e| e.to_string())?
 }
 
-/// Dev only. AGENT_TERM_HISTFILE, when non-empty, is the HISTFILE the shell uses instead of the real
-/// ~/.zsh_history, so manual runs never write there. Unset (the default) keeps the user's own history.
+/// Dev only. WATT_HISTFILE (or the old AGENT_TERM_HISTFILE), when non-empty, is the HISTFILE the shell uses instead of
+/// the real ~/.zsh_history, so manual runs never write there. Unset (the default) keeps the user's own history.
 fn dev_histfile() -> Option<PathBuf> {
-    std::env::var_os("AGENT_TERM_HISTFILE").filter(|v| !v.is_empty()).map(PathBuf::from)
+    dir_override("WATT_HISTFILE", "AGENT_TERM_HISTFILE")
 }
 
 #[derive(Serialize)]
@@ -515,7 +517,7 @@ async fn new_conversation(
     if let Some(store) = persist.0.clone() {
         let forgot = blocking(move || store.forget_last().map_err(|e| e.to_string())).await;
         if let Err(e) = forgot {
-            eprintln!("agent-term: the last conversation was not forgotten ({e})");
+            eprintln!("watt: the last conversation was not forgotten ({e})");
         }
     }
     Ok(())
@@ -720,7 +722,7 @@ async fn load_conversation(
         store.ui.patch(patch).map(|_| ()).map_err(|e| e.to_string())
     });
     if let Err(e) = remember.await {
-        eprintln!("agent-term: the last conversation was not remembered ({e})");
+        eprintln!("watt: the last conversation was not remembered ({e})");
     }
     Ok(LoadedConversation { id, title, messages, todos })
 }
@@ -777,7 +779,7 @@ async fn delete_conversation(
             store.forget_if_last(&id).map(|_| ())
         };
         if let Err(e) = remembered {
-            eprintln!("agent-term: the last conversation was not forgotten ({e})");
+            eprintln!("watt: the last conversation was not forgotten ({e})");
         }
         Ok(DeleteResult { deleted_live })
     })
@@ -807,7 +809,7 @@ async fn delete_all_conversations(
     blocking(move || {
         let deleted_live = delete_saved(&sessions, &store, None)?;
         if let Err(e) = store.forget_last() {
-            eprintln!("agent-term: the last conversation was not forgotten ({e})");
+            eprintln!("watt: the last conversation was not forgotten ({e})");
         }
         Ok(DeleteResult { deleted_live })
     })

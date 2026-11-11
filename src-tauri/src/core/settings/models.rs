@@ -504,7 +504,7 @@ mod tests {
     async fn a_stalled_body_hits_the_total_timeout() {
         let url = stalling_server();
         let client = llm::http_client().unwrap();
-        let err = fetch_within(&client, &url, "test-key", &[], "agent-term-test/0", Duration::from_millis(300))
+        let err = fetch_within(&client, &url, "test-key", &[], "watt-terminal-test/0", Duration::from_millis(300))
             .await
             .unwrap_err();
         assert_eq!(err, ModelsError::Transport("the request timed out".to_string()));
@@ -537,7 +537,7 @@ mod tests {
         let url = one_shot("403 Forbidden", body);
         let client = llm::http_client().unwrap();
         let headers = [("X-Key".to_string(), HEADER.to_string())];
-        let err = fetch_within(&client, &url, KEY, &headers, "agent-term-test/0", FETCH_TIMEOUT).await.unwrap_err();
+        let err = fetch_within(&client, &url, KEY, &headers, "watt-terminal-test/0", FETCH_TIMEOUT).await.unwrap_err();
         let text = err.to_string();
         assert!(matches!(err, ModelsError::Http { status: 403, .. }), "{err:?}");
         assert!(!text.contains(KEY) && !text.contains(HEADER), "{text}");

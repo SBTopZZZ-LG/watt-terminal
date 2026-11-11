@@ -5,12 +5,35 @@ export const FONT_SIZE_DEFAULT = 13;
 export const FONT_SIZE_MIN = 8;
 export const FONT_SIZE_MAX = 32;
 export const FONT_SIZE_STEP = 1;
-export const FONT_SIZE_KEY = 'agent-term.fontSize';
+export const FONT_SIZE_KEY = 'watt.fontSize';
+/** The key before the rename to Watt. Read only while FONT_SIZE_KEY is absent (see readWithLegacyKey). */
+export const FONT_SIZE_LEGACY_KEY = 'agent-term.fontSize';
 
 /** The part of Storage the font size needs. */
 export interface SizeStorage {
   getItem(key: string): string | null;
   setItem(key: string, value: string): void;
+}
+
+/**
+ * Reads `key`. When it is absent and `legacyKey` holds a value, that value is copied under `key`, so later reads find it
+ * there, and it is returned. The old key is left in place. Null when neither is set. A getItem that throws propagates to
+ * the caller; a setItem that throws is ignored, and the legacy value is still returned.
+ */
+export function readWithLegacyKey(storage: SizeStorage, key: string, legacyKey: string): string | null {
+  const current = storage.getItem(key);
+  if (current !== null) {
+    return current;
+  }
+  const legacy = storage.getItem(legacyKey);
+  if (legacy !== null) {
+    try {
+      storage.setItem(key, legacy);
+    } catch {
+      // Not copied. The legacy value still applies, and the copy is tried again on the next read.
+    }
+  }
+  return legacy;
 }
 
 /** Keeps a size inside [FONT_SIZE_MIN, FONT_SIZE_MAX]. A value that is not a finite number gives the default. */
@@ -47,7 +70,7 @@ export function loadFontSize(storage: SizeStorage | null): number {
     return FONT_SIZE_DEFAULT;
   }
   try {
-    return parseFontSize(storage.getItem(FONT_SIZE_KEY)) ?? FONT_SIZE_DEFAULT;
+    return parseFontSize(readWithLegacyKey(storage, FONT_SIZE_KEY, FONT_SIZE_LEGACY_KEY)) ?? FONT_SIZE_DEFAULT;
   } catch {
     return FONT_SIZE_DEFAULT;
   }

@@ -1,4 +1,6 @@
-# agent-term
+# Watt Terminal
+
+Whatever Agentic Terminal Thing
 
 A terminal where you and an AI agent share one persistent shell session. You run commands in the terminal as usual; the agent can see the same session (commands, output, screen, cwd) and can run commands in it. Built with Tauri v2, Rust, React and TypeScript, with xterm.js for rendering.
 
@@ -23,24 +25,26 @@ npm install
 npm run tauri dev
 ```
 
-To keep manual runs away from your real `~/.zsh_history`, use the isolated-history variant. `AGENT_TERM_HISTFILE` is a dev-only setting. When it is set, the shell's `HISTFILE` is that path. When it is unset, which is the default, the shell uses your own history file.
+To keep manual runs away from your real `~/.zsh_history`, use the isolated-history variant. `WATT_HISTFILE` is a dev-only setting. When it is set, the shell's `HISTFILE` is that path. When it is unset, which is the default, the shell uses your own history file.
 
 ```sh
-AGENT_TERM_HISTFILE=/tmp/agent-term-hist npm run tauri dev
+WATT_HISTFILE=/tmp/watt-terminal-hist npm run tauri dev
 ```
 
-The shell leaves a blank row before each prompt that follows a command, and a thin separator line sits in that row. `AGENT_TERM_PROMPT_GAP=0` turns the blank row off, in which case the line sits on the prompt's top edge.
+The shell leaves a blank row before each prompt that follows a command, and a thin separator line sits in that row. `WATT_PROMPT_GAP=0` turns the blank row off, in which case the line sits on the prompt's top edge.
 
 To try a real model instead of the mock agent, set three variables. Keep the key out of your shell history: read it from your password manager (`NAME` is the name of your entry):
 
 ```sh
-AGENT_TERM_LLM_URL=https://openrouter.ai/api/v1/chat/completions \
-AGENT_TERM_LLM_MODEL=deepseek/deepseek-v4.1-flash \
-AGENT_TERM_LLM_KEY="$(gopass show -o NAME)" \
+WATT_LLM_URL=https://openrouter.ai/api/v1/chat/completions \
+WATT_LLM_MODEL=deepseek/deepseek-v4.1-flash \
+WATT_LLM_KEY="$(gopass show -o NAME)" \
 npm run tauri dev
 ```
 
-Optional: `AGENT_TERM_LLM_HEADERS` (`Name: value` lines, or separated by `;`; `{session_id}` is replaced by the conversation id, for example `x-opencode-session: {session_id}` for OpenCode Go), `AGENT_TERM_LLM_STREAM=0` (wait for each whole reply instead of streaming), and `AGENT_TERM_LLM_MAX_TOKENS` (a positive number). When URL, key or model is missing, the mock agent is used. A bad value is printed to the terminal at launch and the mock agent is used. These variables are for development only; they will move to a settings file.
+Optional: `WATT_LLM_HEADERS` (`Name: value` lines, or separated by `;`; `{session_id}` is replaced by the conversation id, for example `x-opencode-session: {session_id}` for OpenCode Go), `WATT_LLM_STREAM=0` (wait for each whole reply instead of streaming), and `WATT_LLM_MAX_TOKENS` (a positive number). When URL, key or model is missing, the mock agent is used. A bad value is printed to the terminal at launch and the mock agent is used. These variables are for development only; they will move to a settings file.
+
+The older `AGENT_TERM_*` names (for example `AGENT_TERM_LLM_URL`) still work when the matching `WATT_*` name is not set.
 
 ## Input
 

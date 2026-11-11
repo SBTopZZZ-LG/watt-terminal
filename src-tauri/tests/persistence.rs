@@ -12,18 +12,18 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use agent_term_lib::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate};
-use agent_term_lib::core::chat::agent_loop::{Conversation, LlmAgent, LlmSettings};
-use agent_term_lib::core::chat::redact::Redactor;
-use agent_term_lib::core::chat::todo::{self, Todo, TodoStatus};
-use agent_term_lib::core::llm::{TurnCancel, http_client};
-use agent_term_lib::core::persist::conversations::{ConversationMeta, SaveRequest};
-use agent_term_lib::core::persist::turn::{FinishedTurn, TurnEnv, resume, save_turn};
-use agent_term_lib::core::persist::workspace::Workspace;
-use agent_term_lib::core::keys::KeyPlan;
-use agent_term_lib::core::persist::{Persist, PersistError};
-use agent_term_lib::core::record::{Cwd, RecordSummary};
-use agent_term_lib::core::tools::{AgentTools, CommandView, RunOutcome, ScreenView, SendKeysOutcome, WaitView};
+use watt_terminal_lib::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate};
+use watt_terminal_lib::core::chat::agent_loop::{Conversation, LlmAgent, LlmSettings};
+use watt_terminal_lib::core::chat::redact::Redactor;
+use watt_terminal_lib::core::chat::todo::{self, Todo, TodoStatus};
+use watt_terminal_lib::core::llm::{TurnCancel, http_client};
+use watt_terminal_lib::core::persist::conversations::{ConversationMeta, SaveRequest};
+use watt_terminal_lib::core::persist::turn::{FinishedTurn, TurnEnv, resume, save_turn};
+use watt_terminal_lib::core::persist::workspace::Workspace;
+use watt_terminal_lib::core::keys::KeyPlan;
+use watt_terminal_lib::core::persist::{Persist, PersistError};
+use watt_terminal_lib::core::record::{Cwd, RecordSummary};
+use watt_terminal_lib::core::tools::{AgentTools, CommandView, RunOutcome, ScreenView, SendKeysOutcome, WaitView};
 use serde_json::{Value, json};
 
 const KEY: &str = "sk-or-test-SECRETVALUE-0123456789";
@@ -37,7 +37,7 @@ struct TempDir(PathBuf);
 impl TempDir {
     fn new() -> Self {
         let n = NEXT_DIR.fetch_add(1, Ordering::SeqCst);
-        let path = std::env::temp_dir().join(format!("agent-term-persist-it-{}-{n}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("watt-terminal-persist-it-{}-{n}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).expect("create temp dir");
         TempDir(path)

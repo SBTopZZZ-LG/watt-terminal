@@ -16,10 +16,10 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use agent_term_lib::core::observer::{InputState, ScreenSnapshot};
-use agent_term_lib::core::pty::OutputSink;
-use agent_term_lib::core::record::{Record, Source};
-use agent_term_lib::core::session::{Session, SpawnConfig};
+use watt_terminal_lib::core::observer::{InputState, ScreenSnapshot};
+use watt_terminal_lib::core::pty::OutputSink;
+use watt_terminal_lib::core::record::{Record, Source};
+use watt_terminal_lib::core::session::{Session, SpawnConfig};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -40,7 +40,7 @@ impl OutputSink for ChanSink {
 
 pub fn unique_name(tag: &str) -> PathBuf {
     let n = NEXT_ID.fetch_add(1, Ordering::SeqCst);
-    std::env::temp_dir().join(format!("agent-term-test-{}-{n}-{tag}", std::process::id()))
+    std::env::temp_dir().join(format!("watt-terminal-test-{}-{n}-{tag}", std::process::id()))
 }
 
 /// Temporary real ZDOTDIR: wrapper files that source the user's own $HOME files, then point HISTFILE at a temp file.
@@ -89,7 +89,7 @@ pub fn start_with_hook(hook: Option<Hook>) -> Harness {
     start_inner(hook, None)
 }
 
-/// Like `start`, but the shell's HISTFILE is set to `histfile` by the shim (the AGENT_TERM_HISTFILE path).
+/// Like `start`, but the shell's HISTFILE is set to `histfile` by the shim (the WATT_HISTFILE path).
 pub fn start_with_histfile(histfile: &Path) -> Harness {
     start_inner(None, Some(histfile.to_path_buf()))
 }

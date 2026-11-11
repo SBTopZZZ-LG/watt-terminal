@@ -1,7 +1,7 @@
-# AgentTerm shell integration for bash >= 4.4. Injected into a running shell (core/inject.rs), never sourced by the shim.
+# Watt shell integration for bash >= 4.4. Injected into a running shell (core/inject.rs), never sourced by the shim.
 # The loader evals this file inside a blob, so there is no top-level return: the install runs in _at_install.
 # Every OSC 133/633 event carries n=<nonce>, the same contract as integration.zsh. The nonce comes from the plain
-# variable _agentterm_inject_nonce, is never exported, and is never unset (PS0 and PROMPT read it on every prompt).
+# variable _watt_inject_nonce, is never exported, and is never unset (PS0 and PROMPT read it on every prompt).
 # Hooks: PS0 emits E and C before a command, PROMPT_COMMAND (first element) emits D, then Cwd, and PROMPT_COMMAND
 # (last element) puts A and B around PS1. No DEBUG trap.
 
@@ -80,19 +80,19 @@ _at_hello() {
 
 _at_install() {
   if [[ -n ${_at_installed-} ]]; then
-    echo 'agentterm: already integrated'
+    echo 'watt: already integrated'
     return 0
   fi
   if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )) || [[ :${SHELLOPTS-}: == *:posix:* ]]; then
-    echo "agentterm: Unsupported shell bash $BASH_VERSION (need >= 4.4)"
+    echo "watt: Unsupported shell bash $BASH_VERSION (need >= 4.4)"
     return 0
   fi
   if ! shopt -q promptvars; then
-    echo 'agentterm: Unsupported shell (promptvars off)'
+    echo 'watt: Unsupported shell (promptvars off)'
     return 0
   fi
   _at_installed=1
-  _at_nonce=${_agentterm_inject_nonce-}
+  _at_nonce=${_watt_inject_nonce-}
   printf -v _at_pA '\033]133;A;n=%s\033\\' "$_at_nonce"
   printf -v _at_pB '\033]133;B;n=%s\033\\' "$_at_nonce"
   printf -v _at_pP '\033]133;P;n=%s;k=s\033\\' "$_at_nonce"
