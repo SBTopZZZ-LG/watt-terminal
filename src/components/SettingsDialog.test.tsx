@@ -35,6 +35,7 @@ const SETTINGS: Settings = {
   providers: [ACME, LOCAL],
   default_model: { provider_id: 'acme', model_id: 'big/one' },
   global_context_limit: 8000,
+  approval: { mode: 'manual', allow: [], deny: [] },
 };
 
 function view(over: Partial<SettingsView> = {}): SettingsView {

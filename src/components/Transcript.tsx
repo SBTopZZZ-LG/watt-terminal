@@ -5,6 +5,7 @@ import { previewJson } from '../lib/format';
 import { isAtBottom, shouldFollowAfterSend } from '../lib/stickScroll';
 import { approvalTitle } from '../lib/transcript';
 import type { TranscriptItem } from '../lib/transcript';
+import { askedBecause, decisionLabel, decisionTooltip } from '../lib/approvalReasons';
 import { groupTranscript, toolGroupSummary } from '../lib/toolGroups';
 import type { GroupItem } from '../lib/toolGroups';
 import type { TodoItem } from '../lib/types';
@@ -38,6 +39,8 @@ interface Props {
   history?: ReactNode;
   /** A notice shown above the chat body (the settings banner). Shown with the chat view only, and it never moves the body's scroll. */
   banner?: ReactNode;
+  /** A notice pinned above the chat body, above `banner` (the approve-all warning). Same placement and rules as `banner`. */
+  warning?: ReactNode;
 }
 
 /** The agent conversation, docked above the input bar. Collapsible, scrollable, and capped by CSS. */
@@ -56,6 +59,7 @@ export function Transcript({
   onToggleHistory,
   history,
   banner = null,
+  warning = null,
 }: Props) {
   const bodyRef = useRef<HTMLDivElement>(null);
   const entries = useMemo(() => groupTranscript(items), [items]);
@@ -177,6 +181,7 @@ export function Transcript({
       </div>
       {open && view === 'history' && history}
       {/* Pinned: siblings above the body, so they never scroll away and the body's scroll and follow logic is untouched. */}
+      {bodyShown && warning}
       {bodyShown && banner}
       {bodyShown && <TodoPanel items={todos} />}
       {bodyShown && (
@@ -248,17 +253,27 @@ function Entry({ item, onApprove }: { item: TranscriptItem; onApprove: Props['on
         <details className={`tool tool-${status}`}>
           <summary>
             {item.name}
-            {item.decision !== null && <span className={`decision decision-${item.decision}`}> {item.decision}</span>}: {status}
+            {item.decision !== null && (
+              <span
+                className={`decision decision-${item.decision}`}
+                title={decisionTooltip(item.decision, item.reason) ?? undefined}
+              >
+                {` ${decisionLabel(item.decision, item.reason)}`}
+              </span>
+            )}
+            : {status}
           </summary>
           <pre>{previewJson({ args: item.args, result: item.result })}</pre>
         </details>
       );
     }
-    case 'approval':
+    case 'approval': {
+      const why = askedBecause(item.reason);
       return (
         <div className={`approval approval-${item.state}`}>
           <div className="approval-title">{approvalTitle(item.name)}</div>
           <code className="approval-text">{visibleEscapes(item.text)}</code>
+          {why !== null && <div className="approval-reason">{why}</div>}
           {item.state === 'pending' && (
             <div className="approval-actions">
               <button type="button" className="approve" onClick={() => onApprove(item.callId, true)}>
@@ -273,6 +288,7 @@ function Entry({ item, onApprove }: { item: TranscriptItem; onApprove: Props['on
           {item.state === 'resolved' && <div className="approval-note">Resolved</div>}
         </div>
       );
+    }
   }
 }
 

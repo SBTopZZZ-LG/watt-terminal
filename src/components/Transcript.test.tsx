@@ -135,3 +135,46 @@ describe('Transcript: todo panel', () => {
     expect(html).not.toContain('class="tool');
   });
 });
+
+describe('Transcript: approval reasons', () => {
+  const callAndResult = (decision: 'auto' | 'manual' | 'denied', reason?: 'rule' | 'gate_chars') => [
+    { type: 'agent_event' as const, event: { type: 'tool_call' as const, call_id: 'c1', name: 'run_command', args: {} } },
+    {
+      type: 'agent_event' as const,
+      event: { type: 'tool_result' as const, call_id: 'c1', name: 'run_command', ok: decision !== 'denied', decision, ...(reason ? { reason } : {}), result: {} },
+    },
+  ];
+
+  it('an automatic run shows its reason in the label, and why in the tooltip', () => {
+    const html = render(callAndResult('auto', 'rule'));
+    expect(html).toContain('auto · rule');
+    expect(html).toContain('title="Ran without asking: an allow rule matches this command."');
+  });
+
+  it('an approved call keeps the label "manual", and its tooltip says why it asked', () => {
+    const html = render(callAndResult('manual', 'gate_chars'));
+    expect(html).toContain('decision-manual');
+    expect(html).not.toContain('manual · ');
+    expect(html).toContain('title="Asked because the command has a character outside letters, digits, spaces and _-./:=@+, so your rules do not apply to it."');
+  });
+
+  it('a call with no reason has the bare label and no tooltip', () => {
+    const html = render(callAndResult('auto'));
+    expect(html).toContain('decision-auto');
+    expect(html).not.toContain('auto · ');
+    expect(html).not.toContain('title="Ran without');
+  });
+
+  it('the approval card says why it asks, in one muted line', () => {
+    const html = render([
+      { type: 'agent_event', event: { type: 'approval_request', call_id: 'c1', name: 'run_command', text: 'ls | wc', reason: 'gate_chars' } },
+    ]);
+    expect(html).toContain('<div class="approval-reason">Asked because the command has a character outside');
+  });
+
+  it('an approval card without a reason has no reason line', () => {
+    const html = render([{ type: 'agent_event', event: { type: 'approval_request', call_id: 'c1', name: 'send_keys', text: 'ls' } }]);
+    expect(html).toContain('class="approval approval-pending"');
+    expect(html).not.toContain('approval-reason');
+  });
+});

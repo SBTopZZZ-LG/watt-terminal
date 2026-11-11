@@ -1,7 +1,7 @@
 // The agent transcript: what the user said, what the agent said, its tool calls, and approval requests.
 // Pure reducer over AgentEvents (from Rust) and local actions (sent messages, clicks, errors).
 
-import type { AgentEvent, TodoItem, ToolDecision } from './types';
+import type { AgentEvent, ApprovalReasonCode, TodoItem, ToolDecision } from './types';
 import { visibleEscapes } from './visibleEscapes';
 import { TODO_TOOL } from './todoView';
 
@@ -12,8 +12,10 @@ export type TranscriptItem =
   | { id: number; kind: 'user'; clientId: number; text: string }
   /** `streaming` is true while text_delta events are still extending this message. */
   | { id: number; kind: 'agent'; text: string; streaming: boolean }
-  | { id: number; kind: 'tool'; callId: string; name: string; args: unknown; status: ToolStatus; result: unknown; decision: ToolDecision | null }
-  | { id: number; kind: 'approval'; callId: string; name: string; text: string; state: ApprovalState; approve: boolean | null }
+  /** `reason` is why the call asked or ran without asking. Null for read tools and calls refused before the policy. */
+  | { id: number; kind: 'tool'; callId: string; name: string; args: unknown; status: ToolStatus; result: unknown; decision: ToolDecision | null; reason: ApprovalReasonCode | null }
+  /** `reason` is why the card asks. */
+  | { id: number; kind: 'approval'; callId: string; name: string; text: string; state: ApprovalState; approve: boolean | null; reason: ApprovalReasonCode | null }
   | { id: number; kind: 'notice'; text: string };
 
 /** A transcript item before the reducer gives it an id. `Omit` over the union would lose the variants, so it is distributed. */
@@ -147,15 +149,17 @@ function applyAgentEvent(t: Transcript, ev: AgentEvent): Transcript {
         status: 'running',
         result: null,
         decision: null,
+        reason: null,
       }));
     case 'tool_result': {
       if (ev.name === TODO_TOOL) {
         return t;
       }
+      const reason = ev.reason ?? null;
       const hasTool = t.items.some((i) => i.kind === 'tool' && i.callId === ev.call_id);
       const items = t.items.map((i) => {
         if (i.kind === 'tool' && i.callId === ev.call_id) {
-          return { ...i, status: ev.ok ? ('ok' as const) : ('failed' as const), result: ev.result, decision: ev.decision };
+          return { ...i, status: ev.ok ? ('ok' as const) : ('failed' as const), result: ev.result, decision: ev.decision, reason };
         }
         if (i.kind === 'approval' && i.callId === ev.call_id) {
           return { ...i, state: 'resolved' as const };
@@ -175,6 +179,7 @@ function applyAgentEvent(t: Transcript, ev: AgentEvent): Transcript {
             status: ev.ok ? 'ok' : 'failed',
             result: ev.result,
             decision: ev.decision,
+            reason,
           }));
     }
     case 'approval_request':
@@ -186,6 +191,7 @@ function applyAgentEvent(t: Transcript, ev: AgentEvent): Transcript {
         text: ev.text,
         state: 'pending',
         approve: null,
+        reason: ev.reason ?? null,
       }));
     case 'done':
       // The turn is over: the streamed message (if any) is closed, and so is the thinking state.

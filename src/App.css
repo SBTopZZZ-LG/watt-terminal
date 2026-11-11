@@ -762,6 +762,12 @@ input {
   font-size: 11px;
 }
 
+/* An automatic or approved run is routine: muted, like the rest of the row. Denied and refused keep their colour. */
+.decision-auto,
+.decision-manual {
+  color: var(--muted);
+}
+
 .decision-denied,
 .decision-refused {
   color: var(--fail);
@@ -1419,6 +1425,14 @@ input {
   font-family: var(--mono);
   white-space: pre-wrap;
   word-break: break-all;
+}
+
+/* Why the card asks. One muted line, under the command. */
+.approval-reason {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
 }
 
 .approval-actions {
@@ -2152,8 +2166,9 @@ input {
   font-size: 12px;
 }
 
-.settings-dialog input:not([type="checkbox"]),
-.settings-dialog select {
+.settings-dialog input:not([type="checkbox"]):not([type="radio"]),
+.settings-dialog select,
+.settings-dialog textarea {
   min-width: 0;
   padding: 3px 6px;
   border: 1px solid var(--line);
@@ -2163,12 +2178,14 @@ input {
   font-size: 12px;
 }
 
-.settings-dialog input[type="checkbox"] {
+.settings-dialog input[type="checkbox"],
+.settings-dialog input[type="radio"] {
   accent-color: var(--accent);
 }
 
 .settings-dialog input:focus,
-.settings-dialog select:focus {
+.settings-dialog select:focus,
+.settings-dialog textarea:focus {
   outline: 1px solid var(--accent);
   outline-offset: -1px;
 }
@@ -2182,7 +2199,8 @@ input {
 }
 
 .settings-dialog input:disabled,
-.settings-dialog select:disabled {
+.settings-dialog select:disabled,
+.settings-dialog textarea:disabled {
   opacity: 0.55;
 }
 
@@ -2400,6 +2418,56 @@ input {
   margin-top: 10px;
   padding-top: 8px;
   border-top: 1px dashed var(--rule);
+}
+
+/* Approvals: the mode radios, the rule boxes (one rule per line), the built-in list and "Try a command". */
+.settings-modes {
+  min-width: 0;
+  margin: 6px 0 0;
+  padding: 0;
+  border: 0;
+}
+
+.settings-modes legend {
+  padding: 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.settings-dialog .settings-rules {
+  display: block;
+  width: 100%;
+  min-height: 3.2em;
+  resize: vertical;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.settings-builtin {
+  margin: 8px 0 0;
+}
+
+.settings-builtin summary {
+  color: var(--muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.settings-builtin-list {
+  margin: 4px 0;
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.settings-try {
+  margin-top: 12px;
+}
+
+.settings-try .settings-inline > input {
+  flex: 1 1 160px;
 }
 
 /* The model chip is a button, so it takes the same focus ring as the other chip buttons. */

@@ -51,6 +51,22 @@ export type SessionEvent =
  */
 export type ToolDecision = 'read' | 'manual' | 'auto' | 'denied' | 'refused';
 
+/**
+ * Why a call asked or ran without asking (core/approval). Wire codes, as sent in `reason`. "approve_all" and "rule" are
+ * the reasons a call ran without asking; the others say why it asked.
+ */
+export type ApprovalReasonCode =
+  | 'approve_all'
+  | 'rule'
+  | 'manual_mode'
+  | 'send_keys'
+  | 'gate_chars'
+  | 'gate_path'
+  | 'gate_denylist'
+  | 'deny_rule'
+  | 'no_rule'
+  | 'auto_cap';
+
 export type AgentEvent =
   | { type: 'text'; text: string }
   /** Streamed assistant text. `text` events still carry whole messages. */
@@ -58,8 +74,10 @@ export type AgentEvent =
   /** The model is working on a reply (true) or has produced its first output (false). */
   | { type: 'thinking'; active: boolean }
   | { type: 'tool_call'; call_id: string; name: string; args: unknown }
-  | { type: 'tool_result'; call_id: string; name: string; ok: boolean; decision: ToolDecision; result: unknown }
-  | { type: 'approval_request'; call_id: string; name: string; text: string }
+  /** `reason` is absent for read tools, `todo_write` and calls refused before the policy. */
+  | { type: 'tool_result'; call_id: string; name: string; ok: boolean; decision: ToolDecision; reason?: ApprovalReasonCode; result: unknown }
+  /** `reason` is why the call asks. */
+  | { type: 'approval_request'; call_id: string; name: string; text: string; reason?: ApprovalReasonCode }
   /** The agent is executing an approved shell call (true) and has finished it (false). */
   | { type: 'agent_control'; active: boolean }
   /** The conversation's todo list was replaced by a successful todo_write. `items` is the whole list. */
@@ -228,12 +246,31 @@ export interface ModelRef {
   model_id: string;
 }
 
+/** `manual`: every run_command waits for the user. `regex`: the hard gate, then the deny and allow rules, decide. */
+export type ApprovalMode = 'manual' | 'regex';
+
+/** How run_command is approved, as saved. Approve-all is session-only and is not here. */
+export interface ApprovalSettings {
+  mode: ApprovalMode;
+  /** One regular expression per entry. A command runs without asking when one matches the whole command. */
+  allow: string[];
+  /** Matched the same way. A deny match wins over an allow match. */
+  deny: string[];
+}
+
+/** What the saved approval settings would decide for one command, without running it (test_approval). */
+export interface ApprovalPreview {
+  verdict: 'auto' | 'ask';
+  reason: ApprovalReasonCode;
+}
+
 export interface Settings {
   version: number;
   providers: Provider[];
   default_model: ModelRef | null;
   /** Tokens. null means no cap. */
   global_context_limit: number | null;
+  approval: ApprovalSettings;
 }
 
 /** Which secrets a provider has stored. Never their values. */

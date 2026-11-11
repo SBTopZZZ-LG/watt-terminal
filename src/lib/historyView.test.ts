@@ -56,6 +56,7 @@ describe('itemsFromMessages', () => {
       status: 'ok',
       result: 'a.txt\nb.txt',
       decision: null,
+      reason: null,
     });
   });
 
@@ -82,7 +83,7 @@ describe('itemsFromMessages', () => {
       { role: 'assistant', content: null, tool_calls: [{ id: 'c9', type: 'function', function: { name: 'run_command', arguments: '{}' } }] },
     ]);
     expect(items).toEqual([
-      { kind: 'tool', callId: 'c9', name: 'run_command', args: {}, status: 'failed', result: NO_RESULT_TEXT, decision: null },
+      { kind: 'tool', callId: 'c9', name: 'run_command', args: {}, status: 'failed', result: NO_RESULT_TEXT, decision: null, reason: null },
     ]);
   });
 

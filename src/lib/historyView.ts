@@ -148,6 +148,7 @@ export function itemsFromMessages(messages: ChatMessage[]): NewItem[] {
           status,
           result: content ?? NO_RESULT_TEXT,
           decision: null,
+          reason: null,
         });
       }
     }

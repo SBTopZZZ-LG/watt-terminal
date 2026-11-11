@@ -281,6 +281,50 @@ describe('transcriptReducer: approvals and decisions', () => {
   });
 });
 
+describe('transcriptReducer: approval reasons', () => {
+  it('an approval request carries its reason, and null without one', () => {
+    const t = run([
+      { type: 'agent_event', event: { type: 'approval_request', call_id: 'a1', name: 'run_command', text: 'ls | wc', reason: 'gate_chars' } },
+      { type: 'agent_event', event: { type: 'approval_request', call_id: 'a2', name: 'send_keys', text: 'ls' } },
+    ]);
+    expect(t.items[0]).toMatchObject({ kind: 'approval', reason: 'gate_chars' });
+    expect(t.items[1]).toMatchObject({ kind: 'approval', reason: null });
+  });
+
+  it('the reason stays on the card after it is resolved', () => {
+    const t = run([
+      { type: 'agent_event', event: { type: 'approval_request', call_id: 'a1', name: 'run_command', text: 'ls', reason: 'no_rule' } },
+      { type: 'agent_event', event: { type: 'tool_result', call_id: 'a1', name: 'run_command', ok: true, decision: 'manual', reason: 'no_rule', result: {} } },
+    ]);
+    expect(t.items[0]).toMatchObject({ kind: 'approval', state: 'resolved', reason: 'no_rule' });
+  });
+
+  it('a tool result carries its reason onto the tool item, and a call has none until then', () => {
+    const before = run([toolCall('c1')]);
+    expect(before.items[0]).toMatchObject({ kind: 'tool', reason: null });
+    const after = run([
+      toolCall('c1'),
+      { type: 'agent_event', event: { type: 'tool_result', call_id: 'c1', name: 'run_command', ok: true, decision: 'auto', reason: 'rule', result: {} } },
+    ]);
+    expect(after.items[0]).toMatchObject({ kind: 'tool', decision: 'auto', reason: 'rule' });
+  });
+
+  it('a result without a reason (a read tool) leaves it null', () => {
+    const t = run([
+      toolCall('c1'),
+      { type: 'agent_event', event: { type: 'tool_result', call_id: 'c1', name: 'get_cwd', ok: true, decision: 'read', result: {} } },
+    ]);
+    expect(t.items[0]).toMatchObject({ kind: 'tool', reason: null });
+  });
+
+  it('an orphan result keeps its reason', () => {
+    const t = run([
+      { type: 'agent_event', event: { type: 'tool_result', call_id: 'o', name: 'run_command', ok: false, decision: 'denied', reason: 'deny_rule', result: {} } },
+    ]);
+    expect(t.items[0]).toMatchObject({ kind: 'tool', reason: 'deny_rule' });
+  });
+});
+
 describe('transcriptReducer: conversation_reset', () => {
   it('empties the items and the thinking flag, and keeps ids increasing', () => {
     const before = run([

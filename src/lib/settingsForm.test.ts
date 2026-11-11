@@ -476,6 +476,7 @@ describe('modelOptions and modelRefKey', () => {
     ],
     default_model: null,
     global_context_limit: null,
+    approval: { mode: 'manual', allow: [], deny: [] },
   };
 
   it('lists every model of every provider in order, labelled "Provider · model"', () => {

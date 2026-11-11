@@ -28,6 +28,7 @@ import { AgentPanel, Workspace } from './components/AgentPanel';
 import { HistoryView } from './components/HistoryView';
 import { SettingsDialog } from './components/SettingsDialog';
 import { SettingsBanner } from './components/SettingsBanner';
+import { AutoApproveNotice } from './components/AutoApproveNotice';
 
 const CTRL_C = '\u0003';
 
@@ -667,6 +668,7 @@ export default function App() {
               onToggle={() => dispatchPanel({ type: 'toggle' })}
               onApprove={answer}
               onNewConversation={newConversation}
+              warning={autoApprove ? <AutoApproveNotice onTurnOff={toggleAutoApprove} /> : null}
               banner={
                 settingsState !== null && recoveryKind(settingsState) !== 'ok' && !settingsBannerHidden ? (
                   <SettingsBanner

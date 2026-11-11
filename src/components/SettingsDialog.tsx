@@ -1,6 +1,8 @@
 import { useEffect, useId, useRef, useState } from 'react';
 import type { KeyboardEvent, ReactNode } from 'react';
 import { api, errorText } from '../lib/api';
+import { approvalInput, draftFromApproval, isApprovalDirty } from '../lib/approvalForm';
+import type { ApprovalDraft } from '../lib/approvalForm';
 import {
   buildSaveInput,
   chatHost,
@@ -17,6 +19,7 @@ import {
 import type { ProviderDraft } from '../lib/settingsForm';
 import { RECOVERY_BUSY_LABEL, REVERT_CONFIRM, reasonText, recoveryExplanation, recoveryKind } from '../lib/settingsRecovery';
 import type { ProviderPreset, RecoverAction, SettingsStateView, SettingsView } from '../lib/types';
+import { ApprovalSection } from './ApprovalSection';
 import { ProviderEditor } from './ProviderEditor';
 import type { TestState } from './ProviderEditor';
 
@@ -399,9 +402,17 @@ export function SettingsDialog({ onClose, onChanged, onViewLoaded }: SettingsDia
   const [editor, setEditor] = useState<EditorState | null>(null);
   const [askClose, setAskClose] = useState(false);
   const [recovery, setRecovery] = useState<RecoveryState>(NO_RECOVERY);
+  // The Approvals section's edit, or null when it shows the saved settings. Its baseline is the view's approval settings.
+  const [approvalDraft, setApprovalDraft] = useState<ApprovalDraft | null>(null);
+  const [approvalSaving, setApprovalSaving] = useState(false);
+  const [approvalError, setApprovalError] = useState<string | null>(null);
+  // undefined while the built-in list loads; null when it could not be read.
+  const [builtinDeny, setBuiltinDeny] = useState<string[] | null | undefined>(undefined);
 
   const view = load.kind === 'ready' ? load.view : null;
   const dirty = editor !== null && isDirty(editor.draft, editor.saved);
+  const approvalDirty = view !== null && approvalDraft !== null && isApprovalDirty(approvalDraft, view.settings.approval);
+  const approvalShown = view === null ? null : (approvalDraft ?? draftFromApproval(view.settings.approval));
 
   // Load the settings each time the dialog opens or Retry is pressed. The presets are static, so a failure only hides them.
   useEffect(() => {
@@ -434,6 +445,26 @@ export function SettingsDialog({ onClose, onChanged, onViewLoaded }: SettingsDia
         }
       },
       () => undefined,
+    );
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  // The built-in deny list is fixed in the backend, so it is read once. A failure shows as "not available" in the section.
+  useEffect(() => {
+    let live = true;
+    api.approvalBuiltinDeny().then(
+      (list) => {
+        if (live) {
+          setBuiltinDeny(list);
+        }
+      },
+      () => {
+        if (live) {
+          setBuiltinDeny(null);
+        }
+      },
     );
     return () => {
       live = false;
@@ -475,18 +506,26 @@ export function SettingsDialog({ onClose, onChanged, onViewLoaded }: SettingsDia
 
   // A save in flight: closing now would offer to discard a change that is being saved, and would drop its result. Esc, the
   // backdrop and Close are ignored until it settles.
-  const saving = editor?.saving === true;
+  const saving = editor?.saving === true || approvalSaving;
 
   const requestClose = () => {
     if (saving) {
       return;
     }
-    if (dirty) {
+    if (dirty || approvalDirty) {
       setAskClose(true);
       return;
     }
     onClose();
   };
+
+  // The question the close guard asks, naming what is unsaved.
+  const discardQuestion =
+    dirty && approvalDirty
+      ? 'Discard unsaved changes?'
+      : dirty
+        ? 'Discard unsaved provider changes?'
+        : 'Discard unsaved approval changes?';
 
   const discardAndClose = () => {
     setEditor(null);
@@ -745,6 +784,8 @@ export function SettingsDialog({ onClose, onChanged, onViewLoaded }: SettingsDia
         setAskClose(false);
         setDefaults({ busy: false, error: null });
         setLimit({ text: limitText(v), error: null, busy: false });
+        setApprovalDraft(null);
+        setApprovalError(null);
         setRecovery(NO_RECOVERY);
         onChanged();
       },
@@ -752,7 +793,30 @@ export function SettingsDialog({ onClose, onChanged, onViewLoaded }: SettingsDia
     );
   };
 
+  /** Saves the Approvals draft. The backend checks the rules; a refused save shows its message and keeps the draft. */
+  const saveApproval = () => {
+    if (view === null || approvalDraft === null || approvalSaving) {
+      return;
+    }
+    setApprovalSaving(true);
+    setApprovalError(null);
+    api.setApprovalSettings(approvalInput(approvalDraft)).then(
+      (v) => {
+        applyView(v);
+        setApprovalDraft(null);
+        setApprovalSaving(false);
+        onChanged();
+      },
+      (e: unknown) => {
+        setApprovalSaving(false);
+        setApprovalError(errorText(e));
+      },
+    );
+  };
+
   const locked = view !== null && view.load_error !== null;
+  // The Approvals section is read-only while settings.json is not in use (broken, last good, or a load error).
+  const approvalLocked = locked || (view !== null && recoveryKind(view.settings_state) !== 'ok');
   const takenIds = view === null ? [] : view.settings.providers.filter((p) => p.id !== editor?.forId).map((p) => p.id);
 
   let editorSlot: { forId: string | null; node: ReactNode } | null = null;
@@ -848,11 +912,30 @@ export function SettingsDialog({ onClose, onChanged, onViewLoaded }: SettingsDia
             onOpenProvider={openProvider}
             onAddProvider={addProvider}
           />
+          {view !== null && approvalShown !== null && (
+            <ApprovalSection
+              draft={approvalShown}
+              dirty={approvalDirty}
+              locked={approvalLocked}
+              saving={approvalSaving}
+              saveError={approvalError}
+              builtinDeny={builtinDeny}
+              onChange={(draft) => {
+                setApprovalDraft(draft);
+                setApprovalError(null);
+              }}
+              onSave={saveApproval}
+              onUndo={() => {
+                setApprovalDraft(null);
+                setApprovalError(null);
+              }}
+            />
+          )}
         </div>
         <footer className="settings-foot">
           {askClose ? (
             <>
-              <span className="settings-warn">Discard unsaved provider changes?</span>
+              <span className="settings-warn">{discardQuestion}</span>
               <button type="button" className="settings-danger" onClick={discardAndClose}>
                 Discard and close
               </button>

@@ -3,6 +3,8 @@
 
 import { Channel, invoke } from '@tauri-apps/api/core';
 import type {
+  ApprovalPreview,
+  ApprovalSettings,
   ConversationMeta,
   DeleteResult,
   FetchOutcome,
@@ -128,6 +130,18 @@ export const api = {
   },
   providerPresets() {
     return invoke<ProviderPreset[]>('provider_presets');
+  },
+  /** Saves the approval mode and rules. Refused while settings.json is broken. A bad rule fails with its number named. */
+  setApprovalSettings(input: ApprovalSettings) {
+    return invoke<SettingsView>('set_approval_settings', { input });
+  },
+  /** What the saved approval settings would decide for a command, without running it. Approve-all is not part of it. */
+  testApproval(command: string) {
+    return invoke<ApprovalPreview>('test_approval', { command });
+  },
+  /** The built-in deny list: first words that always ask, whatever the rules say. */
+  approvalBuiltinDeny() {
+    return invoke<string[]>('approval_builtin_deny');
   },
   /** Fetches the provider's model list (one request to the provider) and merges it into the saved models. */
   fetchModels(providerId: string) {
