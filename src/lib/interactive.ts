@@ -5,6 +5,9 @@
 // run_command result with its `record`). Pure: the transcript view builds the groups from the items, and the reducer asks
 // which ones are open.
 //
+// A shell level pushed above the group's command ends the group as integrated (the reducer appends a `record_end` marked
+// `integrated`, see transcript.ts). The group records the depth it opened at, so a push above that depth ends it.
+//
 // Nesting: a group opened while another is open is nested in it, and the items go to the latest one still open.
 
 import { capDisplay } from './keysDisplay';
@@ -25,6 +28,15 @@ interface EndedBy {
 /** A group's contents: an item, or a nested group. */
 export type FrameNode = { kind: 'item'; item: TranscriptItem } | { kind: 'frame'; frame: Frame };
 
+/**
+ * How a group ended. `exit` is the command's exit code, or null when it is not known. `integrated`: a shell level was pushed
+ * above the command, so the group closed while the command may still run.
+ */
+export interface GroupEnd {
+  exit: number | null;
+  integrated?: boolean;
+}
+
 export interface Frame {
   /** The id of the opening tool row. Stable, so it can be a React key. */
   id: number;
@@ -34,8 +46,10 @@ export interface Frame {
   command: string;
   /** When the call that opened the group started (Unix ms), or null when unknown. */
   startedAt: number | null;
+  /** The shell depth (the levels count, the local one included) when the opening result arrived. Null when unknown. */
+  levelDepth: number | null;
   /** Null while the command runs. */
-  ended: { exit: number | null } | null;
+  ended: GroupEnd | null;
   children: FrameNode[];
 }
 
@@ -88,7 +102,7 @@ export function buildFrames(items: TranscriptItem[]): { children: FrameNode[]; o
     }
   });
 
-  const root: Frame = { id: -1, callId: '', recordId: -1, command: '', startedAt: null, ended: null, children: [] };
+  const root: Frame = { id: -1, callId: '', recordId: -1, command: '', startedAt: null, levelDepth: null, ended: null, children: [] };
   const stack: Frame[] = [root];
   const opened = new Set<number>();
 
@@ -103,6 +117,7 @@ export function buildFrames(items: TranscriptItem[]): { children: FrameNode[]; o
         recordId: opener.recordId,
         command: opener.command,
         startedAt: item.kind === 'tool' ? item.startedAt ?? null : null,
+        levelDepth: item.kind === 'tool' ? item.levelDepth ?? null : null,
         ended: null,
         children: [],
       };
@@ -131,7 +146,7 @@ export function buildFrames(items: TranscriptItem[]): { children: FrameNode[]; o
         if (item.kind === 'tool') {
           frame.children.push({ kind: 'item', item });
         }
-        frame.ended = { exit: end.exit };
+        frame.ended = item.kind === 'record_end' && item.integrated === true ? { exit: end.exit, integrated: true } : { exit: end.exit };
         stack.splice(found, 1);
         return;
       }
@@ -140,6 +155,14 @@ export function buildFrames(items: TranscriptItem[]): { children: FrameNode[]; o
   });
 
   return { children: root.children, open: stack.slice(1) };
+}
+
+/**
+ * The open groups a level pushed to `depth` ends: those whose command was opened at a shallower depth. Outermost first. A group
+ * with no known depth is left open. Used by the reducer when the shell levels change (see transcript.ts).
+ */
+export function openFramesBelow(items: TranscriptItem[], depth: number): Frame[] {
+  return buildFrames(items).open.filter((f) => f.levelDepth !== null && f.levelDepth < depth);
 }
 
 /** The index of the last frame in the stack for `recordId`, or -1. (Array.prototype.findLastIndex is not in this build's lib.) */
@@ -173,12 +196,16 @@ export function formatElapsed(ms: number): string {
 
 /**
  * The header of a group: "Interactive · <command> · running 3m 05s", then "finished · exit N", or "ended" when the exit code is
- * not known. The command is escaped and capped; a newline in it shows as \n so the header stays one line.
+ * not known, or "integrated" when a shell level was pushed above the command. The command is escaped and capped; a newline in
+ * it shows as \n so the header stays one line.
  */
-export function interactiveHeader(group: { command: string; startedAt: number | null; ended: { exit: number | null } | null }, now: number): string {
+export function interactiveHeader(group: { command: string; startedAt: number | null; ended: GroupEnd | null }, now: number): string {
   const command = capDisplay(group.command, HEADER_COMMAND_CHARS).replace(/\n/g, '\\n');
   const prefix = command === '' ? 'Interactive' : `Interactive · ${command}`;
   if (group.ended !== null) {
+    if (group.ended.integrated === true) {
+      return `${prefix} · integrated`;
+    }
     return group.ended.exit === null ? `${prefix} · ended` : `${prefix} · finished · exit ${group.ended.exit}`;
   }
   return group.startedAt === null ? `${prefix} · running` : `${prefix} · running ${formatElapsed(now - group.startedAt)}`;

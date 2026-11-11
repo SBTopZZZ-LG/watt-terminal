@@ -41,6 +41,15 @@ function runCommand(callId: string, recordId: number, command: string, at = T0):
 
 const run = (actions: TranscriptAction[], start: Transcript = EMPTY_TRANSCRIPT): Transcript => actions.reduce(transcriptReducer, start);
 
+/** The shell levels now, the local one included (the levels event's count). */
+const levels = (depth: number): TranscriptAction => ({ type: 'levels_changed', depth });
+
+/** The top-level group's frame of the transcript, by its record id. */
+function frameOf(items: TranscriptItem[], recordId: number) {
+  const found = buildFrames(items).children.find((c) => c.kind === 'frame' && c.frame.recordId === recordId);
+  return found !== undefined && found.kind === 'frame' ? found.frame : undefined;
+}
+
 describe('openedBy and endedBy', () => {
   const item = (over: Partial<Extract<TranscriptItem, { kind: 'tool' }>>): TranscriptItem => ({
     id: 1,
@@ -179,6 +188,101 @@ describe('openRecordIds: nesting', () => {
   });
 });
 
+describe('a level pushed above a group ends it as integrated', () => {
+  it('the group records the shell depth its running result arrived at, and the transcript keeps the depth', () => {
+    expect(run(runCommand('c1', 7, 'ssh host')).depth).toBe(1);
+    const t = run([levels(2), ...runCommand('c1', 7, 'ssh host')]);
+    expect(t.depth).toBe(2);
+    expect(frameOf(t.items, 7)?.levelDepth).toBe(2);
+    expect(frameOf(run(runCommand('c1', 7, 'ssh host')).items, 7)?.levelDepth).toBe(1);
+  });
+
+  it('a level pushed above the command ends the group with no exit code, and says integrated', () => {
+    const t = run([...runCommand('c1', 7, 'ssh ubuntu@lidia'), levels(2)]);
+    expect(openRecordIds(t.items).size).toBe(0);
+    expect(t.items[t.items.length - 1]).toMatchObject({ kind: 'record_end', recordId: 7, exit: null, integrated: true });
+    const frame = frameOf(t.items, 7);
+    expect(frame?.ended).toEqual({ exit: null, integrated: true });
+    expect(frame && interactiveHeader(frame, T0 + 9_000)).toBe('Interactive · ssh ubuntu@lidia · integrated');
+  });
+
+  it('a record_finished after the integration adds no item: the command ends later, the group does not', () => {
+    const t = run([...runCommand('c1', 7, 'ssh host'), levels(2)]);
+    const after = run([finished(7, 0)], t);
+    expect(after.items).toBe(t.items);
+    expect(frameOf(after.items, 7)?.ended).toEqual({ exit: null, integrated: true });
+  });
+
+  it('the agent commands after the push are outside the group, and their results do not reopen it', () => {
+    const t = run([
+      ...runCommand('c1', 7, 'ssh ubuntu@lidia'),
+      call('g1', 'get_screen', {}),
+      result('g1', 'get_screen', {}),
+      levels(2),
+      call('a1', 'run_command', { command: 'sudo apt update' }),
+      result('a1', 'run_command', { outcome: 'finished', record: record(8, 0) }),
+    ]);
+    expect(openRecordIds(t.items).size).toBe(0);
+    const { children } = buildFrames(t.items);
+    expect(children.map((c) => c.kind)).toEqual(['frame', 'item']);
+    const frame = children[0];
+    expect(frame.kind === 'frame' && frame.frame.children.map((c) => (c.kind === 'item' && c.item.kind === 'tool' ? c.item.name : c.kind))).toEqual(['get_screen']);
+    expect(children[1].kind === 'item' && children[1].item.kind === 'tool' && children[1].item.name).toBe('run_command');
+  });
+
+  it('the push ends it whichever row came first: a request_integration row alone does not end it, the levels change does', () => {
+    const t = run([
+      ...runCommand('c1', 7, 'ssh host'),
+      call('ri1', 'request_integration', {}),
+      result('ri1', 'request_integration', { outcome: 'integrated', label: 'ssh host' }),
+    ]);
+    expect([...openRecordIds(t.items)]).toEqual([7]);
+    expect(openRecordIds(run([levels(2)], t).items).size).toBe(0);
+  });
+
+  it('a manual Integrate pushes a level too: the same levels change ends the group, with no request row at all', () => {
+    const t = run([...runCommand('c1', 7, 'ssh host'), levels(2)]);
+    expect(frameOf(t.items, 7)?.ended).toEqual({ exit: null, integrated: true });
+  });
+
+  it('a group opened at the depth the levels already are is not ended by a levels change to that depth, but a deeper one ends it', () => {
+    const t = run([levels(2), ...runCommand('c1', 7, 'ssh host')]);
+    expect([...openRecordIds(run([levels(2)], t).items)]).toEqual([7]);
+    expect([...openRecordIds(run([levels(3)], t).items)]).toEqual([]);
+  });
+
+  it('a level popped (a shallower depth) ends nothing: the command the group is for may still run', () => {
+    const t = run([levels(2), ...runCommand('c1', 7, 'ssh host'), levels(1)]);
+    expect(t.depth).toBe(1);
+    expect([...openRecordIds(t.items)]).toEqual([7]);
+  });
+
+  it('a deeper-then-back sequence: the push ends the group once, the pop after it ends nothing, a new group at the shallow depth ends at the next push', () => {
+    const t = run([
+      ...runCommand('c1', 7, 'ssh host'),
+      levels(2),
+      levels(1),
+      ...runCommand('c2', 9, 'make'),
+      levels(2),
+    ]);
+    expect(openRecordIds(t.items).size).toBe(0);
+    expect(t.items.filter((i) => i.kind === 'record_end' && i.recordId === 7)).toHaveLength(1);
+    expect(frameOf(t.items, 9)?.ended).toEqual({ exit: null, integrated: true });
+  });
+
+  it('a long-running command in the nested shell opens its own group after the push, and its record_finished closes it', () => {
+    const t = run([...runCommand('c1', 7, 'ssh ubuntu@lidia'), levels(2), ...runCommand('c2', 9, 'sleep 60')]);
+    expect([...openRecordIds(t.items)]).toEqual([9]);
+    const { children } = buildFrames(t.items);
+    expect(children.map((c) => (c.kind === 'frame' ? c.frame.recordId : 'item'))).toEqual([7, 9]);
+    const closed = run([finished(9, 0)], t);
+    expect(openRecordIds(closed.items).size).toBe(0);
+    const inner = frameOf(closed.items, 9);
+    expect(inner && interactiveHeader(inner, T0 + 5_000)).toBe('Interactive · sleep 60 · finished · exit 0');
+    expect(frameOf(closed.items, 7)?.ended).toEqual({ exit: null, integrated: true });
+  });
+});
+
 describe('the approval and the other steps inside a group', () => {
   it('the approval of the run_command call that opened the group stays above it, not inside', () => {
     const t = run([
@@ -237,6 +341,12 @@ describe('interactiveHeader', () => {
     const header = interactiveHeader({ command: `a\n${'x'.repeat(200)}`, startedAt: null, ended: null }, T0);
     expect(header).toMatch(/^Interactive · a\\nx+… · running$/);
     expect(header.length).toBeLessThan(120);
+  });
+
+  it('says integrated when a shell level was pushed above the command, and not finished', () => {
+    expect(interactiveHeader({ command: 'ssh ubuntu@lidia', startedAt: T0, ended: { exit: null, integrated: true } }, T0 + 9_000)).toBe(
+      'Interactive · ssh ubuntu@lidia · integrated',
+    );
   });
 
   it('shows running without a time when the start is not known', () => {

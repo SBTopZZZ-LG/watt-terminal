@@ -3,7 +3,7 @@
 
 import { isDeclinedIntegration } from './integrate';
 import { buildFrames } from './interactive';
-import type { FrameNode } from './interactive';
+import type { FrameNode, GroupEnd } from './interactive';
 import type { TranscriptItem } from './transcript';
 import { visibleEscapes } from './visibleEscapes';
 
@@ -19,7 +19,7 @@ export interface InteractiveGroup {
   command: string;
   startedAt: number | null;
   /** Null while the command runs. */
-  ended: { exit: number | null } | null;
+  ended: GroupEnd | null;
   entries: TranscriptEntry[];
 }
 

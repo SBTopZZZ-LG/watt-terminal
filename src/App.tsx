@@ -148,6 +148,7 @@ export default function App() {
     setAutoSuspended(s.auto_approve_suspended);
     setLevels(s.levels);
     setSessionNonces(s.nonces);
+    dispatchTranscript({ type: 'levels_changed', depth: s.depth });
     setLlm(s.llm);
     setSettingsState(s.settings_state ?? null);
     if (recoveryKind(s.settings_state) !== 'ok') {
@@ -349,6 +350,9 @@ export default function App() {
           // against them. The location and approve-all follow the new top level.
           setSessionNonces(ev.nonces);
           setLevels(nestedLevels(ev.levels));
+          // The depth ends an interactive group a level was pushed above (see transcript.ts). The same for an integration the
+          // agent asked for and one the user started.
+          dispatchTranscript({ type: 'levels_changed', depth: ev.levels.length });
           refreshAutoState();
           return;
         default:

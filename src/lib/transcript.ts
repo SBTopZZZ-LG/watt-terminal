@@ -4,7 +4,7 @@
 import type { AgentEvent, ApprovalReasonCode, RecordSummary, TodoItem, ToolDecision } from './types';
 import { visibleEscapes } from './visibleEscapes';
 import { TODO_TOOL } from './todoView';
-import { openRecordIds, openedBy } from './interactive';
+import { openFramesBelow, openRecordIds, openedBy } from './interactive';
 
 export type ToolStatus = 'running' | 'ok' | 'failed';
 export type ApprovalState = 'pending' | 'answering' | 'resolved';
@@ -16,15 +16,19 @@ export type TranscriptItem =
   /**
    * `reason` is why the call asked or ran without asking. Null for read tools and calls refused before the policy.
    * `startedAt` is when the call started (Unix ms), set for the calls of this session; absent for a reopened conversation.
+   * `levelDepth` is the shell depth when the result that opened an interactive group arrived (see interactive.ts). Absent otherwise.
    */
-  | { id: number; kind: 'tool'; callId: string; name: string; args: unknown; status: ToolStatus; result: unknown; decision: ToolDecision | null; reason: ApprovalReasonCode | null; startedAt?: number }
+  | { id: number; kind: 'tool'; callId: string; name: string; args: unknown; status: ToolStatus; result: unknown; decision: ToolDecision | null; reason: ApprovalReasonCode | null; startedAt?: number; levelDepth?: number }
   /**
    * `reason` is why the card asks. `location` is the nested shell the command is for (its label), or null on the local shell.
    * `display` is the decoded input of a send_keys card (null for the others, and for a card from an older backend).
    */
   | { id: number; kind: 'approval'; callId: string; name: string; text: string; display: string | null; state: ApprovalState; approve: boolean | null; reason: ApprovalReasonCode | null; location: string | null }
-  /** The command an interactive group opened on has ended (see interactive.ts). Not shown: it closes the group. */
-  | { id: number; kind: 'record_end'; recordId: number; exit: number | null }
+  /**
+   * The command an interactive group opened on has ended (see interactive.ts). Not shown: it closes the group. `integrated` is set
+   * when a shell level was pushed above the command (levels_changed), so the group ends while the command may still run.
+   */
+  | { id: number; kind: 'record_end'; recordId: number; exit: number | null; integrated?: boolean }
   | { id: number; kind: 'notice'; text: string };
 
 /** A transcript item before the reducer gives it an id. `Omit` over the union would lose the variants, so it is distributed. */
@@ -44,6 +48,8 @@ export interface Transcript {
    * opens a group can arrive after the command has finished, so the group is closed at once when it does (see transcript.ts).
    */
   finished: FinishedRecord[];
+  /** The shell depth now: the levels count, the local one included. 1 means no nested shell (see levels_changed). */
+  depth: number;
 }
 
 export interface FinishedRecord {
@@ -51,7 +57,7 @@ export interface FinishedRecord {
   exit: number | null;
 }
 
-export const EMPTY_TRANSCRIPT: Transcript = { items: [], inFlight: 0, nextId: 1, thinking: false, todos: [], finished: [] };
+export const EMPTY_TRANSCRIPT: Transcript = { items: [], inFlight: 0, nextId: 1, thinking: false, todos: [], finished: [], depth: 1 };
 
 /** Keeps the transcript bounded; the oldest items go first. */
 export const MAX_ITEMS = 500;
@@ -75,6 +81,11 @@ export type TranscriptAction =
   | { type: 'sync_busy'; busy: boolean }
   /** A new shell replaced the old one. Pending approvals and running tools can never finish, so they are closed. */
   | { type: 'session_reset' }
+  /**
+   * The shell levels changed (the levels event, or a status read). `depth` is the count now, the local one included. A level
+   * pushed above an open group's command ends that group as integrated. A shallower depth ends nothing.
+   */
+  | { type: 'levels_changed'; depth: number }
   /** The agent's conversation was cleared on the Rust side. Only sent after a successful reset, never while busy. Clears the todos too. */
   | { type: 'conversation_reset' }
   /**
@@ -152,6 +163,8 @@ export function transcriptReducer(t: Transcript, action: TranscriptAction): Tran
       }
       return add(next, (id) => ({ id, kind: 'notice', text: 'New shell session started.' }));
     }
+    case 'levels_changed':
+      return levelsChanged(t, action.depth);
     case 'conversation_reset':
       // Keeps nextId, so ids stay unique for the React keys of the items that come after.
       return { ...t, items: [], inFlight: 0, thinking: false, todos: [] };
@@ -202,7 +215,7 @@ function applyAgentEvent(t: Transcript, ev: AgentEvent, at: number | undefined):
       const hasTool = t.items.some((i) => i.kind === 'tool' && i.callId === ev.call_id);
       const items = t.items.map((i) => {
         if (i.kind === 'tool' && i.callId === ev.call_id) {
-          return { ...i, status: ev.ok ? ('ok' as const) : ('failed' as const), result: ev.result, decision: ev.decision, reason };
+          return withLevelDepth({ ...i, status: ev.ok ? ('ok' as const) : ('failed' as const), result: ev.result, decision: ev.decision, reason }, t.depth);
         }
         if (i.kind === 'approval' && i.callId === ev.call_id) {
           return { ...i, state: 'resolved' as const };
@@ -214,7 +227,9 @@ function applyAgentEvent(t: Transcript, ev: AgentEvent, at: number | undefined):
       if (hasTool) {
         return closeIfFinished(next, ev.call_id);
       }
-      return add(next, (id) => ({
+      return add(next, (id) =>
+        withLevelDepth(
+          {
             id,
             kind: 'tool',
             callId: ev.call_id,
@@ -224,7 +239,10 @@ function applyAgentEvent(t: Transcript, ev: AgentEvent, at: number | undefined):
             result: ev.result,
             decision: ev.decision,
             reason,
-          }));
+          },
+          t.depth,
+        ),
+      );
     }
     case 'approval_request':
       return add(t, (id) => ({
@@ -281,6 +299,30 @@ function add(t: Transcript, make: (id: number) => TranscriptItem): Transcript {
   const items = [...closeStream(t.items), item];
   // Trimming drops the oldest items only. The streamed message is always the last item, so it is never trimmed here.
   return { ...t, items: items.length > MAX_ITEMS ? items.slice(items.length - MAX_ITEMS) : items, nextId: t.nextId + 1 };
+}
+
+/** A tool row whose result opens an interactive group records the shell depth it opened at. Other rows are returned as they are. */
+function withLevelDepth(item: TranscriptItem, depth: number): TranscriptItem {
+  if (item.kind !== 'tool' || openedBy(item) === null) {
+    return item;
+  }
+  return { ...item, levelDepth: depth };
+}
+
+/**
+ * The shell levels changed to `depth`. Deeper: each open group whose command was opened at a shallower depth ends as
+ * integrated, since the agent's commands from now on run in the new level, not in the shell the group is for. Shallower
+ * (a level popped): nothing ends, because the command the group is for may still run. Only the depth moves then.
+ */
+function levelsChanged(t: Transcript, depth: number): Transcript {
+  if (depth <= t.depth) {
+    return { ...t, depth };
+  }
+  let next: Transcript = { ...t, depth };
+  for (const frame of openFramesBelow(t.items, depth)) {
+    next = add(next, (id) => ({ id, kind: 'record_end', recordId: frame.recordId, exit: null, integrated: true }));
+  }
+  return next;
 }
 
 /**
