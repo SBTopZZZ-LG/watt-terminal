@@ -26,9 +26,10 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use reqwest::header::{HeaderName, HeaderValue};
 use serde_json::{Value, json};
 
-use crate::core::agent::{Agent, AgentCtx, AgentEvent, DENIED};
+use crate::core::agent::{Agent, AgentCtx, AgentEvent, DENIED, UserMessage};
 use crate::core::env::env_setting;
 use crate::core::foreground::{Foreground, ForegroundKind};
+use crate::core::chat::attachments::{Resolver, user_content};
 use crate::core::chat::history::History;
 use crate::core::chat::project::project;
 use crate::core::chat::prompt;
@@ -36,6 +37,7 @@ use crate::core::chat::redact::Redactor;
 use crate::core::chat::todo::{self, Todo, TodoList};
 use crate::core::llm::{self, AssistantReply, ChatRequest, Delta, LlmError, ProviderConfig, ToolCall, TurnCancel};
 use crate::core::observer::OpenAgentRecord;
+use crate::core::persist::attachments::AttachmentStore;
 use crate::core::settings::LimitsSettings;
 use crate::core::tools::{age_text, foreground_next_step, TopLevel};
 
@@ -277,6 +279,8 @@ pub struct LlmAgent {
     stream: bool,
     redactor: Redactor,
     history: Arc<Mutex<History>>,
+    /// The conversation's id, which names the directory its attachment files are read from.
+    conversation_id: String,
     todos: TodoList,
     cancel: Arc<TurnCancel>,
     system: String,
@@ -287,6 +291,8 @@ pub struct LlmAgent {
     checkpoint: Option<Checkpoint>,
     /// The caps this turn runs under (see `with_limits`).
     limits: LimitsSettings,
+    /// Where the images of attached messages are read from (see `with_attachments`). None: they are not sent.
+    attachments: Option<AttachmentStore>,
 }
 
 impl LlmAgent {
@@ -315,6 +321,7 @@ impl LlmAgent {
             stream: settings.stream,
             redactor: Redactor::new(known),
             history,
+            conversation_id: conversation_id.to_string(),
             todos,
             cancel,
             system: prompt::system_prompt(),
@@ -322,12 +329,20 @@ impl LlmAgent {
             resume_note: None,
             checkpoint: None,
             limits: LimitsSettings::default(),
+            attachments: None,
         }
     }
 
     /// The caps this turn runs under: the saved limits, read per user message. The default is the saved default.
     pub fn with_limits(mut self, limits: LimitsSettings) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// The attachment store the images of this conversation are read from when a model call sends them. Without it,
+    /// those images are reported as no longer available.
+    pub fn with_attachments(mut self, store: AttachmentStore) -> Self {
+        self.attachments = Some(store);
         self
     }
 
@@ -386,7 +401,8 @@ impl LlmAgent {
         if let Some(block) = todo::prompt_block(&lock_todos(&self.todos)) {
             system = format!("{system}\n\n{block}");
         }
-        let messages = lock(&self.history).messages(&system);
+        let mut resolver = Resolver::new(self.attachments.as_ref(), &self.conversation_id);
+        let messages = lock(&self.history).messages(&system, &mut resolver);
         let req = ChatRequest {
             model: self.model.clone(),
             messages,
@@ -487,8 +503,10 @@ impl LlmAgent {
 }
 
 impl Agent for LlmAgent {
-    fn respond(&mut self, user_text: &str, ctx: &AgentCtx<'_>) {
-        lock(&self.history).push_user(user_text);
+    fn respond(&mut self, message: &UserMessage, ctx: &AgentCtx<'_>) {
+        // The document text is redacted here, as it enters the history (see `user_content`).
+        let content = user_content(&message.text, &message.attachments, &self.redactor);
+        lock(&self.history).push_user_content(content);
         self.save_checkpoint();
         // The finished note is for this turn's first model call only: it says what finished since the last turn.
         let mut finished = finished_since_last_turn(&lock(&self.history).snapshot(), ctx);

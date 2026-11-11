@@ -20,10 +20,11 @@ use tauri_plugin_window_state::StateFlags;
 // Core logic (PTY, shell integration, observer, agent) has no Tauri dependency, so `cargo test` runs it headless.
 pub mod core;
 
-use crate::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate, AutoState, MockAgent, OnDrop, TurnRules};
+use crate::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate, AutoState, MockAgent, OnDrop, TurnRules, UserMessage};
 use crate::core::env::env_setting;
 use crate::core::approval::{self, ApprovalPolicy, ManualPolicy};
 use crate::core::chat::agent_loop::{self, Conversation, LlmAgent, LlmSettings, USER_AGENT};
+use crate::core::chat::attachments::{AttachmentInput, ImageFile, prepare};
 use crate::core::chat::history::History;
 use crate::core::chat::redact::Redactor;
 use crate::core::chat::todo::{Todo, TodoList};
@@ -415,18 +416,36 @@ fn turn_limits(service: Option<&SettingsService>) -> LimitsSettings {
     service.and_then(|s| s.limits_settings().ok()).unwrap_or_default()
 }
 
+/// Writes the images of a message to the attachment store, before the message is recorded. Without a store there is
+/// nowhere to keep them, so the message is refused.
+fn write_images(store: Option<&Persist>, conversation_id: &str, images: &[ImageFile]) -> Result<(), String> {
+    if images.is_empty() {
+        return Ok(());
+    }
+    let persist = store.ok_or_else(|| NO_STORE.to_string())?;
+    let files = persist.conversations.attachments();
+    for image in images {
+        files
+            .write(conversation_id, &image.sha256, image.ext, &image.bytes)
+            .map_err(|e| format!("the attachment was not saved ({e})"))?;
+    }
+    Ok(())
+}
+
 /// Starts one agent turn on its own thread. Events arrive on the events channel. The model is chosen by `choose_llm`,
 /// and the approval policy by `approval_policy`. Both are read from the settings before the turn starts, so an error
-/// leaves the agent idle.
+/// leaves the agent idle. `attachments` are checked first: a refused message changes nothing.
 #[tauri::command]
 async fn agent_message(
     session_id: String,
     text: String,
+    attachments: Option<Vec<AttachmentInput>>,
     reg: State<'_, Reg>,
     persist: State<'_, PersistState>,
     settings: State<'_, SettingsState>,
 ) -> Result<(), String> {
     let att = session(&reg, &session_id)?;
+    let prepared = prepare(&attachments.unwrap_or_default())?;
     // Reading a saved model touches the Keychain, so it runs on the blocking pool.
     let service = settings.0.clone();
     let (chosen, policy, rules, limits) = blocking(move || {
@@ -439,11 +458,17 @@ async fn agent_message(
     let cancel = Arc::new(TurnCancel::new());
     let (history, todos, conversation_id) = att.begin_turn(&cancel)?;
     let store = persist.0.clone();
-    // Only the LLM agent writes history, so only its turns are saved. The mock agent never touches the history.
+    // Only the LLM agent writes history, so only its turns are saved. The mock agent never touches the history, and it
+    // ignores attachments.
     let (mut llm, saved) = match chosen {
         None => (None, None),
         Some((llm_settings, model)) => match agent_loop::shared_client() {
             Ok(client) => {
+                // The images are on disk before the message is recorded, so a saved message never names a missing file.
+                if let Err(e) = write_images(store.as_deref(), &conversation_id, &prepared.images) {
+                    att.end_turn();
+                    return Err(e);
+                }
                 let state = Arc::new(SavedState {
                     conversation_id: conversation_id.clone(),
                     history: history.clone(),
@@ -451,11 +476,14 @@ async fn agent_message(
                     model: Some(model),
                 });
                 let checkpoint = checkpoint_saver(store.clone(), att.clone(), state.clone());
-                let agent = LlmAgent::new(client, llm_settings, &conversation_id, history, todos, cancel.clone())
+                let mut agent = LlmAgent::new(client, llm_settings, &conversation_id, history, todos, cancel.clone())
                     // The note is taken only by a turn that calls the model: a turn that fails to start keeps it.
                     .with_resume_note(att.conversation.take_resume_note())
                     .with_checkpoint(checkpoint)
                     .with_limits(limits);
+                if let Some(persist) = store.as_ref() {
+                    agent = agent.with_attachments(persist.conversations.attachments().clone());
+                }
                 (Some(agent), Some(state))
             }
             Err(e) => {
@@ -464,6 +492,7 @@ async fn agent_message(
             }
         },
     };
+    let message = UserMessage { text, attachments: prepared.attachments };
     let worker = att.clone();
     let spawned = thread::Builder::new().name("agent".into()).spawn(move || {
         // Runs on panic too, so a crashed turn cannot leave the agent busy or in control of the shell.
@@ -479,8 +508,8 @@ async fn agent_message(
         };
         let ctx = AgentCtx::new(&tools, &worker.approvals, &emit).with_policy(policy.as_ref()).with_rules(rules);
         match llm.as_mut() {
-            Some(agent) => agent::run_turn(agent, &text, &ctx),
-            None => agent::run_turn(&mut MockAgent, &text, &ctx),
+            Some(agent) => agent::run_turn(agent, &message, &ctx),
+            None => agent::run_turn(&mut MockAgent, &message, &ctx),
         }
         // The history is final now, and this is still before the turn is ended (the guard above). The end of a turn
         // is saved as finished, whether it completed, was cancelled, or failed.

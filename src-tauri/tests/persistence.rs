@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use watt_terminal_lib::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate};
+use watt_terminal_lib::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate, UserMessage};
 use watt_terminal_lib::core::chat::agent_loop::{Conversation, LlmAgent, LlmSettings};
 use watt_terminal_lib::core::chat::redact::Redactor;
 use watt_terminal_lib::core::chat::todo::{self, Todo, TodoStatus};
@@ -198,7 +198,7 @@ fn run(agent: &mut LlmAgent, text: &str) {
     let gate = ApprovalGate::new();
     let emit = |_: AgentEvent| {};
     let ctx = AgentCtx::new(&tools, &gate, &emit);
-    agent::run_turn(agent, text, &ctx);
+    agent::run_turn(agent, &UserMessage::text(text), &ctx);
 }
 
 /// The end-of-turn save, as the app does it: the history snapshot, the agent's redactor, and the shell's directory.

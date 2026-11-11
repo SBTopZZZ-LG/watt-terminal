@@ -3,6 +3,7 @@
 //! over the provider adapter (core/llm).
 
 pub mod agent_loop;
+pub mod attachments;
 pub mod history;
 pub mod project;
 pub mod prompt;

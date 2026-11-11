@@ -7,7 +7,7 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use watt_terminal_lib::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate, DENIED, MockAgent, user_input};
+use watt_terminal_lib::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate, DENIED, MockAgent, UserMessage, user_input};
 use watt_terminal_lib::core::approval::RegexPolicy;
 use watt_terminal_lib::core::chat::project::project;
 use watt_terminal_lib::core::chat::redact::Redactor;
@@ -31,7 +31,7 @@ fn turn(s: &Session, approvals: &ApprovalGate, text: &str) -> Vec<AgentEvent> {
     let emit = move |ev: AgentEvent| sink.lock().unwrap().push(ev);
     let tools = SessionTools::new(s);
     let ctx = AgentCtx::new(&tools, approvals, &emit);
-    agent::run_turn(&mut MockAgent, text, &ctx);
+    agent::run_turn(&mut MockAgent, &UserMessage::text(text), &ctx);
     log.lock().unwrap().clone()
 }
 
@@ -44,7 +44,7 @@ fn turn_in_thread(s: Arc<Session>, approvals: Arc<ApprovalGate>, text: &str) -> 
         let emit = move |ev: AgentEvent| sink.lock().unwrap().push(ev);
         let tools = SessionTools::new(&s);
         let ctx = AgentCtx::new(&tools, &approvals, &emit);
-        agent::run_turn(&mut MockAgent, &text, &ctx);
+        agent::run_turn(&mut MockAgent, &UserMessage::text(&text), &ctx);
     });
     (h, log)
 }
@@ -665,7 +665,7 @@ fn cancel_turn_ends_a_turn_waiting_in_run_command_and_keeps_its_command() {
         let emit = move |ev: AgentEvent| sink.lock().unwrap().push(ev);
         let tools = SessionTools::new(&s1).with_cancel(token);
         let ctx = AgentCtx::new(&tools, &a1, &emit);
-        agent::run_turn(&mut MockAgent, "please run `sleep 2; echo turn-kept`", &ctx);
+        agent::run_turn(&mut MockAgent, &UserMessage::text("please run `sleep 2; echo turn-kept`"), &ctx);
     });
     assert!(wait_state(&s, InputState::Running, Duration::from_secs(10)), "state={:?}", s.state());
     let cancelled_at = Instant::now();

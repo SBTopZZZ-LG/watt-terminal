@@ -8,8 +8,12 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use watt_terminal_lib::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
+use watt_terminal_lib::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate, UserMessage};
 use watt_terminal_lib::core::chat::agent_loop::{agent_record_note, Conversation, LlmAgent, LlmSettings};
+use watt_terminal_lib::core::chat::attachments::{Attachment, Resolver};
+use watt_terminal_lib::core::persist::attachments::{sha256_hex, AttachmentStore};
 use watt_terminal_lib::core::settings::LimitsSettings;
 use watt_terminal_lib::core::chat::history::History;
 use watt_terminal_lib::core::chat::prompt;
@@ -317,16 +321,21 @@ fn agent_for(s: &LlmSettings, conv: &Conversation, cancel: Arc<TurnCancel>) -> L
 
 /// Runs one turn and returns every event it emitted, `Done` included.
 fn turn(agent: &mut LlmAgent, tools: &dyn AgentTools, gate: &ApprovalGate, text: &str) -> Vec<AgentEvent> {
+    turn_message(agent, tools, gate, &UserMessage::text(text))
+}
+
+/// Runs one turn with a whole user message (text and attachments) and returns every event it emitted.
+fn turn_message(agent: &mut LlmAgent, tools: &dyn AgentTools, gate: &ApprovalGate, message: &UserMessage) -> Vec<AgentEvent> {
     let log: Mutex<Vec<AgentEvent>> = Mutex::new(Vec::new());
     let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
     let ctx = AgentCtx::new(tools, gate, &emit);
-    agent::run_turn(agent, text, &ctx);
+    agent::run_turn(agent, message, &ctx);
     log.into_inner().unwrap()
 }
 
 /// The stored history without the system message.
 fn stored(history: &Arc<Mutex<History>>) -> Vec<Value> {
-    history.lock().unwrap().messages("")[1..].to_vec()
+    history.lock().unwrap().messages("", &mut Resolver::none())[1..].to_vec()
 }
 
 fn texts(events: &[AgentEvent]) -> Vec<String> {
@@ -562,7 +571,7 @@ fn a_declined_integration_does_not_end_the_turn() {
     };
     let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
     let ctx = AgentCtx::new(&tools, &gate, &emit);
-    agent::run_turn(&mut agent, "integrate the ssh shell", &ctx);
+    agent::run_turn(&mut agent, &UserMessage::text("integrate the ssh shell"), &ctx);
     let events = log.into_inner().unwrap();
 
     assert_eq!(*tools.integrations.lock().unwrap(), 0, "a declined shell is not integrated");
@@ -1214,4 +1223,139 @@ fn the_agent_note_names_the_command_and_offers_integration_for_an_ssh_session() 
     let note = agent_record_note(std::slice::from_ref(&rec), Some(&sleep), &r).expect("a note");
     assert!(note.contains("(1m)") && !note.contains("request_integration"), "{note}");
     assert_eq!(agent_record_note(&[], None, &r), None);
+}
+
+// Attachments on the wire: what the provider receives for a message that carries them.
+
+/// A temporary attachment store for one test, removed when the test ends.
+struct StoreDir(std::path::PathBuf);
+
+impl StoreDir {
+    fn new(tag: &str) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("watt-attach-wire-{}-{n}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        StoreDir(dir)
+    }
+
+    fn store(&self) -> AttachmentStore {
+        AttachmentStore::new(self.0.join("attachments"))
+    }
+}
+
+impl Drop for StoreDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Bytes that start like a PNG. The wire does not decode images, so the signature is all that matters here.
+fn png(seed: u8) -> Vec<u8> {
+    let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+    bytes.extend_from_slice(&[seed; 40]);
+    bytes
+}
+
+/// Writes the image file for conversation `conv_id` and returns its attachment record.
+fn image_attachment(store: &AttachmentStore, conv_id: &str, name: &str, seed: u8) -> Attachment {
+    let bytes = png(seed);
+    let sha256 = sha256_hex(&bytes);
+    store.write(conv_id, &sha256, "png", &bytes).unwrap();
+    Attachment::Image { sha256, mime: "image/png".into(), name: name.into(), bytes: bytes.len() as u64, w: 4, h: 3, thumb: None }
+}
+
+/// The messages of the first request the provider received (system message included).
+fn request_messages(provider: &Provider) -> Vec<Value> {
+    body_of(&provider.requests()[0])["messages"].as_array().expect("messages").clone()
+}
+
+#[test]
+fn a_text_only_message_is_sent_as_a_plain_string() {
+    let provider = serve(vec![Script::json(text_reply("ok"))]);
+    let conv = Conversation::new().unwrap();
+    let dir = StoreDir::new("text-only");
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()))
+        .with_attachments(dir.store());
+    turn(&mut agent, &FakeTools::default(), &no_gate(), "hello");
+    assert_eq!(request_messages(&provider)[1], json!({"role": "user", "content": "hello"}));
+}
+
+#[test]
+fn text_and_an_image_are_sent_as_an_array_with_an_image_url_part() {
+    let provider = serve(vec![Script::json(text_reply("ok"))]);
+    let conv = Conversation::new().unwrap();
+    let dir = StoreDir::new("image");
+    let store = dir.store();
+    let image = image_attachment(&store, &conv.id(), "shot.png", 1);
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new())).with_attachments(store);
+    let message = UserMessage { text: "what is this?".into(), attachments: vec![image] };
+    turn_message(&mut agent, &FakeTools::default(), &no_gate(), &message);
+
+    let url = format!("data:image/png;base64,{}", STANDARD.encode(png(1)));
+    assert_eq!(
+        request_messages(&provider)[1]["content"],
+        json!([
+            {"type": "text", "text": "what is this?"},
+            {"type": "image_url", "image_url": {"url": url}},
+        ])
+    );
+    // The history keeps the stored part, not the wire form.
+    assert_eq!(conv.history().lock().unwrap().snapshot()[0]["content"][1]["type"], "watt_image");
+}
+
+#[test]
+fn text_and_a_document_are_sent_as_one_string_with_the_document_wrapped_and_redacted() {
+    let provider = serve(vec![Script::json(text_reply("ok"))]);
+    let conv = Conversation::new().unwrap();
+    let dir = StoreDir::new("document");
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()))
+        .with_attachments(dir.store());
+    let document = format!("line one\nkey {KEY}\n");
+    let message = UserMessage {
+        text: "summarise".into(),
+        attachments: vec![Attachment::File { name: "notes.txt".into(), bytes: document.len() as u64, text: document }],
+    };
+    turn_message(&mut agent, &FakeTools::default(), &no_gate(), &message);
+
+    assert_eq!(
+        request_messages(&provider)[1]["content"],
+        "summarise\n\n<attached_file name=\"notes.txt\">\nline one\nkey [REDACTED]\n\n</attached_file>"
+    );
+    let stored_text = conv.history().lock().unwrap().snapshot()[0]["content"][1]["text"].as_str().unwrap().to_string();
+    assert!(stored_text.contains("[REDACTED]") && !stored_text.contains(KEY), "the history holds the redacted text");
+}
+
+#[test]
+fn images_older_than_the_last_three_image_messages_are_left_out_of_the_request() {
+    const NAMES: [&str; 4] = ["a.png", "b.png", "c.png", "d.png"];
+    let provider = serve(vec![Script::json(text_reply("ok"))]);
+    let conv = Conversation::new().unwrap();
+    let dir = StoreDir::new("elided");
+    let store = dir.store();
+    let redactor = Redactor::new(Vec::new());
+    let mut history = History::new();
+    for (n, name) in NAMES.iter().enumerate() {
+        let image = image_attachment(&store, &conv.id(), name, n as u8 + 1);
+        history.push_user_content(watt_terminal_lib::core::chat::attachments::user_content(
+            &format!("message {n}"),
+            &[image],
+            &redactor,
+        ));
+        history.push_assistant(json!({"role": "assistant", "content": format!("reply {n}")}));
+    }
+    conv.restore(conv.id(), history, Vec::new(), false);
+
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new())).with_attachments(store);
+    turn(&mut agent, &FakeTools::default(), &no_gate(), "and now?");
+
+    // system, then user 0, reply 0, user 1, reply 1, user 2, reply 2, user 3, reply 3, and the new user message.
+    let sent = request_messages(&provider);
+    assert_eq!(sent[1]["content"], "message 0\n\n[image a.png omitted from context]");
+    for (index, name) in [(3usize, "b.png"), (5, "c.png"), (7, "d.png")] {
+        assert_eq!(sent[index]["content"][1]["type"], "image_url", "{name} is sent");
+    }
+    assert_eq!(sent[9], json!({"role": "user", "content": "and now?"}));
+    // Elision is for the request only: the stored history keeps the first image.
+    assert_eq!(conv.history().lock().unwrap().snapshot()[0]["content"][1]["name"], "a.png");
 }

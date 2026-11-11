@@ -25,6 +25,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use super::PersistError;
+use super::attachments::AttachmentStore;
 use super::workspace::{Workspace, is_hidden_or_control};
 use crate::core::chat::redact::Redactor;
 use crate::core::chat::todo::{self, Todo};
@@ -119,6 +120,9 @@ struct IndexFile {
 #[derive(Debug)]
 pub struct ConversationStore {
     dir: PathBuf,
+    /// The attachment files of the conversations: the sibling `attachments` directory of `dir`. Deleting a conversation
+    /// removes its files, and `prune` sweeps the files of conversations that are no longer listed.
+    attachments: AttachmentStore,
     lock: Mutex<()>,
     /// Conversation files read, for the tests that check when the index is rebuilt from them.
     #[cfg(test)]
@@ -128,12 +132,19 @@ pub struct ConversationStore {
 impl ConversationStore {
     /// A store over `dir`. The directory is created on the first write.
     pub fn new(dir: impl Into<PathBuf>) -> Self {
+        let dir = dir.into();
         Self {
-            dir: dir.into(),
+            attachments: AttachmentStore::new(dir.with_file_name("attachments")),
+            dir,
             lock: Mutex::new(()),
             #[cfg(test)]
             reads: AtomicUsize::new(0),
         }
+    }
+
+    /// The attachment files, which the agent writes to before it records a message that carries attachments.
+    pub fn attachments(&self) -> &AttachmentStore {
+        &self.attachments
     }
 
     /// Writes the conversation and its index entry. A new id gets `created_at = now` and a title derived from the
@@ -201,12 +212,14 @@ impl ConversationStore {
         Ok(self.index_locked()?.conversations)
     }
 
-    /// Deletes one conversation and its index entry. Deleting an id that does not exist is not an error.
+    /// Deletes one conversation, its index entry and its attachment files. Deleting an id that does not exist is not an
+    /// error.
     pub fn delete(&self, id: &str) -> Result<(), PersistError> {
         check_id(id)?;
         let _guard = self.guard();
         remove_if_exists(&self.path_for(id))?;
-        self.update_index_locked(&[id], |metas| metas.retain(|m| m.id != id))
+        self.update_index_locked(&[id], |metas| metas.retain(|m| m.id != id))?;
+        self.remove_attachments(id)
     }
 
     /// Sets the title. The title is trimmed and must be 1 to 120 characters with no control characters. The
@@ -227,8 +240,9 @@ impl ConversationStore {
         Ok(meta)
     }
 
-    /// Keeps the `keep` most recently updated conversations and deletes the rest. `protect` is never deleted and is
-    /// kept in addition to the `keep` newest. Returns the ids that were deleted.
+    /// Keeps the `keep` most recently updated conversations and deletes the rest, with their attachment files. `protect`
+    /// is never deleted and is kept in addition to the `keep` newest. Attachment directories of conversations that are
+    /// neither listed nor skipped (see `index_locked`) are swept too. Returns the ids that were deleted.
     pub fn prune(&self, keep: usize, protect: Option<&str>) -> Result<Vec<String>, PersistError> {
         if let Some(id) = protect {
             check_id(id)?;
@@ -247,12 +261,19 @@ impl ConversationStore {
             let touched: Vec<&str> = removed.iter().map(String::as_str).collect();
             self.update_index_locked(&touched, |metas| metas.retain(|m| !removed.contains(&m.id)))?;
         }
+        // Only the conversations the index still lists (and the damaged ones it skips, whose files are still there) keep
+        // their attachments.
+        let index = self.index_locked()?;
+        let kept: HashSet<String> =
+            index.conversations.iter().map(|m| m.id.clone()).chain(index.skipped.iter().cloned()).collect();
+        self.attachments.remove_except(&kept).map_err(|e| io_error(self.attachments.root(), e))?;
         let mut removed: Vec<String> = removed.into_iter().collect();
         removed.sort();
         Ok(removed)
     }
 
-    /// Deletes every conversation, the moved-aside damaged files, and the index. Other files are left alone.
+    /// Deletes every conversation, the moved-aside damaged files, the index, and every conversation's attachment files.
+    /// Other files are left alone.
     pub fn delete_all(&self) -> Result<(), PersistError> {
         let _guard = self.guard();
         let entries = match fs::read_dir(&self.dir) {
@@ -270,7 +291,12 @@ impl ConversationStore {
                 remove_if_exists(&entry.path())?;
             }
         }
-        Ok(())
+        self.attachments.remove_all().map_err(|e| io_error(self.attachments.root(), e))
+    }
+
+    /// Removes one conversation's attachment files. Caller holds the lock.
+    fn remove_attachments(&self, id: &str) -> Result<(), PersistError> {
+        self.attachments.remove_conversation(id).map_err(|e| io_error(&self.attachments.root().join(id), e))
     }
 
     fn guard(&self) -> MutexGuard<'_, ()> {
@@ -458,16 +484,42 @@ pub fn normalize_title(raw: &str) -> Result<String, PersistError> {
     Ok(title.to_string())
 }
 
-/// The title of a conversation: the first non-empty line of the first user message that has one, whitespace
-/// collapsed, at most 80 characters with a trailing "…" when cut. "Untitled" when there is no such line.
+/// The title of a conversation: the first non-empty line of the first user text that has one, whitespace collapsed, at
+/// most 80 characters with a trailing "…" when cut. A user message with attachments contributes its text part. When no
+/// user text has a line, the name of the first attachment is used. "Untitled" when there is neither.
 pub fn derive_title(messages: &[Value]) -> String {
-    messages
-        .iter()
-        .filter(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-        .filter_map(|m| m.get("content").and_then(Value::as_str))
-        .find_map(first_line)
+    let users: Vec<&Value> =
+        messages.iter().filter(|m| m.get("role").and_then(Value::as_str) == Some("user")).collect();
+    let from_text = users.iter().flat_map(|m| user_texts(m)).find_map(first_line);
+    from_text
+        .or_else(|| users.iter().flat_map(|m| attachment_names(m)).find_map(first_line))
         .map(truncate_title)
         .unwrap_or_else(|| UNTITLED.to_string())
+}
+
+/// The texts of a user message: its string content, or the text parts of its array content.
+fn user_texts(m: &Value) -> Vec<&str> {
+    match m.get("content") {
+        Some(Value::String(text)) => vec![text.as_str()],
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter(|p| p["type"] == "text")
+            .filter_map(|p| p["text"].as_str())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The names of the attachments of a user message (none for a plain string).
+fn attachment_names(m: &Value) -> Vec<&str> {
+    match m.get("content") {
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter(|p| p["type"] == "watt_image" || p["type"] == "watt_file")
+            .filter_map(|p| p["name"].as_str())
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn first_line(text: &str) -> Option<String> {
@@ -490,15 +542,23 @@ fn truncate_title(line: String) -> String {
 }
 
 /// A copy of `messages` with the redactor applied to the text that could carry a secret: the `content` of every
-/// message, and the `function.arguments` of every tool call. Ids, roles, names and structure are unchanged.
+/// message, the text parts and document text of a message with attachments, and the `function.arguments` of every tool
+/// call. Ids, roles, names and structure are unchanged, and so are image thumbnails and every base64 value, which the
+/// redactor's patterns could otherwise corrupt.
 pub fn redact_messages(messages: &[Value], redactor: &Redactor) -> Vec<Value> {
     messages
         .iter()
         .map(|message| {
             let mut message = message.clone();
             if let Some(obj) = message.as_object_mut() {
-                if let Some(Value::String(content)) = obj.get_mut("content") {
-                    *content = redactor.redact(content);
+                match obj.get_mut("content") {
+                    Some(Value::String(content)) => *content = redactor.redact(content),
+                    Some(Value::Array(parts)) => {
+                        for part in parts.iter_mut() {
+                            redact_part(part, redactor);
+                        }
+                    }
+                    _ => {}
                 }
                 if let Some(Value::Array(calls)) = obj.get_mut("tool_calls") {
                     for call in calls.iter_mut() {
@@ -513,6 +573,16 @@ pub fn redact_messages(messages: &[Value], redactor: &Redactor) -> Vec<Value> {
             message
         })
         .collect()
+}
+
+/// Redacts the text of one content part: a text part, or a document. Other parts are not touched.
+fn redact_part(part: &mut Value, redactor: &Redactor) {
+    if !matches!(part["type"].as_str(), Some("text") | Some("watt_file")) {
+        return;
+    }
+    if let Some(Value::String(text)) = part.get_mut("text") {
+        *text = redactor.redact(text);
+    }
 }
 
 /// The todo list with the redactor applied to each content. A redacted content can grow past the limit when a short secret
@@ -1392,5 +1462,153 @@ mod tests {
         assert!(!s.load(&id(82)).unwrap().in_turn);
         // Without the key (the file as older builds wrote it) the flag reads as false.
         assert!(!fs::read_to_string(s.path_for(&id(82))).unwrap().contains("in_turn"));
+    }
+
+    // Attachments: titles, redaction and the attachment files
+
+    use crate::core::persist::attachments::sha256_hex;
+
+    fn image_part(sha: &str, name: &str, thumb: Option<&str>) -> Value {
+        let mut part =
+            json!({"type": "watt_image", "sha256": sha, "mime": "image/png", "name": name, "bytes": 8, "w": 1, "h": 1});
+        if let Some(thumb) = thumb {
+            part["thumb"] = json!(thumb);
+        }
+        part
+    }
+
+    /// A save of one user message with an image (and its text), and the reply.
+    fn save_with_image(s: &ConversationStore, n: u32, sha: &str) {
+        let messages = vec![
+            json!({"role": "user", "content": [{"type": "text", "text": "look"}, image_part(sha, "shot.png", None)]}),
+            json!({"role": "assistant", "content": "ok"}),
+        ];
+        let req = SaveRequest { messages, ..request(&id(n), "unused") };
+        s.save(&req, &redactor(), u64::from(n)).unwrap();
+    }
+
+    /// Writes one image file for conversation `n` and returns its content address.
+    fn put_image(s: &ConversationStore, n: u32, seed: u8) -> String {
+        let bytes = vec![seed; 8];
+        let sha = sha256_hex(&bytes);
+        s.attachments().write(&id(n), &sha, "png", &bytes).unwrap();
+        sha
+    }
+
+    fn attachment_dir(s: &ConversationStore, n: u32) -> PathBuf {
+        s.attachments().root().join(id(n))
+    }
+
+    #[test]
+    fn the_title_comes_from_the_text_of_an_attachment_message_or_else_the_first_name() {
+        let sha = "a".repeat(64);
+        let with_text = [json!({"role": "user", "content": [
+            {"type": "text", "text": "Explain\nthis"},
+            {"type": "watt_file", "name": "a.txt", "bytes": 1, "text": "x"},
+        ]})];
+        assert_eq!(derive_title(&with_text), "Explain");
+
+        let blank_text_first = [
+            json!({"role": "user", "content": [{"type": "text", "text": "  "}, image_part(&sha, "shot.png", None)]}),
+            json!({"role": "user", "content": [{"type": "text", "text": "Later question"}]}),
+        ];
+        assert_eq!(derive_title(&blank_text_first), "Later question", "a text line beats an attachment name");
+
+        let only_files = [json!({"role": "user", "content": [
+            {"type": "text", "text": ""},
+            {"type": "watt_file", "name": "notes.md", "bytes": 1, "text": "x"},
+        ]})];
+        assert_eq!(derive_title(&only_files), "notes.md");
+        let nothing = [json!({"role": "user", "content": [{"type": "text", "text": ""}]})];
+        assert_eq!(derive_title(&nothing), "Untitled");
+    }
+
+    #[test]
+    fn redaction_walks_text_parts_and_document_text_but_never_thumbnails_or_base64() {
+        let thumb = "data:image/png;base64,AKIAIOSFODNN7EXAMPLE";
+        let messages = vec![json!({"role": "user", "content": [
+            {"type": "text", "text": format!("key {SECRET}")},
+            {"type": "watt_file", "name": "notes.txt", "bytes": 9, "text": format!("token={SECRET}")},
+            image_part(&"c".repeat(64), "shot.png", Some(thumb)),
+        ]})];
+        let out = redact_messages(&messages, &redactor());
+        let parts = out[0]["content"].as_array().unwrap();
+        assert_eq!(parts[0]["text"], "key [REDACTED]");
+        assert_eq!(parts[1]["text"], "token=[REDACTED]");
+        assert_eq!(parts[2], messages[0]["content"][2], "the image part, thumbnail included, is untouched");
+
+        // The same through a save: the file has the redacted text and the thumbnail as it was.
+        let tmp = TempDir::new();
+        let s = store(&tmp);
+        let req = SaveRequest { messages, ..request(&id(90), "unused") };
+        s.save(&req, &redactor(), 1).unwrap();
+        let on_disk = fs::read_to_string(s.path_for(&id(90))).unwrap();
+        assert!(on_disk.contains(thumb), "the thumbnail is on disk as it was");
+        assert!(!on_disk.contains(SECRET), "{on_disk}");
+        assert_eq!(s.load(&id(90)).unwrap().title, "key [REDACTED]");
+    }
+
+    #[test]
+    fn delete_removes_the_attachment_files_of_that_conversation_only() {
+        let tmp = TempDir::new();
+        let s = store(&tmp);
+        let sha_a = put_image(&s, 90, 1);
+        save_with_image(&s, 90, &sha_a);
+        let sha_b = put_image(&s, 91, 2);
+        save_with_image(&s, 91, &sha_b);
+        assert!(attachment_dir(&s, 90).exists());
+
+        s.delete(&id(90)).unwrap();
+        assert!(!attachment_dir(&s, 90).exists(), "the deleted conversation's files are gone");
+        assert!(attachment_dir(&s, 91).join(format!("{sha_b}.png")).exists());
+    }
+
+    #[test]
+    fn prune_removes_the_attachments_of_pruned_conversations_and_sweeps_orphans() {
+        let tmp = TempDir::new();
+        let s = store(&tmp);
+        for n in 90..93 {
+            let sha = put_image(&s, n, n as u8);
+            save_with_image(&s, n, &sha);
+        }
+        // A directory for an id that no conversation has, and a file that is not a conversation directory.
+        put_image(&s, 99, 9);
+        fs::write(s.attachments().root().join("notes.txt"), b"not ours").unwrap();
+
+        let removed = s.prune(2, None).unwrap();
+        assert_eq!(removed, vec![id(90)], "the oldest conversation is pruned");
+        assert!(!attachment_dir(&s, 90).exists(), "its files go with it");
+        assert!(attachment_dir(&s, 91).exists() && attachment_dir(&s, 92).exists());
+        assert!(!attachment_dir(&s, 99).exists(), "an orphan directory is swept");
+        assert_eq!(fs::read(s.attachments().root().join("notes.txt")).unwrap(), b"not ours");
+    }
+
+    #[test]
+    fn a_damaged_conversation_keeps_its_attachments_when_the_store_is_pruned() {
+        let tmp = TempDir::new();
+        let s = store(&tmp);
+        // Never saved, and its file is damaged: the index skips it, so the sweep must not take its files.
+        fs::create_dir_all(&s.dir).unwrap();
+        fs::write(s.path_for(&id(95)), b"garbage").unwrap();
+        put_image(&s, 95, 5);
+        s.list().unwrap();
+        s.prune(10, None).unwrap();
+        assert!(attachment_dir(&s, 95).exists(), "a damaged conversation keeps its files");
+    }
+
+    #[test]
+    fn delete_all_removes_every_attachment_directory_and_keeps_other_entries() {
+        let tmp = TempDir::new();
+        let s = store(&tmp);
+        for n in 90..92 {
+            let sha = put_image(&s, n, n as u8);
+            save_with_image(&s, n, &sha);
+        }
+        fs::write(s.attachments().root().join("notes.txt"), b"not ours").unwrap();
+
+        s.delete_all().unwrap();
+        assert!(!attachment_dir(&s, 90).exists() && !attachment_dir(&s, 91).exists());
+        assert!(s.list().unwrap().is_empty());
+        assert_eq!(fs::read(s.attachments().root().join("notes.txt")).unwrap(), b"not ours");
     }
 }

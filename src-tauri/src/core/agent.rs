@@ -17,6 +17,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::core::approval::{self, ApprovalPolicy, ManualPolicy, Reason, SendKeysCall, SendKeysMemory, Verdict};
+use crate::core::chat::attachments::Attachment;
 use crate::core::chat::todo::Todo;
 use crate::core::foreground::{self, Foreground, ForegroundKind};
 use crate::core::keys::KeyPlan;
@@ -682,14 +683,28 @@ impl<'a> AgentCtx<'a> {
     }
 }
 
+/// One user message as an agent gets it: its text and its attachments (core/chat/attachments). A message without
+/// attachments is `UserMessage::text`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UserMessage {
+    pub text: String,
+    pub attachments: Vec<Attachment>,
+}
+
+impl UserMessage {
+    pub fn text(text: &str) -> Self {
+        UserMessage { text: text.to_string(), attachments: Vec::new() }
+    }
+}
+
 pub trait Agent {
     /// Handles one user message. Replies and tool activity go out through `ctx`.
-    fn respond(&mut self, user_text: &str, ctx: &AgentCtx<'_>);
+    fn respond(&mut self, message: &UserMessage, ctx: &AgentCtx<'_>);
 }
 
 /// Runs one turn and always ends it with `Done`.
-pub fn run_turn(agent: &mut dyn Agent, user_text: &str, ctx: &AgentCtx<'_>) {
-    agent.respond(user_text, ctx);
+pub fn run_turn(agent: &mut dyn Agent, message: &UserMessage, ctx: &AgentCtx<'_>) {
+    agent.respond(message, ctx);
     ctx.emit(AgentEvent::Done);
 }
 
@@ -701,8 +716,9 @@ describe the screen (\"what do you see\"), tell you the directory (\"where am I\
 once you approve it (\"run `pwd`\").";
 
 impl Agent for MockAgent {
-    fn respond(&mut self, user_text: &str, ctx: &AgentCtx<'_>) {
-        let text = user_text.trim();
+    /// The mock answers the text only; attachments are not looked at.
+    fn respond(&mut self, message: &UserMessage, ctx: &AgentCtx<'_>) {
+        let text = message.text.trim();
         // ASCII lowercasing keeps byte offsets equal to those in `text`.
         let lower = text.to_ascii_lowercase();
         if let Some(cmd) = run_request(text, &lower) {

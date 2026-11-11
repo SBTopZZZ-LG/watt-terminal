@@ -5,12 +5,14 @@
 //! - `<data_dir>/conversations/<id>.json`: one file per conversation (`conversations.rs`).
 //! - `<data_dir>/conversations/index.json`: metadata of every conversation, for listing. It is a cache: when it is
 //!   missing, corrupt or disagrees with the files, `list` rebuilds it by reading the conversation files.
+//! - `<data_dir>/attachments/<id>/<sha256>.<ext>`: the image bytes of a conversation's attachments (`attachments.rs`).
 //! - `<config_dir>/ui-state.json`: small UI preferences and the last conversation used (`ui_state.rs`).
 //!
 //! Every write goes through `write_private_atomic` (core/settings): a temp file in the same directory, then rename.
 //! Files are 0600 and directories 0700. Conversation messages are the model-facing history, redacted before they
 //! are written (see `conversations::redact_messages`). The UI transcript is not stored.
 
+pub mod attachments;
 pub mod conversations;
 pub mod turn;
 pub mod ui_state;
