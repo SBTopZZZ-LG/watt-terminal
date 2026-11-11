@@ -548,11 +548,6 @@ input {
   overflow-wrap: anywhere;
 }
 
-.agent-panel.dock-left .bar-input,
-.agent-panel.dock-right .bar-input {
-  flex: 1 1 0;
-}
-
 .agent-panel.dock-left .approval-actions,
 .agent-panel.dock-right .approval-actions {
   flex-wrap: wrap;
@@ -1630,26 +1625,24 @@ input {
   background: var(--bg);
 }
 
-.bar-mode {
-  min-width: 52px;
-  padding: 2px 6px;
-  border: 1px dashed var(--rule);
-  border-radius: 2px;
-  font: 11px/18px var(--mono);
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  text-align: center;
-  background: var(--panel);
-  color: var(--muted);
-}
-
-.mode-agent {
-  color: var(--accent);
-}
-
-.bar-input {
-  flex: 1 1 auto;
+/*
+ * The field: the textarea's box, and the wrapper the busy light is drawn on. Its basis is 0 so it takes the free width
+ * and the send button stays on the same row in a narrow dock.
+ */
+.bar-field {
+  position: relative;
+  flex: 1 1 0;
   min-width: 0;
+}
+
+/* A textarea that grows with its text (InputBar sets the height). The max-height caps it, and then it scrolls. */
+.bar-input {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  max-height: 160px;
+  overflow-y: auto;
+  resize: none;
   padding: 6px 8px;
   border: 1px solid var(--line);
   border-radius: 2px;
@@ -1660,6 +1653,98 @@ input {
 .bar-input:focus {
   outline: none;
   border-color: var(--accent);
+}
+
+/*
+ * While the agent is busy, a 2px ring of light travels around the field's border: a conic highlight whose start angle
+ * turns (the custom property is registered so it interpolates). The ring is a mask over the layer, so only the border
+ * area shows and nothing shifts. The textarea's own border stays the dim base colour while busy, so the light has
+ * something to contrast with even when the field is focused.
+ */
+@property --bar-wave-angle {
+  syntax: '<angle>';
+  inherits: false;
+  initial-value: 0deg;
+}
+
+.bar-field.is-busy::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  padding: 2px;
+  border-radius: 2px;
+  background: conic-gradient(
+    from var(--bar-wave-angle),
+    transparent 0deg,
+    transparent 200deg,
+    var(--accent) 300deg,
+    color-mix(in srgb, var(--accent) 45%, white) 340deg,
+    transparent 360deg
+  );
+  mask-image: linear-gradient(#000 0 0), linear-gradient(#000 0 0);
+  mask-clip: content-box, border-box;
+  mask-composite: exclude;
+  -webkit-mask-image: linear-gradient(#000 0 0), linear-gradient(#000 0 0);
+  -webkit-mask-clip: content-box, border-box;
+  -webkit-mask-composite: xor;
+  pointer-events: none;
+  animation: bar-busy-wave 2.4s linear infinite;
+}
+
+/* A static glow around the field while busy. A box-shadow on the textarea costs nothing per frame. */
+.bar-field.is-busy .bar-input {
+  border-color: var(--line);
+  box-shadow: 0 0 8px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+@keyframes bar-busy-wave {
+  from {
+    --bar-wave-angle: 0deg;
+  }
+  to {
+    --bar-wave-angle: 360deg;
+  }
+}
+
+/* No motion: the whole ring is a static accent border while busy. */
+@media (prefers-reduced-motion: reduce) {
+  .bar-field.is-busy::before {
+    animation: none;
+    background: var(--accent);
+    opacity: 0.6;
+  }
+}
+
+/* Send, or Stop while the agent is busy. Fixed size, so the field takes the rest of the row. */
+.bar-send {
+  flex: 0 0 30px;
+  align-self: flex-end;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid var(--accent);
+  border-radius: 2px;
+  background: var(--panel);
+  color: var(--accent);
+  cursor: pointer;
+}
+
+.bar-send.is-stop {
+  border-color: var(--fail);
+  color: var(--fail);
+}
+
+.bar-send:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.bar-send:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 
 .bar-hint,

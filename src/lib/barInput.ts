@@ -8,6 +8,22 @@ export function messageFor(text: string): string | null {
 }
 
 /**
+ * Whether an Up or Down press takes history, rather than moving the caret inside a multi-line text. Up takes it only
+ * when the caret is on the first line, Down only on the last. Single-line text always takes it.
+ */
+export function historyKeyTakesLine(dir: 'up' | 'down', text: string, caret: number): boolean {
+  return dir === 'up' ? !text.slice(0, caret).includes('\n') : !text.slice(caret).includes('\n');
+}
+
+/**
+ * The send button's state. While the agent is busy it is Stop, which interrupts. Otherwise it sends, and is disabled
+ * when there is nothing to send or the bar is locked. Stop is disabled only when locked.
+ */
+export function sendButtonFor(busy: boolean, text: string, locked: boolean): { stop: boolean; disabled: boolean } {
+  return { stop: busy, disabled: locked || (!busy && messageFor(text) === null) };
+}
+
+/**
  * Up/Down history of agent messages in memory. `index` equals `entries.length` when showing the live line, whose text
  * is kept as the draft when the user starts walking back.
  */

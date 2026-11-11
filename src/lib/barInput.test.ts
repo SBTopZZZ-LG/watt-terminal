@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { History, messageFor } from './barInput';
+import { History, historyKeyTakesLine, messageFor, sendButtonFor } from './barInput';
 
 describe('messageFor', () => {
   it('empty and whitespace-only text sends nothing', () => {
@@ -42,5 +42,52 @@ describe('History', () => {
     h.record('where am I');
     expect(h.back('')).toBe('where am I');
     expect(h.back('where am I')).toBeNull();
+  });
+});
+
+describe('historyKeyTakesLine', () => {
+  it('single-line text always takes Up and Down, whatever the caret', () => {
+    expect(historyKeyTakesLine('up', 'why', 0)).toBe(true);
+    expect(historyKeyTakesLine('up', 'why', 3)).toBe(true);
+    expect(historyKeyTakesLine('down', 'why', 0)).toBe(true);
+    expect(historyKeyTakesLine('down', 'why', 3)).toBe(true);
+    expect(historyKeyTakesLine('up', '', 0)).toBe(true);
+  });
+
+  it('multi-line text: Up takes history only on the first line', () => {
+    const text = 'first\nsecond';
+    expect(historyKeyTakesLine('up', text, 0)).toBe(true);
+    expect(historyKeyTakesLine('up', text, 5)).toBe(true); // end of the first line
+    expect(historyKeyTakesLine('up', text, 6)).toBe(false); // start of the second line
+    expect(historyKeyTakesLine('up', text, text.length)).toBe(false);
+  });
+
+  it('multi-line text: Down takes history only on the last line', () => {
+    const text = 'first\nsecond';
+    expect(historyKeyTakesLine('down', text, 0)).toBe(false);
+    expect(historyKeyTakesLine('down', text, 5)).toBe(false); // end of the first line, the newline is after the caret
+    expect(historyKeyTakesLine('down', text, 6)).toBe(true);
+    expect(historyKeyTakesLine('down', text, text.length)).toBe(true);
+  });
+});
+
+describe('sendButtonFor', () => {
+  it('idle with nothing to send: a disabled Send', () => {
+    expect(sendButtonFor(false, '', false)).toEqual({ stop: false, disabled: true });
+    expect(sendButtonFor(false, '   ', false)).toEqual({ stop: false, disabled: true });
+  });
+
+  it('idle with text: an enabled Send', () => {
+    expect(sendButtonFor(false, 'why', false)).toEqual({ stop: false, disabled: false });
+  });
+
+  it('busy: Stop is enabled even with no text', () => {
+    expect(sendButtonFor(true, '', false)).toEqual({ stop: true, disabled: false });
+    expect(sendButtonFor(true, 'typing ahead', false)).toEqual({ stop: true, disabled: false });
+  });
+
+  it('locked disables the button in either state', () => {
+    expect(sendButtonFor(false, 'why', true)).toEqual({ stop: false, disabled: true });
+    expect(sendButtonFor(true, '', true)).toEqual({ stop: true, disabled: true });
   });
 });

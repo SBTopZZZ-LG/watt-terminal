@@ -187,7 +187,8 @@ export interface BarKeyContext {
 /**
  * What a key pressed in the input bar means. Ctrl-C is always `interrupt` (the caller sends ^C to the PTY),
  * whatever the state. Enter approves the first pending approval when the input is empty; Escape denies it.
- * Otherwise Escape closes the bar's focus (back to the terminal).
+ * Otherwise Escape closes the bar's focus (back to the terminal). Shift-Enter is `none`, so the textarea
+ * inserts a newline.
  */
 export function barKeyIntent(
   key: string,
@@ -199,6 +200,9 @@ export function barKeyIntent(
   }
   switch (key) {
     case 'Enter':
+      if (mods.shift) {
+        return 'none';
+      }
       return ctx.inputEmpty && ctx.hasPendingApproval ? 'approve_first' : 'submit';
     case 'Escape':
       return ctx.hasPendingApproval ? 'deny_first' : 'close';

@@ -823,6 +823,7 @@ export default function App() {
               hintInline={locked ? false : route.hintInline}
               locked={locked}
               hasPendingApproval={pendingApproval !== null}
+              busy={busy}
               focusToken={focusToken}
               onFocusChange={setBarOpen}
               onRestart={restartShell}

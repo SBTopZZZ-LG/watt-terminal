@@ -1,8 +1,8 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { barKeyIntent } from '../lib/inputState';
 import type { BarMode } from '../lib/inputState';
-import { History, messageFor } from '../lib/barInput';
+import { History, historyKeyTakesLine, messageFor, sendButtonFor } from '../lib/barInput';
 
 interface Props {
   mode: BarMode;
@@ -11,6 +11,8 @@ interface Props {
   /** Show the hint as the input's placeholder instead of a row under it, so the bar's height does not change. */
   hintInline: boolean;
   hasPendingApproval: boolean;
+  /** The agent is mid-turn. The button becomes Stop, and the field's border shows a light while it lasts. */
+  busy: boolean;
   /** An integration is running: the input takes no text and sends nothing until it answers. */
   locked: boolean;
   /** Bumped by the parent to move focus into the input (or the restart button, when the shell exited). */
@@ -29,12 +31,27 @@ interface Props {
   onClose: () => void;
 }
 
+/**
+ * Sets the textarea's height to fit its text. The CSS max-height caps it, and the field scrolls past that. scrollHeight
+ * leaves out the border, so the border's height is added back (the box is border-box). An empty field goes back to its
+ * one-row height: the placeholder can wrap to several lines in a narrow dock, and scrollHeight counts those.
+ */
+function fitHeight(el: HTMLTextAreaElement) {
+  if (el.value === '') {
+    el.style.height = '';
+    return;
+  }
+  el.style.height = 'auto';
+  const border = el.offsetHeight - el.clientHeight;
+  el.style.height = `${el.scrollHeight + border}px`;
+}
+
 export function InputBar(props: Props) {
-  const { mode, hint, hintInline, hasPendingApproval, focusToken } = props;
+  const { mode, hint, hintInline, hasPendingApproval, busy, focusToken } = props;
   const [text, setText] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
   const restartRef = useRef<HTMLButtonElement>(null);
   const history = useRef(new History());
 
@@ -49,6 +66,31 @@ export function InputBar(props: Props) {
       inputRef.current?.focus();
     }
   }, [focusToken]);
+
+  // The field grows with its text. Runs before paint, so a cleared field shrinks back without a flash.
+  useLayoutEffect(() => {
+    if (inputRef.current) {
+      fitHeight(inputRef.current);
+    }
+  }, [text, mode]);
+
+  // A narrower or wider dock rewraps the text, so the height is fitted again. Only a width change counts, so the
+  // height this sets does not start another round.
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') {
+      return;
+    }
+    let width = el.clientWidth;
+    const observer = new ResizeObserver(() => {
+      if (el.clientWidth !== width) {
+        width = el.clientWidth;
+        fitHeight(el);
+      }
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [mode]);
 
   if (mode === 'exited') {
     return (
@@ -86,7 +128,21 @@ export function InputBar(props: Props) {
     setError(null);
   }
 
-  function onKeyDown(e: ReactKeyboardEvent<HTMLInputElement>) {
+  const send = sendButtonFor(busy, text, props.locked);
+
+  /** The send button: Stop while busy, otherwise the same as Enter. Focus stays in the input either way. */
+  function onSendClick() {
+    if (send.stop) {
+      props.onInterrupt();
+      inputRef.current?.focus();
+      return;
+    }
+    if (!sending && !props.locked) {
+      void submit().then(() => inputRef.current?.focus());
+    }
+  }
+
+  function onKeyDown(e: ReactKeyboardEvent<HTMLTextAreaElement>) {
     if (e.nativeEvent.isComposing) {
       return;
     }
@@ -120,6 +176,10 @@ export function InputBar(props: Props) {
         }
         return;
       case 'history_prev': {
+        // In a multi-line text, Up moves the caret until it is on the first line.
+        if (!historyKeyTakesLine('up', text, e.currentTarget.selectionStart)) {
+          return;
+        }
         e.preventDefault();
         const older = history.current.back(text);
         if (older !== null) {
@@ -128,6 +188,10 @@ export function InputBar(props: Props) {
         return;
       }
       case 'history_next': {
+        // In a multi-line text, Down moves the caret until it is on the last line.
+        if (!historyKeyTakesLine('down', text, e.currentTarget.selectionEnd)) {
+          return;
+        }
         e.preventDefault();
         const newer = history.current.forward();
         if (newer !== null) {
@@ -146,25 +210,55 @@ export function InputBar(props: Props) {
 
   return (
     <div className={`bar bar-${mode}`}>
-      <span className="bar-mode mode-agent">agent</span>
-      <input
-        ref={inputRef}
-        className="bar-input"
-        value={text}
-        placeholder={inlineHint ?? 'Ask the agent…  (Ctrl/Cmd+Shift+A to focus, Esc to return)'}
-        spellCheck={false}
-        autoComplete="off"
-        disabled={props.locked}
-        onChange={(e) => {
-          setText(e.currentTarget.value);
-          setError(null);
-        }}
-        onKeyDown={onKeyDown}
-        onFocus={() => props.onFocusChange(true)}
-        onBlur={() => props.onFocusChange(false)}
-      />
+      <div className={busy ? 'bar-field is-busy' : 'bar-field'}>
+        <textarea
+          ref={inputRef}
+          className="bar-input"
+          rows={1}
+          value={text}
+          placeholder={inlineHint ?? 'Ask the agent…  (Ctrl/Cmd+Shift+A to focus, Esc to return)'}
+          spellCheck={false}
+          autoComplete="off"
+          disabled={props.locked}
+          onChange={(e) => {
+            setText(e.currentTarget.value);
+            setError(null);
+          }}
+          onKeyDown={onKeyDown}
+          onFocus={() => props.onFocusChange(true)}
+          onBlur={() => props.onFocusChange(false)}
+        />
+      </div>
+      {/* mousedown keeps focus in the input: a blur closes the bar on the alternate screen. */}
+      <button
+        type="button"
+        className={send.stop ? 'bar-send is-stop' : 'bar-send'}
+        aria-label={send.stop ? 'Stop' : 'Send'}
+        title={send.stop ? 'Stop' : 'Send'}
+        disabled={send.disabled}
+        onMouseDown={(e) => e.preventDefault()}
+        onClick={onSendClick}
+      >
+        {send.stop ? <StopIcon /> : <SendIcon />}
+      </button>
       {error !== null && <div className="bar-error">{error}</div>}
       {error === null && hint !== null && !hintInline && <div className="bar-hint">{hint}</div>}
     </div>
+  );
+}
+
+function SendIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" focusable="false">
+      <path d="M12 19V5M5 12l7-7 7 7" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function StopIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true" focusable="false">
+      <rect x="5" y="5" width="14" height="14" rx="2" fill="currentColor" />
+    </svg>
   );
 }

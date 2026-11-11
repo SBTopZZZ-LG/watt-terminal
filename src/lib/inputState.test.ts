@@ -223,6 +223,16 @@ describe('barKeyIntent', () => {
     expect(barKeyIntent('Enter', { ctrl: false, shift: false }, none)).toBe('submit');
   });
 
+  it('Shift-Enter is not a submit or an approval: it is none, so the textarea inserts a newline', () => {
+    expect(barKeyIntent('Enter', { ctrl: false, shift: true }, none)).toBe('none');
+    expect(barKeyIntent('Enter', { ctrl: false, shift: true }, { inputEmpty: false, hasPendingApproval: false })).toBe(
+      'none',
+    );
+    expect(barKeyIntent('Enter', { ctrl: false, shift: true }, { inputEmpty: true, hasPendingApproval: true })).toBe(
+      'none',
+    );
+  });
+
   it('Escape denies a pending approval, otherwise it closes the bar (focus back to the terminal)', () => {
     expect(barKeyIntent('Escape', { ctrl: false, shift: false }, { inputEmpty: true, hasPendingApproval: true })).toBe(
       'deny_first',
