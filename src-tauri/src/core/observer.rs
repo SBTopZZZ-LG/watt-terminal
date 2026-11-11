@@ -35,6 +35,8 @@ pub const PENDING_TIMEOUT: Duration = Duration::from_secs(30);
 pub const LABEL_CAP: usize = 200;
 /// The key of the local shell's level.
 pub const LOCAL_KEY: u64 = 0;
+/// The command text of a nested record whose text the shell did not report (bash does not record every command).
+pub const UNAVAILABLE_COMMAND: &str = "(command text unavailable)";
 
 // ---------- queue ----------
 
@@ -223,6 +225,36 @@ pub struct LevelInfo {
     pub state: InputState,
 }
 
+/// Why `Core::begin_injection` (and so `Session::integrate_shell`) did not start. The texts are for the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InjectRefusal {
+    /// No command is running at the top level (an idle prompt, a shell that is booting, or an exited session).
+    NotRunning,
+    /// A full-screen program is open. Close it first.
+    AltScreen,
+    /// The running program is not a shell, ssh, su or a container exec, so there is no shell to integrate.
+    NoShellProgram,
+    /// The depth cap is reached: another level would pass MAX_DEPTH.
+    TooDeep,
+    /// Another integration is in flight, or a level is already waiting for its Hello.
+    Busy,
+}
+
+impl std::fmt::Display for InjectRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InjectRefusal::NotRunning => write!(f, "no command is running in this shell, so there is nothing to integrate"),
+            InjectRefusal::AltScreen => write!(f, "a full-screen program is open; close it first"),
+            InjectRefusal::NoShellProgram => {
+                write!(f, "the running program is not a shell, ssh, su or a container exec, so there is no shell to integrate")
+            }
+            InjectRefusal::TooDeep => write!(f, "the shell is nested too deeply to integrate another level"),
+            InjectRefusal::Busy => write!(f, "another shell integration is already in progress"),
+        }
+    }
+}
+
 /// Session changes for listeners (the UI). Delivered in order, outside the core lock.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -356,6 +388,18 @@ fn screen_fingerprint(screen: &vt100::Screen) -> u64 {
     hasher.finish()
 }
 
+/// The text and source of an E event at a nested level. bash does not record every command (ignoreboth, ignoredups, or
+/// history off), so its E can be empty, and an E can differ from the line the agent sent. A pending agent line is then the
+/// truth: its text and source win. Otherwise the E stands, as it does at level 0.
+fn nested_command_line(text: String, pending: Option<(Source, Option<String>)>) -> (String, Source) {
+    match pending {
+        Some((source @ Source::Agent { .. }, Some(agent_text))) if agent_text != text => (agent_text, source),
+        Some((source, Some(pending_text))) if pending_text == text => (text, source),
+        Some((source, None)) => (text, source),
+        _ => (text, Source::Unknown),
+    }
+}
+
 /// What a level keeps while another level is on top. The top level's own state lives in the Core's fields (lifecycle,
 /// pending, last_e, and the parser's capture target), so the existing code reads the top unchanged. Put back on pop.
 /// A level is only parked while it is Running (a push needs that), so its lifecycle is not stored: on pop it is Running.
@@ -408,6 +452,12 @@ struct PendingLevel {
     since: Instant,
 }
 
+/// An injection in flight: the loader was typed with `token`, and `sh` is set once its Ready carried that token.
+struct Injection {
+    token: String,
+    sh: Option<String>,
+}
+
 pub struct Core {
     parser: Parser<Collector>,
     /// Hash of the visible screen at the last `note_screen`. Compared on each call.
@@ -424,6 +474,10 @@ pub struct Core {
     pending_level: Option<PendingLevel>,
     /// Pushes refused (not Running, depth cap) and nested events refused for want of a pending level.
     refused: u64,
+    /// The injection in flight, if any (see `begin_injection`).
+    injection: Option<Injection>,
+    /// Ready events whose token was not the one in flight (or none was in flight). Not forged: they are only counted.
+    stray_ready: u64,
     /// The top level's lifecycle.
     lifecycle: Lifecycle,
     spawned_at: Instant,
@@ -468,6 +522,8 @@ impl Core {
             next_key: LOCAL_KEY + 1,
             pending_level: None,
             refused: 0,
+            injection: None,
+            stray_ready: 0,
             lifecycle: Lifecycle::Booting,
             spawned_at: Instant::now(),
             shell_pid: None,
@@ -556,6 +612,15 @@ impl Core {
             return;
         }
         self.prune_pending();
+        // Ready is untagged, so its token is what ties it to the injection in flight. It counts at any depth, because the
+        // loader can be typed into a nested shell as well as the local one.
+        if let Event::Ready { token, sh } = &event {
+            match self.injection.as_mut() {
+                Some(inj) if inj.token == *token => inj.sh = Some(sh.clone()),
+                _ => self.stray_ready += 1,
+            }
+            return;
+        }
         let Some(key) = level else {
             // Untagged OSC 7 is the local shell's cwd only. A nested shell does not change it.
             if self.top_is_local() {
@@ -693,6 +758,58 @@ impl Core {
         self.events.push(SessionEvent::Levels { levels, nonces });
     }
 
+    /// Starts an injection with `token`: the loader is about to be typed. Only while the top level is Running a program that
+    /// holds a shell (ssh, a shell, su, a container exec), with no level pending, no injection in flight and depth to spare.
+    pub fn begin_injection(&mut self, token: &str) -> Result<(), InjectRefusal> {
+        if self.injection.is_some() || self.pending_level.is_some() {
+            return Err(InjectRefusal::Busy);
+        }
+        if self.depth() >= MAX_DEPTH {
+            return Err(InjectRefusal::TooDeep);
+        }
+        match self.lifecycle_view() {
+            InputState::Running => {}
+            InputState::Alt => return Err(InjectRefusal::AltScreen),
+            _ => return Err(InjectRefusal::NotRunning),
+        }
+        let holds_a_shell = self.foreground().is_some_and(|fg| {
+            matches!(fg.kind, ForegroundKind::Ssh | ForegroundKind::Shell | ForegroundKind::Su | ForegroundKind::ContainerExec)
+        });
+        if !holds_a_shell {
+            return Err(InjectRefusal::NoShellProgram);
+        }
+        self.injection = Some(Injection { token: token.to_string(), sh: None });
+        Ok(())
+    }
+
+    /// The shell name (`zsh` or `bash`) once the loader's Ready arrived for the injection in flight.
+    pub fn injection_ready(&self) -> Option<String> {
+        self.injection.as_ref().and_then(|inj| inj.sh.clone())
+    }
+
+    /// Ends the injection in flight, whatever its outcome.
+    pub fn end_injection(&mut self) {
+        self.injection = None;
+    }
+
+    /// Ready events that did not match the injection in flight, counted and otherwise ignored.
+    pub fn stray_ready_events(&self) -> u64 {
+        self.stray_ready
+    }
+
+    /// Drops the level that `expect_level` registered (its nonce is retired, so a late Hello counts as stale).
+    pub fn cancel_pending_level(&mut self) {
+        if let Some(pending) = self.pending_level.take() {
+            self.scanner.retire_nonce(pending.key);
+            self.levels_changed();
+        }
+    }
+
+    /// The shell name of the top level (`zsh` or `bash`), from its Hello. None until the Hello.
+    pub fn top_sh(&self) -> Option<&str> {
+        self.stack.last().and_then(|l| l.sh.as_deref())
+    }
+
     /// The key of the level on top, the one that takes events and submits. 0 is the local shell.
     pub fn top_key(&self) -> u64 {
         self.stack.last().map_or(LOCAL_KEY, |l| l.key)
@@ -759,17 +876,23 @@ impl Core {
                 }
             }
             Event::CommandLine(text) => {
-                let source = match self.pending.take() {
-                    Some((source, None)) => source,
-                    Some((source, Some(pending_text))) if pending_text == text => source,
-                    _ => Source::Unknown,
+                let pending = self.pending.take();
+                let entry = if self.top_is_local() {
+                    let source = match pending {
+                        Some((source, None)) => source,
+                        Some((source, Some(pending_text))) if pending_text == text => source,
+                        _ => Source::Unknown,
+                    };
+                    (text, source)
+                } else {
+                    nested_command_line(text, pending)
                 };
-                self.last_e = Some((text, source));
+                self.last_e = Some(entry);
             }
             Event::CommandStart => {
                 // C while a record is open: the previous command ended without a D we could trust.
                 self.close_open(RecordStatus::Incomplete);
-                let (command, source) = self.last_e.take().unwrap_or_else(|| (String::new(), Source::Unknown));
+                let (command, source) = self.command_for_c();
                 self.pending = None;
                 // The line the user typed has run (or is running): the prompt is no longer holding their text.
                 self.user_typed = false;
@@ -815,6 +938,21 @@ impl Core {
         self.desynced = true;
         self.last_e = None;
         self.pending = None;
+    }
+
+    /// The command text and source for the record that C starts. Level 0 takes E as it always did. A nested level takes
+    /// the E it has (already corrected by `nested_command_line`), or else the pending agent line, or else a placeholder.
+    fn command_for_c(&mut self) -> (String, Source) {
+        if self.top_is_local() {
+            return self.last_e.take().unwrap_or_else(|| (String::new(), Source::Unknown));
+        }
+        match self.last_e.take() {
+            Some((text, source)) if !text.is_empty() => (text, source),
+            _ => match self.pending.take() {
+                Some((source @ Source::Agent { .. }, Some(text))) => (text, source),
+                _ => (UNAVAILABLE_COMMAND.to_string(), Source::User),
+            },
+        }
     }
 
     fn start_record(&mut self, command: String, source: Source) {
@@ -1953,5 +2091,170 @@ mod tests {
         let mut c = core();
         c.feed(&osc("7;file://mac.local/tmp/x"));
         assert_eq!(c.cwd(), Some(Cwd { host: "mac.local".into(), path: "/tmp/x".into() }));
+    }
+
+    // ---------- injection (B2b) ----------
+
+    const TOKEN: &str = "TOK123";
+
+    fn ready(token: &str, sh: &str) -> Vec<u8> {
+        osc(&format!("633;Ready;t={token};sh={sh}"))
+    }
+
+    #[test]
+    fn injection_is_refused_unless_a_shell_program_runs_at_a_running_top() {
+        let mut prompt = core();
+        prompt.lifecycle = Lifecycle::Prompt;
+        assert_eq!(prompt.begin_injection(TOKEN), Err(InjectRefusal::NotRunning));
+
+        let mut alt = running("ssh ubuntu@lidia");
+        alt.parser.process(b"\x1b[?1049h");
+        assert_eq!(alt.begin_injection(TOKEN), Err(InjectRefusal::AltScreen));
+
+        let mut sleep = running("sleep 5");
+        assert_eq!(sleep.begin_injection(TOKEN), Err(InjectRefusal::NoShellProgram));
+        let mut multiplexer = running("tmux attach");
+        assert_eq!(multiplexer.begin_injection(TOKEN), Err(InjectRefusal::NoShellProgram));
+
+        for command in ["ssh ubuntu@lidia", "zsh -f -i", "su -", "docker exec -it app sh"] {
+            let mut ok = running(command);
+            assert_eq!(ok.begin_injection(TOKEN), Ok(()), "{command}");
+            ok.end_injection();
+        }
+    }
+
+    #[test]
+    fn injection_is_busy_while_one_is_in_flight_or_a_level_is_pending() {
+        let mut c = running("zsh -f -i");
+        assert_eq!(c.begin_injection(TOKEN), Ok(()));
+        assert_eq!(c.begin_injection("other"), Err(InjectRefusal::Busy));
+        c.end_injection();
+
+        c.expect_level(CHILD, "zsh -f -i");
+        assert_eq!(c.begin_injection(TOKEN), Err(InjectRefusal::Busy), "a pending level is in the way");
+        c.cancel_pending_level();
+        assert_eq!(c.begin_injection(TOKEN), Ok(()));
+    }
+
+    #[test]
+    fn injection_is_too_deep_at_the_depth_cap() {
+        let mut deep = running("ssh h");
+        for i in 1..MAX_DEPTH {
+            let nonce = format!("nested-{i}");
+            deep.expect_level(&nonce, "ssh h");
+            deep.feed(&tagged("633;Hello", &nonce, ";v=1;pid=1"));
+            deep.feed(&tagged("133;A", &nonce, ""));
+            deep.feed(&tagged("633;E", &nonce, ";sleep 1"));
+            deep.feed(&tagged("133;C", &nonce, ""));
+        }
+        assert_eq!(deep.depth(), MAX_DEPTH);
+        assert_eq!(deep.begin_injection(TOKEN), Err(InjectRefusal::TooDeep));
+    }
+
+    /// Ready is untagged and matched by its token. It sets the shell only for the injection in flight, at any depth.
+    #[test]
+    fn a_ready_with_the_token_in_flight_sets_the_shell_at_any_depth() {
+        let mut c = running("zsh -f -i");
+        c.begin_injection(TOKEN).expect("injection");
+        c.feed(&ready("WRONG", "zsh"));
+        assert_eq!(c.injection_ready(), None);
+        assert_eq!(c.stray_ready_events(), 1);
+        c.feed(&ready(TOKEN, "bash"));
+        assert_eq!(c.injection_ready().as_deref(), Some("bash"));
+        assert_eq!(c.stray_ready_events(), 1);
+        c.end_injection();
+        c.feed(&ready(TOKEN, "zsh"));
+        assert_eq!(c.injection_ready(), None, "no injection in flight");
+        assert_eq!(c.stray_ready_events(), 2);
+
+        let mut n = nested_at_prompt();
+        remote_running(&mut n, "bash --norc");
+        assert_eq!(n.begin_injection(TOKEN), Ok(()));
+        n.feed(&ready(TOKEN, "zsh"));
+        assert_eq!(n.injection_ready().as_deref(), Some("zsh"), "the loader was typed into the remote shell");
+    }
+
+    #[test]
+    fn cancel_pending_level_retires_its_nonce_and_announces_it() {
+        let mut c = running("zsh -f -i");
+        c.expect_level(CHILD, "zsh -f -i");
+        c.take_events(true);
+        c.cancel_pending_level();
+        let announced = levels_events(&c.take_events(true));
+        assert_eq!(announced.len(), 1);
+        assert!(!announced[0].1.contains(&CHILD.to_string()), "the cancelled nonce is still accepted");
+        c.feed(&tagged("633;Hello", CHILD, ";v=1;pid=1"));
+        assert_eq!(c.depth(), 1);
+        assert_eq!((c.stale_events(), c.forged_events()), (1, 0));
+    }
+
+    #[test]
+    fn the_top_shell_name_is_the_top_levels_hello() {
+        assert_eq!(nested().top_sh(), Some("bash"));
+        assert_eq!(core().top_sh(), None);
+    }
+
+    /// bash records nothing for a repeated command, so its E is empty. The pending agent line names the record and its source.
+    #[test]
+    fn a_nested_command_with_an_empty_e_takes_the_agent_line() {
+        let mut c = nested_at_prompt();
+        c.begin_submit(Some((agent("run-e1"), Some("echo same".into()))));
+        c.feed(&tagged("633;E", CHILD, ";"));
+        c.feed(&tagged("133;C", CHILD, ""));
+        c.feed(&tagged("133;D", CHILD, ";exit=0;ps=0"));
+        let rec = c.get_record(2).expect("the remote record");
+        assert_eq!(rec.command, "echo same");
+        assert!(matches!(&rec.source, Source::Agent { call_id } if call_id == "run-e1"), "{:?}", rec.source);
+        assert_eq!(rec.level, 1);
+        assert_eq!(rec.status, RecordStatus::Complete);
+    }
+
+    #[test]
+    fn a_nested_e_that_differs_from_the_agent_line_gives_the_agent_line() {
+        let mut c = nested_at_prompt();
+        c.begin_submit(Some((agent("run-e2"), Some("ls".into()))));
+        c.feed(&tagged("633;E", CHILD, ";ls -la"));
+        c.feed(&tagged("133;C", CHILD, ""));
+        c.feed(&tagged("133;D", CHILD, ";exit=0;ps=0"));
+        let rec = c.get_record(2).expect("the remote record");
+        assert_eq!(rec.command, "ls");
+        assert!(matches!(&rec.source, Source::Agent { call_id } if call_id == "run-e2"));
+    }
+
+    /// No E event at all, but the agent line is pending: the record still takes the agent line.
+    #[test]
+    fn a_nested_command_with_no_e_event_takes_the_pending_agent_line() {
+        let mut c = nested_at_prompt();
+        c.begin_submit(Some((agent("run-e3"), Some("pwd".into()))));
+        c.feed(&tagged("133;C", CHILD, ""));
+        c.feed(&tagged("133;D", CHILD, ";exit=0;ps=0"));
+        let rec = c.get_record(2).expect("the remote record");
+        assert_eq!(rec.command, "pwd");
+        assert!(matches!(&rec.source, Source::Agent { call_id } if call_id == "run-e3"));
+    }
+
+    /// Nothing says what ran: the placeholder, with the user as the source.
+    #[test]
+    fn a_nested_command_with_no_text_and_no_agent_line_is_a_placeholder() {
+        let mut c = nested_at_prompt();
+        c.feed(&tagged("633;E", CHILD, ";"));
+        c.feed(&tagged("133;C", CHILD, ""));
+        c.feed(&tagged("133;D", CHILD, ";exit=0;ps=0"));
+        let rec = c.get_record(2).expect("the remote record");
+        assert_eq!(rec.command, UNAVAILABLE_COMMAND);
+        assert!(matches!(rec.source, Source::User));
+    }
+
+    /// Level 0 is unchanged: an empty E stays an empty command text, whatever the pending line was.
+    #[test]
+    fn level_zero_keeps_an_empty_e_as_an_empty_command() {
+        let mut c = core();
+        c.begin_submit(Some((agent("run-e4"), Some("echo same".into()))));
+        c.handle(Event::CommandLine(String::new()));
+        c.handle(Event::CommandStart);
+        c.handle(Event::CommandEnd { exit: 0, pipestatus: vec![0] });
+        let rec = c.get_record(1).expect("the local record");
+        assert_eq!(rec.command, "");
+        assert!(matches!(rec.source, Source::Unknown));
     }
 }

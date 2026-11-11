@@ -11,19 +11,30 @@ use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
 
 use crate::core::foreground::Foreground;
+use crate::core::inject::{self, END_MARKER};
 use crate::core::observer::{
-    run_observer, Activity, CallStatus, Core, EventSink, InputState, IntegrationStatus, LevelInfo, ObsMsg, ObsQueue,
-    ObserverStatus, ScreenSnapshot, Shared,
+    run_observer, Activity, CallStatus, Core, EventSink, InjectRefusal, InputState, IntegrationStatus, LevelInfo, ObsMsg,
+    ObsQueue, ObserverStatus, ScreenSnapshot, Shared,
 };
 use crate::core::pty::{self, Gate, OutputSink};
 use crate::core::record::{Cwd, Record, RecordSummary, Source};
 use crate::core::shim;
+
+/// Ctrl-C is sent before the loader. The loader is typed once the output has been quiet this long (or the cap passes).
+const QUIET_FOR: Duration = Duration::from_millis(300);
+const QUIET_CAP: Duration = Duration::from_secs(2);
+/// How long the loader has to say Ready, and how long the new level has to say Hello after its blob.
+const READY_WAIT: Duration = Duration::from_secs(5);
+const PUSH_WAIT: Duration = Duration::from_secs(5);
+const INJECT_POLL: Duration = Duration::from_millis(20);
+/// The line the loader prints (alone on its row) when it refuses the shell.
+const UNSUPPORTED_LINE: &str = "Unsupported shell";
 
 #[derive(Debug, Clone)]
 pub struct SpawnConfig {
@@ -56,6 +67,9 @@ pub enum SubmitError {
     ObserverDesynced,
     /// The session has no writer any more (the shell exited or the session was closed).
     Closed,
+    /// The top level is bash, and the text has a newline. bash's multi-line history is joined or split, so the
+    /// observer cannot attribute it safely. Nothing was written.
+    MultiLineAtBash,
 }
 
 impl std::fmt::Display for SubmitError {
@@ -65,8 +79,29 @@ impl std::fmt::Display for SubmitError {
             SubmitError::UserTyped => write!(f, "{}", user_text_refusal()),
             SubmitError::ObserverDesynced => write!(f, "observer is desynced; wait for the next prompt"),
             SubmitError::Closed => write!(f, "session is closed"),
+            SubmitError::MultiLineAtBash => write!(
+                f,
+                "this shell is bash and cannot take multi-line commands safely; send one line, or join with ;"
+            ),
         }
     }
+}
+
+/// What `Session::integrate_shell` reports. Tagged for the UI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum IntegrateOutcome {
+    /// The shell is integrated as a new level, and it is on top.
+    Integrated { key: u64, label: String, sh: String, user: Option<String>, host: Option<String> },
+    /// The loader refused the shell (bash older than 4.4, posix mode, or promptvars off). Nothing was installed.
+    UnsupportedShell,
+    /// The loader did not say Ready in time. Ctrl-C was sent.
+    Timeout,
+    /// The blob went in, but the level did not appear. `hint` is the shell's last message, or the last screen line.
+    /// Ctrl-C was sent and the pending level dropped.
+    Failed { hint: String },
+    /// Not started. See the reason.
+    Refused { reason: InjectRefusal },
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -82,6 +117,9 @@ enum WriteCmd {
     /// (or the submit timeout, for an empty line).
     User(Vec<u8>),
     Submit { source: Source, text: String, reply: Sender<Result<(), SubmitError>> },
+    /// Bytes for the injection (Ctrl-C, the loader, the blob lines). Written as they are: no submit gate, no typed-text
+    /// bookkeeping. Only `integrate_shell` sends these.
+    Inject(Vec<u8>),
 }
 
 pub struct Session {
@@ -224,6 +262,157 @@ impl Session {
         self.shared.lock().levels()
     }
 
+    /// The key of the level on top (0 is the local shell).
+    pub fn top_key(&self) -> u64 {
+        self.shared.lock().top_key()
+    }
+
+    /// The label of the nested level on top (the command that started it). None on the local shell.
+    pub fn location(&self) -> Option<String> {
+        self.shared.lock().location()
+    }
+
+    /// Integrates the shell that runs in the foreground (ssh, a nested shell, su, a container exec) as a new level. It
+    /// types Ctrl-C and the loader, waits for the shell's Ready, then writes the blob with a fresh nonce and waits for the
+    /// new level's Hello. Blocking: call it from a blocking thread. One at a time; a second call is refused as Busy.
+    /// The core lock is never held while writing or sleeping.
+    pub fn integrate_shell(&self) -> IntegrateOutcome {
+        let token = match inject::new_token() {
+            Ok(token) => token,
+            Err(e) => return IntegrateOutcome::Failed { hint: format!("no random bytes for the handshake: {e}") },
+        };
+        let label = {
+            let mut core = self.shared.lock();
+            if let Err(reason) = core.begin_injection(&token) {
+                return IntegrateOutcome::Refused { reason };
+            }
+            core.foreground().map(|fg| fg.command).unwrap_or_default()
+        };
+        let outcome = self.run_injection(&token, &label);
+        // Only reached once begin_injection succeeded, so the record here is this call's own.
+        self.shared.lock().end_injection();
+        outcome
+    }
+
+    /// The handshake after `begin_injection`. Every early return leaves the shell as it was, or sends Ctrl-C.
+    fn run_injection(&self, token: &str, label: &str) -> IntegrateOutcome {
+        // Ctrl-C clears whatever the shell has on its line, then the loader is typed once the output settles.
+        self.inject(vec![0x03]);
+        self.wait_quiet();
+        self.inject(format!("{}\r", inject::loader_line(token)).into_bytes());
+
+        let loader = self.poll_until(READY_WAIT, |s| {
+            let ready = s.shared.lock().injection_ready();
+            if let Some(sh) = ready {
+                return Some(Ok(sh));
+            }
+            s.shows_line(UNSUPPORTED_LINE).then_some(Err(()))
+        });
+        let sh = match loader {
+            Some(Ok(sh)) => sh,
+            // The loader printed its refusal and exited. Nothing was written, so no Ctrl-C.
+            Some(Err(())) => return IntegrateOutcome::UnsupportedShell,
+            None => {
+                self.inject(vec![0x03]);
+                return IntegrateOutcome::Timeout;
+            }
+        };
+
+        let nonce = match inject::new_token() {
+            Ok(nonce) => nonce,
+            Err(e) => return self.abort(format!("no random bytes for the nonce: {e}")),
+        };
+        let lines = match inject::blob_lines(&nonce, &sh) {
+            Ok(lines) => lines,
+            Err(e) => return self.abort(e.to_string()),
+        };
+        let key = self.shared.lock().expect_level(&nonce, label);
+        // The Levels event carries the new nonce. It must reach the listener before any blob byte goes out.
+        self.shared.flush();
+        for line in &lines {
+            self.inject(format!("{line}\r").into_bytes());
+        }
+        self.inject(format!("{END_MARKER}\r").into_bytes());
+
+        let pushed = self.poll_until(PUSH_WAIT, |s| (s.shared.lock().top_key() == key).then_some(())).is_some();
+        if !pushed {
+            return self.abort(self.last_message());
+        }
+        let level = self.shared.lock().levels().into_iter().find(|l| l.key == key);
+        match level {
+            Some(level) => IntegrateOutcome::Integrated {
+                key,
+                label: level.label,
+                sh,
+                user: level.user,
+                host: level.host,
+            },
+            None => self.abort(self.last_message()),
+        }
+    }
+
+    /// Drops the pending level and sends Ctrl-C, for a handshake that did not finish. Returns the Failed outcome.
+    fn abort(&self, hint: String) -> IntegrateOutcome {
+        {
+            let mut core = self.shared.lock();
+            core.cancel_pending_level();
+        }
+        self.shared.flush();
+        self.inject(vec![0x03]);
+        IntegrateOutcome::Failed { hint }
+    }
+
+    /// Queues bytes for the writer (no submit gate, no typed-text bookkeeping).
+    fn inject(&self, bytes: Vec<u8>) {
+        let _ = self.wtx.send(WriteCmd::Inject(bytes));
+    }
+
+    /// Returns when the screen has not changed for `QUIET_FOR`, or after `QUIET_CAP`.
+    fn wait_quiet(&self) {
+        let start = Instant::now();
+        let mut seen = self.activity().screen_gen;
+        let mut changed_at = start;
+        loop {
+            thread::sleep(INJECT_POLL);
+            let now_gen = self.activity().screen_gen;
+            if now_gen != seen {
+                seen = now_gen;
+                changed_at = Instant::now();
+            }
+            if changed_at.elapsed() >= QUIET_FOR || start.elapsed() >= QUIET_CAP {
+                return;
+            }
+        }
+    }
+
+    /// Calls `f` every `INJECT_POLL` until it returns Some, or `within` passes.
+    fn poll_until<T>(&self, within: Duration, mut f: impl FnMut(&Session) -> Option<T>) -> Option<T> {
+        let end = Instant::now() + within;
+        loop {
+            if let Some(v) = f(self) {
+                return Some(v);
+            }
+            if Instant::now() >= end {
+                return None;
+            }
+            thread::sleep(INJECT_POLL);
+        }
+    }
+
+    /// True when a screen row is exactly `text` (trimmed). The loader's own echo holds the same words inside a longer line,
+    /// so a substring match would fire on the echo.
+    fn shows_line(&self, text: &str) -> bool {
+        self.screen_snapshot().rows.iter().any(|row| row.trim() == text)
+    }
+
+    /// The shell's last message for a failed handshake: the last row that starts with `agentterm:`, else the last non-blank row.
+    fn last_message(&self) -> String {
+        let rows = self.screen_snapshot().rows;
+        let tagged = rows.iter().rev().find(|r| r.contains("agentterm:"));
+        let any = rows.iter().rev().find(|r| !r.trim().is_empty());
+        tagged.or(any).map(|r| r.trim().to_string()).unwrap_or_default()
+    }
+
     pub fn observer_status(&self) -> ObserverStatus {
         self.shared.lock().observer_status()
     }
@@ -337,6 +526,9 @@ fn run_writer(rx: Receiver<WriteCmd>, mut writer: Box<dyn Write + Send>, shared:
                         match core.lifecycle_view() {
                             // The user's text is on the line: refuse, and write nothing.
                             InputState::Prompt if core.user_typed_since_prompt() => Err(SubmitError::UserTyped),
+                            InputState::Prompt if text.contains('\n') && core.top_sh() == Some("bash") => {
+                                Err(SubmitError::MultiLineAtBash)
+                            }
                             InputState::Prompt => {
                                 let bytes = encode_submit(&text, core.bracketed_paste());
                                 core.begin_submit(Some((source, Some(text))));
@@ -354,6 +546,10 @@ fn run_writer(rx: Receiver<WriteCmd>, mut writer: Box<dyn Write + Send>, shared:
                     Err(e) => Err(e),
                 };
                 let _ = reply.send(result);
+            }
+            WriteCmd::Inject(bytes) => {
+                // The injection's own bytes: no gate, no typed-text bookkeeping (see `integrate_shell`).
+                let _ = write_all(&mut writer, &bytes);
             }
         }
     }

@@ -361,14 +361,21 @@ fn bash_integrates_and_reports_each_command() {
     check_flow(&mut sh, Some(&home.0));
 }
 
-/// Ubuntu 24.04 in docker, bash with no profile. Needs docker and the image. Run with `cargo test -- --ignored docker`.
+/// The image for the docker tests: AT_TEST_IMAGE, or ubuntu:24.04. Must already be present locally.
+fn test_image() -> String {
+    std::env::var("AT_TEST_IMAGE").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| "ubuntu:24.04".to_string())
+}
+
+/// Ubuntu in docker (AT_TEST_IMAGE, default 24.04), bash with no profile. Needs docker and the image. Run with
+/// `cargo test -- --ignored docker`.
 #[test]
-#[ignore = "needs docker and ubuntu:24.04"]
+#[ignore = "needs docker and the image in AT_TEST_IMAGE (default ubuntu:24.04)"]
 fn docker_ubuntu_bash_integrates_and_reports_each_command() {
     let name = format!("at-b2a-{}", std::process::id());
     let _cleanup = ContainerGuard(name.clone());
+    let image = test_image();
     let mut cmd = CommandBuilder::new("docker");
-    cmd.args(["run", "-it", "--rm", "--name", name.as_str(), "ubuntu:24.04", "bash", "--noprofile", "--norc"]);
+    cmd.args(["run", "-it", "--rm", "--name", name.as_str(), image.as_str(), "bash", "--noprofile", "--norc"]);
     let mut sh = Shell::spawn(cmd);
     sh.integrate("bash");
     check_flow(&mut sh, None);

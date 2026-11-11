@@ -36,7 +36,7 @@ use crate::core::persist::{Persist, now_secs};
 use crate::core::pty::OutputSink;
 use crate::core::record::Cwd;
 use crate::core::registry::Registry;
-use crate::core::session::{Session, SessionStats, SpawnConfig};
+use crate::core::session::{IntegrateOutcome, Session, SessionStats, SpawnConfig};
 use crate::core::settings::models::fetch_models as fetch_model_list;
 use crate::core::settings::presets::{self, ProviderPreset};
 use crate::core::settings::secrets::Secrets;
@@ -588,6 +588,14 @@ fn get_status(session_id: String, reg: State<'_, Reg>, settings: State<'_, Setti
     })
 }
 
+/// Integrates the shell in the foreground (ssh, a nested shell, a container exec) as a new level. The handshake waits for
+/// the shell, so it runs on the blocking pool. See `Session::integrate_shell`. Nothing calls it from the UI yet (B4).
+#[tauri::command]
+async fn integrate_shell(session_id: String, reg: State<'_, Reg>) -> Result<IntegrateOutcome, String> {
+    let att = session(&reg, &session_id)?;
+    blocking(move || Ok(att.session.integrate_shell())).await
+}
+
 /// Async, so the `pkill`/`kill` calls in `Session::kill` do not run on the UI thread.
 #[tauri::command]
 async fn kill_session(session_id: String, reg: State<'_, Reg>) -> Result<(), String> {
@@ -928,6 +936,7 @@ pub fn run() {
             approve_tool,
             set_auto_approve,
             get_status,
+            integrate_shell,
             kill_session,
             list_conversations,
             load_conversation,
