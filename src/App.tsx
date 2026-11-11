@@ -8,8 +8,8 @@ import { clearTerminal, currentFontSize, fitToContainer, markConnected, marks, o
 import { appHotkeyFor } from './lib/appHotkeys';
 import { effectiveState, focusAfter, inputReducer, INITIAL_INPUT, isFocusBarHotkey, routeFor } from './lib/inputState';
 import type { BarMode, Route } from './lib/inputState';
-import { canIntegrate, nestedLevels } from './lib/integrate';
-import type { IntegratePhase } from './lib/integrate';
+import { agentDialogPhase, agentIntegratingQuietly, agentRequestAfter, agentRequestClosedBySession, agentRunning, canIntegrate, nestedLevels } from './lib/integrate';
+import type { AgentRequest, IntegratePhase } from './lib/integrate';
 import { agentControlAfter, borderLevel, NO_CONTROL } from './lib/agentControl';
 import type { AgentControl, BorderLevel } from './lib/agentControl';
 import { EMPTY_TRANSCRIPT, firstPendingApproval, isBusy, transcriptReducer } from './lib/transcript';
@@ -47,7 +47,12 @@ export default function App() {
   // The Integrate dialog's phase. While the handshake runs (`running`) no key goes to the shell and the bar takes none: the
   // backend is typing the loader and the blob, and a key typed then would land in the middle of them.
   const [integrate, setIntegrate] = useState<IntegratePhase>({ kind: 'closed' });
-  const locked = integrate.kind === 'running';
+  // The agent's request to integrate the shell (request_integration): a question, a running handshake (in the dialog, or
+  // quietly in auto mode), or its result. The keys are locked while it runs, as for the user's own integration.
+  const [agentReq, setAgentReq] = useState<AgentRequest | null>(null);
+  const locked = integrate.kind === 'running' || agentRunning(agentReq);
+  // The dialog's phase for the agent's request (null: the dialog shows nothing for it, as in auto mode).
+  const agentPhase = agentDialogPhase(agentReq);
   const keyRoute: Route = locked ? { ...route, keys: 'drop' } : route;
   // The nested shell levels, outermost first (the local one is not listed). The last is the shell on top.
   const [levels, setLevels] = useState<LevelInfo[]>([]);
@@ -305,9 +310,23 @@ export default function App() {
       switch (ev.type) {
         case 'state':
           dispatchInput({ type: 'rust_state', state: ev.state, foreground: ev.foreground ?? null });
+          // A shell that exited ends a question still waiting (see agentRequestAfter).
+          setAgentReq((cur) => agentRequestAfter(cur, ev));
           return;
         case 'integration':
           setIntegration(ev.status);
+          return;
+        case 'integration_request':
+          setAgentReq((cur) => agentRequestAfter(cur, ev));
+          // The agent's question is the one that counts: a consent dialog the user opened for this shell gives way to it.
+          if (ev.phase === 'asking') {
+            setIntegrate({ kind: 'closed' });
+          }
+          return;
+        case 'done':
+          // The turn ended: a question still waiting for an answer is closed (nobody can answer it now).
+          setAgentReq((cur) => agentRequestAfter(cur, ev));
+          dispatchTranscript({ type: 'agent_event', event: ev });
           return;
         case 'observer':
           setObserver(ev.status);
@@ -617,6 +636,33 @@ export default function App() {
 
   const closeIntegrate = () => setIntegrate({ kind: 'closed' });
 
+  /** Integrate on the agent's question: the handshake runs with the keys locked, and its `done` event brings the result. */
+  const acceptAgent = () => {
+    if (agentReq?.kind !== 'asking') {
+      return;
+    }
+    const { callId, label } = agentReq;
+    setAgentReq({ kind: 'running', callId, label, shown: true });
+    api.answerIntegration(callId, true).catch((e: unknown) => {
+      // Refused: no such question is pending (it timed out, or the turn ended). Nothing is running for it.
+      setAgentReq((cur) => (cur?.kind === 'running' && cur.callId === callId ? null : cur));
+      dispatchTranscript({ type: 'notice', text: errorText(e) });
+    });
+  };
+
+  /** Decline on the agent's question (Decline, Escape, the backdrop). The dialog closes at once. */
+  const declineAgent = () => {
+    if (agentReq?.kind !== 'asking') {
+      return;
+    }
+    const { callId } = agentReq;
+    setAgentReq(null);
+    // A refused answer means the question was already settled (timed out or cut short): the dialog is closed either way.
+    api.answerIntegration(callId, false).catch(() => undefined);
+  };
+
+  const closeAgent = () => setAgentReq(null);
+
   // Escape in the bar gives the keyboard back to the terminal. On the alternate screen it also closes the strip.
   const closeBar = () => {
     setBarOpen(false);
@@ -633,6 +679,7 @@ export default function App() {
     resetForNewSession();
     dispatchTranscript({ type: 'session_reset' });
     setAgentControl(NO_CONTROL);
+    setAgentReq((cur) => agentRequestClosedBySession(cur));
     const { rows, cols } = terminalSize();
     restart(rows, cols)
       .then(() => api.getStatus())
@@ -678,8 +725,9 @@ export default function App() {
         autoSuspended={autoSuspended}
         onToggleAutoApprove={toggleAutoApprove}
         location={levels.length > 0 ? levels[levels.length - 1] : null}
-        canIntegrate={integrate.kind === 'closed' && canIntegrate(effective, input.foreground)}
+        canIntegrate={integrate.kind === 'closed' && agentReq === null && canIntegrate(effective, input.foreground)}
         onIntegrate={openIntegrate}
+        integrating={agentIntegratingQuietly(agentReq)}
         llm={llm}
         settingsState={settingsState}
         onOpenSettings={openSettings}
@@ -787,7 +835,11 @@ export default function App() {
         }
       />
       {settingsOpen && <SettingsDialog onClose={closeSettings} onChanged={refreshStatus} onViewLoaded={refreshSettingsState} />}
-      {integrate.kind !== 'closed' && <IntegrateDialog phase={integrate} onStart={startIntegrate} onClose={closeIntegrate} />}
+      {agentPhase !== null ? (
+        <IntegrateDialog key="agent" phase={agentPhase} agent={{ onDecline: declineAgent }} onStart={acceptAgent} onClose={closeAgent} />
+      ) : (
+        integrate.kind !== 'closed' && <IntegrateDialog key="user" phase={integrate} onStart={startIntegrate} onClose={closeIntegrate} />
+      )}
     </div>
   );
 }

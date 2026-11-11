@@ -491,3 +491,19 @@ describe('transcriptReducer: todo list', () => {
     expect(after.items[0]).toMatchObject({ kind: 'tool', status: 'ok' });
   });
 });
+
+describe('transcriptReducer: integration requests', () => {
+  it('the integration request events add no rows: the tool call and its result are the row', () => {
+    const before = run([{ type: 'agent_event', event: { type: 'text', text: 'hi' } }]);
+    const after = run(
+      [
+        { type: 'agent_event', event: { type: 'integration_request', call_id: 'c1', phase: 'asking', label: 'ssh ubuntu@lidia' } },
+        { type: 'agent_event', event: { type: 'integration_request', call_id: 'c1', phase: 'running', label: 'ssh ubuntu@lidia' } },
+        { type: 'agent_event', event: { type: 'integration_request', call_id: 'c1', phase: 'done', outcome: { outcome: 'declined' } } },
+      ],
+      before,
+    );
+    expect(after.items).toEqual(before.items);
+    expect(after.inFlight).toBe(before.inFlight);
+  });
+});

@@ -3,10 +3,13 @@
 // The backend does the work (core/session.rs integrate_shell): the UI asks, waits, and reports what came back.
 
 import { CHIP_COMMAND_CHARS, truncateCommand } from './foreground';
-import type { Foreground, InjectRefusal, InputState, IntegrateOutcome, LevelInfo } from './types';
+import type { Foreground, InjectRefusal, InputState, IntegrateOutcome, LevelInfo, ToolDecision, WireEvent } from './types';
 
 /** The programs that can take a shell: a remote login, a nested shell, su, a container exec. Not a multiplexer. */
 const INTEGRATABLE: readonly string[] = ['ssh', 'shell', 'su', 'container_exec'];
+
+/** The agent's tool that asks for the integration (core/chat/prompt.rs). Its rows and requests are told apart by name. */
+export const INTEGRATE_TOOL = 'request_integration';
 
 /** The dialog's phases. `closed` shows nothing; the others are the dialog's three screens. */
 export type IntegratePhase =
@@ -17,6 +20,90 @@ export type IntegratePhase =
 
 /** The phases the dialog is shown in. */
 export type OpenPhase = Exclude<IntegratePhase, { kind: 'closed' }>;
+
+/**
+ * The agent's request to integrate the shell, as the UI holds it. `asking`: the user is asked (the dialog). `running`: the
+ * handshake runs; `shown` is true when the user accepted (the dialog shows it) and false in auto mode (only the strip chip
+ * says so). `result`: the dialog shows the outcome until it is closed.
+ */
+export type AgentRequest =
+  | { kind: 'asking'; callId: string; label: string }
+  | { kind: 'running'; callId: string; label: string; shown: boolean }
+  | { kind: 'result'; callId: string; outcome: IntegrateOutcome };
+
+/**
+ * The request after a wire event. Only the integration request, the turn's end (`done`) and a shell that exited move it:
+ * a question still waiting is closed by the turn ending or the shell going away, since nobody can answer it then. A running
+ * handshake is not stopped by them. Other events return the request as it is.
+ */
+export function agentRequestAfter(cur: AgentRequest | null, ev: WireEvent): AgentRequest | null {
+  switch (ev.type) {
+    case 'integration_request': {
+      if (ev.phase === 'asking') {
+        return { kind: 'asking', callId: ev.call_id, label: ev.label ?? '' };
+      }
+      if (ev.phase === 'running') {
+        // The user's Integrate puts the request in the running state before the backend says so: that still counts as shown.
+        const accepted = cur !== null && cur.callId === ev.call_id && (cur.kind === 'asking' || (cur.kind === 'running' && cur.shown));
+        const known = cur !== null && cur.kind !== 'result' ? cur.label : '';
+        return { kind: 'running', callId: ev.call_id, label: ev.label ?? known, shown: accepted };
+      }
+      if (cur === null || cur.callId !== ev.call_id) {
+        return cur;
+      }
+      // `done`. A shown handshake keeps its result on screen; a declined or cancelled question, and an auto run, end here.
+      const outcome = ev.outcome;
+      if (cur.kind === 'running' && cur.shown && outcome !== undefined && outcome.outcome !== 'declined') {
+        return { kind: 'result', callId: cur.callId, outcome };
+      }
+      return null;
+    }
+    case 'done':
+      return cur?.kind === 'asking' ? null : cur;
+    case 'state':
+      return ev.state === 'exited' && cur?.kind === 'asking' ? null : cur;
+    default:
+      return cur;
+  }
+}
+
+/** The request after the session started a new shell: a question still waiting is closed (it can never be answered). */
+export function agentRequestClosedBySession(cur: AgentRequest | null): AgentRequest | null {
+  return cur?.kind === 'asking' ? null : cur;
+}
+
+/** The dialog's phase for the agent's request, or null when the dialog shows nothing (no request, or auto mode). */
+export function agentDialogPhase(req: AgentRequest | null): OpenPhase | null {
+  if (req === null) {
+    return null;
+  }
+  switch (req.kind) {
+    case 'asking':
+      return { kind: 'consent' };
+    case 'running':
+      return req.shown ? { kind: 'running' } : null;
+    case 'result':
+      return { kind: 'result', outcome: req.outcome };
+  }
+}
+
+/** True in auto mode while the agent's shell is integrated: the strip shows the Integrating… chip, and no dialog. */
+export function agentIntegratingQuietly(req: AgentRequest | null): boolean {
+  return req !== null && req.kind === 'running' && !req.shown;
+}
+
+/** True while the handshake runs for the agent, shown or not: the keys are locked then, as for the user's own integration. */
+export function agentRunning(req: AgentRequest | null): boolean {
+  return req !== null && req.kind === 'running';
+}
+
+/**
+ * True for a request_integration row the user declined. Declined is not a failure: the row shows it as its own status. The
+ * tool's result is a plain error, so the decision is the only sign: `denied` (there is no reason to show).
+ */
+export function isDeclinedIntegration(name: string, decision: ToolDecision | null): boolean {
+  return name === INTEGRATE_TOOL && decision === 'denied';
+}
 
 /** True when the strip offers Integrate: a program that can take a shell is running in the foreground. */
 export function canIntegrate(state: InputState, fg: Foreground | null | undefined): boolean {

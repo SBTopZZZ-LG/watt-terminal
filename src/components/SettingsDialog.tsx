@@ -18,7 +18,7 @@ import {
 } from '../lib/settingsForm';
 import type { ProviderDraft } from '../lib/settingsForm';
 import { RECOVERY_BUSY_LABEL, REVERT_CONFIRM, reasonText, recoveryExplanation, recoveryKind } from '../lib/settingsRecovery';
-import type { ProviderPreset, RecoverAction, SettingsStateView, SettingsView } from '../lib/types';
+import type { AgentRequests, ProviderPreset, RecoverAction, SettingsStateView, SettingsView } from '../lib/types';
 import { ApprovalSection } from './ApprovalSection';
 import { ProviderEditor } from './ProviderEditor';
 import type { TestState } from './ProviderEditor';
@@ -412,7 +412,7 @@ export interface SettingsDialogProps {
 
 /**
  * The AI settings dialog: a modal over the window. It loads the settings, and holds the state of the default model, the
- * context limit, the provider editor and the approval draft. The notices about settings.json stay above a tab strip
+ * context limit, the provider editor, the approval draft and the agent integration setting. The notices about settings.json stay above a tab strip
  * (Models, Approvals); every tab stays mounted, so a switch keeps the drafts. Focus moves in on open, stays in while open,
  * and goes back to where it was on close. Esc closes; a click on the backdrop closes. Unsaved changes are asked about
  * before they are dropped.
@@ -435,6 +435,8 @@ export function SettingsDialog({ onClose, onChanged, onViewLoaded }: SettingsDia
   const [approvalDraft, setApprovalDraft] = useState<ApprovalDraft | null>(null);
   const [approvalSaving, setApprovalSaving] = useState(false);
   const [approvalError, setApprovalError] = useState<string | null>(null);
+  // The agent integration setting is saved on each change (its own command), so it has its own busy and error state.
+  const [integrationSave, setIntegrationSave] = useState<{ busy: boolean; error: string | null }>({ busy: false, error: null });
   // undefined while the built-in list loads; null when it could not be read.
   const [builtinDeny, setBuiltinDeny] = useState<string[] | null | undefined>(undefined);
   // The active tab. The dialog opens on the first one, and a closed dialog forgets it.
@@ -827,6 +829,21 @@ export function SettingsDialog({ onClose, onChanged, onViewLoaded }: SettingsDia
     );
   };
 
+  /** Saves the agent integration setting as soon as it changes. A refused save shows its message; the box shows the saved value. */
+  const setAgentRequests = (value: AgentRequests) => {
+    if (view === null || integrationSave.busy) {
+      return;
+    }
+    setIntegrationSave({ busy: true, error: null });
+    api.setIntegrationSettings({ agent_requests: value }).then(
+      (v) => {
+        applyView(v);
+        setIntegrationSave({ busy: false, error: null });
+      },
+      (e: unknown) => setIntegrationSave({ busy: false, error: errorText(e) }),
+    );
+  };
+
   /** Saves the Approvals draft. The backend checks the rules; a refused save shows its message and keeps the draft. */
   const saveApproval = () => {
     if (view === null || approvalDraft === null || approvalSaving) {
@@ -931,6 +948,10 @@ export function SettingsDialog({ onClose, onChanged, onViewLoaded }: SettingsDia
         saving={approvalSaving}
         saveError={approvalError}
         builtinDeny={builtinDeny}
+        integration={view.settings.integration.agent_requests}
+        integrationBusy={integrationSave.busy}
+        integrationError={integrationSave.error}
+        onIntegrationChange={setAgentRequests}
         onChange={(draft) => {
           setApprovalDraft(draft);
           setApprovalError(null);

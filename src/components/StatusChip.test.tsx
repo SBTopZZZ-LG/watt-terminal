@@ -238,3 +238,39 @@ describe('StatusChip: the location chip, the Integrate button, approve-all in an
     expect(out).not.toMatch(/chip-button chip-warn/);
   });
 });
+
+describe('StatusChip: the agent integrates quietly (auto mode)', () => {
+  function strip(over: { integrating?: boolean; canIntegrate?: boolean } = {}) {
+    return renderToStaticMarkup(
+      <StatusChip
+        integration="live"
+        observer="ok"
+        input="running"
+        cwd={null}
+        autoApprove={false}
+        onToggleAutoApprove={() => {}}
+        llm={LLM_ON}
+        settingsState={null}
+        onOpenSettings={() => {}}
+        integrating={over.integrating}
+        canIntegrate={over.canIntegrate}
+        onIntegrate={() => {}}
+      />,
+    );
+  }
+
+  it('shows the Integrating… chip while the agent integrates', () => {
+    expect(strip({ integrating: true })).toContain('chip-integrating');
+    expect(strip({ integrating: true })).toContain('Integrating…');
+  });
+
+  it('shows no chip otherwise', () => {
+    expect(strip({ integrating: false })).not.toContain('chip-integrating');
+    expect(strip({})).not.toContain('Integrating…');
+  });
+
+  it('is a label, not a button', () => {
+    const out = strip({ integrating: true });
+    expect(out).toMatch(/<span class="chip chip-integrating"[^>]*>Integrating…<\/span>/);
+  });
+});

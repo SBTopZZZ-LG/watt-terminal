@@ -6,12 +6,16 @@ import type { ApprovalSectionProps } from './ApprovalSection';
 const NOOP = () => undefined;
 
 const BASE: ApprovalSectionProps = {
-  draft: { mode: 'regex', allow: 'git status\nls .*', deny: 'rm .*' },
+  draft: { mode: 'regex', allow: 'git status\nls .*', deny: 'rm .*', nested: 'ask' },
   dirty: false,
   locked: false,
   saving: false,
   saveError: null,
   builtinDeny: ['rm', 'sudo'],
+  integration: 'ask',
+  integrationBusy: false,
+  integrationError: null,
+  onIntegrationChange: NOOP,
   onChange: NOOP,
   onSave: NOOP,
   onUndo: NOOP,
@@ -150,5 +154,51 @@ describe('ApprovalSection: try a command', () => {
 
   it('starts with Check disabled, since there is no command yet', () => {
     expect(tagHolding(render(), 'button', '>Check</button>')).toContain('disabled=""');
+  });
+});
+
+describe('ApprovalSection: Remote shells', () => {
+  it('has a Remote shells block with the two controls', () => {
+    const html = render();
+    expect(html).toContain('Remote shells');
+    expect(html).toContain('Auto-approve in SSH and nested shells');
+    expect(html).toContain('Let the agent integrate shells without asking');
+  });
+
+  it('the SSH and nested box is checked for same_as_local, and not otherwise', () => {
+    const on = render({ draft: { ...BASE.draft, nested: 'same_as_local' } });
+    expect(tagHolding(on, 'input', 'Auto-approve in SSH and nested shells')).toContain('checked=""');
+    const off = render();
+    expect(tagHolding(off, 'input', 'Auto-approve in SSH and nested shells')).not.toContain('checked=""');
+  });
+
+  it('the agent-request box is checked for auto only', () => {
+    const auto = render({ integration: 'auto' });
+    expect(tagHolding(auto, 'input', 'Let the agent integrate shells without asking')).toContain('checked=""');
+    const ask = render({ integration: 'ask' });
+    expect(tagHolding(ask, 'input', 'Let the agent integrate shells without asking')).not.toContain('checked=""');
+  });
+
+  it('carries the warnings: remote aliases, PATH and users; the hard gate and deny rules still apply; the loader and the prompts', () => {
+    const html = render();
+    expect(html).toContain('Remote aliases, PATH and users differ from this machine');
+    expect(html).toContain('The hard gate and the deny rules still apply everywhere.');
+    expect(html).toContain('the agent can type the integration loader into whatever shell is in');
+    expect(html).toContain('It refuses at password and other prompts.');
+  });
+
+  it('the agent-request box is disabled while it saves, and the nested box while the draft is frozen', () => {
+    const saving = render({ integrationBusy: true });
+    expect(tagHolding(saving, 'input', 'Let the agent integrate shells without asking')).toContain('disabled=""');
+    expect(saving).toContain('Saving...');
+    const locked = render({ locked: true });
+    expect(tagHolding(locked, 'input', 'Auto-approve in SSH and nested shells')).toContain('disabled=""');
+    expect(tagHolding(locked, 'input', 'Let the agent integrate shells without asking')).toContain('disabled=""');
+  });
+
+  it('shows a refused integration save as an alert', () => {
+    const html = render({ integrationError: 'settings.json is broken; fix or revert it first' });
+    expect(html).toContain('role="alert"');
+    expect(html).toContain('settings.json is broken; fix or revert it first');
   });
 });

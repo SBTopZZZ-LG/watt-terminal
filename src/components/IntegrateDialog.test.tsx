@@ -79,3 +79,43 @@ describe('IntegrateDialog: the result', () => {
     expect(html).toContain('&lt;img');
   });
 });
+
+describe("IntegrateDialog: the agent's question", () => {
+  // The buttons' handlers (Decline, Escape, Integrate) are not in static markup: the harness checks them (run-levels.mjs).
+  function asking() {
+    return renderToStaticMarkup(<IntegrateDialog phase={{ kind: 'consent' }} onStart={NOOP} onClose={NOOP} agent={{ onDecline: NOOP }} />);
+  }
+
+  it('is titled as the agent asking, with the same consent text as the user\'s own dialog', () => {
+    const html = asking();
+    expect(html).toContain('The agent asks to integrate this shell');
+    expect(html).not.toContain('Integrate this shell?');
+    const own = dialog({ kind: 'consent' });
+    const body = (h: string) => h.slice(h.indexOf('integrate-body'), h.indexOf('integrate-foot'));
+    expect(body(html)).toBe(body(own));
+  });
+
+  it('offers Decline (first, so it is the focused one) and Integrate (primary), and no Cancel', () => {
+    const html = asking();
+    expect(html).toMatch(/<button[^>]*>Decline<\/button>/);
+    expect(html).toMatch(/<button[^>]*class="integrate-primary"[^>]*>Integrate<\/button>/);
+    expect(html).not.toContain('>Cancel<');
+    expect(html.indexOf('>Decline<')).toBeLessThan(html.indexOf('>Integrate<'));
+  });
+
+  it('the running and result screens are the same as the user\'s own', () => {
+    const run = renderToStaticMarkup(<IntegrateDialog phase={{ kind: 'running' }} onStart={NOOP} onClose={NOOP} agent={{ onDecline: NOOP }} />);
+    expect(run).toContain('Integrating…');
+    expect(run).not.toContain('<button');
+    const result = renderToStaticMarkup(
+      <IntegrateDialog
+        phase={{ kind: 'result', outcome: { outcome: 'timeout' } }}
+        onStart={NOOP}
+        onClose={NOOP}
+        agent={{ onDecline: NOOP }}
+      />,
+    );
+    expect(result).toContain('The shell did not respond in time.');
+    expect(result).toMatch(/<button[^>]*>Close<\/button>/);
+  });
+});

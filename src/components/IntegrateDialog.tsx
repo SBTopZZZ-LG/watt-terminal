@@ -9,6 +9,11 @@ interface Props {
   onStart(): void;
   /** Closes the dialog. Ignored while the integration runs: the handshake cannot be stopped from here. */
   onClose(): void;
+  /**
+   * Set when the agent asked (request_integration). The consent screen is then the agent's question: its title says so,
+   * Decline (focused) replaces Cancel, and Escape and the backdrop decline. The other screens are the same.
+   */
+  agent?: { onDecline(): void };
 }
 
 /** Moves focus back to the element that had it when the dialog opened, or to the terminal when that is gone. */
@@ -20,12 +25,29 @@ function restoreFocus(opener: Element | null) {
   document.querySelector<HTMLElement>('.xterm-helper-textarea')?.focus();
 }
 
+/** What the consent screen says. The same text for the user's own integration and for the agent's question. */
+function consentBody(): ReactNode {
+  return (
+    <>
+      <p>
+        This types one short command into the shell you are connected to, then sends a small script, about 4 KB, that adds
+        prompt and command markers so the agent can run and read commands there. Nothing is written to disk on the remote
+        machine. The script lives in that shell&apos;s memory only and ends when you exit it.
+      </p>
+      <p>Make sure the remote shell is at its prompt, not at a password or other prompt: it will receive the typed lines.</p>
+      <p>Works with zsh, and bash 4.4 or newer. Other shells are left untouched.</p>
+      <p className="integrate-note">The one-line loader may remain in zsh history (it is removed from bash history).</p>
+    </>
+  );
+}
+
 /**
  * The consent dialog for integrating the shell in the foreground. Three screens: the consent (Cancel is focused, so Enter
- * does not start it), the running handshake (no buttons, keys are locked), and the result. It opens only on a click, never on
- * its own. Escape and the backdrop close it, except while it runs.
+ * does not start it), the running handshake (no buttons, keys are locked), and the result. The user's own integration opens
+ * it only on a click, never on its own. The agent's question (`agent`) opens it when the agent asks; there Decline is focused
+ * and Escape declines. Escape and the backdrop close it, except while it runs.
  */
-export function IntegrateDialog({ phase, onStart, onClose }: Props) {
+export function IntegrateDialog({ phase, onStart, onClose, agent }: Props) {
   const dialogRef = useRef<HTMLDivElement>(null);
   const cancelRef = useRef<HTMLButtonElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
@@ -34,6 +56,14 @@ export function IntegrateDialog({ phase, onStart, onClose }: Props) {
   // The element that had focus when the dialog opened. Read only in a browser: the server render (tests) has no document.
   const [opener] = useState<Element | null>(() => (typeof document === 'undefined' ? null : document.activeElement));
   const running = phase.kind === 'running';
+  // On the agent's question, closing it is a decline: the agent's turn is waiting for the answer.
+  const dismiss = () => {
+    if (agent !== undefined && phase.kind === 'consent') {
+      agent.onDecline();
+    } else {
+      onClose();
+    }
+  };
 
   // Focus follows the screen: Cancel on the consent, Close on the result, the dialog itself while it runs.
   useEffect(() => {
@@ -65,26 +95,27 @@ export function IntegrateDialog({ phase, onStart, onClose }: Props) {
       e.preventDefault();
       e.stopPropagation();
       if (!running) {
-        onClose();
+        dismiss();
       }
     }
   };
 
   let body: ReactNode;
   let foot: ReactNode;
-  if (phase.kind === 'consent') {
-    body = (
+  if (phase.kind === 'consent' && agent !== undefined) {
+    body = consentBody();
+    foot = (
       <>
-        <p>
-          This types one short command into the shell you are connected to, then sends a small script, about 4 KB, that adds
-          prompt and command markers so the agent can run and read commands there. Nothing is written to disk on the remote
-          machine. The script lives in that shell&apos;s memory only and ends when you exit it.
-        </p>
-        <p>Make sure the remote shell is at its prompt, not at a password or other prompt: it will receive the typed lines.</p>
-        <p>Works with zsh, and bash 4.4 or newer. Other shells are left untouched.</p>
-        <p className="integrate-note">The one-line loader may remain in zsh history (it is removed from bash history).</p>
+        <button ref={cancelRef} type="button" onClick={agent.onDecline}>
+          Decline
+        </button>
+        <button type="button" className="integrate-primary" onClick={onStart}>
+          Integrate
+        </button>
       </>
     );
+  } else if (phase.kind === 'consent') {
+    body = consentBody();
     foot = (
       <>
         <button ref={cancelRef} type="button" onClick={onClose}>
@@ -125,7 +156,7 @@ export function IntegrateDialog({ phase, onStart, onClose }: Props) {
       onClick={(e) => {
         // Only a press and release on the backdrop itself closes it, so a drag that ends outside the card does not.
         if (backdropPressed.current && e.target === e.currentTarget && !running) {
-          onClose();
+          dismiss();
         }
       }}
     >
@@ -140,7 +171,11 @@ export function IntegrateDialog({ phase, onStart, onClose }: Props) {
       >
         <header className="integrate-head">
           <h2 className="integrate-title" id={titleId}>
-            {phase.kind === 'consent' ? 'Integrate this shell?' : 'Integrate this shell'}
+            {phase.kind === 'consent'
+              ? agent !== undefined
+                ? 'The agent asks to integrate this shell'
+                : 'Integrate this shell?'
+              : 'Integrate this shell'}
           </h2>
         </header>
         <div className="integrate-body">{body}</div>

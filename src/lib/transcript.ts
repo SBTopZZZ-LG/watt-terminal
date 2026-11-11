@@ -200,6 +200,9 @@ function applyAgentEvent(t: Transcript, ev: AgentEvent): Transcript {
     // Drives the terminal border (see agentControl.ts), not the transcript.
     case 'agent_control':
       return t;
+    // The integration dialog and strip chip follow these (see integrate.ts). The row is the tool call's own (tool_result).
+    case 'integration_request':
+      return t;
     case 'todo_update':
       return { ...t, todos: ev.items };
   }

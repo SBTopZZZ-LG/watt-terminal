@@ -426,6 +426,13 @@ input {
   outline-offset: 1px;
 }
 
+/* The agent is integrating this shell without asking (auto mode). Accent like the location chip, not a button. */
+.chip-integrating {
+  color: var(--accent);
+  border-color: var(--accent);
+  white-space: nowrap;
+}
+
 .chip-button {
   cursor: pointer;
   background: var(--panel);
@@ -1409,6 +1416,11 @@ input {
 
 .tool-failed summary {
   color: var(--fail);
+}
+
+/* Declined is the user's choice, not a failure: muted, like a routine row. */
+.tool-declined summary {
+  color: var(--muted);
 }
 
 /* The rows inside an open group hang under its summary on a dashed rule. The summary is brighter than its rows. */

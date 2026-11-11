@@ -4,7 +4,7 @@ import { api, errorText } from '../lib/api';
 import { overRuleLimit, ruleCountText } from '../lib/approvalForm';
 import type { ApprovalDraft } from '../lib/approvalForm';
 import { AUTO_PER_TURN, previewText } from '../lib/approvalReasons';
-import type { ApprovalMode } from '../lib/types';
+import type { AgentRequests, ApprovalMode } from '../lib/types';
 
 export interface ApprovalSectionProps {
   draft: ApprovalDraft;
@@ -16,6 +16,12 @@ export interface ApprovalSectionProps {
   saveError: string | null;
   /** The built-in deny list: undefined while it loads, null when it could not be read. */
   builtinDeny: string[] | null | undefined;
+  /** The saved agent integration setting. It is saved as soon as it changes, not by Save approvals. */
+  integration: AgentRequests;
+  /** The integration setting is being saved. */
+  integrationBusy: boolean;
+  integrationError: string | null;
+  onIntegrationChange(value: AgentRequests): void;
   onChange(draft: ApprovalDraft): void;
   onSave(): void;
   onUndo(): void;
@@ -30,7 +36,8 @@ const MODES: { value: ApprovalMode; label: string }[] = [
  * The Approvals section of the AI settings: how run_command is approved. Manual asks for every command. Regex rules run a
  * command without asking only when an allow rule matches all of it and no deny rule does, and the built-in checks pass.
  * The section is controlled: the dialog holds the draft and the save, as it does for the provider editor. Saved rules are
- * checked against a command with "Try a command", which needs no draft.
+ * checked against a command with "Try a command", which needs no draft. The Remote shells block is here too: its SSH box is
+ * part of the draft, and the agent box saves as soon as it changes (its own command, see the dialog).
  */
 export function ApprovalSection(p: ApprovalSectionProps) {
   const uid = useId();
@@ -129,6 +136,47 @@ export function ApprovalSection(p: ApprovalSectionProps) {
           </>
         )}
       </details>
+
+      <div className="settings-section-block">
+        <h4 className="settings-section-title" id={`${uid}-remote-title`}>
+          Remote shells
+        </h4>
+        <label className="settings-check">
+          <input
+            type="checkbox"
+            checked={draft.nested === 'same_as_local'}
+            disabled={frozen}
+            aria-describedby={`${uid}-nested-note`}
+            onChange={(e) => p.onChange({ ...draft, nested: e.target.checked ? 'same_as_local' : 'ask' })}
+          />
+          Auto-approve in SSH and nested shells
+        </label>
+        <p className="settings-warn" id={`${uid}-nested-note`}>
+          Off by default. Remote aliases, PATH and users differ from this machine, so with this on, allow rules and approve-all
+          apply in SSH and nested shells too. The hard gate and the deny rules still apply everywhere.
+        </p>
+
+        <label className="settings-check">
+          <input
+            type="checkbox"
+            checked={p.integration === 'auto'}
+            disabled={off || p.integrationBusy}
+            aria-describedby={`${uid}-integrate-note`}
+            onChange={(e) => p.onIntegrationChange(e.target.checked ? 'auto' : 'ask')}
+          />
+          Let the agent integrate shells without asking
+        </label>
+        <p className="settings-hint" id={`${uid}-integrate-note`}>
+          Off by default: the agent asks first. With this on, the agent can type the integration loader into whatever shell is in
+          the foreground, without a dialog. It refuses at password and other prompts. Saved as soon as you change it.
+        </p>
+        {p.integrationBusy && <span className="settings-hint">Saving...</span>}
+        {p.integrationError !== null && (
+          <p className="settings-error" role="alert">
+            {p.integrationError}
+          </p>
+        )}
+      </div>
 
       {p.saveError !== null && (
         <p className="settings-error" role="alert">

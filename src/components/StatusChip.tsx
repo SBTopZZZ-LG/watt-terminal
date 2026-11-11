@@ -21,6 +21,8 @@ interface Props {
   /** Offers the Integrate button in the right-hand group, just before the gear, so it stays visible in a narrow strip. */
   canIntegrate?: boolean;
   onIntegrate?: () => void;
+  /** The agent is integrating this shell without asking (auto mode): the strip says so. The dialog is not shown then. */
+  integrating?: boolean;
   llm: LlmStatus;
   /** The state of settings.json. While it cannot be used, the model chip says so, and the settings button is in warning colour. */
   settingsState?: SettingsStateView | null;
@@ -60,6 +62,7 @@ export function StatusChip(props: Props) {
     location = null,
     canIntegrate = false,
     onIntegrate,
+    integrating = false,
     llm,
     settingsState = null,
     onOpenSettings,
@@ -106,6 +109,11 @@ export function StatusChip(props: Props) {
       >
         {autoSuspended ? 'auto-approve: off in this shell' : `auto-approve: ${autoOn ? 'ON' : 'off'}`}
       </button>
+      {integrating && (
+        <span className="chip chip-integrating" title="The agent is integrating this shell. It was allowed to do so without asking.">
+          Integrating…
+        </span>
+      )}
       {canIntegrate && onIntegrate && (
         <button
           type="button"

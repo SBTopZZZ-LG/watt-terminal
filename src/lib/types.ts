@@ -126,9 +126,17 @@ export type AgentEvent =
   | { type: 'approval_request'; call_id: string; name: string; text: string; reason?: ApprovalReasonCode; level?: number; location?: string }
   /** The agent is executing an approved shell call (true) and has finished it (false). */
   | { type: 'agent_control'; active: boolean }
+  /**
+   * A request to integrate the shell (the request_integration tool). `asking`: the user is asked. `running`: the handshake
+   * runs (`label` names the shell). `done`: it ended with `outcome`, or with `declined` when the user did not agree.
+   */
+  | { type: 'integration_request'; call_id: string; phase: 'asking' | 'running' | 'done'; label?: string; outcome?: AgentIntegrationOutcome }
   /** The conversation's todo list was replaced by a successful todo_write. `items` is the whole list. */
   | { type: 'todo_update'; items: TodoItem[] }
   | { type: 'done' };
+
+/** What an agent's integration request ended with: the handshake's outcome, or `declined` (no integration, no handshake). */
+export type AgentIntegrationOutcome = IntegrateOutcome | { outcome: 'declined' };
 
 export type WireEvent = SessionEvent | AgentEvent;
 
@@ -307,6 +315,13 @@ export interface ModelRef {
 /** `manual`: every run_command waits for the user. `regex`: the hard gate, then the deny and allow rules, decide. */
 export type ApprovalMode = 'manual' | 'regex';
 
+/**
+ * How a nested shell (ssh, a shell the app integrated) is approved. `ask`: its commands always need a card, and approve-all
+ * applies only in the shell it was switched on in. `same_as_local`: the rules and approve-all apply there as they do locally.
+ * The hard gate and the deny rules apply in both.
+ */
+export type Nested = 'ask' | 'same_as_local';
+
 /** How run_command is approved, as saved. Approve-all is session-only and is not here. */
 export interface ApprovalSettings {
   mode: ApprovalMode;
@@ -314,6 +329,15 @@ export interface ApprovalSettings {
   allow: string[];
   /** Matched the same way. A deny match wins over an allow match. */
   deny: string[];
+  nested: Nested;
+}
+
+/** `ask`: the user confirms each request_integration. `auto`: the shell is integrated without a dialog. */
+export type AgentRequests = 'ask' | 'auto';
+
+/** The shell integration settings (core/settings IntegrationSettings). Saved by their own command. */
+export interface IntegrationSettings {
+  agent_requests: AgentRequests;
 }
 
 /** What the saved approval settings would decide for one command, without running it (test_approval). */
@@ -329,6 +353,7 @@ export interface Settings {
   /** Tokens. null means no cap. */
   global_context_limit: number | null;
   approval: ApprovalSettings;
+  integration: IntegrationSettings;
 }
 
 /** Which secrets a provider has stored. Never their values. */

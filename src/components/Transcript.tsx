@@ -6,6 +6,7 @@ import { isAtBottom, shouldFollowAfterSend } from '../lib/stickScroll';
 import { approvalTitle } from '../lib/transcript';
 import type { TranscriptItem } from '../lib/transcript';
 import { askedBecause, decisionLabel, decisionTooltip } from '../lib/approvalReasons';
+import { isDeclinedIntegration } from '../lib/integrate';
 import { groupTranscript, toolGroupSummary } from '../lib/toolGroups';
 import type { GroupItem } from '../lib/toolGroups';
 import type { TodoItem } from '../lib/types';
@@ -248,12 +249,14 @@ function Entry({ item, onApprove }: { item: TranscriptItem; onApprove: Props['on
     case 'notice':
       return <div className="notice">{item.text}</div>;
     case 'tool': {
-      const status = item.status === 'running' ? 'running' : item.status === 'ok' ? 'ok' : 'failed';
+      // A declined integration request is its own status, not a failure: the user chose it.
+      const declined = isDeclinedIntegration(item.name, item.decision);
+      const status = declined ? 'declined' : item.status === 'running' ? 'running' : item.status === 'ok' ? 'ok' : 'failed';
       return (
         <details className={`tool tool-${status}`}>
           <summary>
             {item.name}
-            {item.decision !== null && (
+            {item.decision !== null && !declined && (
               <span
                 className={`decision decision-${item.decision}`}
                 title={decisionTooltip(item.decision, item.reason) ?? undefined}

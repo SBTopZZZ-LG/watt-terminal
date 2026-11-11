@@ -197,3 +197,33 @@ describe('toolGroupSummary', () => {
     expect(toolGroupSummary(g)).toBe('2 tool calls: x\\u{202E}y ×2');
   });
 });
+
+describe('toolGroupSummary: declined integration requests', () => {
+  function group(actions: TranscriptAction[]): GroupItem[] {
+    const [entry] = groupTranscript(items(actions));
+    if (entry.kind !== 'tools') {
+      throw new Error('expected a group');
+    }
+    return entry.items;
+  }
+
+  it('a declined request_integration is counted as declined, not as failed or denied', () => {
+    const g = group([
+      call('c1', 'request_integration'),
+      result('c1', 'request_integration', false, 'denied'),
+      call('c2', 'get_screen'),
+      result('c2', 'get_screen', true, 'read'),
+    ]);
+    expect(toolGroupSummary(g)).toBe('2 tool calls: request_integration, get_screen · declined');
+  });
+
+  it('a denied run_command still says denied, and a failed run still counts', () => {
+    const g = group([
+      call('c1', 'request_integration'),
+      result('c1', 'request_integration', false, 'denied'),
+      call('c2', 'run_command'),
+      result('c2', 'run_command', false, 'denied'),
+    ]);
+    expect(toolGroupSummary(g)).toBe('2 tool calls: request_integration, run_command · 1 failed · denied · declined');
+  });
+});

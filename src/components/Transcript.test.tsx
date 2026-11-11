@@ -178,3 +178,40 @@ describe('Transcript: approval reasons', () => {
     expect(html).not.toContain('approval-reason');
   });
 });
+
+describe('Transcript: a request_integration row', () => {
+  const callIntegrate: TranscriptAction = {
+    type: 'agent_event',
+    event: { type: 'tool_call', call_id: 'c1', name: 'request_integration', args: {} },
+  };
+
+  it('a declined request is a tool row with the status declined, not failed and not denied', () => {
+    const html = render([
+      callIntegrate,
+      { type: 'agent_event', event: { type: 'tool_result', call_id: 'c1', name: 'request_integration', ok: false, decision: 'denied', result: 'declined: the user did not integrate this shell' } },
+    ]);
+    expect(html).toContain('class="tool tool-declined"');
+    expect(html).toContain('request_integration');
+    expect(html).toContain(': declined</summary>');
+    expect(html).not.toContain('decision-denied');
+    expect(html).not.toContain('tool-failed');
+  });
+
+  it('an integrated request is a plain ok row, like the other tool rows', () => {
+    const html = render([
+      callIntegrate,
+      { type: 'agent_event', event: { type: 'tool_result', call_id: 'c1', name: 'request_integration', ok: true, decision: 'manual', result: 'Integrated ssh ubuntu@lidia (zsh).' } },
+    ]);
+    expect(html).toContain('class="tool tool-ok"');
+    expect(html).toContain('decision decision-manual');
+    expect(html).toContain(': ok</summary>');
+  });
+
+  it('a request run without a dialog (auto) shows auto, like any other tool', () => {
+    const html = render([
+      callIntegrate,
+      { type: 'agent_event', event: { type: 'tool_result', call_id: 'c1', name: 'request_integration', ok: true, decision: 'auto', result: 'x' } },
+    ]);
+    expect(html).toContain('auto');
+  });
+});

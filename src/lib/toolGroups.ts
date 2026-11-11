@@ -1,6 +1,7 @@
 // Groups a run of consecutive tool calls in the transcript into one collapsed line. Pure: the view feeds it the items
 // as they are and renders what comes back.
 
+import { isDeclinedIntegration } from './integrate';
 import type { TranscriptItem } from './transcript';
 import { visibleEscapes } from './visibleEscapes';
 
@@ -73,12 +74,17 @@ export function toolGroupSummary(items: GroupItem[]): string {
   if (running) {
     text += ` · running ${visibleEscapes(running.name)}`;
   }
-  const failed = tools.filter((t) => t.status === 'failed').length;
+  // A declined integration request is counted as declined, not as failed or denied.
+  const declined = (t: ToolItem) => isDeclinedIntegration(t.name, t.decision);
+  const failed = tools.filter((t) => t.status === 'failed' && !declined(t)).length;
   if (failed > 0) {
     text += ` · ${failed} failed`;
   }
-  if (tools.some((t) => t.decision === 'denied')) {
+  if (tools.some((t) => t.decision === 'denied' && !declined(t))) {
     text += ' · denied';
+  }
+  if (tools.some(declined)) {
+    text += ' · declined';
   }
   return text;
 }

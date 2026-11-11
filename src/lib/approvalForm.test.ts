@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { MAX_RULES, approvalInput, draftFromApproval, isApprovalDirty, overRuleLimit, parseRules, ruleCountText } from './approvalForm';
 import type { ApprovalSettings } from './types';
 
-const SAVED: ApprovalSettings = { mode: 'regex', allow: ['git status', 'ls .*'], deny: ['rm .*'] };
+const SAVED: ApprovalSettings = { mode: 'regex', allow: ['git status', 'ls .*'], deny: ['rm .*'], nested: 'ask' };
 
 describe('parseRules', () => {
   it('gives one rule per line, in order', () => {
@@ -29,11 +29,11 @@ describe('draftFromApproval and approvalInput', () => {
   });
 
   it('puts each list in its box, one rule per line', () => {
-    expect(draftFromApproval(SAVED)).toEqual({ mode: 'regex', allow: 'git status\nls .*', deny: 'rm .*' });
+    expect(draftFromApproval(SAVED)).toEqual({ mode: 'regex', allow: 'git status\nls .*', deny: 'rm .*', nested: 'ask' });
   });
 
   it('a manual draft with no rules saves no rules', () => {
-    expect(approvalInput({ mode: 'manual', allow: '', deny: '' })).toEqual({ mode: 'manual', allow: [], deny: [] });
+    expect(approvalInput({ mode: 'manual', allow: '', deny: '', nested: 'ask' })).toEqual({ mode: 'manual', allow: [], deny: [], nested: 'ask' });
   });
 });
 
@@ -77,5 +77,20 @@ describe('ruleCountText and overRuleLimit', () => {
     const at = Array.from({ length: MAX_RULES }, (_, i) => `cmd${i}`).join('\n');
     expect(overRuleLimit(at)).toBe(false);
     expect(overRuleLimit(`${at}\nextra`)).toBe(true);
+  });
+});
+
+describe('the nested-shell setting in the draft', () => {
+  it('round-trips, and the saved value is what the draft starts from', () => {
+    const same: ApprovalSettings = { ...SAVED, nested: 'same_as_local' };
+    expect(draftFromApproval(same).nested).toBe('same_as_local');
+    expect(approvalInput(draftFromApproval(same))).toEqual(same);
+  });
+
+  it('is dirty when it differs from the saved value, and clean when it matches', () => {
+    const base = draftFromApproval(SAVED);
+    expect(isApprovalDirty({ ...base, nested: 'same_as_local' }, SAVED)).toBe(true);
+    expect(isApprovalDirty({ ...base, nested: 'ask' }, { ...SAVED, nested: 'same_as_local' })).toBe(true);
+    expect(isApprovalDirty({ ...base, nested: 'ask' }, SAVED)).toBe(false);
   });
 });

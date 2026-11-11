@@ -10,6 +10,7 @@ import type {
   DeleteResult,
   FetchOutcome,
   IntegrateOutcome,
+  IntegrationSettings,
   LoadedConversation,
   ModelRef,
   ProviderPreset,
@@ -70,6 +71,13 @@ export const api = {
   },
   setAutoApprove(on: boolean) {
     return invoke<void>('set_auto_approve', { sessionId: SESSION_ID, on });
+  },
+  /**
+   * Answers the agent's request to integrate the shell (its `asking` event). `accept` runs the integration; anything else
+   * declines it. Errors when no such request is pending (it timed out, or the turn ended).
+   */
+  answerIntegration(callId: string, accept: boolean) {
+    return invoke<void>('answer_integration', { sessionId: SESSION_ID, callId, accept });
   },
   /** Approve-all as the shell on top sees it. Read again after a levels event or a toggle. */
   autoApproveState() {
@@ -147,6 +155,10 @@ export const api = {
   /** Saves the approval mode and rules. Refused while settings.json is broken. A bad rule fails with its number named. */
   setApprovalSettings(input: ApprovalSettings) {
     return invoke<SettingsView>('set_approval_settings', { input });
+  },
+  /** Saves whether the agent's integration requests ask the user or run at once. Refused while settings.json is broken. */
+  setIntegrationSettings(input: IntegrationSettings) {
+    return invoke<SettingsView>('set_integration_settings', { input });
   },
   /** What the saved approval settings would decide for a command, without running it. Approve-all is not part of it. */
   testApproval(command: string) {

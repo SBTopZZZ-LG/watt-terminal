@@ -1,6 +1,19 @@
 import { describe, expect, it } from 'vitest';
-import { canIntegrate, locationChip, nestedLevels, outcomeView, refusalText } from './integrate';
-import type { Foreground, LevelInfo } from './types';
+import {
+  agentDialogPhase,
+  agentIntegratingQuietly,
+  agentRequestAfter,
+  agentRequestClosedBySession,
+  agentRunning,
+  canIntegrate,
+  isDeclinedIntegration,
+  locationChip,
+  nestedLevels,
+  outcomeView,
+  refusalText,
+} from './integrate';
+import type { AgentRequest } from './integrate';
+import type { Foreground, LevelInfo, WireEvent } from './types';
 
 const fg = (kind: Foreground['kind'], command = 'ssh ubuntu@lidia'): Foreground => ({ kind, command });
 
@@ -126,5 +139,140 @@ describe('locationChip', () => {
     expect(locationChip(level({ sh: null, host: null, user: null, label: 'zsh' })).title).toBe(
       'zsh: shell. The agent runs commands in this shell.',
     );
+  });
+});
+
+// ---- the agent's integration request (request_integration) ----
+
+const INTEGRATED = { outcome: 'integrated' as const, key: 1, label: 'ssh ubuntu@lidia', sh: 'zsh', user: 'ubuntu', host: 'lidia' };
+const asked = (callId = 'c1'): WireEvent => ({ type: 'integration_request', call_id: callId, phase: 'asking', label: 'ssh ubuntu@lidia' });
+const running = (callId = 'c1'): WireEvent => ({ type: 'integration_request', call_id: callId, phase: 'running', label: 'ssh ubuntu@lidia' });
+type AgentOutcome = Extract<WireEvent, { type: 'integration_request' }>['outcome'];
+const finished = (callId = 'c1', outcome: AgentOutcome = INTEGRATED): WireEvent => ({
+  type: 'integration_request',
+  call_id: callId,
+  phase: 'done',
+  outcome,
+});
+
+/** The request after a sequence of events, from nothing. */
+function after(events: WireEvent[], start: AgentRequest | null = null): AgentRequest | null {
+  return events.reduce<AgentRequest | null>((cur, ev) => agentRequestAfter(cur, ev), start);
+}
+
+describe('agentRequestAfter: asked, accepted, finished', () => {
+  it('an asking event opens the question with the shell it is about', () => {
+    expect(after([asked()])).toEqual({ kind: 'asking', callId: 'c1', label: 'ssh ubuntu@lidia' });
+  });
+
+  it('accepted: the running handshake is shown, and its done leaves the result on screen', () => {
+    expect(after([asked(), running()])).toEqual({ kind: 'running', callId: 'c1', label: 'ssh ubuntu@lidia', shown: true });
+    expect(after([asked(), running(), finished()])).toEqual({ kind: 'result', callId: 'c1', outcome: INTEGRATED });
+  });
+
+  it('the user accepting puts the request in the running state before the backend says so: still shown', () => {
+    // The UI sets { running, shown } on Integrate; the backend's running event for the same call keeps it shown.
+    const onClick: AgentRequest = { kind: 'running', callId: 'c1', label: 'x', shown: true };
+    expect(after([running()], { kind: 'asking', callId: 'c1', label: 'x' })).toEqual({ kind: 'running', callId: 'c1', label: 'ssh ubuntu@lidia', shown: true });
+    expect(after([running()], onClick)).toEqual({ kind: 'running', callId: 'c1', label: 'ssh ubuntu@lidia', shown: true });
+  });
+
+  it('a failed handshake is a result too, with its outcome', () => {
+    const failed = { outcome: 'failed' as const, hint: 'agentterm: Unsupported shell' };
+    expect(after([asked(), running(), finished('c1', failed)])).toEqual({ kind: 'result', callId: 'c1', outcome: failed });
+  });
+});
+
+describe('agentRequestAfter: auto mode (no question)', () => {
+  it('a running handshake with no question is not shown: the strip says so, and no dialog opens', () => {
+    const req = after([running()]);
+    expect(req).toEqual({ kind: 'running', callId: 'c1', label: 'ssh ubuntu@lidia', shown: false });
+    expect(agentDialogPhase(req)).toBeNull();
+    expect(agentIntegratingQuietly(req)).toBe(true);
+    expect(agentRunning(req)).toBe(true);
+  });
+
+  it('its done clears it: the result is in the transcript, not in a dialog', () => {
+    expect(after([running(), finished()])).toBeNull();
+  });
+});
+
+describe('agentRequestAfter: declined, cut short, or settled by someone else', () => {
+  it('a declined done closes the question', () => {
+    expect(after([asked(), finished('c1', { outcome: 'declined' } as never)])).toBeNull();
+  });
+
+  it('a done for another call leaves the question as it is', () => {
+    const cur = after([asked('c1')]);
+    expect(after([finished('other')], cur)).toEqual(cur);
+  });
+
+  it('a question for a new call replaces the old one', () => {
+    expect(after([asked('c1'), asked('c2')])).toEqual({ kind: 'asking', callId: 'c2', label: 'ssh ubuntu@lidia' });
+  });
+
+  it('the turn ending (done) closes a question that is still waiting', () => {
+    expect(after([asked(), { type: 'done' }])).toBeNull();
+  });
+
+  it('the turn ending does not close a handshake that runs or a result on screen', () => {
+    expect(after([asked(), running(), { type: 'done' }])).toEqual({ kind: 'running', callId: 'c1', label: 'ssh ubuntu@lidia', shown: true });
+    expect(after([asked(), running(), finished(), { type: 'done' }])?.kind).toBe('result');
+  });
+
+  it('the shell exiting closes a question that is still waiting, but not a running handshake', () => {
+    const exited: WireEvent = { type: 'state', state: 'exited' };
+    expect(after([asked(), exited])).toBeNull();
+    expect(after([asked(), running(), exited])?.kind).toBe('running');
+  });
+
+  it('other events leave the request as it is', () => {
+    const cur = after([asked()]);
+    expect(agentRequestAfter(cur, { type: 'state', state: 'prompt' })).toBe(cur);
+    expect(agentRequestAfter(cur, { type: 'text', text: 'hi' })).toBe(cur);
+    expect(agentRequestAfter(null, { type: 'done' })).toBeNull();
+  });
+
+  it('a new shell closes a question that is still waiting, and nothing else', () => {
+    expect(agentRequestClosedBySession(after([asked()]))).toBeNull();
+    const handshake = after([asked(), running()]);
+    expect(agentRequestClosedBySession(handshake)).toBe(handshake);
+    expect(agentRequestClosedBySession(null)).toBeNull();
+  });
+});
+
+describe('agentDialogPhase', () => {
+  it('a question is the consent screen; a shown handshake is running; a result is the result', () => {
+    expect(agentDialogPhase({ kind: 'asking', callId: 'c1', label: 'x' })).toEqual({ kind: 'consent' });
+    expect(agentDialogPhase({ kind: 'running', callId: 'c1', label: 'x', shown: true })).toEqual({ kind: 'running' });
+    expect(agentDialogPhase({ kind: 'result', callId: 'c1', outcome: INTEGRATED })).toEqual({ kind: 'result', outcome: INTEGRATED });
+  });
+
+  it('shows nothing for no request, or a quiet (auto) run', () => {
+    expect(agentDialogPhase(null)).toBeNull();
+    expect(agentDialogPhase({ kind: 'running', callId: 'c1', label: 'x', shown: false })).toBeNull();
+  });
+});
+
+describe('agentIntegratingQuietly and agentRunning', () => {
+  it('the chip is for the quiet run only; the keys are locked for any run', () => {
+    expect(agentIntegratingQuietly({ kind: 'running', callId: 'c1', label: 'x', shown: false })).toBe(true);
+    expect(agentIntegratingQuietly({ kind: 'running', callId: 'c1', label: 'x', shown: true })).toBe(false);
+    expect(agentIntegratingQuietly({ kind: 'asking', callId: 'c1', label: 'x' })).toBe(false);
+    expect(agentIntegratingQuietly(null)).toBe(false);
+    expect(agentRunning({ kind: 'running', callId: 'c1', label: 'x', shown: true })).toBe(true);
+    expect(agentRunning({ kind: 'running', callId: 'c1', label: 'x', shown: false })).toBe(true);
+    expect(agentRunning({ kind: 'asking', callId: 'c1', label: 'x' })).toBe(false);
+    expect(agentRunning(null)).toBe(false);
+  });
+});
+
+describe('isDeclinedIntegration', () => {
+  it('is a request_integration the user declined: denied, from the agent tool only', () => {
+    expect(isDeclinedIntegration('request_integration', 'denied')).toBe(true);
+    expect(isDeclinedIntegration('request_integration', 'manual')).toBe(false);
+    expect(isDeclinedIntegration('request_integration', 'refused')).toBe(false);
+    expect(isDeclinedIntegration('run_command', 'denied')).toBe(false);
+    expect(isDeclinedIntegration('request_integration', null)).toBe(false);
   });
 });
