@@ -1075,6 +1075,11 @@ input {
   color: var(--warn);
 }
 
+/* A quiet note in the transcript, such as the trim note: the muted colour, not the warning one. */
+.notice.notice-muted {
+  color: var(--muted);
+}
+
 .msg {
   padding: 4px 0;
   white-space: pre-wrap;
@@ -3206,4 +3211,249 @@ input {
   border-style: solid;
   border-color: var(--accent);
   color: var(--accent);
+}
+
+/*
+ * The context meter, above the input bar (see ContextMeter.tsx). Collapsed: one button row with a slim bar and the
+ * percentage; the tokens show only when the panel is wide enough (a container query on the row). Expanded: the breakdown
+ * sits in the flow above the button and scrolls past 240px or 60% of the panel. Tokens only; nothing animates.
+ */
+.context-meter-wrap {
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  min-width: 0;
+  container-type: inline-size;
+  border-top: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.agent-panel.is-rail > .context-meter-wrap {
+  display: none;
+}
+
+.context-meter {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  padding: 4px 12px;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.context-meter:hover {
+  color: var(--ink);
+}
+
+.context-meter:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.context-meter-bar {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 36px;
+  height: 4px;
+  overflow: hidden;
+  background: var(--rule);
+}
+
+.context-meter-fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  background: var(--accent);
+}
+
+.context-meter-percent {
+  flex: 0 0 auto;
+  min-width: 4ch;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.context-meter-figures {
+  display: none;
+  flex: 0 0 auto;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Tokens beside the percentage only in a wide panel (the row is the container, so a 240px dock keeps the bar). */
+@container (min-width: 300px) {
+  .context-meter-figures {
+    display: inline;
+  }
+}
+
+.context-meter.is-warn .context-meter-fill {
+  background: var(--warn);
+}
+
+.context-meter.is-warn .context-meter-percent {
+  color: var(--warn);
+}
+
+.context-meter.is-high .context-meter-fill {
+  background: var(--fail);
+}
+
+.context-meter.is-high .context-meter-percent {
+  color: var(--fail);
+}
+
+.context-chevron {
+  flex: 0 0 auto;
+  transform: rotate(-90deg);
+}
+
+.context-meter[aria-expanded="true"] .context-chevron {
+  transform: none;
+}
+
+.context-detail[hidden] {
+  display: none;
+}
+
+.context-detail {
+  display: flex;
+  flex: 0 1 auto;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 0;
+  padding: 6px 12px 4px;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--rule-strong) transparent;
+}
+
+.context-headline {
+  margin: 0;
+  color: var(--ink);
+}
+
+.context-basis,
+.context-trimmed {
+  margin: 0;
+  font-size: 11px;
+}
+
+.context-basis {
+  color: var(--muted);
+}
+
+.context-trimmed {
+  color: var(--warn);
+}
+
+.context-stack {
+  display: flex;
+  flex: 0 0 auto;
+  height: 8px;
+  overflow: hidden;
+  background: var(--rule);
+}
+
+.context-seg {
+  display: block;
+  flex: 0 0 auto;
+  height: 100%;
+  min-width: 0;
+}
+
+.context-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.context-row {
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr) auto 4ch;
+  gap: 8px;
+  align-items: baseline;
+  min-width: 0;
+  color: var(--ink);
+}
+
+.context-row-free,
+.context-row-reserved {
+  color: var(--muted);
+}
+
+.context-row-free {
+  margin-top: 4px;
+  padding-top: 2px;
+  border-top: 1px dashed var(--rule);
+}
+
+.context-swatch {
+  align-self: center;
+  width: 8px;
+  height: 8px;
+  background: var(--rule-strong);
+}
+
+.context-row-free .context-swatch,
+.context-row-reserved .context-swatch {
+  background: transparent;
+  border: 1px solid var(--rule-strong);
+  box-sizing: border-box;
+}
+
+.context-label {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.context-tokens,
+.context-percent {
+  text-align: right;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Seven colours from the theme, one per slot. Every row also names its category, so colour is never the only cue. */
+.context-seg-0 {
+  background: var(--accent);
+}
+
+.context-seg-1 {
+  background: var(--ok);
+}
+
+.context-seg-2 {
+  background: var(--warn);
+}
+
+.context-seg-3 {
+  background: var(--fail);
+}
+
+.context-seg-4 {
+  background: var(--ink);
+}
+
+.context-seg-5 {
+  background: var(--muted);
+}
+
+.context-seg-6 {
+  background: var(--ink-strong);
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { approvalTitle, EMPTY_TRANSCRIPT, firstPendingApproval, isBusy, MAX_ITEMS, transcriptReducer } from './transcript';
+import { approvalTitle, EMPTY_TRANSCRIPT, firstPendingApproval, isBusy, MAX_ITEMS, TRIM_NOTE, transcriptReducer } from './transcript';
 import type { Transcript, TranscriptAction } from './transcript';
 
 function run(actions: TranscriptAction[], start: Transcript = EMPTY_TRANSCRIPT): Transcript {
@@ -65,7 +65,7 @@ describe('transcriptReducer: agent events', () => {
 });
 
 describe('transcriptReducer: context usage', () => {
-  it('a context_usage event is not a transcript item and changes nothing', () => {
+  it('a context_usage event is not a transcript item (it sets the meter value only)', () => {
     const before = run([{ type: 'agent_event', event: { type: 'text', text: 'Hi.' } }]);
     const after = run([
       { type: 'agent_event', event: { type: 'text', text: 'Hi.' } },
@@ -82,7 +82,7 @@ describe('transcriptReducer: context usage', () => {
         },
       },
     ]);
-    expect(after).toEqual(before);
+    expect(after.items).toEqual(before.items);
     expect(after.items.map((i) => i.kind)).toEqual(['agent']);
   });
 
@@ -577,5 +577,114 @@ describe('transcriptReducer: send_keys cards and tool start times', () => {
       { type: 'session_reset' },
     ]);
     expect(t.finished).toEqual([]);
+  });
+});
+
+describe('transcriptReducer: the context meter and the trim note', () => {
+  const usage = (over: Partial<{ trimmed: boolean; used: number; calibrated: boolean; limit: number | null }> = {}): TranscriptAction => ({
+    type: 'agent_event',
+    event: {
+      type: 'context_usage',
+      limit: over.limit === undefined ? 8000 : over.limit,
+      used: over.used ?? 1234,
+      reserved_output: 4096,
+      trimmed: over.trimmed ?? false,
+      calibrated: over.calibrated ?? false,
+      categories: [{ id: 'system', tokens: 1000 }, { id: 'user', tokens: 234 }],
+    },
+  });
+  const notices = (t: Transcript) => t.items.filter((i) => i.kind === 'notice');
+
+  it('stores the usage as the meter value, without the event type', () => {
+    const t = run([usage({ used: 1234, calibrated: true })]);
+    expect(t.context).toEqual({
+      limit: 8000,
+      used: 1234,
+      reserved_output: 4096,
+      trimmed: false,
+      calibrated: true,
+      categories: [{ id: 'system', tokens: 1000 }, { id: 'user', tokens: 234 }],
+    });
+  });
+
+  it('starts with no meter value and no note flag', () => {
+    expect(EMPTY_TRANSCRIPT.context).toBeNull();
+    expect(EMPTY_TRANSCRIPT.trimNoted).toBe(false);
+  });
+
+  it('an untrimmed request adds no note', () => {
+    const t = run([{ type: 'user_sent', clientId: 1, text: 'hi' }, usage()]);
+    expect(notices(t)).toEqual([]);
+    expect(t.trimNoted).toBe(false);
+  });
+
+  it('a trimmed request adds one muted note, after the user message', () => {
+    const t = run([{ type: 'user_sent', clientId: 1, text: 'hi' }, usage({ trimmed: true })]);
+    expect(t.items.map((i) => i.kind)).toEqual(['user', 'notice']);
+    expect(t.items[1]).toMatchObject({ kind: 'notice', text: TRIM_NOTE, muted: true });
+    expect(t.trimNoted).toBe(true);
+  });
+
+  it('the second event of a trimmed request does not add a second note', () => {
+    const t = run([{ type: 'user_sent', clientId: 1, text: 'hi' }, usage({ trimmed: true }), usage({ trimmed: true, calibrated: true })]);
+    expect(notices(t)).toHaveLength(1);
+    expect(t.context?.calibrated).toBe(true);
+  });
+
+  it('later requests of the same turn (a tool round) add no further note', () => {
+    const t = run([
+      { type: 'user_sent', clientId: 1, text: 'hi' },
+      usage({ trimmed: true }),
+      { type: 'agent_event', event: { type: 'tool_call', call_id: 'c1', name: 'get_cwd', args: {} } },
+      usage({ trimmed: true }),
+      usage({ trimmed: false }),
+    ]);
+    expect(notices(t)).toHaveLength(1);
+  });
+
+  it('a note is shown again in the next turn', () => {
+    const t = run([
+      { type: 'user_sent', clientId: 1, text: 'one' },
+      usage({ trimmed: true }),
+      done,
+      { type: 'user_sent', clientId: 2, text: 'two' },
+      usage({ trimmed: true }),
+    ]);
+    expect(notices(t)).toHaveLength(2);
+  });
+
+  it('a turn that ends with no trimmed request keeps the flag clear for the next turn', () => {
+    const t = run([{ type: 'user_sent', clientId: 1, text: 'one' }, usage({ trimmed: false }), done]);
+    expect(t.trimNoted).toBe(false);
+  });
+
+  it('a restored conversation takes its saved usage and adds no note', () => {
+    const saved = { limit: 128000, used: 48213, reserved_output: 4096, trimmed: true, calibrated: true, categories: [{ id: 'user', tokens: 48213 }] };
+    const t = run([{ type: 'conversation_loaded', items: [{ kind: 'notice', text: 'x' }], context: saved }]);
+    expect(t.context).toEqual(saved);
+    expect(notices(t)).toHaveLength(1);
+    expect(t.trimNoted).toBe(false);
+  });
+
+  it('a restored conversation with no saved usage has no meter value', () => {
+    expect(run([{ type: 'conversation_loaded', items: [], context: null }]).context).toBeNull();
+    expect(run([{ type: 'conversation_loaded', items: [] }]).context).toBeNull();
+  });
+
+  it('a reset clears the meter value and the note flag, so the next trimmed request notes again', () => {
+    const t = run([
+      { type: 'user_sent', clientId: 1, text: 'one' },
+      usage({ trimmed: true }),
+      { type: 'conversation_reset' },
+    ]);
+    expect(t.context).toBeNull();
+    expect(t.trimNoted).toBe(false);
+    const next = run([{ type: 'user_sent', clientId: 2, text: 'two' }, usage({ trimmed: true })], t);
+    expect(notices(next)).toHaveLength(1);
+  });
+
+  it('a sent message clears the flag left by an earlier turn that did not end', () => {
+    const t = run([{ type: 'user_sent', clientId: 1, text: 'one' }, usage({ trimmed: true }), { type: 'user_sent', clientId: 2, text: 'two' }]);
+    expect(t.trimNoted).toBe(false);
   });
 });

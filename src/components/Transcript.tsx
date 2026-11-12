@@ -342,7 +342,7 @@ function Entry({ item, onApprove }: { item: TranscriptItem; onApprove: Props['on
         </div>
       );
     case 'notice':
-      return <div className="notice">{item.text}</div>;
+      return <div className={item.muted ? 'notice notice-muted' : 'notice'}>{item.text}</div>;
     // Closes an interactive group (see renderEntries); with no group open there is nothing to show.
     case 'record_end':
       return null;

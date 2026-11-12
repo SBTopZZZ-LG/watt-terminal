@@ -337,3 +337,21 @@ describe('Transcript: attachments on a message the user sent', () => {
     expect(render([{ type: 'user_sent', clientId: 5, text: 'plain' }])).not.toContain('msg-attachments');
   });
 });
+
+describe('Transcript: the trim note', () => {
+  const usage = (trimmed: boolean): TranscriptAction => ({
+    type: 'agent_event',
+    event: { type: 'context_usage', limit: 8000, used: 100, reserved_output: 4096, trimmed, calibrated: false, categories: [] },
+  });
+
+  it('is a muted notice, not a warning', () => {
+    const html = render([{ type: 'user_sent', clientId: 1, text: 'hi' }, usage(true)]);
+    expect(html).toContain('<div class="notice notice-muted">Older messages or tool output were left out of the request');
+  });
+
+  it('a request that was not trimmed shows no note, and no meter markup', () => {
+    const html = render([{ type: 'user_sent', clientId: 1, text: 'hi' }, usage(false)]);
+    expect(html).not.toContain('notice');
+    expect(html).not.toContain('context-meter');
+  });
+});

@@ -25,6 +25,7 @@ import { recoveryKind } from './lib/settingsRecovery';
 import { TerminalView } from './components/TerminalView';
 import { InputBar } from './components/InputBar';
 import { Transcript } from './components/Transcript';
+import { ContextMeter } from './components/ContextMeter';
 import { StatusChip } from './components/StatusChip';
 import { FindBar } from './components/FindBar';
 import { PanelDivider } from './components/PanelDivider';
@@ -321,7 +322,7 @@ export default function App() {
           return;
         }
         epoch.current += 1;
-        dispatchTranscript({ type: 'conversation_loaded', items: itemsFromMessages(loaded.messages), todos: loaded.todos });
+        dispatchTranscript({ type: 'conversation_loaded', items: itemsFromMessages(loaded.messages), todos: loaded.todos, context: loaded.context });
         setConversationId(loaded.id);
       } catch {
         if (transcriptRef.current.items.length === 0) {
@@ -585,7 +586,7 @@ export default function App() {
       return 'The chat changed while this conversation was loading, so it was not opened. Open it again.';
     }
     epoch.current += 1;
-    dispatchTranscript({ type: 'conversation_loaded', items: itemsFromMessages(loaded.messages), todos: loaded.todos });
+    dispatchTranscript({ type: 'conversation_loaded', items: itemsFromMessages(loaded.messages), todos: loaded.todos, context: loaded.context });
     setConversationId(loaded.id);
     setPanelBody('chat');
     setFocusToken((t) => t + 1);
@@ -841,6 +842,7 @@ export default function App() {
                 ) : null
               }
             />
+            <ContextMeter usage={transcript.context} />
             <InputBar
               mode={barMode}
               hint={locked ? 'Integrating this shell. Keys are not sent until it is done.' : route.hint}

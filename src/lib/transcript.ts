@@ -1,7 +1,7 @@
 // The agent transcript: what the user said, what the agent said, its tool calls, and approval requests.
 // Pure reducer over AgentEvents (from Rust) and local actions (sent messages, clicks, errors).
 
-import type { AgentEvent, ApprovalReasonCode, RecordSummary, TodoItem, ToolDecision } from './types';
+import type { AgentEvent, ApprovalReasonCode, ContextUsage, RecordSummary, TodoItem, ToolDecision } from './types';
 import { visibleEscapes } from './visibleEscapes';
 import { TODO_TOOL } from './todoView';
 import { openFramesBelow, openRecordIds, openedBy } from './interactive';
@@ -38,7 +38,8 @@ export type TranscriptItem =
    * when a shell level was pushed above the command (levels_changed), so the group ends while the command may still run.
    */
   | { id: number; kind: 'record_end'; recordId: number; exit: number | null; integrated?: boolean }
-  | { id: number; kind: 'notice'; text: string };
+  /** `muted` is a quiet note (the trim note), drawn in the muted colour rather than the warning one. */
+  | { id: number; kind: 'notice'; text: string; muted?: boolean };
 
 /** A transcript item before the reducer gives it an id. `Omit` over the union would lose the variants, so it is distributed. */
 export type NewItem = TranscriptItem extends infer T ? (T extends unknown ? Omit<T, 'id'> : never) : never;
@@ -59,6 +60,10 @@ export interface Transcript {
   finished: FinishedRecord[];
   /** The shell depth now: the levels count, the local one included. 1 means no nested shell (see levels_changed). */
   depth: number;
+  /** The context usage of the latest model request (the context meter). Null for a new conversation, and until a request runs. */
+  context: ContextUsage | null;
+  /** A trim note was added in the current turn. Cleared by user_sent, so each turn shows at most one. */
+  trimNoted: boolean;
 }
 
 export interface FinishedRecord {
@@ -66,7 +71,20 @@ export interface FinishedRecord {
   exit: number | null;
 }
 
-export const EMPTY_TRANSCRIPT: Transcript = { items: [], inFlight: 0, nextId: 1, thinking: false, todos: [], finished: [], depth: 1 };
+export const EMPTY_TRANSCRIPT: Transcript = {
+  items: [],
+  inFlight: 0,
+  nextId: 1,
+  thinking: false,
+  todos: [],
+  finished: [],
+  depth: 1,
+  context: null,
+  trimNoted: false,
+};
+
+/** The note shown once in a turn when older content was left out of a request. */
+export const TRIM_NOTE = 'Older messages or tool output were left out of the request to fit the model\'s context window.';
 
 /** Keeps the transcript bounded; the oldest items go first. */
 export const MAX_ITEMS = 500;
@@ -100,8 +118,9 @@ export type TranscriptAction =
   /**
    * A saved conversation was opened as the live one. Replaces the items. Ids come from nextId; the newest MAX_ITEMS are kept.
    * Never sent while busy (the backend refuses to load then). `todos` is the loaded conversation's list; absent means none.
+   * `context` is the usage the conversation was saved with (the meter's value on open); absent or null means none.
    */
-  | { type: 'conversation_loaded'; items: NewItem[]; todos?: TodoItem[] };
+  | { type: 'conversation_loaded'; items: NewItem[]; todos?: TodoItem[]; context?: ContextUsage | null };
 
 export function transcriptReducer(t: Transcript, action: TranscriptAction): Transcript {
   switch (action.type) {
@@ -120,7 +139,7 @@ export function transcriptReducer(t: Transcript, action: TranscriptAction): Tran
       return { ...t, finished: finished.slice(Math.max(0, finished.length - MAX_FINISHED)) };
     }
     case 'user_sent':
-      return add({ ...t, inFlight: t.inFlight + 1 }, (id) => ({
+      return add({ ...t, inFlight: t.inFlight + 1, trimNoted: false }, (id) => ({
         id,
         kind: 'user',
         clientId: action.clientId,
@@ -177,12 +196,21 @@ export function transcriptReducer(t: Transcript, action: TranscriptAction): Tran
       return levelsChanged(t, action.depth);
     case 'conversation_reset':
       // Keeps nextId, so ids stay unique for the React keys of the items that come after.
-      return { ...t, items: [], inFlight: 0, thinking: false, todos: [] };
+      return { ...t, items: [], inFlight: 0, thinking: false, todos: [], context: null, trimNoted: false };
     case 'conversation_loaded': {
       // Every id is used up, even for the items the cap drops, so ids keep increasing.
       const made = action.items.map((item, i) => keyed(item, t.nextId + i));
       const items = made.length > MAX_ITEMS ? made.slice(made.length - MAX_ITEMS) : made;
-      return { ...t, items, nextId: t.nextId + action.items.length, inFlight: 0, thinking: false, todos: action.todos ?? [] };
+      return {
+        ...t,
+        items,
+        nextId: t.nextId + action.items.length,
+        inFlight: 0,
+        thinking: false,
+        todos: action.todos ?? [],
+        context: action.context ?? null,
+        trimNoted: false,
+      };
     }
   }
 }
@@ -278,10 +306,31 @@ function applyAgentEvent(t: Transcript, ev: AgentEvent, at: number | undefined):
       return t;
     case 'todo_update':
       return { ...t, todos: ev.items };
-    // The context meter follows these (not built yet); they are not transcript items.
     case 'context_usage':
-      return t;
+      return contextUsage(t, ev);
   }
+}
+
+/**
+ * The context meter's value is the event's usage. The first event of a turn that left older content out adds the trim note,
+ * once: the second event of the same request, and later requests of the turn, do not add another.
+ */
+function contextUsage(t: Transcript, ev: Extract<AgentEvent, { type: 'context_usage' }>): Transcript {
+  const next: Transcript = {
+    ...t,
+    context: {
+      limit: ev.limit,
+      used: ev.used,
+      reserved_output: ev.reserved_output,
+      trimmed: ev.trimmed,
+      calibrated: ev.calibrated,
+      categories: ev.categories,
+    },
+  };
+  if (!ev.trimmed || t.trimNoted) {
+    return next;
+  }
+  return { ...add(next, (id) => ({ id, kind: 'notice', text: TRIM_NOTE, muted: true })), trimNoted: true };
 }
 
 /** Extends the open streamed message, or starts one. The first delta also clears the thinking state. */
