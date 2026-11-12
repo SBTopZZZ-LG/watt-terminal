@@ -14,6 +14,7 @@ use watt_terminal_lib::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate, U
 use watt_terminal_lib::core::chat::agent_loop::{agent_record_note, Conversation, LlmAgent, LlmSettings};
 use watt_terminal_lib::core::chat::attachments::{Attachment, Resolver};
 use watt_terminal_lib::core::chat::context::{self, ContextUsage};
+use watt_terminal_lib::core::chat::trim::{OLD_OUTPUT_NOTE, OMITTED_TURNS_NOTE, TRIM_NOTE};
 use watt_terminal_lib::core::persist::attachments::{sha256_hex, AttachmentStore};
 use watt_terminal_lib::core::settings::LimitsSettings;
 use watt_terminal_lib::core::chat::history::History;
@@ -1640,4 +1641,232 @@ fn a_failed_request_gives_its_estimate_and_no_count() {
     let usages = usages(&events);
     assert_eq!(usages.len(), 1, "the estimate was shown before the request; the failure adds no count");
     assert!(!usages[0].calibrated);
+}
+
+// Trimming to the context limit (core/chat/trim)
+
+/// A history of `turns` turns. Each asks a question, calls get_cwd, gets a long result, and gets a short answer.
+fn long_history(turns: usize) -> History {
+    let mut h = History::new();
+    for n in 0..turns {
+        let id = format!("call_h{n}");
+        h.push_user(&format!("question {n}"));
+        h.push_assistant(json!({"role": "assistant", "content": null, "tool_calls": [
+            {"id": id, "type": "function", "function": {"name": "get_cwd", "arguments": "{}"}}]}));
+        h.push_tool_result(&id, &format!("{n}:{}", "x".repeat(1500)));
+        h.push_assistant(json!({"role": "assistant", "content": format!("answer {n}")}));
+    }
+    h
+}
+
+/// The body of the last request the provider received.
+fn last_body(provider: &Provider) -> Value {
+    let requests = provider.requests();
+    body_of(requests.last().expect("a request"))
+}
+
+/// The smallest limit whose budget (90% of it, less `reserve`) is exactly `budget`: 90% of the limit rounds down to
+/// `budget + reserve`, and no smaller limit does.
+fn limit_for(budget: u32, reserve: u32) -> u32 {
+    ((budget + reserve) * 10).div_ceil(9)
+}
+
+/// The budget of a limit: 90% of it, rounded down, less the reserve.
+fn budget_of(limit: u32, reserve: u32) -> i64 {
+    i64::from(limit) * 9 / 10 - i64::from(reserve)
+}
+
+/// The number of image parts in the messages of a request.
+fn image_parts(body: &Value) -> usize {
+    body["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .filter_map(|m| m["content"].as_array())
+        .flatten()
+        .filter(|p| p["type"] == "image_url")
+        .count()
+}
+
+#[test]
+fn an_over_budget_request_is_trimmed_on_the_wire_and_the_stored_history_is_not() {
+    // The untrimmed size of this request, from a provider with no limit.
+    let probe = serve(vec![Script::json(text_reply("probe"))]);
+    let probe_conv = Conversation::new().unwrap();
+    probe_conv.restore(probe_conv.id(), long_history(12), Vec::new(), false);
+    let probe_settings = LlmSettings { max_tokens: Some(512), ..settings(&probe.url, false) };
+    turn(&mut agent_for(&probe_settings, &probe_conv, Arc::new(TurnCancel::new())), &FakeTools::default(), &auto_gate(), "now");
+    let raw = raw_estimate(&last_body(&probe));
+
+    // A budget of two thirds of that: the untrimmed request does not fit.
+    let budget = raw * 2 / 3;
+    let limit = limit_for(budget, 512);
+    assert!(i64::from(raw) > budget_of(limit, 512));
+    let provider = serve(vec![Script::json(text_reply("trimmed answer"))]);
+    let conv = Conversation::new().unwrap();
+    conv.restore(conv.id(), long_history(12), Vec::new(), false);
+    let s = LlmSettings { context_limit: Some(limit), max_tokens: Some(512), ..settings(&provider.url, false) };
+    let before = stored(&conv.history());
+    let events = turn(&mut agent_for(&s, &conv, Arc::new(TurnCancel::new())), &FakeTools::default(), &auto_gate(), "now");
+
+    let body = last_body(&provider);
+    let sent = raw_estimate(&body);
+    assert!(i64::from(sent) <= budget_of(limit, 512), "{sent} tokens sent, the budget is {}", budget_of(limit, 512));
+    assert!(sent < raw, "the request is smaller than the untrimmed one");
+    assert!(body["messages"][0]["content"].as_str().unwrap().contains(TRIM_NOTE), "the system text says so");
+    assert_eq!(body["messages"][1]["role"], "user", "the first message after the system one is a user message");
+    assert_paired(body["messages"].as_array().unwrap());
+
+    let usages = usages(&events);
+    assert_eq!(usages.len(), 1, "no count in the reply: the estimate only");
+    assert!(usages[0].trimmed, "the event says the request was trimmed");
+    assert_eq!(usages[0].used, sent, "the event describes the request as sent");
+
+    // The stored history is unchanged; this turn's two messages are added after it.
+    let after = stored(&conv.history());
+    assert_eq!(&after[..before.len()], &before[..]);
+    assert_eq!(after.len(), before.len() + 2);
+    assert!(after.iter().any(|m| m["role"] == "tool" && m["content"].as_str().unwrap_or_default().len() > 1000));
+}
+
+#[test]
+fn a_request_that_cannot_fit_is_not_sent_and_the_next_turn_works_after_a_reset() {
+    // A limit of 1112 with a 990-token reserve leaves 10 tokens: nothing fits.
+    let provider = serve(vec![]);
+    let conv = Conversation::new().unwrap();
+    conv.restore(conv.id(), long_history(3), Vec::new(), false);
+    let s = LlmSettings { context_limit: Some(1112), max_tokens: Some(990), ..settings(&provider.url, false) };
+    let events = turn(&mut agent_for(&s, &conv, Arc::new(TurnCancel::new())), &FakeTools::default(), &auto_gate(), "now");
+
+    assert!(provider.requests().is_empty(), "no request reached the provider");
+    let said = texts(&events);
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(
+        said[0].starts_with("This conversation no longer fits the model's context window (about ")
+            && said[0].ends_with(" tokens needed, 10 available). Start a new conversation, or raise the context limit in Settings."),
+        "{}",
+        said[0]
+    );
+    assert!(matches!(events.last(), Some(AgentEvent::Done)), "the turn ends cleanly");
+    assert!(conv.no_vision().lock().unwrap().is_empty(), "nothing is marked as refusing images");
+
+    // After a reset, a conversation that fits is answered.
+    conv.reset().unwrap();
+    let provider = serve(vec![Script::json(text_reply("fresh"))]);
+    let s = LlmSettings { context_limit: Some(1_000_000), max_tokens: Some(990), ..settings(&provider.url, false) };
+    let events = turn(&mut agent_for(&s, &conv, Arc::new(TurnCancel::new())), &FakeTools::default(), &auto_gate(), "again");
+    assert_eq!(texts(&events), ["fresh"]);
+    assert_eq!(provider.requests().len(), 1);
+}
+
+#[test]
+fn without_a_known_limit_the_request_carries_the_whole_history_and_no_trim_note() {
+    let provider = serve(vec![Script::json(text_reply("ok"))]);
+    let conv = Conversation::new().unwrap();
+    conv.restore(conv.id(), long_history(12), Vec::new(), false);
+    let before = stored(&conv.history());
+    let events = turn(&mut agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new())), &FakeTools::default(), &auto_gate(), "now");
+
+    let body = last_body(&provider);
+    let messages = body["messages"].as_array().expect("messages");
+    assert_eq!(messages.len(), 1 + before.len() + 1, "the system message, the stored history, and the new message");
+    assert_eq!(&messages[1..=before.len()], &before[..], "the stored messages, as stored");
+    assert!(!messages[0]["content"].as_str().unwrap().contains(TRIM_NOTE));
+    assert!(!messages.iter().any(|m| m["content"] == OLD_OUTPUT_NOTE), "no tool output is left out");
+    assert!(usages(&events).iter().all(|u| !u.trimmed && u.limit.is_none()));
+}
+
+#[test]
+fn a_calibration_that_doubles_the_estimate_trims_a_history_that_fits_without_it() {
+    // The untrimmed size, and a budget of one and a half times that: the plain request fits.
+    let probe = serve(vec![Script::json(text_reply("probe"))]);
+    let probe_conv = Conversation::new().unwrap();
+    probe_conv.restore(probe_conv.id(), long_history(12), Vec::new(), false);
+    let probe_settings = LlmSettings { max_tokens: Some(512), ..settings(&probe.url, false) };
+    turn(&mut agent_for(&probe_settings, &probe_conv, Arc::new(TurnCancel::new())), &FakeTools::default(), &auto_gate(), "now");
+    let raw = raw_estimate(&last_body(&probe));
+    let budget = raw + raw / 2;
+    let limit = limit_for(budget, 512);
+    assert_eq!(budget_of(limit, 512), i64::from(budget));
+    let with_limit = |url: &str| LlmSettings { context_limit: Some(limit), max_tokens: Some(512), ..settings(url, false) };
+
+    // Uncalibrated, the untrimmed request is estimated at `raw`, which fits.
+    let plain = serve(vec![Script::json(text_reply("plain"))]);
+    let plain_conv = Conversation::new().unwrap();
+    plain_conv.restore(plain_conv.id(), long_history(12), Vec::new(), false);
+    let plain_events = turn(&mut agent_for(&with_limit(&plain.url), &plain_conv, Arc::new(TurnCancel::new())), &FakeTools::default(), &auto_gate(), "now");
+    assert!(!usages(&plain_events)[0].trimmed, "without calibration the request fits");
+    assert_eq!(raw_estimate(&last_body(&plain)), raw);
+
+    // A reply that reported 1000 prompt tokens for an estimate of 1 sets the ratio to its clamp, 2, so the same request
+    // is estimated at about twice `raw`, which is over the budget.
+    let learned = serve(vec![Script::json(text_reply("learned"))]);
+    let learned_conv = Conversation::new().unwrap();
+    learned_conv.restore(learned_conv.id(), long_history(12), Vec::new(), false);
+    learned_conv.calibration().lock().unwrap().observe(1, 1000);
+    let events = turn(&mut agent_for(&with_limit(&learned.url), &learned_conv, Arc::new(TurnCancel::new())), &FakeTools::default(), &auto_gate(), "now");
+
+    let usage = usages(&events);
+    assert!(usage[0].calibrated && usage[0].trimmed, "{usage:?}");
+    assert!(i64::from(usage[0].used) <= budget_of(limit, 512), "the calibrated estimate fits: {}", usage[0].used);
+    assert!(raw_estimate(&last_body(&learned)) < raw, "the trimmed request is smaller");
+}
+
+#[test]
+fn images_in_dropped_turns_are_gone_from_the_trimmed_request() {
+    let dir = StoreDir::new("trim-images");
+    let store = dir.store();
+    let conv = Conversation::new().unwrap();
+    let redactor = Redactor::new(Vec::new());
+    let image_history = || {
+        let mut h = History::new();
+        for n in 0..3u8 {
+            let image = image_attachment(&store, &conv.id(), &format!("shot-{n}.png"), n + 1);
+            h.push_user_content(watt_terminal_lib::core::chat::attachments::user_content(&format!("look {n}"), &[image], &redactor));
+            h.push_assistant(json!({"role": "assistant", "content": format!("seen {n}")}));
+        }
+        h
+    };
+
+    // The untrimmed request carries all three images. A budget one token short of it forces the oldest turn out.
+    conv.restore(conv.id(), image_history(), Vec::new(), false);
+    let probe = serve(vec![Script::json(text_reply("probe"))]);
+    let probe_settings = LlmSettings { max_tokens: Some(512), ..settings(&probe.url, false) };
+    turn_message(&mut agent_for(&probe_settings, &conv, Arc::new(TurnCancel::new())).with_attachments(store.clone()), &FakeTools::default(), &auto_gate(), &UserMessage::text("now"));
+    let raw = raw_estimate(&last_body(&probe));
+    assert_eq!(image_parts(&last_body(&probe)), 3, "all three images are sent");
+
+    conv.restore(conv.id(), image_history(), Vec::new(), false);
+    let provider = serve(vec![Script::json(text_reply("ok"))]);
+    let s = LlmSettings { context_limit: Some(limit_for(raw as u32 - 1, 512)), max_tokens: Some(512), ..settings(&provider.url, false) };
+    let before = stored(&conv.history());
+    let events = turn_message(&mut agent_for(&s, &conv, Arc::new(TurnCancel::new())).with_attachments(store.clone()), &FakeTools::default(), &auto_gate(), &UserMessage::text("now"));
+
+    let body = last_body(&provider);
+    let text = body.to_string();
+    assert!(!text.contains("shot-0.png"), "the oldest turn, and its image, are not sent");
+    assert_eq!(image_parts(&body), 2, "the two newer images are sent");
+    assert_eq!(body["messages"][1]["content"][0]["text"], OMITTED_TURNS_NOTE, "the first kept turn says what was left out");
+    assert!(usages(&events)[0].trimmed);
+    // The stored history still has the image.
+    assert_eq!(&stored(&conv.history())[..before.len()], &before[..]);
+    assert_eq!(conv.history().lock().unwrap().snapshot()[0]["content"][1]["name"], "shot-0.png");
+}
+
+#[test]
+fn the_vision_retry_still_works_under_a_known_limit() {
+    let provider = serve(vec![refused_images(), Script::json(text_reply("I can read the text."))]);
+    let conv = Conversation::new().unwrap();
+    let dir = StoreDir::new("retry-limit");
+    let store = dir.store();
+    let s = LlmSettings { context_limit: Some(1_000_000), max_tokens: Some(512), ..settings(&provider.url, false) };
+    let mut agent = agent_for(&s, &conv, Arc::new(TurnCancel::new())).with_attachments(store.clone());
+    let events = turn_message(&mut agent, &FakeTools::default(), &no_gate(), &image_message(&store, &conv, "what is this?", 1));
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2, "one refused call and one retry");
+    assert!(carries_image(&requests[0]));
+    assert!(!carries_image(&requests[1]));
+    assert_eq!(texts(&events), ["I can read the text.", NO_VISION]);
+    assert!(usages(&events).iter().all(|u| !u.trimmed && u.limit == Some(1_000_000)));
 }

@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use serde_json::{Value, json};
 
 use crate::core::chat::attachments::{self, Resolver};
+use crate::core::chat::trim::{OLD_OUTPUT_NOTE, OMITTED_TURNS_NOTE, TrimPlan};
 
 /// What replaces a tool result when `elide_tool_results` drops it from the request.
 pub const ELIDED_RESULT: &str = "[output elided; call get_command to read it again]";
@@ -102,20 +103,52 @@ impl History {
     /// `attachments::wire_content`): its images are read through `resolver`, and only the recent ones are sent. Every
     /// other message is sent as stored.
     pub fn messages(&self, system: &str, resolver: &mut Resolver<'_>) -> Vec<Value> {
-        let mut out = Vec::with_capacity(self.messages.len() + 1);
-        out.push(json!({"role": "system", "content": system}));
+        self.messages_with(system, resolver, &TrimPlan::none())
+    }
+
+    /// The request's message list under `plan` (see core/chat/trim): `messages` with the older content left out. The
+    /// stored messages are not changed. Dropped turns are cut at a user message, so no tool result is separated from its
+    /// call, and the first message after the system message is the first kept user message.
+    pub fn messages_with(&self, system: &str, resolver: &mut Resolver<'_>, plan: &TrimPlan) -> Vec<Value> {
+        let turns: Vec<usize> =
+            self.messages.iter().enumerate().filter(|(_, m)| role(m) == Some("user")).map(|(i, _)| i).collect();
+        // The last turn is never dropped.
+        let drop = plan.drop_turns.min(turns.len().saturating_sub(1));
+        let start = if drop == 0 { 0 } else { turns[drop] };
+        let last_user = turns.last().copied();
+        // The newest `keep` tool results of the kept messages stay; the older ones are replaced.
+        let tools: Vec<usize> = (start..self.messages.len()).filter(|&i| role(&self.messages[i]) == Some("tool")).collect();
+        let replaced = plan.keep_tool_results.map_or(0, |keep| tools.len().saturating_sub(keep));
+        let old_outputs: HashSet<usize> = tools.into_iter().take(replaced).collect();
         let sent = attachments::images_to_send(&self.messages);
-        for (index, m) in self.messages.iter().enumerate() {
-            match m.get("content").and_then(Value::as_array) {
-                Some(parts) if role(m) == Some("user") => {
-                    let mut wire = m.clone();
-                    wire["content"] = attachments::wire_content(parts, |part| sent.contains(&(index, part)), resolver);
-                    out.push(wire);
+        let mut out = Vec::with_capacity(self.messages.len() - start + 1);
+        out.push(json!({"role": "system", "content": system}));
+        for index in start..self.messages.len() {
+            let m = &self.messages[index];
+            let mut wire = m.clone();
+            if role(m) == Some("user") {
+                if let Some(parts) = m.get("content").and_then(Value::as_array) {
+                    let parts = if plan.elide_old_docs && Some(index) != last_user {
+                        elide_documents(parts)
+                    } else {
+                        parts.clone()
+                    };
+                    wire["content"] = attachments::wire_content(&parts, |part| sent.contains(&(index, part)), resolver);
                 }
-                _ => out.push(m.clone()),
+                if drop > 0 && index == start {
+                    wire["content"] = with_note(wire["content"].take(), OMITTED_TURNS_NOTE);
+                }
+            } else if old_outputs.contains(&index) {
+                wire["content"] = json!(OLD_OUTPUT_NOTE);
             }
+            out.push(wire);
         }
         out
+    }
+
+    /// The number of stored user messages, which is the number of turns.
+    pub fn turn_count(&self) -> usize {
+        self.messages.iter().filter(|m| role(m) == Some("user")).count()
     }
 
     /// Replaces the content of every tool message except the most recent `keep_recent` with `ELIDED_RESULT`.
@@ -201,6 +234,35 @@ impl History {
 
 fn role(m: &Value) -> Option<&str> {
     m.get("role").and_then(Value::as_str)
+}
+
+/// The parts of a user message with each document replaced by a note that it was left out. The parts keep their order,
+/// so the image indexes that `images_to_send` gave still hold.
+fn elide_documents(parts: &[Value]) -> Vec<Value> {
+    parts
+        .iter()
+        .map(|part| {
+            if part["type"] == "watt_file" {
+                let name = attachments::sanitize_name(part["name"].as_str().unwrap_or_default());
+                json!({"type": "text", "text": format!("[file {name} omitted from context]")})
+            } else {
+                part.clone()
+            }
+        })
+        .collect()
+}
+
+/// The wire content with `note` before it: a line of its own, as the first part of a parts array.
+fn with_note(content: Value, note: &str) -> Value {
+    match content {
+        Value::String(text) if text.is_empty() => json!(note),
+        Value::String(text) => json!(format!("{note}\n\n{text}")),
+        Value::Array(mut parts) => {
+            parts.insert(0, json!({"type": "text", "text": note}));
+            Value::Array(parts)
+        }
+        other => other,
+    }
 }
 
 fn strip_reasoning(raw: &mut Value) {
@@ -905,5 +967,182 @@ mod tests {
         h.push_user_content(json!([text_part("look"), image_part("a.png", &sha, 5), file_part("n.txt", "doc")]));
         let restored = History::from_messages(h.snapshot());
         assert_eq!(restored.snapshot(), h.snapshot());
+    }
+
+    // Trimming the wire copy (core/chat/trim)
+
+    /// One turn: the user's text, one assistant message with a call per id, a result for each, then a plain answer.
+    fn tool_turn(h: &mut History, text: &str, ids: &[&str]) {
+        h.push_user(text);
+        h.push_assistant(assistant_calls(ids));
+        for id in ids {
+            h.push_tool_result(id, &format!("result of {id}"));
+        }
+        h.push_assistant(json!({"role": "assistant", "content": format!("answer to {text}")}));
+    }
+
+    fn wire(h: &History, plan: &TrimPlan) -> Vec<Value> {
+        h.messages_with("sys", &mut Resolver::none(), plan)
+    }
+
+    /// The content of each tool message in wire messages, in order.
+    fn tool_contents(messages: &[Value]) -> Vec<String> {
+        messages.iter().filter(|m| role(m) == Some("tool")).map(|m| m["content"].as_str().unwrap_or_default().to_string()).collect()
+    }
+
+    /// The pairing invariant on wire messages whose first message is the system one: the first message after it is a
+    /// user message, every call has exactly one result before the next user or assistant message, and no result answers
+    /// nothing.
+    fn assert_wire_paired(messages: &[Value]) {
+        assert_eq!(messages[0]["role"], "system");
+        if messages.len() > 1 {
+            assert_eq!(messages[1]["role"], "user", "{messages:?}");
+        }
+        let msgs = &messages[1..];
+        let mut all_calls: Vec<String> = Vec::new();
+        for (i, m) in msgs.iter().enumerate() {
+            if role(m) != Some("assistant") {
+                continue;
+            }
+            for call in m.get("tool_calls").and_then(Value::as_array).into_iter().flatten() {
+                let id = call["id"].as_str().unwrap_or_default().to_string();
+                let answers = msgs[i + 1..]
+                    .iter()
+                    .take_while(|n| !matches!(role(n), Some("user") | Some("assistant")))
+                    .filter(|n| n["tool_call_id"].as_str() == Some(id.as_str()))
+                    .count();
+                assert_eq!(answers, 1, "call {id} must have exactly one result: {messages:?}");
+                all_calls.push(id);
+            }
+        }
+        for m in msgs.iter().filter(|m| role(m) == Some("tool")) {
+            let id = m["tool_call_id"].as_str().unwrap_or_default();
+            assert!(all_calls.iter().any(|c| c == id), "tool message {id} answers no call: {messages:?}");
+        }
+    }
+
+    /// Histories with the shapes that trimming must respect: parallel calls, a turn with no answer, calls closed by the
+    /// turn ending or by a reason, and documents in several turns.
+    fn shaped_histories() -> Vec<History> {
+        let mut out = Vec::new();
+        let mut a = History::new();
+        tool_turn(&mut a, "first", &["c1"]);
+        tool_turn(&mut a, "second", &["c2", "c3"]);
+        tool_turn(&mut a, "third", &["c4"]);
+        out.push(a);
+
+        let mut b = History::new();
+        b.push_user("alone");
+        b.push_user("then this");
+        b.push_assistant(assistant_calls(&["d1", "d2"]));
+        b.push_tool_result("d1", "one");
+        b.push_user("next");
+        b.push_assistant(assistant_calls(&["d3"]));
+        b.close_pending("cancelled");
+        out.push(b);
+
+        let mut c = History::new();
+        c.push_user_content(json!([text_part("read this"), file_part("a.txt", "AAA")]));
+        c.push_assistant(json!({"role": "assistant", "content": "ok"}));
+        c.push_user_content(json!([text_part("and this"), file_part("b.txt", "BBB")]));
+        tool_turn(&mut c, "third", &["e1"]);
+        out.push(c);
+        out
+    }
+
+    #[test]
+    fn the_turn_count_is_the_number_of_user_messages() {
+        let mut h = History::new();
+        assert_eq!(h.turn_count(), 0);
+        tool_turn(&mut h, "a", &["c1"]);
+        tool_turn(&mut h, "b", &["c2"]);
+        assert_eq!(h.turn_count(), 2);
+    }
+
+    #[test]
+    fn the_untrimmed_plan_is_the_request_that_messages_builds() {
+        for h in shaped_histories() {
+            assert_eq!(wire(&h, &TrimPlan::none()), h.messages("sys", &mut Resolver::none()));
+        }
+    }
+
+    #[test]
+    fn keeping_the_newest_tool_results_replaces_the_older_ones_across_turns() {
+        let mut h = History::new();
+        tool_turn(&mut h, "first", &["c1", "c2"]);
+        tool_turn(&mut h, "second", &["c3"]);
+        tool_turn(&mut h, "third", &["c4"]);
+        let keep = |n| TrimPlan { keep_tool_results: Some(n), ..TrimPlan::none() };
+        assert_eq!(
+            tool_contents(&wire(&h, &keep(2))),
+            [OLD_OUTPUT_NOTE, OLD_OUTPUT_NOTE, "result of c3", "result of c4"]
+        );
+        assert_eq!(tool_contents(&wire(&h, &keep(8))), ["result of c1", "result of c2", "result of c3", "result of c4"]);
+        assert_eq!(tool_contents(&wire(&h, &keep(0))), [OLD_OUTPUT_NOTE; 4]);
+        assert_wire_paired(&wire(&h, &keep(2)));
+        // The stored results are not changed.
+        assert_eq!(tool_contents(&h.messages("sys", &mut Resolver::none())), ["result of c1", "result of c2", "result of c3", "result of c4"]);
+    }
+
+    #[test]
+    fn eliding_documents_keeps_the_document_of_the_last_user_message() {
+        let mut h = History::new();
+        h.push_user_content(json!([text_part("one"), file_part("a.txt", "AAA")]));
+        h.push_assistant(json!({"role": "assistant", "content": "ok"}));
+        h.push_user_content(json!([text_part("two"), file_part("b.txt", "BBB")]));
+        let plan = TrimPlan { elide_old_docs: true, ..TrimPlan::none() };
+        let sent = wire(&h, &plan);
+        assert_eq!(sent[1]["content"], "one\n\n[file a.txt omitted from context]");
+        assert_eq!(sent[3]["content"], "two\n\n<attached_file name=\"b.txt\">\nBBB\n</attached_file>");
+        assert_wire_paired(&sent);
+        assert_eq!(h.snapshot()[0]["content"][1]["type"], "watt_file", "the stored document is unchanged");
+    }
+
+    #[test]
+    fn dropping_turns_keeps_whole_turns_and_marks_the_first_kept_one() {
+        let mut h = History::new();
+        tool_turn(&mut h, "first", &["c1"]);
+        tool_turn(&mut h, "second", &["c2"]);
+        tool_turn(&mut h, "third", &["c3"]);
+        let drop = |n| TrimPlan { drop_turns: n, ..TrimPlan::none() };
+
+        let one = wire(&h, &drop(1));
+        assert_eq!(one.len(), 1 + 8, "the system message and the last two turns, four messages each");
+        assert_eq!(one[1]["content"], format!("{OMITTED_TURNS_NOTE}\n\nsecond"));
+        assert!(!tool_contents(&one).iter().any(|c| c == "result of c1"), "the first turn is gone");
+        assert_wire_paired(&one);
+
+        // Asking for more than the turns that can go keeps the last turn only.
+        let last = wire(&h, &drop(99));
+        assert_eq!(last.len(), 1 + 4);
+        assert_eq!(last[1]["content"], format!("{OMITTED_TURNS_NOTE}\n\nthird"));
+        assert_wire_paired(&last);
+
+        assert_eq!(wire(&h, &drop(0)), h.messages("sys", &mut Resolver::none()));
+    }
+
+    #[test]
+    fn every_rung_keeps_the_pairing_and_starts_with_a_user_message() {
+        for h in shaped_histories() {
+            for keep in [None, Some(0), Some(1), Some(2), Some(8)] {
+                for elide_old_docs in [false, true] {
+                    for drop_turns in 0..=h.turn_count() {
+                        let plan = TrimPlan { keep_tool_results: keep, elide_old_docs, drop_turns };
+                        assert_wire_paired(&wire(&h, &plan));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_plan_never_changes_the_stored_history() {
+        for h in shaped_histories() {
+            let before = h.snapshot();
+            for drop_turns in 0..=h.turn_count() {
+                let _ = wire(&h, &TrimPlan { keep_tool_results: Some(1), elide_old_docs: true, drop_turns });
+            }
+            assert_eq!(h.snapshot(), before);
+        }
     }
 }

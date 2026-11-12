@@ -30,12 +30,13 @@ use crate::core::agent::{Agent, AgentCtx, AgentEvent, DENIED, UserMessage};
 use crate::core::env::env_setting;
 use crate::core::foreground::{Foreground, ForegroundKind};
 use crate::core::chat::attachments::{Resolver, user_content};
-use crate::core::chat::context::{self, Calibrator};
+use crate::core::chat::context::{self, Calibrator, ContextUsage};
 use crate::core::chat::history::History;
 use crate::core::chat::project::project;
 use crate::core::chat::prompt;
 use crate::core::chat::redact::Redactor;
 use crate::core::chat::todo::{self, Todo, TodoList};
+use crate::core::chat::trim::{self, TrimPlan};
 use crate::core::llm::{self, AssistantReply, ChatRequest, Delta, LlmError, ProviderConfig, ToolCall, TurnCancel};
 use crate::core::observer::OpenAgentRecord;
 use crate::core::persist::attachments::AttachmentStore;
@@ -84,7 +85,8 @@ pub struct LlmSettings {
     pub stream: bool,
     pub max_tokens: Option<u32>,
     /// The context limit that applies to this model, in tokens (core/settings), or None when it is not known. The loop
-    /// reports it with the context usage (core/chat/context); nothing is trimmed to fit it yet.
+    /// reports it with the context usage (core/chat/context), and trims the wire copy of a request to fit it
+    /// (core/chat/trim). Without a known limit, nothing is trimmed.
     pub context_limit: Option<u32>,
 }
 
@@ -300,6 +302,31 @@ impl Conversation {
 /// A save at a checkpoint of the turn. It gets the agent's redactor, which the save uses to scrub what it writes.
 pub type Checkpoint = Box<dyn FnMut(&Redactor) + Send>;
 
+/// One model request as it is sent: the system text it is built from (with the trim note when older content was left
+/// out), the wire messages, and whether anything was left out.
+struct WireRequest {
+    system: String,
+    messages: Vec<Value>,
+    trimmed: bool,
+}
+
+/// A request that does not fit the context limit even with every trim: the estimate of the smallest request, and the
+/// tokens available to a request.
+struct TooLarge {
+    need: u32,
+    available: u32,
+}
+
+impl TooLarge {
+    fn text(&self) -> String {
+        format!(
+            "This conversation no longer fits the model's context window (about {} tokens needed, {} available). Start a new \
+             conversation, or raise the context limit in Settings.",
+            self.need, self.available
+        )
+    }
+}
+
 /// The agent for one turn of a conversation: the provider config with this conversation's headers, the redactor, and
 /// the shared history and cancel token.
 pub struct LlmAgent {
@@ -429,7 +456,8 @@ impl LlmAgent {
 
     /// One model call. Streams text as it arrives, or waits for the whole reply. Returns None when the call was
     /// cancelled or failed; a failure has already been shown to the user. `finished` is the turn's finished note (see
-    /// `finished_since_last_turn`), given to the first call only.
+    /// `finished_since_last_turn`), given to the first call only. Every request is fitted to the context limit first
+    /// (see `fit`); one that does not fit is not sent, and the turn ends with its notice.
     ///
     /// A request with images that the model refuses (see `rejects_images`), before any text was streamed, is sent once
     /// more with the images replaced by notes. The stored history is not changed. The retry is part of this one call:
@@ -462,20 +490,20 @@ impl LlmAgent {
             system = format!("{system}\n\n{block}");
         }
         let mut resolver = Resolver::new(self.attachments.as_ref(), &self.conversation_id);
-        let messages = self.wire_messages(&system, &mut resolver);
-        if !has_image_part(&messages) {
-            return self.finish_call(ctx, self.send(ctx, &system, messages).0);
+        let request = self.fit_or_say(ctx, &system, &mut resolver)?;
+        if !has_image_part(&request.messages) {
+            return self.finish_call(ctx, self.send(ctx, request).0);
         }
         // A model that refused images earlier in this conversation is not asked again: its images are replaced at once.
         if lock_models(&self.no_vision).contains(&self.model) {
-            let text_only = self.wire_messages(&system, &mut Resolver::without_images());
-            return self.finish_call(ctx, self.send(ctx, &system, text_only).0);
+            let text_only = self.fit_or_say(ctx, &system, &mut Resolver::without_images())?;
+            return self.finish_call(ctx, self.send(ctx, text_only).0);
         }
-        match self.send(ctx, &system, messages) {
+        match self.send(ctx, request) {
             // The model refused the images before any text reached the user: the same request goes once more without them.
             (Err(e), false) if rejects_images(&e) => {
-                let text_only = self.wire_messages(&system, &mut Resolver::without_images());
-                match self.send(ctx, &system, text_only).0 {
+                let text_only = self.fit_or_say(ctx, &system, &mut Resolver::without_images())?;
+                match self.send(ctx, text_only).0 {
                     Ok(reply) => {
                         lock_models(&self.no_vision).insert(self.model.clone());
                         let reply = self.finish_call(ctx, Ok(reply));
@@ -491,17 +519,53 @@ impl LlmAgent {
         }
     }
 
-    /// The stored history as wire messages for one request, after `system`. The images go through `resolver`.
-    fn wire_messages(&self, system: &str, resolver: &mut Resolver<'_>) -> Vec<Value> {
-        lock(&self.history).messages(system, resolver)
+    /// The request to send for `system`: the stored history as wire messages, trimmed (see core/chat/trim) when the
+    /// context limit is known and the untrimmed request is over the budget. Nothing is trimmed without a known limit.
+    /// Err when even the smallest request does not fit; the stored history is never changed.
+    fn fit(&self, system: &str, resolver: &mut Resolver<'_>) -> Result<WireRequest, TooLarge> {
+        let Some(limit) = self.context_limit else {
+            return Ok(self.request(system, &TrimPlan::none(), resolver));
+        };
+        let reserve = self.max_tokens.unwrap_or(context::DEFAULT_OUTPUT_RESERVE);
+        let budget = trim::budget(limit, reserve);
+        let calibrator = *lock_calibration(&self.calibration);
+        let max_drop = lock(&self.history).turn_count().saturating_sub(1);
+        let chosen = trim::select(budget, max_drop, |plan| {
+            let request = self.request(system, plan, resolver);
+            let breakdown = context::breakdown(&request.system, &self.tools, &request.messages);
+            context::usage(&breakdown, &calibrator, Some(limit), self.max_tokens).used
+        });
+        match chosen {
+            Ok(plan) => Ok(self.request(system, &plan, resolver)),
+            Err(need) => Err(TooLarge { need, available: u32::try_from(budget.max(0)).unwrap_or(u32::MAX) }),
+        }
+    }
+
+    /// `fit`, and when the request does not fit at all, its notice is shown and no request is made.
+    fn fit_or_say(&self, ctx: &AgentCtx<'_>, system: &str, resolver: &mut Resolver<'_>) -> Option<WireRequest> {
+        match self.fit(system, resolver) {
+            Ok(request) => Some(request),
+            Err(too_large) => {
+                ctx.say(self.redactor.redact(&too_large.text()));
+                None
+            }
+        }
+    }
+
+    /// The request under `plan`: its system text, and its wire messages built with `resolver`.
+    fn request(&self, system: &str, plan: &TrimPlan, resolver: &mut Resolver<'_>) -> WireRequest {
+        let system = trim::system_for(system, plan);
+        let messages = lock(&self.history).messages_with(&system, resolver, plan);
+        WireRequest { system, messages, trimmed: !plan.is_none() }
     }
 
     /// One request, streamed or waited for, with the "thinking" state around it. Returns the result and whether any
-    /// text was streamed to the user during the call. `system` is the system text the messages were built with. The
-    /// context usage of the request is emitted before it is sent, and again with the provider's count if the reply
-    /// reports one (see core/chat/context).
-    fn send(&self, ctx: &AgentCtx<'_>, system: &str, messages: Vec<Value>) -> (Result<AssistantReply, LlmError>, bool) {
-        let breakdown = context::breakdown(system, &self.tools, &messages);
+    /// text was streamed to the user during the call. The context usage of the request is emitted before it is sent, and
+    /// again with the provider's count if the reply reports one (see core/chat/context). The usage says whether older
+    /// content was left out.
+    fn send(&self, ctx: &AgentCtx<'_>, request: WireRequest) -> (Result<AssistantReply, LlmError>, bool) {
+        let WireRequest { system, messages, trimmed } = request;
+        let breakdown = context::breakdown(&system, &self.tools, &messages);
         let req = ChatRequest {
             model: self.model.clone(),
             messages,
@@ -511,7 +575,10 @@ impl LlmAgent {
         let thinking = Cell::new(true);
         let streamed = Cell::new(false);
         ctx.emit(AgentEvent::Thinking { active: true });
-        let before = context::usage(&breakdown, &lock_calibration(&self.calibration), self.context_limit, self.max_tokens);
+        let before = ContextUsage {
+            trimmed,
+            ..context::usage(&breakdown, &lock_calibration(&self.calibration), self.context_limit, self.max_tokens)
+        };
         ctx.emit(AgentEvent::ContextUsage(before.clone()));
         let result = if self.stream {
             let mut on_delta = |delta: Delta| {

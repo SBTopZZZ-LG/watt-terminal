@@ -184,7 +184,7 @@ fn split_notes(text: &str) -> (usize, usize) {
             user += 2;
         }
         let count = segment.chars().count();
-        if is_image_note(segment) {
+        if is_attachment_note(segment) {
             attached += count;
         } else {
             user += count;
@@ -193,9 +193,14 @@ fn split_notes(text: &str) -> (usize, usize) {
     (user, attached)
 }
 
-fn is_image_note(segment: &str) -> bool {
-    segment.starts_with("[image ")
-        && (segment.ends_with(OMITTED_NOTE_END) || segment.ends_with(UNAVAILABLE_NOTE_END) || segment.contains(NOT_SENT_NOTE))
+/// The notes that stand where an image or a document is left out of a request (see `wire_content` and core/chat/trim).
+fn is_attachment_note(segment: &str) -> bool {
+    let image = segment.starts_with("[image ")
+        && (segment.ends_with(OMITTED_NOTE_END)
+            || segment.ends_with(UNAVAILABLE_NOTE_END)
+            || segment.contains(NOT_SENT_NOTE));
+    let document = segment.starts_with("[file ") && segment.ends_with(OMITTED_NOTE_END);
+    image || document
 }
 
 fn classify_assistant(tally: &mut Tally, message: &Value) {
@@ -459,6 +464,14 @@ mod tests {
 
     fn refused_len() -> usize {
         "[image a.png not sent: the current model does not accept images]".chars().count()
+    }
+
+    #[test]
+    fn a_document_left_out_of_a_trimmed_request_is_an_attachment() {
+        let note = "[file notes.txt omitted from context]";
+        let b = one_user(json!(format!("hi\n\n{note}")));
+        assert_eq!(tokens(&b, ATTACHMENTS), estimate_tokens(note.chars().count()));
+        assert_eq!(tokens(&b, USER), estimate_tokens(2 + 2) + MESSAGE_OVERHEAD, "the words and the blank line are the user's");
     }
 
     #[test]
