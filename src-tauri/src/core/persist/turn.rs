@@ -10,6 +10,7 @@ use super::conversations::{ConversationMeta, SaveRequest};
 use super::ui_state::UiStatePatch;
 use super::workspace::{Workspace, workspace_for};
 use super::{Persist, PersistError};
+use crate::core::chat::context::ContextUsage;
 use crate::core::chat::history::History;
 use crate::core::chat::redact::Redactor;
 use crate::core::chat::todo::{self, Todo};
@@ -29,6 +30,8 @@ pub struct FinishedTurn<'a> {
     pub cwd: Option<(&'a str, &'a str)>,
     /// True for a checkpoint inside the turn, false for the save at its end (see `StoredConversation::in_turn`).
     pub in_turn: bool,
+    /// The context usage of the conversation's last model request (see `StoredConversation::context`).
+    pub context: Option<ContextUsage>,
 }
 
 /// This machine, as the workspace needs it: the host name the shell reports, and the home directory.
@@ -47,6 +50,8 @@ pub struct Resumed {
     pub todos: Vec<Todo>,
     /// The file was saved at a checkpoint inside a turn, so that turn never finished (the app ended first).
     pub in_turn: bool,
+    /// The context usage the conversation last had, when its file holds a sane one (see `StoredConversation::context`).
+    pub context: Option<ContextUsage>,
 }
 
 /// Saves a finished turn. Returns `None`, and writes nothing, when the history has no user message. Otherwise it
@@ -84,6 +89,7 @@ fn save_turn_keeping(
         messages: turn.messages,
         todos: turn.todos,
         in_turn: turn.in_turn,
+        context: turn.context,
     };
     let meta = persist.conversations.save(&req, redactor, now)?;
     let pruned = persist.conversations.prune(keep, Some(&id)).map(|_| ());
@@ -103,6 +109,7 @@ pub fn resume(persist: &Persist, id: &str) -> Result<Resumed, PersistError> {
         history: History::from_messages(stored.messages),
         todos: todo::repair(stored.todos),
         in_turn: stored.in_turn,
+        context: stored.context,
     })
 }
 
@@ -145,6 +152,7 @@ mod tests {
             model: Some("model-a".into()),
             cwd,
             in_turn: false,
+            context: None,
         }
     }
 

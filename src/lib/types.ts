@@ -246,6 +246,8 @@ export interface LoadedConversation {
   messages: ChatMessage[];
   /** The repaired todo list. Absent or empty when the conversation had none. */
   todos?: TodoItem[];
+  /** The context usage the conversation ended with, or null when none was saved (see ContextUsage). */
+  context: ContextUsage | null;
 }
 
 /** What a saved-conversation delete reports. `deleted_live` is true when the live conversation was reset to a new one. */

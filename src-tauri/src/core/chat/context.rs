@@ -3,7 +3,7 @@
 //! they are sent, so it counts what the model reads, and the usage is what the context meter shows. The category ids
 //! are strings, so a new category needs no change to the frontend's type.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::core::llm::LlmError;
@@ -283,7 +283,7 @@ impl Calibrator {
 
 /// What the context meter shows for one request. `used` is the estimate of the prompt, or the provider's count once
 /// a reply has reported it (see `with_actual`). `limit` is None when the model's context limit is not known.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextUsage {
     pub limit: Option<u32>,
     pub used: u32,
@@ -295,8 +295,34 @@ pub struct ContextUsage {
     pub categories: Vec<CategoryUsage>,
 }
 
+/// The largest limit or count a stored usage may hold, and the most categories it may list. Anything above is taken for
+/// a damaged file.
+const SANE_TOKENS: u32 = 100_000_000;
+const SANE_CATEGORIES: usize = 16;
+/// The longest category id a stored usage may hold, in bytes (ids are ASCII).
+const SANE_ID_BYTES: usize = 40;
+
+impl ContextUsage {
+    /// True when a usage read from a file could have come from `usage` or `with_actual`: the counts are not absurd, there
+    /// are few categories, each id is a short lower-case word, and the categories sum to `used` (to within one token of
+    /// rounding). A usage that fails this is dropped when it is read (see `ConversationStore`).
+    pub fn is_sane(&self) -> bool {
+        let ids_ok = self.categories.iter().all(|c| {
+            !c.id.is_empty()
+                && c.id.len() <= SANE_ID_BYTES
+                && c.id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        });
+        let sum: u64 = self.categories.iter().map(|c| u64::from(c.tokens)).sum();
+        self.used <= SANE_TOKENS
+            && self.limit.is_none_or(|limit| limit <= SANE_TOKENS)
+            && self.categories.len() <= SANE_CATEGORIES
+            && ids_ok
+            && sum.abs_diff(u64::from(self.used)) <= 1
+    }
+}
+
 /// The tokens of one category. `used` is the sum of the categories.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CategoryUsage {
     pub id: String,
     pub tokens: u32,
@@ -373,15 +399,22 @@ const OVERFLOW_WORDS: [&str; 13] = [
     "payload too large",
 ];
 
+/// The words of a provider's error about how often or how much the account may use the model (a rate limit, a quota), in
+/// lower case. Such an error is not an overflow even when its text also has one of `OVERFLOW_WORDS`, such as "too many
+/// tokens per minute".
+const LIMIT_ON_USE_WORDS: [&str; 8] =
+    ["per minute", "per day", "per hour", "rate limit", "rate-limit", "rate_limit", "quota", "requests per"];
+
 /// True for an error that says the request is too large for the model's context window: a 413, or a 400 or 422 (or a
-/// provider error inside a 200 body) whose message or kind has one of `OVERFLOW_WORDS`. Any other error is not an overflow,
-/// whatever its wording.
+/// provider error inside a 200 body) whose message or kind has one of `OVERFLOW_WORDS` and none of `LIMIT_ON_USE_WORDS`.
+/// Any other error is not an overflow, whatever its wording.
 pub fn is_context_overflow(e: &LlmError) -> bool {
     match e {
         LlmError::Http { status: 413, .. } => true,
         LlmError::Http { status: 400 | 422, kind, message, .. } | LlmError::Provider { kind, message, .. } => {
             let text = format!("{} {message}", kind.as_deref().unwrap_or_default()).to_lowercase();
-            OVERFLOW_WORDS.iter().any(|word| text.contains(word))
+            let overflow = OVERFLOW_WORDS.iter().any(|word| text.contains(word));
+            overflow && !LIMIT_ON_USE_WORDS.iter().any(|word| text.contains(word))
         }
         _ => false,
     }
@@ -698,6 +731,54 @@ mod tests {
         assert_eq!(actual.categories.iter().map(|c| c.tokens).sum::<u32>(), 7);
     }
 
+    /// A usage with the given categories and used count, the rest as `usage` leaves it.
+    fn stored_usage(used: u32, limit: Option<u32>, categories: &[(&str, u32)]) -> ContextUsage {
+        ContextUsage {
+            limit,
+            used,
+            reserved_output: 4096,
+            trimmed: false,
+            calibrated: true,
+            categories: categories
+                .iter()
+                .map(|(id, tokens)| CategoryUsage { id: id.to_string(), tokens: *tokens })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_usage_that_could_have_been_written_is_sane() {
+        assert!(stored_usage(0, None, &[]).is_sane(), "an empty usage");
+        assert!(stored_usage(30, Some(128_000), &[("system", 10), ("user", 20)]).is_sane());
+        assert!(stored_usage(30, None, &[("system", 10), ("user", 19)]).is_sane(), "one token of rounding is allowed");
+        assert!(stored_usage(30, None, &[("system", 10), ("user", 21)]).is_sane(), "and one token the other way");
+        assert!(stored_usage(100_000_000, Some(100_000_000), &[("other", 100_000_000)]).is_sane(), "the largest counts");
+        let sixteen: Vec<(&str, u32)> = (0..16).map(|_| ("x", 1)).collect();
+        assert!(stored_usage(16, None, &sixteen).is_sane(), "sixteen categories");
+        assert!(stored_usage(1, None, &[("a_1_b", 1)]).is_sane(), "lower case, digits and underscores");
+    }
+
+    #[test]
+    fn a_damaged_usage_is_not_sane() {
+        let long_id = "a".repeat(41);
+        let cases = [
+            ("categories sum to less than used", stored_usage(30, None, &[("system", 10)])),
+            ("categories sum to more than used", stored_usage(10, None, &[("system", 10), ("user", 10)])),
+            ("used above the largest count", stored_usage(100_000_001, None, &[("other", 100_000_001)])),
+            ("limit above the largest count", stored_usage(1, Some(100_000_001), &[("other", 1)])),
+            ("seventeen categories", stored_usage(17, None, &(0..17).map(|_| ("x", 1)).collect::<Vec<_>>())),
+            ("a category id over 40 bytes", stored_usage(1, None, &[(long_id.as_str(), 1)])),
+            ("an empty category id", stored_usage(1, None, &[("", 1)])),
+            ("a category id with a space", stored_usage(1, None, &[("tool output", 1)])),
+            ("an upper-case category id", stored_usage(1, None, &[("System", 1)])),
+            ("a category id with a dash", stored_usage(1, None, &[("tool-output", 1)])),
+            ("a category id with a non-ASCII letter", stored_usage(1, None, &[("é", 1)])),
+        ];
+        for (what, usage) in cases {
+            assert!(!usage.is_sane(), "{what} must not be sane: {usage:?}");
+        }
+    }
+
     #[test]
     fn the_usage_serialises_with_the_field_names_the_frontend_reads() {
         let u = usage(&breakdown("abcd", &[], &[]), &Calibrator::default(), None, Some(256));
@@ -742,6 +823,18 @@ mod tests {
         assert!(!is_context_overflow(&LlmError::Transport("context length".into())));
         assert!(!is_context_overflow(&LlmError::Parse("too many tokens".into())));
         assert!(!is_context_overflow(&LlmError::Cancelled));
+    }
+
+    #[test]
+    fn a_rate_limit_or_quota_error_is_not_an_overflow_even_when_it_says_too_many_tokens() {
+        assert!(!is_context_overflow(&http(400, None, "Rate limit reached: too many tokens per minute")));
+        assert!(!is_context_overflow(&http(429, None, "Rate limit reached: too many tokens per minute")));
+        assert!(!is_context_overflow(&http(400, None, "quota exceeded: too many tokens")));
+        assert!(!is_context_overflow(&provider(Some("rate_limit_error"), "too many tokens in the prompt")));
+        assert!(!is_context_overflow(&http(422, None, "too many requests per day: too many tokens")));
+        assert!(!is_context_overflow(&http(400, None, "rate-limited: too many tokens")));
+        // The 413 is an overflow whatever its text says, as before.
+        assert!(is_context_overflow(&http(413, None, "Rate limit reached: too many tokens per minute")));
     }
 
     #[test]

@@ -2116,3 +2116,26 @@ fn a_retry_that_no_longer_fits_shows_the_notice_and_sends_nothing_more() {
     assert!(said[0].starts_with("This conversation no longer fits the model's context window (about "), "{}", said[0]);
     assert!(matches!(events.last(), Some(AgentEvent::Done)));
 }
+
+#[test]
+fn the_conversations_last_usage_is_the_last_usage_event_and_a_turn_without_a_request_leaves_it() {
+    let provider = serve(vec![Script::json(with_usage(text_reply("a"), 321))]);
+    let conv = Conversation::new().unwrap();
+    let s = settings(&provider.url, false);
+    let mut agent = agent_for(&s, &conv, Arc::new(TurnCancel::new())).with_last_usage(conv.last_usage());
+    let events = turn(&mut agent, &FakeTools::default(), &auto_gate(), "hi");
+
+    let emitted = usages(&events);
+    assert_eq!(emitted.len(), 2, "one before the request, one with the provider's count");
+    assert_eq!(emitted[1].used, 321);
+    assert_eq!(conv.last_usage().lock().unwrap().clone(), Some(emitted[1].clone()), "the last usage is the last event");
+
+    // A failed request still emits the usage before it was sent, and that is the last usage too.
+    let refused = serve(vec![Script::error("500 Internal Server Error", json!({"error": {"message": "down"}}))]);
+    let s = settings(&refused.url, false);
+    let mut agent = agent_for(&s, &conv, Arc::new(TurnCancel::new())).with_last_usage(conv.last_usage());
+    let events = turn(&mut agent, &FakeTools::default(), &auto_gate(), "again");
+    let emitted_again = usages(&events);
+    assert_eq!(emitted_again.len(), 1, "no reply, so only the usage before the request");
+    assert_eq!(conv.last_usage().lock().unwrap().clone(), emitted_again.last().cloned());
+}

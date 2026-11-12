@@ -27,6 +27,7 @@ use serde_json::Value;
 use super::PersistError;
 use super::attachments::{AttachmentStore, SWEEP_GRACE};
 use super::workspace::{Workspace, is_hidden_or_control};
+use crate::core::chat::context::ContextUsage;
 use crate::core::chat::redact::Redactor;
 use crate::core::chat::todo::{self, Todo};
 use crate::core::settings::write_private_atomic;
@@ -74,6 +75,11 @@ pub struct StoredConversation {
     /// end-of-turn save writes false, and then the key is left out. Absent in older files, which read as false.
     #[serde(default, skip_serializing_if = "is_false")]
     pub in_turn: bool,
+    /// The context usage of the conversation's last model request, so a restored conversation can show its meter. Absent
+    /// in older files and when no request was made. Read only when it passes `ContextUsage::is_sane`; a usage that does
+    /// not is dropped on read (see `read_stored`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<ContextUsage>,
 }
 
 impl StoredConversation {
@@ -103,6 +109,8 @@ pub struct SaveRequest {
     pub todos: Vec<Todo>,
     /// True for a checkpoint inside a turn, false for the end-of-turn save. Replaces the stored flag.
     pub in_turn: bool,
+    /// The context usage of the conversation's last model request. Replaces the stored one; None when there is none.
+    pub context: Option<ContextUsage>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -175,6 +183,7 @@ impl ConversationStore {
                 messages,
                 todos,
                 in_turn: req.in_turn,
+                context: req.context.clone(),
             },
             None => StoredConversation {
                 version: CONVERSATION_VERSION,
@@ -187,6 +196,7 @@ impl ConversationStore {
                 messages,
                 todos,
                 in_turn: req.in_turn,
+                context: req.context.clone(),
             },
         };
         self.write_file(&stored)?;
@@ -323,7 +333,7 @@ impl ConversationStore {
             Err(e) => return Err(io_error(&path, e)),
         };
         // The serde message can echo a value from the file, so only the error class and position are reported.
-        let stored: StoredConversation = serde_json::from_str(&text).map_err(|e| {
+        let mut stored: StoredConversation = serde_json::from_str(&text).map_err(|e| {
             PersistError::Corrupt(format!(
                 "{} is not a valid conversation ({:?} error at line {}, column {})",
                 path.display(),
@@ -338,6 +348,8 @@ impl ConversationStore {
         if stored.id != id {
             return Err(PersistError::Corrupt(format!("{} holds a different conversation id", path.display())));
         }
+        // A context usage that is out of range is dropped, not a reason to refuse the file: the meter just starts empty.
+        stored.context = stored.context.filter(ContextUsage::is_sane);
         Ok(Some(stored))
     }
 
@@ -677,6 +689,7 @@ mod tests {
             ],
             todos: Vec::new(),
             in_turn: false,
+            context: None,
         }
     }
 
@@ -906,6 +919,7 @@ mod tests {
             ],
             todos: Vec::new(),
             in_turn: false,
+            context: None,
         };
         let meta = s.save(&req, &redactor(), 1_000).unwrap();
         assert_eq!(meta.id, id(1));
@@ -940,6 +954,7 @@ mod tests {
             ],
             todos: Vec::new(),
             in_turn: false,
+            context: None,
         };
         s.save(&req, &redactor(), 5).unwrap();
         let on_disk = fs::read_to_string(s.path_for(&id(2))).unwrap();
@@ -972,6 +987,7 @@ mod tests {
             messages: vec![json!({"role": "user", "content": "different now"})],
             todos: Vec::new(),
             in_turn: false,
+            context: None,
         };
         let meta = s.save(&again, &redactor(), 250).unwrap();
         assert_eq!(meta.created_at, 100);
@@ -1404,9 +1420,59 @@ mod tests {
             messages: vec![json!({"role": "user", "content": SECRET})],
             todos: Vec::new(),
             in_turn: false,
+            context: None,
         };
         let meta = s.save(&req, &redactor(), 1).unwrap();
         assert_eq!(meta.title, "[REDACTED]");
+    }
+
+    /// A usage whose categories sum to `used`, with a limit, as a finished request would leave it.
+    fn usage_of(used: u32) -> ContextUsage {
+        use crate::core::chat::context::CategoryUsage;
+        ContextUsage {
+            limit: Some(128_000),
+            used,
+            reserved_output: 4096,
+            trimmed: false,
+            calibrated: true,
+            categories: vec![CategoryUsage { id: "user".into(), tokens: used }],
+        }
+    }
+
+    #[test]
+    fn the_context_usage_is_saved_and_loaded_and_a_file_without_it_has_none() {
+        let tmp = TempDir::new();
+        let s = store(&tmp);
+        let with = SaveRequest { context: Some(usage_of(42)), ..request(&id(83), "hi") };
+        s.save(&with, &redactor(), 1).unwrap();
+        assert!(fs::read_to_string(s.path_for(&id(83))).unwrap().contains("\"context\""));
+        assert_eq!(s.load(&id(83)).unwrap().context, Some(usage_of(42)));
+
+        // Without a usage the key is left out of the file, as `in_turn` is.
+        s.save(&request(&id(84), "hi"), &redactor(), 1).unwrap();
+        assert!(!fs::read_to_string(s.path_for(&id(84))).unwrap().contains("\"context\""));
+        assert_eq!(s.load(&id(84)).unwrap().context, None);
+
+        // A file saved before the field existed loads with none.
+        let base = json!({"version": 1, "id": id(85), "title": "t", "created_at": 1, "updated_at": 1,
+            "workspace": workspace(), "model": null, "messages": []});
+        assert_eq!(serde_json::from_value::<StoredConversation>(base).unwrap().context, None);
+    }
+
+    #[test]
+    fn a_saved_context_that_is_not_sane_is_dropped_on_read_and_the_conversation_still_loads() {
+        let tmp = TempDir::new();
+        let s = store(&tmp);
+        // Above the largest count a usage may hold, with the categories still summing to it.
+        let damaged = usage_of(100_000_001);
+        let req = SaveRequest { context: Some(damaged), ..request(&id(86), "still here") };
+        s.save(&req, &redactor(), 1).unwrap();
+        let loaded = s.load(&id(86)).unwrap();
+        assert_eq!(loaded.context, None, "the absurd usage is dropped");
+        assert_eq!(loaded.messages[0]["content"], "still here", "the messages are kept");
+        // A rename rewrites the file from what was read, so the dropped usage does not come back.
+        s.rename(&id(86), "renamed").unwrap();
+        assert_eq!(s.load(&id(86)).unwrap().context, None);
     }
 
     #[test]

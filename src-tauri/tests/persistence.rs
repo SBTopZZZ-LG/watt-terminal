@@ -218,6 +218,7 @@ fn finish(
         model: Some(MODEL.to_string()),
         cwd,
         in_turn: false,
+        context: None,
     };
     let env = TurnEnv { local_host: "this-mac", home: None };
     save_turn(persist, turn, agent.redactor(), env, now).expect("save succeeds")
@@ -363,6 +364,7 @@ fn a_saved_unanswered_tool_call_is_closed_before_the_model_sees_the_resumed_hist
                 messages: stored_messages,
                 todos: Vec::new(),
                 in_turn: false,
+                context: None,
             },
             &Redactor::new(vec![KEY.to_string()]),
             5,
@@ -400,6 +402,7 @@ fn a_turn_saved_over_a_damaged_conversation_file_goes_through_and_is_listed() {
         model: Some(MODEL.to_string()),
         cwd: None,
         in_turn: false,
+        context: None,
     };
     let env = TurnEnv { local_host: "this-mac", home: None };
     let saved = save_turn(&persist, turn, &Redactor::new(Vec::new()), env, 9).expect("save succeeds").expect("saved");
@@ -484,6 +487,7 @@ fn an_older_file_without_todos_loads_with_an_empty_list() {
                 messages: vec![json!({"role": "user", "content": "old"}), json!({"role": "assistant", "content": "ok"})],
                 todos: Vec::new(),
                 in_turn: false,
+                context: None,
             },
             &Redactor::new(Vec::new()),
             3,
@@ -545,6 +549,7 @@ fn new_conversation_clears_the_todo_list_and_the_saved_copy_keeps_its_own() {
         model: None,
         cwd: None,
         in_turn: false,
+        context: None,
     };
     save_turn(&persist, turn, &Redactor::new(Vec::new()), TurnEnv { local_host: "this-mac", home: None }, 4).unwrap();
 
@@ -649,6 +654,7 @@ fn recording_checkpoint(persist: &Arc<Persist>, conv: &Conversation) -> (impl Fn
             model: Some(MODEL.to_string()),
             cwd: None,
             in_turn: true,
+            context: None,
         };
         let env = TurnEnv { local_host: "this-mac", home: None };
         save_turn(&persist, turn, redactor, env, 10).expect("the checkpoint saves");
@@ -713,7 +719,15 @@ fn a_turn_cut_short_by_a_crash_resumes_with_the_interrupted_note() {
     let id = format!("ses_{:032x}", 40);
     let messages = vec![json!({"role": "user", "content": "migrate the database"})];
     let turn =
-        FinishedTurn { conversation_id: &id, messages, todos: Vec::new(), model: None, cwd: None, in_turn: true };
+        FinishedTurn {
+            conversation_id: &id,
+            messages,
+            todos: Vec::new(),
+            model: None,
+            cwd: None,
+            in_turn: true,
+            context: None,
+        };
     save_turn(&persist, turn, &Redactor::new(Vec::new()), TurnEnv { local_host: "this-mac", home: None }, 1).unwrap();
 
     let loaded = resume(&persist, &id).unwrap();

@@ -77,6 +77,9 @@ pub type Calibration = Arc<Mutex<Calibrator>>;
 /// `Conversation::learned_limits`).
 pub type LearnedLimits = Arc<Mutex<HashMap<String, u32>>>;
 
+/// The context usage last emitted for a conversation, shared by its agents (see `Conversation::last_usage`).
+pub type LastUsage = Arc<Mutex<Option<ContextUsage>>>;
+
 /// The provider settings read from the environment. Holds the key, so `Debug` hides it.
 #[derive(Clone)]
 pub struct LlmSettings {
@@ -238,6 +241,9 @@ pub struct Conversation {
     /// The context limits that overflow errors taught, per model id. Kept by `reset` and `restore`, like the no-vision memo:
     /// it is a fact about the model.
     learned_limits: LearnedLimits,
+    /// The usage last emitted for this conversation, kept so a saved conversation can show its meter when it is restored.
+    /// Cleared by `reset`; `restore` clears it too, and the caller then sets the saved one (see `set_last_usage`).
+    last_usage: LastUsage,
 }
 
 impl Conversation {
@@ -250,6 +256,7 @@ impl Conversation {
             no_vision: Arc::new(Mutex::new(HashSet::new())),
             calibration: Arc::new(Mutex::new(Calibrator::default())),
             learned_limits: Arc::new(Mutex::new(HashMap::new())),
+            last_usage: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -280,14 +287,25 @@ impl Conversation {
         self.learned_limits.clone()
     }
 
-    /// Clears the history, the todo list, any pending resume note and the calibration, and rotates the id. The caller
-    /// makes sure no turn is running.
+    /// The usage last emitted for this conversation (see `LlmAgent::with_last_usage`).
+    pub fn last_usage(&self) -> LastUsage {
+        self.last_usage.clone()
+    }
+
+    /// Sets the usage the conversation shows, for a conversation restored from storage (see `restore`).
+    pub fn set_last_usage(&self, usage: Option<ContextUsage>) {
+        *lock_usage(&self.last_usage) = usage;
+    }
+
+    /// Clears the history, the todo list, any pending resume note, the calibration and the last usage, and rotates the id.
+    /// The caller makes sure no turn is running.
     pub fn reset(&self) -> io::Result<()> {
         let id = new_conversation_id()?;
         lock(&self.history).clear();
         lock_todos(&self.todos).clear();
         *lock_note(&self.resume_note) = None;
         *lock_calibration(&self.calibration) = Calibrator::default();
+        *lock_usage(&self.last_usage) = None;
         *lock_string(&self.id) = id;
         Ok(())
     }
@@ -303,6 +321,8 @@ impl Conversation {
         *lock_note(&self.resume_note) = Some(resume_note_for(in_turn));
         // The restored conversation is a different content: the calibration learned from the live one does not carry over.
         *lock_calibration(&self.calibration) = Calibrator::default();
+        // The last usage belongs to the content it was measured on. The caller sets the saved one (see `set_last_usage`).
+        *lock_usage(&self.last_usage) = None;
     }
 
     /// The resume note, once: a turn that calls the model takes it, and the next turn gets none. `None` for a
@@ -372,6 +392,8 @@ pub struct LlmAgent {
     calibration: Calibration,
     /// The context limits learned from overflow errors, by model id (see `with_learned_limits`).
     learned_limits: LearnedLimits,
+    /// The usage last emitted, shared with the conversation (see `with_last_usage`).
+    last_usage: LastUsage,
 }
 
 impl LlmAgent {
@@ -413,6 +435,7 @@ impl LlmAgent {
             context_limit: settings.context_limit,
             calibration: Arc::new(Mutex::new(Calibrator::default())),
             learned_limits: Arc::new(Mutex::new(HashMap::new())),
+            last_usage: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -449,6 +472,13 @@ impl LlmAgent {
     /// the learned one, so after an overflow the model's later requests are trimmed before they are sent.
     pub fn with_learned_limits(mut self, limits: LearnedLimits) -> Self {
         self.learned_limits = limits;
+        self
+    }
+
+    /// The usage last emitted, shared with the conversation (see `Conversation::last_usage`). Without it, the usage lasts
+    /// for this agent only. Every usage event this agent emits is also kept here.
+    pub fn with_last_usage(mut self, last: LastUsage) -> Self {
+        self.last_usage = last;
         self
     }
 
@@ -672,7 +702,7 @@ impl LlmAgent {
             trimmed,
             ..context::usage(&breakdown, &lock_calibration(&self.calibration), self.context_limit, self.max_tokens)
         };
-        ctx.emit(AgentEvent::ContextUsage(before.clone()));
+        self.emit_usage(ctx, before.clone());
         let result = if self.stream {
             let mut on_delta = |delta: Delta| {
                 // Reasoning deltas are not shown yet, so they do not end the "thinking" state.
@@ -694,9 +724,15 @@ impl LlmAgent {
         {
             let actual = u32::try_from(actual).unwrap_or(u32::MAX);
             lock_calibration(&self.calibration).observe(breakdown.total(), actual);
-            ctx.emit(AgentEvent::ContextUsage(context::with_actual(&before, actual)));
+            self.emit_usage(ctx, context::with_actual(&before, actual));
         }
         (result, streamed.get())
+    }
+
+    /// Emits a context usage event and keeps it as the conversation's last usage (see `with_last_usage`).
+    fn emit_usage(&self, ctx: &AgentCtx<'_>, usage: ContextUsage) {
+        *lock_usage(&self.last_usage) = Some(usage.clone());
+        ctx.emit(AgentEvent::ContextUsage(usage));
     }
 
     /// Ends one model call: a reply that was not streamed is said, and an error is shown. None when there is no reply.
@@ -1131,6 +1167,10 @@ fn lock_learned(m: &Mutex<HashMap<String, u32>>) -> MutexGuard<'_, HashMap<Strin
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+fn lock_usage(m: &Mutex<Option<ContextUsage>>) -> MutexGuard<'_, Option<ContextUsage>> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1299,6 +1339,22 @@ mod tests {
         conversation.reset().unwrap();
         assert_ne!(conversation.id(), before);
         assert!(lock(&conversation.history()).is_empty());
+    }
+
+    #[test]
+    fn the_last_usage_is_cleared_by_reset_and_replaced_by_restore() {
+        let usage = context::usage(&context::breakdown("abcd", &[], &[]), &Calibrator::default(), Some(100), None);
+        let saved = ContextUsage { used: 7, ..usage.clone() };
+        let conversation = Conversation::new().unwrap();
+        *lock_usage(&conversation.last_usage()) = Some(usage);
+
+        conversation.restore(conversation.id(), History::new(), Vec::new(), false);
+        assert!(lock_usage(&conversation.last_usage()).is_none(), "a restore clears it until the caller sets the saved one");
+        conversation.set_last_usage(Some(saved.clone()));
+        assert_eq!(*lock_usage(&conversation.last_usage()), Some(saved.clone()));
+
+        conversation.reset().unwrap();
+        assert!(lock_usage(&conversation.last_usage()).is_none(), "a reset clears it");
     }
 
     #[test]

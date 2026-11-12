@@ -23,8 +23,9 @@ pub mod core;
 use crate::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate, AutoState, MockAgent, OnDrop, TurnRules, UserMessage};
 use crate::core::env::env_setting;
 use crate::core::approval::{self, ApprovalPolicy, ManualPolicy};
-use crate::core::chat::agent_loop::{self, Conversation, LlmAgent, LlmSettings, USER_AGENT};
+use crate::core::chat::agent_loop::{self, Conversation, LastUsage, LlmAgent, LlmSettings, USER_AGENT};
 use crate::core::chat::attachments::{AttachmentInput, ImageFile, prepare};
+use crate::core::chat::context::ContextUsage;
 use crate::core::chat::history::History;
 use crate::core::chat::redact::Redactor;
 use crate::core::chat::todo::{Todo, TodoList};
@@ -219,11 +220,13 @@ struct SavedState {
     history: Arc<Mutex<History>>,
     todos: TodoList,
     model: Option<String>,
+    /// The conversation's last context usage, saved with it so a restored conversation can show its meter.
+    context: LastUsage,
 }
 
-/// Saves the conversation: the whole history and todo list, redacted, with the shell's directory. `in_turn` is true at
-/// a checkpoint inside a turn and false at the end of the turn. A failure is logged without any content and never
-/// fails the turn.
+/// Saves the conversation: the whole history, todo list and last context usage, redacted, with the shell's directory.
+/// `in_turn` is true at a checkpoint inside a turn and false at the end of the turn. A failure is logged without any
+/// content and never fails the turn.
 fn save_conversation(store: &Persist, session: &Session, state: &SavedState, redactor: &Redactor, in_turn: bool) {
     let cwd = session.cwd();
     let cwd_pair = cwd.as_ref().map(|c| (c.host.as_str(), c.path.as_str()));
@@ -234,6 +237,7 @@ fn save_conversation(store: &Persist, session: &Session, state: &SavedState, red
         model: state.model.clone(),
         cwd: cwd_pair,
         in_turn,
+        context: lock(&state.context).clone(),
     };
     let home = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
     let env = TurnEnv { local_host: local_host(), home: home.as_deref() };
@@ -474,6 +478,7 @@ async fn agent_message(
                     history: history.clone(),
                     todos: todos.clone(),
                     model: Some(model),
+                    context: att.conversation.last_usage(),
                 });
                 let checkpoint = checkpoint_saver(store.clone(), att.clone(), state.clone());
                 let mut agent = LlmAgent::new(client, llm_settings, &conversation_id, history, todos, cancel.clone())
@@ -483,7 +488,8 @@ async fn agent_message(
                     .with_limits(limits)
                     .with_no_vision(att.conversation.no_vision())
                     .with_calibration(att.conversation.calibration())
-                    .with_learned_limits(att.conversation.learned_limits());
+                    .with_learned_limits(att.conversation.learned_limits())
+                    .with_last_usage(att.conversation.last_usage());
                 if let Some(persist) = store.as_ref() {
                     agent = agent.with_attachments(persist.conversations.attachments().clone());
                 }
@@ -719,6 +725,8 @@ struct LoadedConversation {
     messages: Vec<Value>,
     /// The todo list the conversation ended with (repaired). Empty when it had none.
     todos: Vec<Todo>,
+    /// The context usage the conversation ended with, or null when none was saved (or it was not sane).
+    context: Option<ContextUsage>,
 }
 
 /// A saved conversation as the live one. The file is read and repaired first. Then, when the agent is idle, the live
@@ -740,6 +748,7 @@ async fn load_conversation(
     let title = resumed.title;
     let todos = resumed.todos;
     let in_turn = resumed.in_turn;
+    let context = resumed.context;
     {
         // The busy check and the restore happen under the turn-cancel lock, as `begin_turn` and `new_conversation` do.
         let _turn = lock(&att.turn_cancel);
@@ -747,6 +756,7 @@ async fn load_conversation(
             return Err(BUSY_REFUSAL.into());
         }
         att.conversation.restore(id.clone(), resumed.history, todos.clone(), in_turn);
+        att.conversation.set_last_usage(context.clone());
     }
     let remember_id = id.clone();
     let remember = blocking(move || {
@@ -756,7 +766,7 @@ async fn load_conversation(
     if let Err(e) = remember.await {
         eprintln!("watt: the last conversation was not remembered ({e})");
     }
-    Ok(LoadedConversation { id, title, messages, todos })
+    Ok(LoadedConversation { id, title, messages, todos, context })
 }
 
 /// What a delete reports: whether a live conversation was among those deleted and was reset to a new one.
