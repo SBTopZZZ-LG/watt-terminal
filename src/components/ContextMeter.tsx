@@ -3,42 +3,39 @@ import type { KeyboardEvent } from 'react';
 import type { ContextUsage } from '../lib/types';
 import { detailMaxHeight, formatTokens, groupDigits, headline, level, percent, rows, segments, share } from '../lib/contextMeter';
 
-/** The stacked bar's colours repeat after this many categories. Matches .context-seg-0 to .context-seg-6 in App.css. */
-const SLOTS = 7;
-
 interface Props {
   /** The latest request's usage. Null hides the meter altogether. */
   usage: ContextUsage | null;
 }
 
 /**
- * The expanded view's contents: the headline, whether the count is the provider's or an estimate, the stacked bar (only when
- * the limit is known), one row per category with Free and Reserved, and a line when older content was left out.
+ * The expanded view's contents: the headline, a line when older content was left out, whether the count is the provider's or an
+ * estimate, the stacked bar (only when the limit is known), and one row per category with Free and Reserved.
  */
 export function ContextBreakdown({ usage }: { usage: ContextUsage }) {
   const limit = usage.limit !== null && usage.limit > 0 ? usage.limit : null;
   return (
     <>
       <p className="context-headline">{headline(usage)}</p>
+      {usage.trimmed && <p className="context-trimmed">Older content was left out of the last request.</p>}
       <p className="context-basis">{usage.calibrated ? "Provider's count" : 'Estimated'}</p>
       {limit !== null && (
         <div className="context-stack" aria-hidden="true">
           {segments(usage).map((s, i) => (
-            <span key={i} className={`context-seg context-seg-${i % SLOTS}`} style={{ width: `${s.share}%` }} />
+            <span key={i} className={`context-seg context-seg-${s.slot}`} style={{ width: `${s.share}%` }} />
           ))}
         </div>
       )}
       <ul className="context-rows">
         {rows(usage).map((r, i) => (
           <li key={i} className={`context-row context-row-${r.kind}`}>
-            <span className={r.slot === null ? 'context-swatch' : `context-swatch context-seg-${r.slot % SLOTS}`} aria-hidden="true" />
+            <span className={r.slot === null ? 'context-swatch' : `context-swatch context-seg-${r.slot}`} aria-hidden="true" />
             <span className="context-label">{r.label}</span>
             <span className="context-tokens">{groupDigits(r.tokens)}</span>
             <span className="context-percent">{r.percent}</span>
           </li>
         ))}
       </ul>
-      {usage.trimmed && <p className="context-trimmed">Older content was left out of the last request.</p>}
     </>
   );
 }

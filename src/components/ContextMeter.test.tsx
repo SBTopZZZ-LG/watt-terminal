@@ -79,7 +79,7 @@ describe('ContextBreakdown: the expanded view', () => {
   it('draws the stacked bar with one segment per category, in colour slots, and a row for each', () => {
     const out = breakdown(usage());
     expect(out).toContain('class="context-seg context-seg-0" style="width:12.5%"');
-    expect(out).toContain('class="context-seg context-seg-1"');
+    expect(out).toContain('class="context-seg context-seg-3"');
     expect(out).toContain('<span class="context-label">System instructions</span><span class="context-tokens">1,000</span><span class="context-percent">13%</span>');
     expect(out).toContain('<span class="context-label">Attachments</span><span class="context-tokens">234</span><span class="context-percent">3%</span>');
   });
@@ -103,6 +103,16 @@ describe('ContextBreakdown: the expanded view', () => {
   it('says so when older content was left out, and not otherwise', () => {
     expect(breakdown(usage({ trimmed: true }))).toContain('Older content was left out of the last request.');
     expect(breakdown(usage({ trimmed: false }))).not.toContain('Older content');
+  });
+
+  it('puts the trim line directly under the headline, above the basis and the bar', () => {
+    const out = breakdown(usage({ trimmed: true }));
+    const headlineAt = out.indexOf('class="context-headline"');
+    const trimAt = out.indexOf('class="context-trimmed"');
+    expect(headlineAt).toBeGreaterThanOrEqual(0);
+    expect(trimAt).toBeGreaterThan(headlineAt);
+    expect(trimAt).toBeLessThan(out.indexOf('class="context-basis"'));
+    expect(trimAt).toBeLessThan(out.indexOf('class="context-stack"'));
   });
 
   it('shows an unknown category by its id, escaped as text, never as markup', () => {

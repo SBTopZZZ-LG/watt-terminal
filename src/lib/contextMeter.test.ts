@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { DETAIL_MAX_PX, detailMaxHeight, formatTokens, groupDigits, headline, labelOf, level, percent, rows, segments, share } from './contextMeter';
+import { DETAIL_MAX_PX, detailMaxHeight, formatTokens, groupDigits, headline, labelOf, level, percent, rows, segments, share, slotsFor } from './contextMeter';
 import type { ContextUsage } from './types';
 
 const usage = (over: Partial<ContextUsage> = {}): ContextUsage => ({
@@ -138,7 +138,7 @@ describe('rows', () => {
   it('lists the categories with tokens in the backend order, then Free and Reserved, with percentages of the limit', () => {
     expect(rows(usage())).toEqual([
       { kind: 'category', id: 'system', label: 'System instructions', tokens: 1000, percent: '13%', slot: 0 },
-      { kind: 'category', id: 'attachments', label: 'Attachments', tokens: 234, percent: '3%', slot: 1 },
+      { kind: 'category', id: 'attachments', label: 'Attachments', tokens: 234, percent: '3%', slot: 3 },
       { kind: 'free', id: 'free', label: 'Free', tokens: 2670, percent: '33%', slot: null },
       { kind: 'reserved', id: 'reserved', label: 'Reserved for reply', tokens: 4096, percent: '51%', slot: null },
     ]);
@@ -182,6 +182,62 @@ describe('segments', () => {
   it('takes shares of the used tokens when the limit is not known, summing to 100', () => {
     const s = segments(usage({ limit: null, used: 4, categories: [{ id: 'system', tokens: 3 }, { id: 'user', tokens: 1 }] }));
     expect(s.map((x) => x.share)).toEqual([75, 25]);
+  });
+
+  it('gives each segment the colour slot its row uses', () => {
+    const categories = [{ id: 'tool_output', tokens: 300 }, { id: 'reasoning', tokens: 100 }, { id: 'system', tokens: 200 }];
+    const s = segments(usage({ categories }));
+    // reasoning is unknown: slots 0 and 6 are held, so it takes the first free one, 1.
+    expect(s.map((x) => [x.id, x.slot])).toEqual([['tool_output', 6], ['reasoning', 1], ['system', 0]]);
+    expect(rows(usage({ categories })).filter((r) => r.kind === 'category').map((r) => r.slot)).toEqual([6, 1, 0]);
+  });
+});
+
+describe('slotsFor', () => {
+  it('gives every known id its fixed slot, in any order and with any others around it', () => {
+    expect(slotsFor(['system', 'tools', 'user', 'attachments', 'assistant', 'tool_output', 'other'])).toEqual([0, 1, 2, 3, 4, 6, 5]);
+    expect(slotsFor(['tool_output'])).toEqual([6]);
+    expect(slotsFor(['user', 'system'])).toEqual([2, 0]);
+  });
+
+  it('keeps the other colour the muted one (slot 5) and tool_output the brightest (slot 6)', () => {
+    expect(slotsFor(['other'])).toEqual([5]);
+    expect(slotsFor(['tool_output'])).toEqual([6]);
+  });
+
+  it('gives an unknown id a slot the shown known ids do not hold, so a new category does not move a known colour', () => {
+    // Without an unknown id, tool_output is slot 6. With one among the known ids, it still is.
+    expect(slotsFor(['system', 'tool_output'])).toEqual([0, 6]);
+    expect(slotsFor(['system', 'reasoning', 'tool_output'])).toEqual([0, 1, 6]);
+  });
+
+  it('takes the free slots in slot order, cycling by order of first appearance among the unknown ids', () => {
+    // Shown known ids hold 0 and 1: the free slots are 2, 3, 4, 5, 6.
+    expect(slotsFor(['system', 'tools', 'alpha', 'beta'])).toEqual([0, 1, 2, 3]);
+    // Shown known ids hold 0 to 5: only slot 6 is free, so every unknown id gets 6.
+    expect(slotsFor(['system', 'tools', 'user', 'attachments', 'assistant', 'other', 'alpha', 'beta'])).toEqual([0, 1, 2, 3, 4, 5, 6, 6]);
+  });
+
+  it('gives the same unknown id the same slot each time it appears', () => {
+    expect(slotsFor(['alpha', 'beta', 'alpha', 'gamma'])).toEqual([0, 1, 0, 2]);
+  });
+
+  it('cycles the unknown ids through all seven slots when every slot is held by a known id', () => {
+    const known = ['system', 'tools', 'user', 'attachments', 'assistant', 'other', 'tool_output'];
+    const unknown = Array.from({ length: 8 }, (_, i) => `u${i}`);
+    const slots = slotsFor([...known, ...unknown]);
+    expect(slots.slice(0, 7)).toEqual([0, 1, 2, 3, 4, 5, 6]);
+    expect(slots.slice(7)).toEqual([0, 1, 2, 3, 4, 5, 6, 0]);
+  });
+
+  it('does not take an inherited property name for a known id', () => {
+    expect(slotsFor(['constructor'])).toEqual([0]);
+    // system holds slot 0, so the unknown id takes the first free slot, 1, and is not read as a known one.
+    expect(slotsFor(['__proto__', 'system'])).toEqual([1, 0]);
+  });
+
+  it('returns no slots for no ids', () => {
+    expect(slotsFor([])).toEqual([]);
   });
 });
 

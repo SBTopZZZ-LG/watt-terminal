@@ -18,6 +18,23 @@ const LABELS: Record<string, string> = {
 /** ok below 70%, warn from 70%, high from 85% (or when the reply's reserve would not fit). Unknown when no limit is known. */
 export type MeterLevel = 'unknown' | 'ok' | 'warn' | 'high';
 
+/** The seven colour slots, .context-seg-0 to .context-seg-6 in App.css. */
+export const SLOT_COUNT = 7;
+
+/**
+ * The fixed colour slot of each known category. 'other' is the most muted colour (slot 5, --muted in App.css), so it is
+ * not the bright tool_output slot.
+ */
+const KNOWN_SLOTS: Record<string, number> = {
+  system: 0,
+  tools: 1,
+  user: 2,
+  attachments: 3,
+  assistant: 4,
+  other: 5,
+  tool_output: 6,
+};
+
 /** A row of the breakdown. Categories with no tokens are left out; Free and Reserved come only when the limit is known. */
 export interface MeterRow {
   kind: 'category' | 'free' | 'reserved';
@@ -26,7 +43,7 @@ export interface MeterRow {
   tokens: number;
   /** Of the limit when known, else of the tokens used. A label: '37%', '<1%' or '0%'. */
   percent: string;
-  /** The category's place among the category rows (its colour), or null for Free and Reserved. */
+  /** The category's colour slot (0 to SLOT_COUNT - 1), or null for Free and Reserved. */
   slot: number | null;
 }
 
@@ -35,6 +52,8 @@ export interface Segment {
   id: string;
   label: string;
   share: number;
+  /** The colour slot, the same one the category's row uses. */
+  slot: number;
 }
 
 /** The expanded breakdown is at most this tall, and at most 60% of the agent panel. */
@@ -115,6 +134,33 @@ export function labelOf(id: string): string {
   return Object.prototype.hasOwnProperty.call(LABELS, id) ? LABELS[id] : safeText(id);
 }
 
+function isKnown(id: string): boolean {
+  return Object.prototype.hasOwnProperty.call(KNOWN_SLOTS, id);
+}
+
+/**
+ * The colour slot of each category id, in the order given. A known id always has its fixed slot, so its colour does not
+ * move when other categories come and go. An unknown id takes a slot no shown known id holds (in slot order), cycling by
+ * its order of first appearance among the unknown ids. When the shown known ids hold every slot, the unknown ids cycle
+ * through all of them.
+ */
+export function slotsFor(ids: string[]): number[] {
+  const taken = new Set(ids.filter(isKnown).map((id) => KNOWN_SLOTS[id]));
+  const all = Array.from({ length: SLOT_COUNT }, (_, s) => s);
+  const free = all.filter((s) => !taken.has(s));
+  const pool = free.length > 0 ? free : all;
+  const order = new Map<string, number>();
+  return ids.map((id) => {
+    if (isKnown(id)) {
+      return KNOWN_SLOTS[id];
+    }
+    if (!order.has(id)) {
+      order.set(id, order.size);
+    }
+    return pool[order.get(id)! % pool.length];
+  });
+}
+
 /** The headline of the expanded view: '48,213 of 128,000 tokens (37%)', or without the limit: '48,213 tokens'. */
 export function headline(u: ContextUsage): string {
   const limit = knownLimit(u);
@@ -124,7 +170,7 @@ export function headline(u: ContextUsage): string {
   return `Context: ${groupDigits(u.used)} of ${groupDigits(limit)} tokens (${percent(u.used, limit)})`;
 }
 
-/** The categories with tokens, in the backend's order. Their index is the colour slot the bar and the rows share. */
+/** The categories with tokens, in the backend's order. */
 function shownCategories(u: ContextUsage): { id: string; tokens: number }[] {
   return u.categories.filter((c) => c.tokens > 0);
 }
@@ -133,13 +179,15 @@ function shownCategories(u: ContextUsage): { id: string; tokens: number }[] {
 export function rows(u: ContextUsage): MeterRow[] {
   const limit = knownLimit(u);
   const whole = limit ?? u.used;
-  const out: MeterRow[] = shownCategories(u).map((c, slot) => ({
+  const shown = shownCategories(u);
+  const slots = slotsFor(shown.map((c) => c.id));
+  const out: MeterRow[] = shown.map((c, i) => ({
     kind: 'category',
     id: c.id,
     label: labelOf(c.id),
     tokens: c.tokens,
     percent: percent(c.tokens, whole),
-    slot,
+    slot: slots[i],
   }));
   if (limit !== null) {
     const free = Math.max(0, limit - u.used - u.reserved_output);
@@ -163,7 +211,9 @@ export function rows(u: ContextUsage): MeterRow[] {
 export function segments(u: ContextUsage): Segment[] {
   const limit = knownLimit(u);
   const whole = limit ?? u.used;
-  const parts: Segment[] = shownCategories(u).map((c) => ({ id: c.id, label: labelOf(c.id), share: share(c.tokens, whole) }));
+  const shown = shownCategories(u);
+  const slots = slotsFor(shown.map((c) => c.id));
+  const parts: Segment[] = shown.map((c, i) => ({ id: c.id, label: labelOf(c.id), share: share(c.tokens, whole), slot: slots[i] }));
   const total = parts.reduce((sum, p) => sum + p.share, 0);
   if (total > 100) {
     const scale = 100 / total;
