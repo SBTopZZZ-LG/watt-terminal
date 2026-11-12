@@ -2,6 +2,22 @@
   "name": "watt-terminal",
   "private": true,
   "version": "0.1.0",
+  "description": "A terminal where you and an AI agent share one persistent shell session",
+  "license": "MIT",
+  "author": "SBTopZZZ-LG",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SBTopZZZ-LG/watt-terminal.git"
+  },
+  "keywords": [
+    "terminal",
+    "ai-agent",
+    "tauri",
+    "rust",
+    "react",
+    "xterm",
+    "macos"
+  ],
   "type": "module",
   "scripts": {
     "dev": "vite",

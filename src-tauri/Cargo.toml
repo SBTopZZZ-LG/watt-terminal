@@ -1,9 +1,11 @@
 [package]
 name = "watt-terminal"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "A terminal where you and an AI agent share one persistent shell session"
+authors = ["SBTopZZZ-LG"]
 edition = "2024"
+license = "MIT"
+repository = "https://github.com/SBTopZZZ-LG/watt-terminal"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

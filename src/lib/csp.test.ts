@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import config from '../../src-tauri/tauri.conf.json';
 
 // The Content-Security-Policy that Tauri ships in a built app (app.security.csp). The policy is parsed into directives
-// so each rule can be checked on its own. The browser check in /tmp/poc-ui-2/csp-check.mjs reads the same string.
+// so each rule can be checked on its own. A separate browser check (kept outside the repo) reads the same string.
 
 const security = config.app.security as { csp?: unknown; devCsp?: unknown; dangerousDisableAssetCspModification?: unknown };
 

@@ -3,8 +3,8 @@ import { formatCwd, previewJson, shortenPath } from './format';
 
 describe('shortenPath', () => {
   it('replaces a macOS or Linux home with ~', () => {
-    expect(shortenPath('/Users/sbtopzzz')).toBe('~');
-    expect(shortenPath('/Users/sbtopzzz/Developer/watt-terminal')).toBe('~/Developer/watt-terminal');
+    expect(shortenPath('/Users/me')).toBe('~');
+    expect(shortenPath('/Users/me/Developer/watt-terminal')).toBe('~/Developer/watt-terminal');
     expect(shortenPath('/home/me/src')).toBe('~/src');
   });
 
@@ -21,8 +21,8 @@ describe('formatCwd', () => {
   });
 
   it('shows only the shortened path, never the host', () => {
-    expect(formatCwd({ host: 'mac', path: '/Users/sbtopzzz' })).toBe('~');
-    expect(formatCwd({ host: 'mac', path: '/Users/sbtopzzz/Developer' })).toBe('~/Developer');
+    expect(formatCwd({ host: 'mac', path: '/Users/me' })).toBe('~');
+    expect(formatCwd({ host: 'mac', path: '/Users/me/Developer' })).toBe('~/Developer');
     expect(formatCwd({ host: 'mac', path: '/tmp' })).toBe('/tmp');
     expect(formatCwd({ host: 'mac', path: '/tmp' })).not.toContain('mac');
   });
