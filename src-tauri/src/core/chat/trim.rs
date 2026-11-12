@@ -3,6 +3,8 @@
 //! with `select`. The rungs leave out more and more of the older content, in this order: old tool outputs, then old
 //! documents, then whole old turns. The first plan whose calibrated estimate fits the budget is sent.
 
+use crate::core::chat::context;
+
 /// Said in the system text of a trimmed request. It is part of the estimate, and never stored.
 pub const TRIM_NOTE: &str = "Note: some older messages or tool outputs were omitted to fit the context window.";
 /// What stands in for an old tool output on the wire. It is generic: the tool may not be `get_command`.
@@ -45,6 +47,17 @@ const RUNGS: [TrimPlan; 5] = [
 /// the reserve alone is more than that, in which case nothing fits.
 pub fn budget(limit: u32, reserve: u32) -> i64 {
     i64::from(limit) * 9 / 10 - i64::from(reserve)
+}
+
+/// The context limit for the one retry after an overflow that named no limit: the smallest one whose budget (see `budget`)
+/// is 70% of the failed request's estimate, rounded down, plus the reserve. The result is kept within the limits that are
+/// taken from a provider's error (see `context::LIMIT_MIN` and `context::LIMIT_MAX`).
+pub fn overflow_limit(estimate: u32, reserve: u32) -> u32 {
+    let wanted_budget = i64::from(estimate) * 7 / 10;
+    // budget(L) >= n holds exactly when 9L >= 10n, so the smallest such L is ceil(10n / 9).
+    let needed = (wanted_budget + i64::from(reserve)) * 10;
+    let limit = (needed + 8) / 9;
+    u32::try_from(limit.clamp(i64::from(context::LIMIT_MIN), i64::from(context::LIMIT_MAX))).unwrap_or(context::LIMIT_MAX)
 }
 
 /// The system text of a request under `plan`: the text itself, with the trim note added when anything is left out.
@@ -169,5 +182,16 @@ mod tests {
         // Five rungs, the smallest request, then bisection over 1..=1000: about ten more.
         assert_eq!(select(500, 1000, estimate).map(|p| p.drop_turns), Ok(500));
         assert!(calls.get() <= 5 + 1 + 10 + 1, "{} estimates", calls.get());
+    }
+
+    #[test]
+    fn the_overflow_limit_is_the_smallest_whose_budget_is_seventy_percent_of_the_estimate() {
+        // 70% of 10000 is 7000; the budget of 8347 is 7512 - 512 = 7000, and 8346 gives 6999.
+        assert_eq!(overflow_limit(10_000, 512), 8347);
+        assert!(budget(8347, 512) >= 7000 && budget(8346, 512) < 7000);
+        // Zero reserve, a small estimate: below the minimum, so the minimum.
+        assert_eq!(overflow_limit(100, 0), context::LIMIT_MIN);
+        // A huge estimate: above the maximum, so the maximum.
+        assert_eq!(overflow_limit(u32::MAX, 0), context::LIMIT_MAX);
     }
 }

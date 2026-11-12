@@ -73,6 +73,10 @@ pub type NoVisionModels = Arc<Mutex<HashSet<String>>>;
 /// The calibration of a conversation's estimates, shared by its agents (see `Conversation::calibration`).
 pub type Calibration = Arc<Mutex<Calibrator>>;
 
+/// The context limits learned per model id from overflow errors, shared by a conversation's agents (see
+/// `Conversation::learned_limits`).
+pub type LearnedLimits = Arc<Mutex<HashMap<String, u32>>>;
+
 /// The provider settings read from the environment. Holds the key, so `Debug` hides it.
 #[derive(Clone)]
 pub struct LlmSettings {
@@ -231,6 +235,9 @@ pub struct Conversation {
     /// How far this conversation's estimates were from the provider's counts. In memory only; reset by `reset` and
     /// `restore`, since it belongs to the content it was learned from.
     calibration: Calibration,
+    /// The context limits that overflow errors taught, per model id. Kept by `reset` and `restore`, like the no-vision memo:
+    /// it is a fact about the model.
+    learned_limits: LearnedLimits,
 }
 
 impl Conversation {
@@ -242,6 +249,7 @@ impl Conversation {
             resume_note: Mutex::new(None),
             no_vision: Arc::new(Mutex::new(HashSet::new())),
             calibration: Arc::new(Mutex::new(Calibrator::default())),
+            learned_limits: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -265,6 +273,11 @@ impl Conversation {
     /// The calibration of this conversation's estimates (see `LlmAgent::with_calibration`).
     pub fn calibration(&self) -> Calibration {
         self.calibration.clone()
+    }
+
+    /// The context limits learned for this conversation's models (see `LlmAgent::with_learned_limits`).
+    pub fn learned_limits(&self) -> LearnedLimits {
+        self.learned_limits.clone()
     }
 
     /// Clears the history, the todo list, any pending resume note and the calibration, and rotates the id. The caller
@@ -357,6 +370,8 @@ pub struct LlmAgent {
     context_limit: Option<u32>,
     /// The conversation's calibration (see `with_calibration`).
     calibration: Calibration,
+    /// The context limits learned from overflow errors, by model id (see `with_learned_limits`).
+    learned_limits: LearnedLimits,
 }
 
 impl LlmAgent {
@@ -397,6 +412,7 @@ impl LlmAgent {
             no_vision: Arc::new(Mutex::new(HashSet::new())),
             context_limit: settings.context_limit,
             calibration: Arc::new(Mutex::new(Calibrator::default())),
+            learned_limits: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -428,6 +444,14 @@ impl LlmAgent {
         self
     }
 
+    /// The context limits learned from overflow errors, shared with the conversation (see `Conversation::learned_limits`).
+    /// Without it, what is learned lasts for this agent only. The limit of a model is the smaller of the configured one and
+    /// the learned one, so after an overflow the model's later requests are trimmed before they are sent.
+    pub fn with_learned_limits(mut self, limits: LearnedLimits) -> Self {
+        self.learned_limits = limits;
+        self
+    }
+
     /// The note about a resumed conversation (from `Conversation::take_resume_note`). It goes into the system message
     /// of every model call of this turn and is never stored in the history.
     pub fn with_resume_note(mut self, note: Option<String>) -> Self {
@@ -454,18 +478,9 @@ impl LlmAgent {
         }
     }
 
-    /// One model call. Streams text as it arrives, or waits for the whole reply. Returns None when the call was
-    /// cancelled or failed; a failure has already been shown to the user. `finished` is the turn's finished note (see
-    /// `finished_since_last_turn`), given to the first call only. Every request is fitted to the context limit first
-    /// (see `fit`); one that does not fit is not sent, and the turn ends with its notice.
-    ///
-    /// A request with images that the model refuses (see `rejects_images`), before any text was streamed, is sent once
-    /// more with the images replaced by notes. The stored history is not changed. The retry is part of this one call:
-    /// the caps count replies that ask for tools (see `charge`), so a failed attempt is never counted, and the reply
-    /// that comes back is counted once, as any other reply.
-    fn ask_model(&self, ctx: &AgentCtx<'_>, finished: Option<&str>) -> Option<AssistantReply> {
-        // The resume note, the terminal notes, the finished note and the todo block are added to this request's system
-        // message only. None is stored in the history. The todo block comes last.
+    /// The system text of one model call: the base prompt, then the notes and blocks that apply to this call. They are
+    /// added here only, and none of them is stored in the history. The todo block comes last.
+    fn system_text(&self, ctx: &AgentCtx<'_>, finished: Option<&str>) -> String {
         let mut system = self.system.clone();
         if let Some(note) = &self.resume_note {
             system = format!("{system}\n\n{note}");
@@ -489,44 +504,122 @@ impl LlmAgent {
         if let Some(block) = todo::prompt_block(&lock_todos(&self.todos)) {
             system = format!("{system}\n\n{block}");
         }
-        let mut resolver = Resolver::new(self.attachments.as_ref(), &self.conversation_id);
-        let request = self.fit_or_say(ctx, &system, &mut resolver)?;
-        if !has_image_part(&request.messages) {
-            return self.finish_call(ctx, self.send(ctx, request).0);
-        }
+        system
+    }
+
+    /// One model call. Streams text as it arrives, or waits for the whole reply. Returns None when the call was
+    /// cancelled or failed; a failure has already been shown to the user. `finished` is the turn's finished note (see
+    /// `finished_since_last_turn`), given to the first call only. Every request is fitted to the context limit first
+    /// (see `fit`); one that does not fit is not sent, and the turn ends with its notice.
+    ///
+    /// Two kinds of retry are possible, each at most once, and only before any text was streamed. An overflow (see
+    /// `context::is_context_overflow`) is retried with a smaller limit (see `overflow_retry_limit`). A request with images
+    /// that the model refuses (see `rejects_images`) is sent once more with the images replaced by notes. An overflow is
+    /// never taken for a refusal of images. The stored history is not changed. The retries are part of this one call: the
+    /// caps count replies that ask for tools (see `charge`), so a failed attempt is never counted, and the reply that comes
+    /// back is counted once, as any other reply.
+    fn ask_model(&self, ctx: &AgentCtx<'_>, finished: Option<&str>) -> Option<AssistantReply> {
+        let system = self.system_text(ctx, finished);
         // A model that refused images earlier in this conversation is not asked again: its images are replaced at once.
-        if lock_models(&self.no_vision).contains(&self.model) {
-            let text_only = self.fit_or_say(ctx, &system, &mut Resolver::without_images())?;
-            return self.finish_call(ctx, self.send(ctx, text_only).0);
-        }
-        match self.send(ctx, request) {
-            // The model refused the images before any text reached the user: the same request goes once more without them.
-            (Err(e), false) if rejects_images(&e) => {
-                let text_only = self.fit_or_say(ctx, &system, &mut Resolver::without_images())?;
-                match self.send(ctx, text_only).0 {
-                    Ok(reply) => {
+        let mut images = !lock_models(&self.no_vision).contains(&self.model);
+        let mut limit = self.effective_limit();
+        let (mut overflow_retry, mut image_retry) = (true, true);
+        // Set when the images were refused: a reply to the retry is then remembered as refusing them, and is noticed.
+        let mut image_refused = false;
+        // The error of the request that asked for the image retry. It is what the user sees if that retry fails too.
+        let mut asker_error: Option<LlmError> = None;
+        loop {
+            let mut resolver = if images {
+                Resolver::new(self.attachments.as_ref(), &self.conversation_id)
+            } else {
+                Resolver::without_images()
+            };
+            let request = self.fit_or_say(ctx, limit, &system, &mut resolver)?;
+            let sent_images = has_image_part(&request.messages);
+            let estimate = self.estimate(&request);
+            let (result, streamed) = self.send(ctx, request);
+            match result {
+                Ok(reply) => {
+                    if image_refused {
                         lock_models(&self.no_vision).insert(self.model.clone());
                         let reply = self.finish_call(ctx, Ok(reply));
                         ctx.say(NO_VISION_NOTICE);
-                        reply
+                        return reply;
                     }
-                    Err(LlmError::Cancelled) => None,
-                    // The retry failed too: the user sees the error of the request as it was first sent.
-                    Err(_) => self.finish_call(ctx, Err(e)),
+                    return self.finish_call(ctx, Ok(reply));
                 }
+                Err(LlmError::Cancelled) => return None,
+                Err(e) if overflow_retry && !streamed && context::is_context_overflow(&e) => {
+                    overflow_retry = false;
+                    asker_error = None;
+                    let Some(smaller) = self.overflow_retry_limit(&e, estimate, limit) else {
+                        return self.finish_call(ctx, Err(e));
+                    };
+                    // `smaller` is below the limit this request was fitted to, which is the effective one, so it only lowers it.
+                    lock_learned(&self.learned_limits).insert(self.model.clone(), smaller);
+                    limit = Some(smaller);
+                }
+                Err(e)
+                    if image_retry
+                        && !streamed
+                        && sent_images
+                        && rejects_images(&e)
+                        && !context::is_context_overflow(&e) =>
+                {
+                    image_retry = false;
+                    images = false;
+                    image_refused = true;
+                    asker_error = Some(e);
+                }
+                Err(e) => return self.finish_call(ctx, Err(asker_error.take().unwrap_or(e))),
             }
-            (result, _) => self.finish_call(ctx, result),
         }
     }
 
-    /// The request to send for `system`: the stored history as wire messages, trimmed (see core/chat/trim) when the
-    /// context limit is known and the untrimmed request is over the budget. Nothing is trimmed without a known limit.
+    /// The context limit that applies now: the smaller of the configured one and the one learned for this model from an
+    /// overflow. Either may be unknown; None only when both are.
+    fn effective_limit(&self) -> Option<u32> {
+        let learned = lock_learned(&self.learned_limits).get(&self.model).copied();
+        match (self.context_limit, learned) {
+            (Some(configured), Some(learned)) => Some(configured.min(learned)),
+            (configured, learned) => configured.or(learned),
+        }
+    }
+
+    /// The tokens kept for the reply: `max_tokens`, or the default.
+    fn reserve(&self) -> u32 {
+        self.max_tokens.unwrap_or(context::DEFAULT_OUTPUT_RESERVE)
+    }
+
+    /// The calibrated estimate of one request, as the usage event reports it.
+    fn estimate(&self, request: &WireRequest) -> u32 {
+        let breakdown = context::breakdown(&request.system, &self.tools, &request.messages);
+        context::usage(&breakdown, &lock_calibration(&self.calibration), None, None).used
+    }
+
+    /// The limit for the one retry after an overflow: the limit the provider's error names, or else the one that cuts the
+    /// failed request to 70% of its estimate (see `trim::overflow_limit`). `fitted` is the limit the failed request was
+    /// fitted to. None when the new limit is not below it: the retry would be the same request, so it is not made.
+    fn overflow_retry_limit(&self, e: &LlmError, estimate: u32, fitted: Option<u32>) -> Option<u32> {
+        let named = match e {
+            LlmError::Http { message, .. } | LlmError::Provider { message, .. } => context::limit_in_message(message),
+            _ => None,
+        };
+        let limit = named.unwrap_or_else(|| trim::overflow_limit(estimate, self.reserve()));
+        match fitted {
+            Some(now) if limit >= now => None,
+            _ => Some(limit),
+        }
+    }
+
+    /// The request to send for `system` under `limit`: the stored history as wire messages, trimmed (see core/chat/trim)
+    /// when the limit is known and the untrimmed request is over the budget. Nothing is trimmed without a known limit.
     /// Err when even the smallest request does not fit; the stored history is never changed.
-    fn fit(&self, system: &str, resolver: &mut Resolver<'_>) -> Result<WireRequest, TooLarge> {
-        let Some(limit) = self.context_limit else {
+    fn fit(&self, limit: Option<u32>, system: &str, resolver: &mut Resolver<'_>) -> Result<WireRequest, TooLarge> {
+        let Some(limit) = limit else {
             return Ok(self.request(system, &TrimPlan::none(), resolver));
         };
-        let reserve = self.max_tokens.unwrap_or(context::DEFAULT_OUTPUT_RESERVE);
+        let reserve = self.reserve();
         let budget = trim::budget(limit, reserve);
         let calibrator = *lock_calibration(&self.calibration);
         let max_drop = lock(&self.history).turn_count().saturating_sub(1);
@@ -542,8 +635,8 @@ impl LlmAgent {
     }
 
     /// `fit`, and when the request does not fit at all, its notice is shown and no request is made.
-    fn fit_or_say(&self, ctx: &AgentCtx<'_>, system: &str, resolver: &mut Resolver<'_>) -> Option<WireRequest> {
-        match self.fit(system, resolver) {
+    fn fit_or_say(&self, ctx: &AgentCtx<'_>, limit: Option<u32>, system: &str, resolver: &mut Resolver<'_>) -> Option<WireRequest> {
+        match self.fit(limit, system, resolver) {
             Ok(request) => Some(request),
             Err(too_large) => {
                 ctx.say(self.redactor.redact(&too_large.text()));
@@ -1031,6 +1124,10 @@ fn lock_models(m: &Mutex<HashSet<String>>) -> MutexGuard<'_, HashSet<String>> {
 }
 
 fn lock_calibration(m: &Mutex<Calibrator>) -> MutexGuard<'_, Calibrator> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn lock_learned(m: &Mutex<HashMap<String, u32>>) -> MutexGuard<'_, HashMap<String, u32>> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 

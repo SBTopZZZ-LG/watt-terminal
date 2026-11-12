@@ -321,6 +321,7 @@ fn agent_for(s: &LlmSettings, conv: &Conversation, cancel: Arc<TurnCancel>) -> L
     LlmAgent::new(&http_client().expect("client"), s.clone(), &conv.id(), conv.history(), conv.todos(), cancel)
         .with_no_vision(conv.no_vision())
         .with_calibration(conv.calibration())
+        .with_learned_limits(conv.learned_limits())
 }
 
 /// Runs one turn and returns every event it emitted, `Done` included.
@@ -1869,4 +1870,249 @@ fn the_vision_retry_still_works_under_a_known_limit() {
     assert!(!carries_image(&requests[1]));
     assert_eq!(texts(&events), ["I can read the text.", NO_VISION]);
     assert!(usages(&events).iter().all(|u| !u.trimmed && u.limit == Some(1_000_000)));
+}
+
+// Recovering from a context overflow (context::is_context_overflow, the retry in ask_model)
+
+/// A 400 whose text says the prompt is too large for the model.
+fn overflow_400(message: &str) -> Script {
+    Script::error("400 Bad Request", json!({"error": {"message": message, "code": 400}}))
+}
+
+/// The raw estimate of the untrimmed request for `long_history(12)` and "now", with a 512-token reserve and no limit.
+fn untrimmed_long_estimate() -> u32 {
+    let probe = serve(vec![Script::json(text_reply("probe"))]);
+    let conv = Conversation::new().unwrap();
+    conv.restore(conv.id(), long_history(12), Vec::new(), false);
+    let s = LlmSettings { max_tokens: Some(512), ..settings(&probe.url, false) };
+    turn(&mut agent_for(&s, &conv, Arc::new(TurnCancel::new())), &FakeTools::default(), &auto_gate(), "now");
+    raw_estimate(&last_body(&probe))
+}
+
+#[test]
+fn an_overflow_that_names_the_limit_is_retried_at_it_and_the_learned_limit_applies_to_the_rest_of_the_turn_and_the_next() {
+    let raw = untrimmed_long_estimate();
+    let named = limit_for(raw * 2 / 3, 512);
+    let message = format!("This model's maximum context length is {named} tokens. However, your messages resulted in {raw} tokens.");
+    let provider = serve(vec![
+        overflow_400(&message),
+        Script::json(tool_reply(&[("call_a", "get_cwd", "{}")])),
+        Script::json(text_reply("done")),
+        Script::json(text_reply("next")),
+    ]);
+    let conv = Conversation::new().unwrap();
+    conv.restore(conv.id(), long_history(12), Vec::new(), false);
+    let s = LlmSettings { max_tokens: Some(512), ..settings(&provider.url, false) };
+    // Two model calls are allowed. The failed one is not charged, so the tool round and the answer both fit.
+    let limits = LimitsSettings { max_model_calls: 2, model_calls_unlimited: false, ..LimitsSettings::default() };
+    let events = turn(&mut agent_for(&s, &conv, Arc::new(TurnCancel::new())).with_limits(limits), &FakeTools::default(), &auto_gate(), "now");
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3, "the failed call, its retry, and the answer after the tool round");
+    assert_eq!(raw_estimate(&body_of(&requests[0])), raw, "the failed call was the untrimmed request");
+    let retry = body_of(&requests[1]);
+    assert!(retry["messages"][0]["content"].as_str().unwrap().contains(TRIM_NOTE), "the retry is trimmed");
+    assert!(raw_estimate(&retry) <= budget_of(named, 512) as u32, "the retry fits the named limit");
+    assert!(body_of(&requests[2])["messages"][0]["content"].as_str().unwrap().contains(TRIM_NOTE), "the next call of the turn is trimmed up front");
+    assert_eq!(texts(&events), ["done"], "the turn ends with the answer, not a stop at the call cap");
+    assert_eq!(conv.learned_limits().lock().unwrap().get(MODEL), Some(&named));
+
+    // The next turn is trimmed before its first request: no failed call is needed to learn the limit again.
+    let limits = LimitsSettings { max_model_calls: 2, model_calls_unlimited: false, ..LimitsSettings::default() };
+    let events = turn(&mut agent_for(&s, &conv, Arc::new(TurnCancel::new())).with_limits(limits), &FakeTools::default(), &auto_gate(), "again");
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 4);
+    assert!(body_of(&requests[3])["messages"][0]["content"].as_str().unwrap().contains(TRIM_NOTE));
+    assert_eq!(texts(&events), ["next"]);
+}
+
+#[test]
+fn an_overflow_that_names_no_limit_is_retried_at_seventy_percent_of_the_estimate() {
+    let raw = untrimmed_long_estimate();
+    let provider = serve(vec![overflow_400("Input is too long for this model."), Script::json(text_reply("ok"))]);
+    let conv = Conversation::new().unwrap();
+    conv.restore(conv.id(), long_history(12), Vec::new(), false);
+    let s = LlmSettings { max_tokens: Some(512), ..settings(&provider.url, false) };
+    let events = turn(&mut agent_for(&s, &conv, Arc::new(TurnCancel::new())), &FakeTools::default(), &auto_gate(), "now");
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let expected = limit_for(raw * 7 / 10, 512);
+    assert_eq!(conv.learned_limits().lock().unwrap().get(MODEL), Some(&expected));
+    let retry = body_of(&requests[1]);
+    assert!(retry["messages"][0]["content"].as_str().unwrap().contains(TRIM_NOTE));
+    assert!(raw_estimate(&retry) <= budget_of(expected, 512) as u32);
+    assert_eq!(texts(&events), ["ok"]);
+}
+
+#[test]
+fn a_413_is_retried_once_with_a_smaller_limit() {
+    let provider = serve(vec![
+        Script::error("413 Payload Too Large", json!({"error": {"message": "Request Entity Too Large"}})),
+        Script::json(text_reply("ok")),
+    ]);
+    let conv = Conversation::new().unwrap();
+    conv.restore(conv.id(), long_history(12), Vec::new(), false);
+    let s = LlmSettings { max_tokens: Some(512), ..settings(&provider.url, false) };
+    let events = turn(&mut agent_for(&s, &conv, Arc::new(TurnCancel::new())), &FakeTools::default(), &auto_gate(), "now");
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(body_of(&requests[1])["messages"][0]["content"].as_str().unwrap().contains(TRIM_NOTE));
+    assert_eq!(texts(&events), ["ok"]);
+}
+
+#[test]
+fn a_provider_error_in_a_200_body_saying_the_prompt_is_too_long_is_retried() {
+    let provider = serve(vec![
+        Script::json(json!({"error": {"message": "prompt is too long: 250000 tokens > 200000 maximum", "code": 400}})),
+        Script::json(text_reply("ok")),
+    ]);
+    let conv = Conversation::new().unwrap();
+    conv.restore(conv.id(), long_history(12), Vec::new(), false);
+    let s = LlmSettings { max_tokens: Some(512), ..settings(&provider.url, false) };
+    let events = turn(&mut agent_for(&s, &conv, Arc::new(TurnCancel::new())), &FakeTools::default(), &auto_gate(), "now");
+
+    assert_eq!(provider.requests().len(), 2);
+    assert_eq!(texts(&events), ["ok"]);
+}
+
+#[test]
+fn a_400_that_is_not_an_overflow_is_shown_once_and_not_retried() {
+    let provider = serve(vec![Script::error("400 Bad Request", json!({"error": {"message": "invalid model", "code": 400}}))]);
+    let conv = Conversation::new().unwrap();
+    conv.restore(conv.id(), long_history(12), Vec::new(), false);
+    let s = LlmSettings { max_tokens: Some(512), context_limit: Some(1_000_000), ..settings(&provider.url, false) };
+    let events = turn(&mut agent_for(&s, &conv, Arc::new(TurnCancel::new())), &FakeTools::default(), &auto_gate(), "now");
+
+    assert_eq!(provider.requests().len(), 1, "a plain 400 is not an overflow");
+    assert_eq!(texts(&events), ["The provider returned HTTP 400: invalid model"]);
+    assert!(conv.learned_limits().lock().unwrap().is_empty(), "nothing is learned");
+}
+
+#[test]
+fn an_overflow_naming_a_limit_that_is_not_below_the_one_in_force_is_not_retried() {
+    let provider = serve(vec![overflow_400("This model's maximum context length is 128000 tokens.")]);
+    let conv = Conversation::new().unwrap();
+    conv.restore(conv.id(), long_history(12), Vec::new(), false);
+    let s = LlmSettings { context_limit: Some(8_000), max_tokens: Some(512), ..settings(&provider.url, false) };
+    let events = turn(&mut agent_for(&s, &conv, Arc::new(TurnCancel::new())), &FakeTools::default(), &auto_gate(), "now");
+
+    assert_eq!(provider.requests().len(), 1, "the same request with the same limit would fail the same way");
+    assert_eq!(texts(&events), ["The provider returned HTTP 400: This model's maximum context length is 128000 tokens."]);
+    assert_eq!(conv.learned_limits().lock().unwrap().get(MODEL), None);
+}
+
+#[test]
+fn an_overflow_with_images_is_not_taken_for_a_refusal_and_the_images_are_still_sent() {
+    let provider = serve(vec![
+        overflow_400("This model's maximum context length is 8192 tokens."),
+        Script::json(text_reply("seen")),
+    ]);
+    let conv = Conversation::new().unwrap();
+    let dir = StoreDir::new("overflow-image");
+    let store = dir.store();
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new())).with_attachments(store.clone());
+    let events = turn_message(&mut agent, &FakeTools::default(), &no_gate(), &image_message(&store, &conv, "what is this?", 1));
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(carries_image(&requests[0]) && carries_image(&requests[1]), "the retry still sends the image, which fits");
+    assert_eq!(texts(&events), ["seen"], "no notice about images");
+    assert!(conv.no_vision().lock().unwrap().is_empty(), "the model is not marked as refusing images");
+}
+
+#[test]
+fn an_image_refusal_after_the_overflow_retry_still_gets_the_image_retry_and_the_notice() {
+    let provider = serve(vec![
+        overflow_400("This model's maximum context length is 8192 tokens."),
+        refused_images(),
+        Script::json(text_reply("text only")),
+    ]);
+    let conv = Conversation::new().unwrap();
+    let dir = StoreDir::new("overflow-then-refusal");
+    let store = dir.store();
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new())).with_attachments(store.clone());
+    let events = turn_message(&mut agent, &FakeTools::default(), &no_gate(), &image_message(&store, &conv, "look", 2));
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3, "overflow, the refused retry, and the image-free retry");
+    assert!(carries_image(&requests[1]) && !carries_image(&requests[2]));
+    assert_eq!(texts(&events), ["text only", NO_VISION]);
+    assert!(conv.no_vision().lock().unwrap().contains(MODEL), "the refusal is remembered");
+}
+
+#[test]
+fn when_the_overflow_retry_fails_too_its_error_is_shown_and_there_is_no_third_request() {
+    let provider = serve(vec![overflow_400("Input is too long."), overflow_400("Input is still too long.")]);
+    let conv = Conversation::new().unwrap();
+    conv.restore(conv.id(), long_history(12), Vec::new(), false);
+    let s = LlmSettings { max_tokens: Some(512), ..settings(&provider.url, false) };
+    let events = turn(&mut agent_for(&s, &conv, Arc::new(TurnCancel::new())), &FakeTools::default(), &auto_gate(), "now");
+
+    assert_eq!(provider.requests().len(), 2, "one retry, no loop");
+    assert_eq!(texts(&events), ["The provider returned HTTP 400: Input is still too long."]);
+    assert!(matches!(events.last(), Some(AgentEvent::Done)));
+}
+
+#[test]
+fn an_overflow_after_text_was_streamed_is_not_retried() {
+    let body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n\
+                data: {\"error\":{\"message\":\"Input is too long.\"}}\n\n";
+    let provider = serve(vec![Script::sse(body), Script::json(text_reply("never sent"))]);
+    let conv = Conversation::new().unwrap();
+    conv.restore(conv.id(), long_history(12), Vec::new(), false);
+    let s = LlmSettings { max_tokens: Some(512), ..settings(&provider.url, true) };
+    let events = turn(&mut agent_for(&s, &conv, Arc::new(TurnCancel::new())), &FakeTools::default(), &auto_gate(), "now");
+
+    assert_eq!(provider.requests().len(), 1, "text was already shown, so there is no retry");
+    assert_eq!(deltas(&events), ["partial"]);
+    assert_eq!(texts(&events), ["The provider reported an error: Input is too long."]);
+}
+
+#[test]
+fn the_learned_limit_survives_a_reset_and_a_restore_and_the_smaller_of_it_and_the_configured_limit_applies() {
+    let raw = untrimmed_long_estimate();
+    let small = limit_for(raw / 2, 512);
+    let big = limit_for(raw * 2, 512);
+    let conv = Conversation::new().unwrap();
+    conv.learned_limits().lock().unwrap().insert(MODEL.to_string(), small);
+
+    // The configured limit is large and the learned one small: the request is trimmed to the learned one.
+    let provider = serve(vec![Script::json(text_reply("a"))]);
+    conv.restore(conv.id(), long_history(12), Vec::new(), false);
+    let s = LlmSettings { context_limit: Some(big), max_tokens: Some(512), ..settings(&provider.url, false) };
+    turn(&mut agent_for(&s, &conv, Arc::new(TurnCancel::new())), &FakeTools::default(), &auto_gate(), "now");
+    assert!(last_body(&provider)["messages"][0]["content"].as_str().unwrap().contains(TRIM_NOTE), "learned small applies");
+
+    // A reset and a restore keep what was learned.
+    conv.reset().unwrap();
+    assert_eq!(conv.learned_limits().lock().unwrap().get(MODEL), Some(&small));
+    conv.restore(conv.id(), long_history(12), Vec::new(), false);
+    assert_eq!(conv.learned_limits().lock().unwrap().get(MODEL), Some(&small));
+
+    // The configured limit is small and the learned one large: the configured one applies.
+    conv.learned_limits().lock().unwrap().insert(MODEL.to_string(), big);
+    let provider = serve(vec![Script::json(text_reply("b"))]);
+    let s = LlmSettings { context_limit: Some(small), max_tokens: Some(512), ..settings(&provider.url, false) };
+    let events = turn(&mut agent_for(&s, &conv, Arc::new(TurnCancel::new())), &FakeTools::default(), &auto_gate(), "now");
+    assert!(last_body(&provider)["messages"][0]["content"].as_str().unwrap().contains(TRIM_NOTE), "configured small applies");
+    assert!(usages(&events)[0].trimmed);
+}
+
+#[test]
+fn a_retry_that_no_longer_fits_shows_the_notice_and_sends_nothing_more() {
+    let provider = serve(vec![overflow_400("Input is too long.")]);
+    let conv = Conversation::new().unwrap();
+    conv.restore(conv.id(), long_history(3), Vec::new(), false);
+    // The newest message alone is about 7,500 tokens: no trim of the history can make the retry fit.
+    let huge = "word ".repeat(6000);
+    let s = LlmSettings { max_tokens: Some(512), ..settings(&provider.url, false) };
+    let events = turn(&mut agent_for(&s, &conv, Arc::new(TurnCancel::new())), &FakeTools::default(), &auto_gate(), &huge);
+
+    assert_eq!(provider.requests().len(), 1, "the retry is not sent");
+    let said = texts(&events);
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(said[0].starts_with("This conversation no longer fits the model's context window (about "), "{}", said[0]);
+    assert!(matches!(events.last(), Some(AgentEvent::Done)));
 }

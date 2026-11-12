@@ -6,6 +6,8 @@
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::core::llm::LlmError;
+
 /// The category ids. `OTHER` also takes anything the classifier does not recognise.
 pub const SYSTEM: &str = "system";
 pub const TOOLS: &str = "tools";
@@ -353,6 +355,85 @@ pub fn with_actual(estimate: &ContextUsage, actual: u32) -> ContextUsage {
     out
 }
 
+/// The words of a provider's error for a prompt that is too large, in lower case. They are matched in the message and in
+/// the error kind. A 413 is an overflow whatever its text says (see `is_context_overflow`).
+const OVERFLOW_WORDS: [&str; 13] = [
+    "context length",
+    "context_length",
+    "context window",
+    "context size",
+    "maximum context",
+    "max context",
+    "prompt is too long",
+    "input is too long",
+    "too many tokens",
+    "reduce the length of the messages",
+    "request too large",
+    "request entity too large",
+    "payload too large",
+];
+
+/// True for an error that says the request is too large for the model's context window: a 413, or a 400 or 422 (or a
+/// provider error inside a 200 body) whose message or kind has one of `OVERFLOW_WORDS`. Any other error is not an overflow,
+/// whatever its wording.
+pub fn is_context_overflow(e: &LlmError) -> bool {
+    match e {
+        LlmError::Http { status: 413, .. } => true,
+        LlmError::Http { status: 400 | 422, kind, message, .. } | LlmError::Provider { kind, message, .. } => {
+            let text = format!("{} {message}", kind.as_deref().unwrap_or_default()).to_lowercase();
+            OVERFLOW_WORDS.iter().any(|word| text.contains(word))
+        }
+        _ => false,
+    }
+}
+
+/// The words after which a provider names the model's context limit, in lower case.
+const LIMIT_ANCHORS: [&str; 7] =
+    ["maximum context length", "context length", "context window", "context size", "max context", "limit of", "limit is"];
+/// How many characters after an anchor the number may start.
+const LIMIT_WINDOW: usize = 60;
+/// The smallest and the largest context limit that is taken from a message.
+pub const LIMIT_MIN: u32 = 2000;
+pub const LIMIT_MAX: u32 = 100_000_000;
+
+/// The context limit that a provider's error text names, if it names one: the first number of at least 1000 (commas
+/// allowed, as in "8,192") that starts within 60 characters after one of `LIMIT_ANCHORS`, taking the anchors in the order
+/// they appear. None when there is no such number, or when it is outside [`LIMIT_MIN`, `LIMIT_MAX`].
+pub fn limit_in_message(msg: &str) -> Option<u32> {
+    let lower = msg.to_lowercase();
+    let mut ends: Vec<usize> = LIMIT_ANCHORS
+        .iter()
+        .flat_map(|anchor| lower.match_indices(anchor).map(move |(at, _)| at + anchor.len()))
+        .collect();
+    ends.sort_unstable();
+    let number = ends.into_iter().find_map(|end| first_number_at_least(&lower[end..], 1000, LIMIT_WINDOW))?;
+    u32::try_from(number).ok().filter(|n| (LIMIT_MIN..=LIMIT_MAX).contains(n))
+}
+
+/// The first run of digits in `text` (commas allowed inside it) that reads as at least `min` and starts before the
+/// character at `starts_before`. A run is read whole, so a number is not cut at that point.
+fn first_number_at_least(text: &str, min: u64, starts_before: usize) -> Option<u64> {
+    let mut run = String::new();
+    let mut start = 0;
+    // A space at the end closes a run that runs to the end of the text.
+    for (index, c) in text.chars().chain(std::iter::once(' ')).enumerate() {
+        if c.is_ascii_digit() || (c == ',' && !run.is_empty()) {
+            if run.is_empty() {
+                start = index;
+            }
+            run.push(c);
+            continue;
+        }
+        if start < starts_before
+            && let Some(n) = run.replace(',', "").parse::<u64>().ok().filter(|n| *n >= min)
+        {
+            return Some(n);
+        }
+        run.clear();
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -626,5 +707,67 @@ mod tests {
         assert_eq!(value["trimmed"], false);
         assert_eq!(value["calibrated"], false);
         assert_eq!(value["categories"][0], json!({"id": "system", "tokens": 1}));
+    }
+
+    fn http(status: u16, kind: Option<&str>, message: &str) -> LlmError {
+        LlmError::Http { status, code: None, kind: kind.map(str::to_string), message: message.to_string() }
+    }
+
+    fn provider(kind: Option<&str>, message: &str) -> LlmError {
+        LlmError::Provider { code: None, kind: kind.map(str::to_string), message: message.to_string() }
+    }
+
+    #[test]
+    fn overflow_errors_are_a_413_or_a_400_422_or_provider_error_with_the_wording() {
+        assert!(is_context_overflow(&http(413, None, "too big")), "a 413 whatever its text");
+        assert!(is_context_overflow(&http(400, None, "This model's maximum context length is 128000 tokens.")));
+        assert!(is_context_overflow(&http(400, Some("context_length_exceeded"), "Bad")), "the kind alone is enough");
+        assert!(is_context_overflow(&http(422, None, "Prompt is too long: 250000 tokens > 200000 maximum")));
+        assert!(is_context_overflow(&http(400, None, "Input is too long for requested model.")));
+        assert!(is_context_overflow(&http(400, None, "Request too large for this model")));
+        assert!(is_context_overflow(&http(400, None, "Please reduce the length of the messages or completion.")));
+        assert!(is_context_overflow(&provider(None, "Your input exceeds the context window of this model")));
+        assert!(is_context_overflow(&provider(Some("invalid_request_error"), "too many tokens in the prompt")));
+    }
+
+    #[test]
+    fn other_errors_are_not_overflows() {
+        assert!(!is_context_overflow(&http(401, None, "invalid key, maximum context length")), "a 401 is not an overflow");
+        assert!(!is_context_overflow(&http(429, None, "rate limit exceeded")));
+        assert!(!is_context_overflow(&http(500, None, "context length: internal failure")));
+        assert!(!is_context_overflow(&http(400, None, "invalid model")));
+        assert!(!is_context_overflow(&http(400, None, "bad request")));
+        assert!(!is_context_overflow(&http(400, None, "rate limit reached, try again")));
+        assert!(!is_context_overflow(&http(422, None, "image input is not supported")));
+        assert!(!is_context_overflow(&LlmError::Transport("context length".into())));
+        assert!(!is_context_overflow(&LlmError::Parse("too many tokens".into())));
+        assert!(!is_context_overflow(&LlmError::Cancelled));
+    }
+
+    #[test]
+    fn the_limit_is_the_first_number_after_an_anchor() {
+        let openai = "This model's maximum context length is 128000 tokens. However, your messages resulted in 130123 tokens.";
+        assert_eq!(limit_in_message(openai), Some(128000), "the first number, not the one that came to the request");
+        assert_eq!(limit_in_message("context length of 8,192 tokens"), Some(8192));
+        assert_eq!(limit_in_message("Context window: 1,000,000 tokens"), Some(1_000_000));
+        assert_eq!(limit_in_message("the limit is 32768"), Some(32768));
+        assert_eq!(limit_in_message("limit of 4096, and more"), Some(4096));
+        assert_eq!(limit_in_message("Your input has 130123 tokens, above the context length of 128000."), Some(128000));
+    }
+
+    #[test]
+    fn a_limit_that_is_missing_small_far_or_out_of_range_is_none() {
+        assert_eq!(limit_in_message("prompt is too long"), None, "no anchor");
+        assert_eq!(limit_in_message("130123 tokens is more than the context length"), None, "the number is before the anchor");
+        assert_eq!(limit_in_message("context length is 512 tokens"), None, "below 1000");
+        assert_eq!(limit_in_message("context length is 1500 tokens"), None, "below the 2000 minimum");
+        assert_eq!(limit_in_message("context length is 200000000 tokens"), None, "above the maximum");
+        assert_eq!(limit_in_message(&format!("context length{}128000", " ".repeat(60))), None, "starts past 60 characters");
+    }
+
+    #[test]
+    fn a_number_is_read_whole_when_it_starts_within_the_window() {
+        let at_59 = format!("context length{}128000", " ".repeat(59));
+        assert_eq!(limit_in_message(&at_59), Some(128000), "starts at character 59, so it is read whole");
     }
 }
