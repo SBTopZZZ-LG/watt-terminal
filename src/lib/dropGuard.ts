@@ -19,8 +19,9 @@ export function installDropGuard(target: Pick<EventTarget, 'addEventListener' | 
   };
   target.addEventListener('dragover', cancel, true);
   target.addEventListener('drop', cancel, true);
+  // The options form matches the listeners added above with capture; Node 22's EventTarget does not match a boolean capture here.
   return () => {
-    target.removeEventListener('dragover', cancel, true);
-    target.removeEventListener('drop', cancel, true);
+    target.removeEventListener('dragover', cancel, { capture: true });
+    target.removeEventListener('drop', cancel, { capture: true });
   };
 }

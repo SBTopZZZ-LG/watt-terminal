@@ -123,8 +123,7 @@ impl History {
         let sent = attachments::images_to_send(&self.messages);
         let mut out = Vec::with_capacity(self.messages.len() - start + 1);
         out.push(json!({"role": "system", "content": system}));
-        for index in start..self.messages.len() {
-            let m = &self.messages[index];
+        for (index, m) in self.messages.iter().enumerate().skip(start) {
             let mut wire = m.clone();
             if role(m) == Some("user") {
                 if let Some(parts) = m.get("content").and_then(Value::as_array) {
