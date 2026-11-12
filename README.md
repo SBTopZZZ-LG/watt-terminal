@@ -76,6 +76,32 @@ cd src-tauri && cargo test
 
 The Rust integration tests spawn real `zsh -l` sessions through the user's own startup files (`~/.zshenv`, `~/.zprofile`, `~/.zshrc`, `~/.zlogin`). They run with a temporary `HISTFILE` so the real `~/.zsh_history` is not written. Expect them to take about a minute, since they run one at a time.
 
+## Build and install the macOS app
+
+Prerequisites: macOS (Apple Silicon or Intel), the Xcode command line tools (`xcode-select --install`), Rust with `cargo` (found in `~/.cargo/bin` even when your shell does not load it), and Node.js with npm. The build runs `npm ci` if `node_modules` is missing.
+
+```sh
+npm run app:build                # release build of Watt.app, after the type check and tests
+npm run app:install              # copy it to /Applications (or ~/Applications)
+npm run app:release -- --open    # build, install, then launch
+```
+
+Both scripts take `--help`. Useful flags:
+
+- `app:build`: `--dmg` also makes a DMG from the signed app (by `scripts/app-dmg.sh`, not Tauri's own DMG), `--debug` builds the debug profile, `--no-checks` skips `tsc` and `vitest`, `--full` also runs `cargo clippy` and `cargo test` (about five more minutes). Set `SIGN_IDENTITY` to always sign with a named identity (hardened runtime) instead of ad-hoc.
+- `app:install`: `--dest DIR`, `--open`, `--force` (kill Watt if it has not quit after 10 seconds), `--dry-run`, `--uninstall`. Install never launches Watt unless you pass `--open`.
+- `app:release` passes `--dmg`, `--debug`, `--no-checks`, `--full`, `--dest`, `--open` and `--force` through.
+
+The build lands in `src-tauri/target/release/bundle/macos/Watt.app` (`target/debug/` with `--debug`), and the DMG (`Watt_<version>_aarch64.dmg`) in `src-tauri/target/release/bundle/dmg/`. The install goes to `/Applications/Watt.app`, or to `~/Applications` when `/Applications` is not writable.
+
+The app is ad-hoc signed (unless `SIGN_IDENTITY` is set) and not notarised. The DMG is made from that signed app, and the app inside the DMG is checked before the script finishes. That is fine on the Mac that built it. A DMG or app copied to another Mac is blocked by Gatekeeper. Right-click the app and choose Open, or run `xattr -dr com.apple.quarantine /Applications/Watt.app`.
+
+Rollback: before each install replaces the app, the old copy is kept in `~/Library/Caches/watt-terminal/previous/` (the two newest). To roll back, quit Watt and copy one of them over the installed app.
+
+Uninstall with `npm run app:install -- --uninstall`. It removes the app only. Your data in `~/Library/Application Support/dev.watt.terminal` and the Keychain items are never touched, by install or uninstall. Because the build is ad-hoc signed, macOS may ask again for the old Keychain item and for any permissions after an install.
+
+The scripts are tested with fake bundles, which need no build and never launch Watt: `bash scripts/test-app-scripts.sh`.
+
 ## Known limitations
 
 - Mock agent only. There is no LLM yet.
