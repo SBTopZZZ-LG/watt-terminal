@@ -88,4 +88,16 @@ The Rust integration tests spawn real `zsh -l` sessions through the user's own s
 
 Dropping a file on the terminal does nothing, as it did before: the app never inserted a dropped file's path. The native file drop is off (`dragDropEnabled: false` in `src-tauri/tauri.conf.json`), so the webview receives the drag and can take it. A file dropped on the agent's input bar is attached to the message; a drop anywhere else is cancelled (see `src/lib/dropGuard.ts`).
 
-The bundle identifier (`dev.agentterm.app`, in `src-tauri/tauri.conf.json`) and the Keychain service name keep the app's old name on purpose. They decide where settings, window state and stored API keys live, so changing them would orphan existing user data. `tauri.conf.json` is strict JSON, so the note cannot sit there; the Keychain constant has its own comment in `src-tauri/src/core/settings/secrets.rs`.
+The bundle identifier is `dev.watt.terminal` (`src-tauri/tauri.conf.json`). It names the app's data folder and the Keychain item for API keys. The app used to be called `dev.agentterm.app`. On the first launch under the new identifier, the old data is copied, not moved:
+
+- The old folder `~/Library/Application Support/dev.agentterm.app/` (settings, UI state, window state, conversations) is copied to `~/Library/Application Support/dev.watt.terminal/`. The copy is skipped when the new folder already has content.
+- The saved API keys are copied from the old Keychain item (service `dev.agentterm.app`, account `secrets`) to a new one (service `dev.watt.terminal`). macOS may ask once for permission to read the old item.
+
+Nothing is deleted. Once you are happy with the new app, you can remove the old copies yourself:
+
+```sh
+security delete-generic-password -s dev.agentterm.app
+rm -r "$HOME/Library/Application Support/dev.agentterm.app"
+```
+
+Quit the old app before the first launch under the new name. A running old instance keeps using its own folder and its own single-instance socket, so the two apps do not see each other, and changes it makes later are not copied over. The `WATT_CONFIG_DIR` and `WATT_DATA_DIR` overrides skip the folder copy.

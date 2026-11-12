@@ -1010,7 +1010,41 @@ async fn test_connection(
     Ok(test_model(client, &plan).await)
 }
 
+/// The bundle identifier before the rename to Watt, and the current one (tauri.conf.json). On macOS the app's data
+/// folder is named after the identifier, so the old folder is copied to the new one once (`migrate_app_folder`).
+#[cfg(target_os = "macos")]
+const LEGACY_IDENTIFIER: &str = "dev.agentterm.app";
+#[cfg(target_os = "macos")]
+const IDENTIFIER: &str = "dev.watt.terminal";
+
+/// Copies the old app folder to the new one before anything reads it, so the window state plugin and the stores see the
+/// user's files. Skipped when a config or data folder override is set (tests and development). A failure is logged and
+/// startup goes on.
+#[cfg(target_os = "macos")]
+fn migrate_app_folder() {
+    let overridden = dir_override("WATT_CONFIG_DIR", "AGENT_TERM_CONFIG_DIR").is_some()
+        || dir_override("WATT_DATA_DIR", "AGENT_TERM_DATA_DIR").is_some();
+    if overridden {
+        return;
+    }
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let support = PathBuf::from(home).join("Library").join("Application Support");
+    let legacy = support.join(LEGACY_IDENTIFIER);
+    let new = support.join(IDENTIFIER);
+    match crate::core::migrate::migrate_legacy_dir(&legacy, &new) {
+        Ok(crate::core::migrate::MigrateOutcome::Copied) => {
+            eprintln!("watt: copied the app folder from {LEGACY_IDENTIFIER} to {IDENTIFIER}");
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("watt: could not copy the app folder from {LEGACY_IDENTIFIER}: {e}"),
+    }
+}
+
 pub fn run() {
+    #[cfg(target_os = "macos")]
+    migrate_app_folder();
     // Reads the dev LLM settings now, so a bad value is reported at launch and falls back to the mock agent.
     agent_loop::settings();
     let app = tauri::Builder::default()

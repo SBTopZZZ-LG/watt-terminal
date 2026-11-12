@@ -21,9 +21,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use super::write_private_atomic;
 use crate::core::env::env_setting;
 
-// KEEP: the service name is the app's original identifier, not its display name. Changing it would point the app at a
-// different Keychain item, and the user's saved API keys live under the old name. Do not rename it with the app.
-const KEYCHAIN_SERVICE: &str = "dev.agentterm.app";
+// The Keychain item is named after the app's identifier (`dev.watt.terminal`, see tauri.conf.json). The user's saved
+// keys were stored under the old identifier, `LEGACY_KEYCHAIN_SERVICE`. The first launch under the new name copies that
+// item across (`MigratingStore`). The old item is only read for the copy: the app never changes or deletes it.
+const KEYCHAIN_SERVICE: &str = "dev.watt.terminal";
+const LEGACY_KEYCHAIN_SERVICE: &str = "dev.agentterm.app";
 const KEYCHAIN_ACCOUNT: &str = "secrets";
 const SECRETS_FILE_ENV: &str = "WATT_SECRETS_FILE";
 const LEGACY_SECRETS_FILE_ENV: &str = "AGENT_TERM_SECRETS_FILE";
@@ -118,6 +120,52 @@ impl SecretStore for FileStore {
     }
 }
 
+/// The macOS store: `primary` (the new Keychain item) with `legacy` (the item under the old identifier) behind it. When
+/// `primary` is empty, the legacy blob is copied into it and read back. The legacy item is never changed or deleted.
+/// If the copy fails, the next launch copies again, because the new item is still missing. If the copy reads back
+/// different, the new item is wrong and the next launch uses it; the next save of a key rewrites it from the cache.
+/// In both cases this session uses the legacy blob. Errors and logs carry no blob content.
+pub struct MigratingStore {
+    primary: Box<dyn SecretStore>,
+    legacy: Box<dyn SecretStore>,
+}
+
+impl MigratingStore {
+    pub fn new(primary: Box<dyn SecretStore>, legacy: Box<dyn SecretStore>) -> Self {
+        Self { primary, legacy }
+    }
+}
+
+impl SecretStore for MigratingStore {
+    fn load(&self) -> Result<Option<String>, SecretError> {
+        if let Some(blob) = self.primary.load()? {
+            return Ok(Some(blob));
+        }
+        // A failed legacy read is an error, not an empty store: an empty answer would let a save write the new item
+        // without the user's keys.
+        let Some(legacy) = self.legacy.load()? else {
+            return Ok(None);
+        };
+        // The copy is checked by reading it back. Either way this session uses the legacy blob, the source of truth;
+        // a failed or different copy is reported on stderr, with no content.
+        let copied = self.primary.save(&legacy).and_then(|()| self.primary.load());
+        if !matches!(&copied, Ok(Some(back)) if *back == legacy) {
+            eprintln!(
+                "watt: the saved secrets were not copied to the new Keychain item; this session uses the old one"
+            );
+        }
+        Ok(Some(legacy))
+    }
+
+    fn save(&self, blob: &str) -> Result<(), SecretError> {
+        self.primary.save(blob)
+    }
+
+    fn kind(&self) -> &'static str {
+        "keychain"
+    }
+}
+
 /// In-memory store for tests. Clones share the same state, so a test can keep a handle after giving one to `Secrets`.
 #[cfg(test)]
 #[derive(Clone, Default)]
@@ -130,6 +178,7 @@ pub struct MemoryStore {
 struct MemoryState {
     blob: Mutex<Option<String>>,
     loads: AtomicUsize,
+    fail_loads: AtomicBool,
     fail_saves: AtomicBool,
 }
 
@@ -152,12 +201,19 @@ impl MemoryStore {
     pub fn set_fail_saves(&self, fail: bool) {
         self.inner.fail_saves.store(fail, Ordering::SeqCst);
     }
+
+    pub fn set_fail_loads(&self, fail: bool) {
+        self.inner.fail_loads.store(fail, Ordering::SeqCst);
+    }
 }
 
 #[cfg(test)]
 impl SecretStore for MemoryStore {
     fn load(&self) -> Result<Option<String>, SecretError> {
         self.inner.loads.fetch_add(1, Ordering::SeqCst);
+        if self.inner.fail_loads.load(Ordering::SeqCst) {
+            return Err(SecretError::Unavailable("simulated failure".into()));
+        }
         Ok(self.inner.blob.lock().unwrap().clone())
     }
 
@@ -200,10 +256,10 @@ impl Secrets {
     pub fn from_env(_config_dir: &Path) -> Self {
         match env_setting(SECRETS_FILE_ENV, LEGACY_SECRETS_FILE_ENV) {
             Some(path) => Self::new(Box::new(FileStore { path: PathBuf::from(path) })),
-            None => Self::new(Box::new(KeychainStore {
-                service: KEYCHAIN_SERVICE.into(),
-                account: KEYCHAIN_ACCOUNT.into(),
-            })),
+            None => Self::new(Box::new(MigratingStore::new(
+                Box::new(KeychainStore { service: KEYCHAIN_SERVICE.into(), account: KEYCHAIN_ACCOUNT.into() }),
+                Box::new(KeychainStore { service: LEGACY_KEYCHAIN_SERVICE.into(), account: KEYCHAIN_ACCOUNT.into() }),
+            ))),
         }
     }
 
@@ -468,6 +524,118 @@ mod tests {
         first.set(&api_key_name("p"), "DUMMY-key").unwrap();
         let second = Secrets::new(Box::new(FileStore { path }));
         assert_eq!(second.get(&api_key_name("p")).unwrap().as_deref(), Some("DUMMY-key"));
+    }
+
+    /// A store whose saves come back changed, to exercise the read-back check.
+    struct ChangingStore(MemoryStore);
+
+    impl SecretStore for ChangingStore {
+        fn load(&self) -> Result<Option<String>, SecretError> {
+            self.0.load()
+        }
+
+        fn save(&self, blob: &str) -> Result<(), SecretError> {
+            self.0.save(&format!("{blob} "))
+        }
+
+        fn kind(&self) -> &'static str {
+            "memory"
+        }
+    }
+
+    fn migrating(primary: &MemoryStore, legacy: &MemoryStore) -> MigratingStore {
+        MigratingStore::new(Box::new(primary.clone()), Box::new(legacy.clone()))
+    }
+
+    #[test]
+    fn legacy_blob_is_copied_once_and_the_legacy_item_is_left_alone() {
+        let primary = MemoryStore::default();
+        let legacy = MemoryStore::with_blob(r#"{"a":"1"}"#);
+        let store = migrating(&primary, &legacy);
+
+        assert_eq!(store.load().unwrap().as_deref(), Some(r#"{"a":"1"}"#));
+        assert_eq!(primary.stored().as_deref(), Some(r#"{"a":"1"}"#));
+        assert_eq!(legacy.stored().as_deref(), Some(r#"{"a":"1"}"#));
+
+        // Once the new item exists it is the one read, so a later change to the old item does not come back.
+        legacy.save(r#"{"a":"changed"}"#).unwrap();
+        assert_eq!(store.load().unwrap().as_deref(), Some(r#"{"a":"1"}"#));
+        assert_eq!(legacy.stored().as_deref(), Some(r#"{"a":"changed"}"#));
+    }
+
+    #[test]
+    fn the_new_item_wins_when_both_exist() {
+        let primary = MemoryStore::with_blob(r#"{"a":"new"}"#);
+        let legacy = MemoryStore::with_blob(r#"{"a":"old"}"#);
+        let store = migrating(&primary, &legacy);
+
+        assert_eq!(store.load().unwrap().as_deref(), Some(r#"{"a":"new"}"#));
+        assert_eq!(primary.stored().as_deref(), Some(r#"{"a":"new"}"#));
+        assert_eq!(legacy.stored().as_deref(), Some(r#"{"a":"old"}"#));
+    }
+
+    #[test]
+    fn no_legacy_item_means_no_blob() {
+        let primary = MemoryStore::default();
+        let legacy = MemoryStore::default();
+        let store = migrating(&primary, &legacy);
+
+        assert_eq!(store.load().unwrap(), None);
+        assert_eq!(primary.stored(), None, "nothing must be written when there is nothing to copy");
+    }
+
+    #[test]
+    fn a_failed_copy_falls_back_to_the_legacy_blob_and_is_retried_later() {
+        let primary = MemoryStore::default();
+        let legacy = MemoryStore::with_blob(r#"{"a":"1"}"#);
+        let store = migrating(&primary, &legacy);
+
+        primary.set_fail_saves(true);
+        assert_eq!(store.load().unwrap().as_deref(), Some(r#"{"a":"1"}"#));
+        assert_eq!(primary.stored(), None);
+
+        // The next launch sees the new item still missing and copies again.
+        primary.set_fail_saves(false);
+        let next_launch = migrating(&primary, &legacy);
+        assert_eq!(next_launch.load().unwrap().as_deref(), Some(r#"{"a":"1"}"#));
+        assert_eq!(primary.stored().as_deref(), Some(r#"{"a":"1"}"#));
+    }
+
+    #[test]
+    fn a_copy_that_does_not_read_back_is_not_trusted_and_the_legacy_blob_is_used() {
+        let primary = MemoryStore::default();
+        let legacy = MemoryStore::with_blob(r#"{"a":"1"}"#);
+        let store = MigratingStore::new(Box::new(ChangingStore(primary.clone())), Box::new(legacy.clone()));
+
+        assert_eq!(store.load().unwrap().as_deref(), Some(r#"{"a":"1"}"#));
+        assert_eq!(primary.stored().as_deref(), Some("{\"a\":\"1\"} "), "the copy is what was written");
+        assert_eq!(legacy.stored().as_deref(), Some(r#"{"a":"1"}"#));
+    }
+
+    #[test]
+    fn a_failed_legacy_read_is_an_error_and_writes_nothing_and_shows_no_value() {
+        let value = "DUMMY-secret-value-88";
+        let primary = MemoryStore::default();
+        let legacy = MemoryStore::with_blob(&format!(r#"{{"k":"{value}"}}"#));
+        legacy.set_fail_loads(true);
+        let store = migrating(&primary, &legacy);
+
+        let err = store.load().unwrap_err();
+        assert!(matches!(err, SecretError::Unavailable(_)));
+        assert!(!err.to_string().contains(value));
+        assert!(!format!("{err:?}").contains(value));
+        assert_eq!(primary.stored(), None, "an unreadable old item must not produce an empty new one");
+    }
+
+    #[test]
+    fn secrets_over_a_migrating_store_read_the_old_keys() {
+        let primary = MemoryStore::default();
+        let legacy = MemoryStore::with_blob(r#"{"provider.p.api_key":"DUMMY-key"}"#);
+        let secrets = Secrets::new(Box::new(migrating(&primary, &legacy)));
+        assert_eq!(secrets.get("provider.p.api_key").unwrap().as_deref(), Some("DUMMY-key"));
+        secrets.remove("provider.p.api_key").unwrap();
+        assert_eq!(primary.stored().as_deref(), Some("{}"));
+        assert!(legacy.stored().unwrap().contains("DUMMY-key"), "the old item is never changed");
     }
 
     /// Real macOS Keychain round trip. Ignored by default because it touches the login Keychain. Run with

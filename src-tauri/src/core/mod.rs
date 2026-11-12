@@ -11,6 +11,7 @@ pub mod foreground;
 pub mod inject;
 pub mod keys;
 pub mod llm;
+pub mod migrate;
 pub mod observer;
 pub mod persist;
 pub mod pty;
