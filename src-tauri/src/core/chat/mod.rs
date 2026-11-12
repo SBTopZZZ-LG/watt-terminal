@@ -4,6 +4,7 @@
 
 pub mod agent_loop;
 pub mod attachments;
+pub mod context;
 pub mod history;
 pub mod project;
 pub mod prompt;

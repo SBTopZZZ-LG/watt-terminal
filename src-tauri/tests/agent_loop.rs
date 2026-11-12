@@ -13,6 +13,7 @@ use base64::engine::general_purpose::STANDARD;
 use watt_terminal_lib::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate, UserMessage};
 use watt_terminal_lib::core::chat::agent_loop::{agent_record_note, Conversation, LlmAgent, LlmSettings};
 use watt_terminal_lib::core::chat::attachments::{Attachment, Resolver};
+use watt_terminal_lib::core::chat::context::{self, ContextUsage};
 use watt_terminal_lib::core::persist::attachments::{sha256_hex, AttachmentStore};
 use watt_terminal_lib::core::settings::LimitsSettings;
 use watt_terminal_lib::core::chat::history::History;
@@ -318,6 +319,7 @@ fn settings(url: &str, stream: bool) -> LlmSettings {
 fn agent_for(s: &LlmSettings, conv: &Conversation, cancel: Arc<TurnCancel>) -> LlmAgent {
     LlmAgent::new(&http_client().expect("client"), s.clone(), &conv.id(), conv.history(), conv.todos(), cancel)
         .with_no_vision(conv.no_vision())
+        .with_calibration(conv.calibration())
 }
 
 /// Runs one turn and returns every event it emitted, `Done` included.
@@ -1523,4 +1525,119 @@ fn a_retried_reply_counts_once_against_the_model_call_cap() {
         texts(&events),
         [NO_VISION.to_string(), "I stopped after 1 model calls in one turn. The limit can be changed in Settings > Limits.".to_string()]
     );
+}
+
+/// The context usage events of a turn, in order.
+fn usages(events: &[AgentEvent]) -> Vec<ContextUsage> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ContextUsage(usage) => Some(usage.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `reply` with the provider's usage block, as a streamed or non-streamed reply carries it.
+fn with_usage(mut reply: Value, prompt_tokens: u64) -> Value {
+    reply["usage"] = json!({"prompt_tokens": prompt_tokens, "completion_tokens": 3});
+    reply
+}
+
+/// The raw breakdown of a request as the provider received it: the system text, the tools and the messages.
+fn raw_breakdown(body: &Value) -> context::Breakdown {
+    let messages = body["messages"].as_array().expect("messages");
+    let system = messages[0]["content"].as_str().expect("system text");
+    let tools = body["tools"].as_array().cloned().unwrap_or_default();
+    context::breakdown(system, &tools, messages)
+}
+
+/// The raw estimate of a request as the provider received it.
+fn raw_estimate(body: &Value) -> u32 {
+    raw_breakdown(body).total()
+}
+
+#[test]
+fn a_reply_with_a_prompt_count_gives_the_estimate_then_the_provider_count() {
+    let provider = serve(vec![Script::json(with_usage(text_reply("hi"), 1234))]);
+    let s = LlmSettings { context_limit: Some(8_000), max_tokens: Some(512), ..settings(&provider.url, false) };
+    let conv = Conversation::new().unwrap();
+    let mut agent = agent_for(&s, &conv, Arc::new(TurnCancel::new()));
+    let events = turn(&mut agent, &FakeTools::default(), &auto_gate(), "hello");
+
+    assert!(matches!(events.first(), Some(AgentEvent::Thinking { active: true })), "thinking still comes first");
+    let usages = usages(&events);
+    assert_eq!(usages.len(), 2, "an estimate before the request, the provider's count after its reply");
+    let (estimate, actual) = (&usages[0], &usages[1]);
+    assert_eq!((estimate.limit, estimate.reserved_output), (Some(8_000), 512));
+    assert!(!estimate.calibrated, "nothing was learned yet");
+    assert_eq!(estimate.used, estimate.categories.iter().map(|c| c.tokens).sum::<u32>());
+    assert_eq!(estimate.used, raw_estimate(&body_of(&provider.requests()[0])), "the estimate is the request as sent");
+    assert_eq!(actual.used, 1234);
+    assert_eq!(actual.used, actual.categories.iter().map(|c| c.tokens).sum::<u32>());
+    assert!(actual.calibrated, "the count calibrated the conversation");
+    assert_eq!(actual.limit, Some(8_000));
+}
+
+#[test]
+fn the_calibration_carries_to_the_next_turn_of_the_conversation() {
+    let provider = serve(vec![Script::json(with_usage(text_reply("one"), 1234)), Script::json(text_reply("two"))]);
+    let s = settings(&provider.url, false);
+    let conv = Conversation::new().unwrap();
+    let first = usages(&turn(&mut agent_for(&s, &conv, Arc::new(TurnCancel::new())), &FakeTools::default(), &auto_gate(), "first"));
+    let second = usages(&turn(&mut agent_for(&s, &conv, Arc::new(TurnCancel::new())), &FakeTools::default(), &auto_gate(), "second"));
+
+    assert_eq!(first.len(), 2);
+    assert_eq!(second.len(), 1, "this reply reports no count, so only the estimate");
+    assert!(second[0].calibrated, "the first turn's count calibrates the second");
+    // The ratio after one count is halfway from 1 to the sample, within the clamp. Each category of the second estimate is
+    // that ratio applied to its own raw tokens, rounded, and `used` is their sum. The raw breakdowns come from the requests
+    // the provider received.
+    let first_raw = raw_estimate(&body_of(&provider.requests()[0]));
+    let second_breakdown = raw_breakdown(&body_of(&provider.requests()[1]));
+    assert_eq!(first[0].used, first_raw);
+    let ratio = (0.5 + 0.5 * (1234.0 / f64::from(first_raw))).clamp(0.5, 2.0);
+    for ((id, raw), category) in second_breakdown.categories.iter().zip(&second[0].categories) {
+        assert_eq!(&category.id, id);
+        assert_eq!(category.tokens, (ratio * f64::from(*raw)).round() as u32, "{id}");
+    }
+    let sum: u32 = second[0].categories.iter().map(|c| c.tokens).sum();
+    assert_eq!(second[0].used, sum);
+}
+
+#[test]
+fn a_reset_conversation_starts_with_no_calibration() {
+    let provider = serve(vec![Script::json(with_usage(text_reply("one"), 1234)), Script::json(text_reply("two"))]);
+    let s = settings(&provider.url, false);
+    let conv = Conversation::new().unwrap();
+    turn(&mut agent_for(&s, &conv, Arc::new(TurnCancel::new())), &FakeTools::default(), &auto_gate(), "first");
+    conv.reset().unwrap();
+    let events = turn(&mut agent_for(&s, &conv, Arc::new(TurnCancel::new())), &FakeTools::default(), &auto_gate(), "again");
+    assert!(usages(&events).iter().all(|u| !u.calibrated), "a new conversation is estimated from scratch");
+}
+
+#[test]
+fn without_a_known_limit_the_usage_has_no_limit_and_the_default_reserve() {
+    let provider = serve(vec![Script::json(text_reply("hi"))]);
+    let conv = Conversation::new().unwrap();
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
+    let events = turn(&mut agent, &FakeTools::default(), &auto_gate(), "hello");
+
+    let usages = usages(&events);
+    assert_eq!(usages.len(), 1, "no count in the reply: the estimate only");
+    assert_eq!(usages[0].limit, None);
+    assert_eq!(usages[0].reserved_output, 4096);
+    assert!(usages[0].used > 0);
+}
+
+#[test]
+fn a_failed_request_gives_its_estimate_and_no_count() {
+    let provider = serve(vec![Script::error("500 Internal Server Error", json!({"error": {"message": "boom"}}))]);
+    let conv = Conversation::new().unwrap();
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
+    let events = turn(&mut agent, &FakeTools::default(), &auto_gate(), "hello");
+
+    let usages = usages(&events);
+    assert_eq!(usages.len(), 1, "the estimate was shown before the request; the failure adds no count");
+    assert!(!usages[0].calibrated);
 }

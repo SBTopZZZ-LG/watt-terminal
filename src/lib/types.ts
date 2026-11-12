@@ -139,7 +139,21 @@ export type AgentEvent =
   | { type: 'integration_request'; call_id: string; phase: 'asking' | 'running' | 'done'; label?: string; outcome?: AgentIntegrationOutcome }
   /** The conversation's todo list was replaced by a successful todo_write. `items` is the whole list. */
   | { type: 'todo_update'; items: TodoItem[] }
+  /** The context usage of a model request: sent before the request, and again with the provider's count once a reply reports it. */
+  | ({ type: 'context_usage' } & ContextUsage)
   | { type: 'done' };
+
+/** The context usage of one model request (core/chat/context). `used` is the estimate, or the provider's count once `calibrated`. */
+export interface ContextUsage {
+  /** The model's context limit in tokens, or null when it is not known. */
+  limit: number | null;
+  used: number;
+  reserved_output: number;
+  /** True when older content was left out of the request. Always false for now. */
+  trimmed: boolean;
+  calibrated: boolean;
+  categories: { id: string; tokens: number }[];
+}
 
 /** What an agent's integration request ended with: the handshake's outcome, or `declined` (no integration, no handshake). */
 export type AgentIntegrationOutcome = IntegrateOutcome | { outcome: 'declined' };

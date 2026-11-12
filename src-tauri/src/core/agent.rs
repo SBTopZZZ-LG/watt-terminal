@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 
 use crate::core::approval::{self, ApprovalPolicy, ManualPolicy, Reason, SendKeysCall, SendKeysMemory, Verdict};
 use crate::core::chat::attachments::Attachment;
+use crate::core::chat::context::ContextUsage;
 use crate::core::chat::todo::Todo;
 use crate::core::foreground::{self, Foreground, ForegroundKind};
 use crate::core::keys::KeyPlan;
@@ -300,6 +301,9 @@ pub enum AgentEvent {
     AgentControl { active: bool },
     /// The conversation's todo list was replaced by a successful `todo_write`. `items` is the whole list.
     TodoUpdate { items: Vec<Todo> },
+    /// The context usage of a model request: emitted before the request is sent, and again with the provider's own count
+    /// once a reply reports it. The wire type is `context_usage` (see core/chat/context).
+    ContextUsage(ContextUsage),
     Done,
 }
 

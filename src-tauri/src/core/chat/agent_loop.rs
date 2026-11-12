@@ -30,6 +30,7 @@ use crate::core::agent::{Agent, AgentCtx, AgentEvent, DENIED, UserMessage};
 use crate::core::env::env_setting;
 use crate::core::foreground::{Foreground, ForegroundKind};
 use crate::core::chat::attachments::{Resolver, user_content};
+use crate::core::chat::context::{self, Calibrator};
 use crate::core::chat::history::History;
 use crate::core::chat::project::project;
 use crate::core::chat::prompt;
@@ -68,6 +69,9 @@ const NO_VISION_NOTICE: &str =
 /// The models (by id) that refused images in a conversation. Shared by the conversation's agents, so each turn sees it.
 pub type NoVisionModels = Arc<Mutex<HashSet<String>>>;
 
+/// The calibration of a conversation's estimates, shared by its agents (see `Conversation::calibration`).
+pub type Calibration = Arc<Mutex<Calibrator>>;
+
 /// The provider settings read from the environment. Holds the key, so `Debug` hides it.
 #[derive(Clone)]
 pub struct LlmSettings {
@@ -79,7 +83,8 @@ pub struct LlmSettings {
     /// True streams the reply (text appears as it arrives); false waits for the whole reply.
     pub stream: bool,
     pub max_tokens: Option<u32>,
-    /// The context limit that applies to this model, in tokens (core/settings). Not used by the loop yet.
+    /// The context limit that applies to this model, in tokens (core/settings), or None when it is not known. The loop
+    /// reports it with the context usage (core/chat/context); nothing is trimmed to fit it yet.
     pub context_limit: Option<u32>,
 }
 
@@ -221,6 +226,9 @@ pub struct Conversation {
     resume_note: Mutex<Option<String>>,
     /// The models that refused images here. Kept by `reset` and `restore`: it is a fact about the model, not the chat.
     no_vision: NoVisionModels,
+    /// How far this conversation's estimates were from the provider's counts. In memory only; reset by `reset` and
+    /// `restore`, since it belongs to the content it was learned from.
+    calibration: Calibration,
 }
 
 impl Conversation {
@@ -231,6 +239,7 @@ impl Conversation {
             todos: Arc::new(Mutex::new(Vec::new())),
             resume_note: Mutex::new(None),
             no_vision: Arc::new(Mutex::new(HashSet::new())),
+            calibration: Arc::new(Mutex::new(Calibrator::default())),
         })
     }
 
@@ -251,13 +260,19 @@ impl Conversation {
         self.no_vision.clone()
     }
 
-    /// Clears the history, the todo list and any pending resume note, and rotates the id. The caller makes sure no
-    /// turn is running.
+    /// The calibration of this conversation's estimates (see `LlmAgent::with_calibration`).
+    pub fn calibration(&self) -> Calibration {
+        self.calibration.clone()
+    }
+
+    /// Clears the history, the todo list, any pending resume note and the calibration, and rotates the id. The caller
+    /// makes sure no turn is running.
     pub fn reset(&self) -> io::Result<()> {
         let id = new_conversation_id()?;
         lock(&self.history).clear();
         lock_todos(&self.todos).clear();
         *lock_note(&self.resume_note) = None;
+        *lock_calibration(&self.calibration) = Calibrator::default();
         *lock_string(&self.id) = id;
         Ok(())
     }
@@ -271,6 +286,8 @@ impl Conversation {
         *lock(&self.history) = history;
         *lock_todos(&self.todos) = todos;
         *lock_note(&self.resume_note) = Some(resume_note_for(in_turn));
+        // The restored conversation is a different content: the calibration learned from the live one does not carry over.
+        *lock_calibration(&self.calibration) = Calibrator::default();
     }
 
     /// The resume note, once: a turn that calls the model takes it, and the next turn gets none. `None` for a
@@ -309,6 +326,10 @@ pub struct LlmAgent {
     attachments: Option<AttachmentStore>,
     /// The models that refused images, by id (see `with_no_vision`).
     no_vision: NoVisionModels,
+    /// The context limit of the model, from the settings (see `LlmSettings::context_limit`).
+    context_limit: Option<u32>,
+    /// The conversation's calibration (see `with_calibration`).
+    calibration: Calibration,
 }
 
 impl LlmAgent {
@@ -347,6 +368,8 @@ impl LlmAgent {
             limits: LimitsSettings::default(),
             attachments: None,
             no_vision: Arc::new(Mutex::new(HashSet::new())),
+            context_limit: settings.context_limit,
+            calibration: Arc::new(Mutex::new(Calibrator::default())),
         }
     }
 
@@ -368,6 +391,13 @@ impl LlmAgent {
     /// would fail first.
     pub fn with_no_vision(mut self, models: NoVisionModels) -> Self {
         self.no_vision = models;
+        self
+    }
+
+    /// The calibration shared with the conversation (see `Conversation::calibration`). Without it, the calibration lasts
+    /// for this agent only. Each reply that reports its prompt size teaches it, and the next request is estimated with it.
+    pub fn with_calibration(mut self, calibration: Calibration) -> Self {
+        self.calibration = calibration;
         self
     }
 
@@ -434,18 +464,18 @@ impl LlmAgent {
         let mut resolver = Resolver::new(self.attachments.as_ref(), &self.conversation_id);
         let messages = self.wire_messages(&system, &mut resolver);
         if !has_image_part(&messages) {
-            return self.finish_call(ctx, self.send(ctx, messages).0);
+            return self.finish_call(ctx, self.send(ctx, &system, messages).0);
         }
         // A model that refused images earlier in this conversation is not asked again: its images are replaced at once.
         if lock_models(&self.no_vision).contains(&self.model) {
             let text_only = self.wire_messages(&system, &mut Resolver::without_images());
-            return self.finish_call(ctx, self.send(ctx, text_only).0);
+            return self.finish_call(ctx, self.send(ctx, &system, text_only).0);
         }
-        match self.send(ctx, messages) {
+        match self.send(ctx, &system, messages) {
             // The model refused the images before any text reached the user: the same request goes once more without them.
             (Err(e), false) if rejects_images(&e) => {
                 let text_only = self.wire_messages(&system, &mut Resolver::without_images());
-                match self.send(ctx, text_only).0 {
+                match self.send(ctx, &system, text_only).0 {
                     Ok(reply) => {
                         lock_models(&self.no_vision).insert(self.model.clone());
                         let reply = self.finish_call(ctx, Ok(reply));
@@ -467,8 +497,11 @@ impl LlmAgent {
     }
 
     /// One request, streamed or waited for, with the "thinking" state around it. Returns the result and whether any
-    /// text was streamed to the user during the call.
-    fn send(&self, ctx: &AgentCtx<'_>, messages: Vec<Value>) -> (Result<AssistantReply, LlmError>, bool) {
+    /// text was streamed to the user during the call. `system` is the system text the messages were built with. The
+    /// context usage of the request is emitted before it is sent, and again with the provider's count if the reply
+    /// reports one (see core/chat/context).
+    fn send(&self, ctx: &AgentCtx<'_>, system: &str, messages: Vec<Value>) -> (Result<AssistantReply, LlmError>, bool) {
+        let breakdown = context::breakdown(system, &self.tools, &messages);
         let req = ChatRequest {
             model: self.model.clone(),
             messages,
@@ -478,6 +511,8 @@ impl LlmAgent {
         let thinking = Cell::new(true);
         let streamed = Cell::new(false);
         ctx.emit(AgentEvent::Thinking { active: true });
+        let before = context::usage(&breakdown, &lock_calibration(&self.calibration), self.context_limit, self.max_tokens);
+        ctx.emit(AgentEvent::ContextUsage(before.clone()));
         let result = if self.stream {
             let mut on_delta = |delta: Delta| {
                 // Reasoning deltas are not shown yet, so they do not end the "thinking" state.
@@ -494,6 +529,13 @@ impl LlmAgent {
             block(llm::complete(&self.client, &self.cfg, &req, &self.cancel))
         };
         stop_thinking(ctx, &thinking);
+        if let Ok(reply) = &result
+            && let Some(actual) = reply.usage.as_ref().map(|usage| usage.prompt_tokens).filter(|&n| n > 0)
+        {
+            let actual = u32::try_from(actual).unwrap_or(u32::MAX);
+            lock_calibration(&self.calibration).observe(breakdown.total(), actual);
+            ctx.emit(AgentEvent::ContextUsage(context::with_actual(&before, actual)));
+        }
         (result, streamed.get())
     }
 
@@ -918,6 +960,10 @@ fn lock_note(m: &Mutex<Option<String>>) -> MutexGuard<'_, Option<String>> {
 }
 
 fn lock_models(m: &Mutex<HashSet<String>>) -> MutexGuard<'_, HashSet<String>> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn lock_calibration(m: &Mutex<Calibrator>) -> MutexGuard<'_, Calibrator> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 

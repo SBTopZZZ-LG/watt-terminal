@@ -64,6 +64,41 @@ describe('transcriptReducer: agent events', () => {
   });
 });
 
+describe('transcriptReducer: context usage', () => {
+  it('a context_usage event is not a transcript item and changes nothing', () => {
+    const before = run([{ type: 'agent_event', event: { type: 'text', text: 'Hi.' } }]);
+    const after = run([
+      { type: 'agent_event', event: { type: 'text', text: 'Hi.' } },
+      {
+        type: 'agent_event',
+        event: {
+          type: 'context_usage',
+          limit: 8000,
+          used: 1234,
+          reserved_output: 4096,
+          trimmed: false,
+          calibrated: true,
+          categories: [{ id: 'system', tokens: 1000 }, { id: 'user', tokens: 234 }],
+        },
+      },
+    ]);
+    expect(after).toEqual(before);
+    expect(after.items.map((i) => i.kind)).toEqual(['agent']);
+  });
+
+  it('a context_usage event with no limit does not disturb a running turn', () => {
+    const t = run([
+      { type: 'user_sent', clientId: 1, text: 'look' },
+      {
+        type: 'agent_event',
+        event: { type: 'context_usage', limit: null, used: 10, reserved_output: 4096, trimmed: false, calibrated: false, categories: [] },
+      },
+    ]);
+    expect(isBusy(t)).toBe(true);
+    expect(t.items.map((i) => i.kind)).toEqual(['user']);
+  });
+});
+
 describe('transcriptReducer: local actions', () => {
   it('a sent message shows as the user, and the turn is busy until done', () => {
     const t = run([{ type: 'user_sent', clientId: 7, text: 'what was the last command' }]);

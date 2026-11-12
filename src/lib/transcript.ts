@@ -278,6 +278,9 @@ function applyAgentEvent(t: Transcript, ev: AgentEvent, at: number | undefined):
       return t;
     case 'todo_update':
       return { ...t, todos: ev.items };
+    // The context meter follows these (not built yet); they are not transcript items.
+    case 'context_usage':
+      return t;
   }
 }
 

@@ -481,7 +481,8 @@ async fn agent_message(
                     .with_resume_note(att.conversation.take_resume_note())
                     .with_checkpoint(checkpoint)
                     .with_limits(limits)
-                    .with_no_vision(att.conversation.no_vision());
+                    .with_no_vision(att.conversation.no_vision())
+                    .with_calibration(att.conversation.calibration());
                 if let Some(persist) = store.as_ref() {
                     agent = agent.with_attachments(persist.conversations.attachments().clone());
                 }
