@@ -106,20 +106,12 @@ describe('Transcript: history button', () => {
 });
 
 describe('Transcript: todo panel', () => {
-  const todos = [{ content: 'plan', status: 'in_progress' as const }];
   const base = { items: [], busy: false, thinking: false, onToggle: () => {}, onApprove: () => {}, onNewConversation: () => {} };
 
-  it('is pinned above the scrolling body, not inside it', () => {
-    const html = renderToStaticMarkup(<Transcript {...base} todos={todos} open />);
-    const panel = html.indexOf('class="todo-panel');
-    expect(panel).toBeGreaterThan(-1);
-    expect(panel).toBeLessThan(html.indexOf('class="transcript-body"'));
-  });
-
-  it('is hidden when the list is empty, and when the chat body is not shown', () => {
-    expect(renderToStaticMarkup(<Transcript {...base} todos={[]} open />)).not.toContain('todo-panel');
-    expect(renderToStaticMarkup(<Transcript {...base} todos={todos} open={false} />)).not.toContain('todo-panel');
-    expect(renderToStaticMarkup(<Transcript {...base} todos={todos} open view="history" history={<div />} />)).not.toContain('todo-panel');
+  // The todo panel sits between the transcript and the context meter, rendered by App (see App.tsx), so it is never in here.
+  it('is not rendered by the transcript, open or not', () => {
+    expect(renderToStaticMarkup(<Transcript {...base} open />)).not.toContain('todo-panel');
+    expect(renderToStaticMarkup(<Transcript {...base} open={false} />)).not.toContain('todo-panel');
   });
 
   it('todo_write rows never render as tool rows', () => {

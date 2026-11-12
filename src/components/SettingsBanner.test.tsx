@@ -52,14 +52,12 @@ describe('Transcript: the banner sits above the chat body, in the chat view only
         onApprove={NOOP}
         onNewConversation={NOOP}
         banner={banner}
-        todos={[{ content: 'a todo', status: 'pending' }]}
       />,
     );
 
-  it('shows above the todo panel and the body', () => {
+  it('shows above the body', () => {
     const out = render();
     expect(out).toContain('BANNER');
-    expect(out.indexOf('BANNER')).toBeLessThan(out.indexOf('todo-panel'));
     expect(out.indexOf('BANNER')).toBeLessThan(out.indexOf('transcript-body'));
   });
 

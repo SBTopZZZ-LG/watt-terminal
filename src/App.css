@@ -516,22 +516,35 @@ input {
 }
 
 /*
- * A fixed size (sized): the transcript takes what the bar leaves, and its body scrolls. Auto top and bottom panels keep
- * the 35vh cap on .transcript-body instead, so they grow with their content up to it.
+ * A fixed size (sized): the transcript takes what the bar, the todo list and the meter leave, and its body scrolls. Auto top
+ * and bottom panels keep the 35vh cap on .transcript-body instead, so they grow with their content up to it.
+ * The transcript's size is the part above the body (--transcript-chrome, measured by Transcript.tsx) plus the body's floor, which is
+ * min(64px, half the transcript) (--transcript-floor: 64px). Solved for the transcript, that is chrome + min(64px, chrome), which
+ * is the least size below. It is also the basis, so the transcript only fills what the todo list leaves, and the todo keeps its
+ * content while the panel has room. The minimum keeps the body at its floor and never clipped. The floor is relative, as it was
+ * before the todo panel, so an expanded context meter still fits a short panel. When the agent panel is tight (data-tight, set
+ * from its overflow, see panelTight.ts) the floor goes and the basis becomes the content: the todo list gives way first, then the
+ * transcript, so the bar and the meter stay inside the panel and the header may be the part that clips.
+ * Its shrink factor is 1 (a sum under 1 would be scaled down by flexbox); the todo's is far larger (see below).
  */
 .agent-panel.is-sized > .transcript {
-  flex: 1 1 auto;
-  min-height: 0;
+  --transcript-floor: 64px;
+  --transcript-least: calc(var(--transcript-chrome, 0px) + min(var(--transcript-floor), var(--transcript-chrome, 0px)));
+  flex: 1 1 var(--transcript-least);
+  min-height: var(--transcript-least);
+  overflow: hidden;
 }
 
-/*
- * The body keeps at least 120px, or half the transcript when that is less. It gives way first when the panel is short
- * (shrink factor 100, against 1 for the todo panel and the header): an expanded todo list then keeps its room until the body
- * is at its floor, and only then does the list shrink. A shrink factor below 1 would be scaled down by flexbox, so it is not used.
- */
+.agent-panel.is-sized[data-tight] > .transcript {
+  --transcript-floor: 0px;
+  --transcript-least: 0px;
+  flex-basis: auto;
+}
+
+/* A sized panel's body takes the transcript's room after its header and banners, and scrolls inside it. */
 .agent-panel.is-sized .transcript-body {
   flex: 1 100 auto;
-  min-height: min(120px, 50%);
+  min-height: 0;
   max-height: none;
 }
 
@@ -572,6 +585,7 @@ input {
 }
 
 .agent-panel.is-rail > .transcript,
+.agent-panel.is-rail > .todo-panel,
 .agent-panel.is-rail > .bar {
   display: none;
 }
@@ -917,17 +931,20 @@ input {
 }
 
 /*
- * The todo panel, pinned above the body (see TodoPanel.tsx). One line collapsed, the list below when expanded. Tokens only,
- * and no animation, so prefers-reduced-motion has nothing to stop. Text wraps inside the list and ellipsises in the summary.
+ * The todo panel, between the transcript and the context meter (see TodoPanel.tsx). One line collapsed, the list below when
+ * expanded. Tokens only, and no animation, so prefers-reduced-motion has nothing to stop. Text wraps inside the list and
+ * ellipsises in the summary. Its rule is on top: the transcript above it has none, and the meter below has its own top rule.
  */
 /* Collapsed, the panel keeps its line (it never shrinks under its toggle). Expanded, it can shrink, and its list gives way. */
 .todo-panel {
+  --todo-toggle-h: 25px; /* 4px padding, 17px line, 4px padding (.todo-toggle) */
+  --todo-row-h: 21px; /* 2px padding, 17px line, 2px padding (.todo-item) */
   display: flex;
   flex: 0 0 auto;
   flex-direction: column;
   min-width: 0;
   padding: 0 12px;
-  border-bottom: 1px dashed var(--rule);
+  border-top: 1px dashed var(--rule);
   font-size: 12px;
 }
 
@@ -944,6 +961,7 @@ input {
   color: var(--muted);
   font-family: var(--mono);
   font-size: 12px;
+  line-height: 17px;
   text-align: left;
   cursor: pointer;
 }
@@ -966,10 +984,35 @@ input {
   color: var(--ink);
 }
 
-/* Expanded, the panel can shrink: the body takes the squeeze first (see .agent-panel.is-sized .transcript-body), then the list. */
+/*
+ * Expanded, the panel is its content (the list's rows, up to its cap). The gap under the list is here, not in the list: the
+ * list's own padding would count as overflow when it scrolls. In an auto panel nothing squeezes it.
+ */
 .todo-panel.expanded {
   flex: 0 1 auto;
   min-height: 0;
+  padding-bottom: 6px;
+}
+
+/*
+ * In a fixed-size panel the list gives way first: this panel shrinks, its list shrinks inside it, and the transcript only gives
+ * up room after it. The shrink factor is far above the transcript's (1), so the transcript's share of a shortfall is negligible
+ * while this panel can still shrink. The panel keeps its toggle, a 1px border and the 6px gap, and two rows of the list while
+ * it has more than one item. When the panel is tight (data-tight) the two rows and the gap go too: the list shrinks to
+ * nothing, the panel is its toggle and border, and the transcript body gets the room.
+ */
+.agent-panel.is-sized > .todo-panel.expanded {
+  flex: 0 1000000 auto;
+}
+
+.agent-panel.is-sized > .todo-panel.expanded.multi {
+  min-height: calc(var(--todo-toggle-h) + 7px + 2 * var(--todo-row-h));
+}
+
+.agent-panel.is-sized[data-tight] > .todo-panel.expanded,
+.agent-panel.is-sized[data-tight] > .todo-panel.expanded.multi {
+  min-height: calc(var(--todo-toggle-h) + 1px);
+  padding-bottom: 0;
 }
 
 /* Everything completed: the summary drops to the dim colour, so it reads as a note rather than a task. */
@@ -989,20 +1032,29 @@ input {
 
 /*
  * Capped (inline, by TodoPanel: 40% of the agent panel, 180px at most), with its own scroll, so a long list does not take the
- * transcript. It is a shrinkable flex child: in a sized panel it gives up room to the body (whose min-height keeps the messages
- * visible), and scrolls inside what it keeps. Positioned, so its rows' offsetTop is measured from the list (the scroll origin).
+ * transcript. It is a shrinkable flex child: in a sized panel it gives up room first (see .agent-panel.is-sized > .todo-panel),
+ * and scrolls inside what it keeps. Positioned, so its rows' offsetTop is measured from the list (the scroll origin).
+ * Overflow is hidden until TodoPanel finds the rows taller than the box (.is-scrollable), so a list that fits shows no bar.
+ * No padding here: the gap under the list is on the panel (.todo-panel.expanded).
  */
 .todo-list {
   position: relative;
   flex: 0 1 auto;
   min-height: 0;
   margin: 0;
-  padding: 0 0 6px;
+  padding: 0;
   list-style: none;
-  overflow-y: auto;
+  overflow-y: hidden;
   overflow-wrap: anywhere;
+  scrollbar-width: thin;
+  scrollbar-color: var(--rule-strong) transparent;
 }
 
+.todo-list.is-scrollable {
+  overflow-y: auto;
+}
+
+/* Whole-pixel rows (2 + 17 + 2 = 21px), so the list's content height is an integer and never rounds into a scrollbar. */
 .todo-item {
   position: relative;
   display: flex;
@@ -1010,6 +1062,7 @@ input {
   align-items: flex-start;
   min-width: 0;
   padding: 2px 0;
+  line-height: 17px;
   color: var(--ink);
 }
 

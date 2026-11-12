@@ -13,23 +13,18 @@ import { interactiveHeader } from '../lib/interactive';
 import { isDeclinedIntegration } from '../lib/integrate';
 import { groupTranscript, toolGroupSummary } from '../lib/toolGroups';
 import type { GroupItem, InteractiveGroup, TranscriptEntry } from '../lib/toolGroups';
-import type { TodoItem } from '../lib/types';
 import { visibleEscapes } from '../lib/visibleEscapes';
 import { Markdown } from './Markdown';
-import { TodoPanel } from './TodoPanel';
+import { chatBodyShown } from '../lib/panelLayout';
+import { settleTight } from '../lib/panelTight';
 import type { Dock } from '../lib/panelLayout';
 import wattMark from '../assets/watt-mark.png';
-
-/** The default for `todos`, so the prop can be left out. A constant, so it is not a new array on every render. */
-const NO_TODOS: TodoItem[] = [];
 
 interface Props {
   items: TranscriptItem[];
   busy: boolean;
   /** The model is working and has not produced output yet. */
   thinking: boolean;
-  /** The conversation's todo list. The panel above the body shows it; empty hides the panel. */
-  todos?: TodoItem[];
   open: boolean;
   onToggle: () => void;
   onApprove: (callId: string, approve: boolean) => void;
@@ -54,7 +49,6 @@ export function Transcript({
   items,
   busy,
   thinking,
-  todos = NO_TODOS,
   open,
   onToggle,
   onApprove,
@@ -68,6 +62,7 @@ export function Transcript({
   warning = null,
 }: Props) {
   const bodyRef = useRef<HTMLDivElement>(null);
+  const sectionRef = useRef<HTMLElement>(null);
   const entries = useMemo(() => groupTranscript(items), [items]);
   /** Whether the view follows new content. A ref, read in effects and handlers, so changing it does not re-render. */
   const following = useRef(true);
@@ -78,7 +73,51 @@ export function Transcript({
   const lastTop = useRef(0);
   const [showJump, setShowJump] = useState(false);
   /** The chat body is on screen. Switching to the history view and back remounts it, like closing and opening the panel. */
-  const bodyShown = open && view === 'chat';
+  const bodyShown = chatBodyShown(open, view);
+
+  // The part above the body (the header and the banners) in px, published as --transcript-chrome. In a sized panel the transcript's
+  // least size is this plus the body's floor (App.css), so the floor holds and the body is never clipped. With no body on screen
+  // (the history view, the panel closed) there is no floor. The agent panel's tight flag is settled here too (panelTight.ts), since
+  // the transcript is always on screen. Re-measured after each render, and a frame after a part above the body, or the panel, changes
+  // size. The measure runs in that frame, so the style change does not trip the observer's loop limit.
+  useLayoutEffect(() => {
+    const section = sectionRef.current;
+    if (!section) {
+      return;
+    }
+    const agent = section.closest<HTMLElement>('.agent-panel');
+    const settle = () => {
+      const body = bodyRef.current;
+      if (body && section.contains(body)) {
+        const chrome = body.getBoundingClientRect().top - section.getBoundingClientRect().top;
+        section.style.setProperty('--transcript-chrome', `${chrome}px`);
+        section.style.removeProperty('--transcript-floor');
+      } else {
+        section.style.setProperty('--transcript-chrome', '0px');
+        section.style.setProperty('--transcript-floor', '0px');
+      }
+      settleTight(agent);
+    };
+    settle();
+    if (typeof ResizeObserver === 'undefined') {
+      return;
+    }
+    const observer = new ResizeObserver(() => requestAnimationFrame(settle));
+    if (agent) {
+      observer.observe(agent);
+      // The panel's other parts (the todo list, the context meter, the bar) change their own heights without a render: the meter's
+      // breakdown opens on its own state. Their size changes settle the flag too.
+      for (const child of Array.from(agent.children)) {
+        observer.observe(child);
+      }
+    }
+    for (const child of Array.from(section.children)) {
+      if (child !== bodyRef.current) {
+        observer.observe(child);
+      }
+    }
+    return () => observer.disconnect();
+  });
 
   // Keyed on the items array, not its length: a streamed delta replaces the last item, and the length stops changing at the cap.
   useLayoutEffect(() => {
@@ -165,7 +204,7 @@ export function Transcript({
   };
 
   return (
-    <section className={`transcript${open ? ' open' : ''}`}>
+    <section ref={sectionRef} className={`transcript${open ? ' open' : ''}`}>
       <div className="transcript-header">
         <button type="button" className="transcript-head" onClick={onToggle}>
           <img className="brand-mark" src={wattMark} width={212} height={256} alt="" aria-hidden="true" />
@@ -190,7 +229,6 @@ export function Transcript({
       {/* Pinned: siblings above the body, so they never scroll away and the body's scroll and follow logic is untouched. */}
       {bodyShown && warning}
       {bodyShown && banner}
-      {bodyShown && <TodoPanel items={todos} />}
       {bodyShown && (
         <div className="transcript-body" ref={bodyRef} tabIndex={-1} onScroll={onScroll} onWheel={onWheel}>
           {items.length === 0 && <div className="empty">Ask the agent something, for example "what was the last command".</div>}

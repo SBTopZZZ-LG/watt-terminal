@@ -7,6 +7,7 @@ import {
   PANEL_MIN,
   STORED_SIZE_MAX,
   TERMINAL_MIN,
+  chatBodyShown,
   clampSize,
   defaultLayout,
   keyboardSize,
@@ -551,5 +552,14 @@ describe('sameLayout', () => {
     expect(sameLayout(a, { ...a, dock: 'left' })).toBe(false);
     expect(sameLayout(a, { ...a, open: false })).toBe(false);
     expect(sameLayout(a, { ...a, sizes: { ...a.sizes, top: 200 } })).toBe(false);
+  });
+});
+
+describe('chatBodyShown', () => {
+  it('shows the chat body only when the panel is open and the view is the chat', () => {
+    expect(chatBodyShown(true, 'chat')).toBe(true);
+    expect(chatBodyShown(false, 'chat')).toBe(false);
+    expect(chatBodyShown(true, 'history')).toBe(false);
+    expect(chatBodyShown(false, 'history')).toBe(false);
   });
 });

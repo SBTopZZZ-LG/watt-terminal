@@ -33,6 +33,17 @@ describe('TodoPanel: a list with unfinished items starts expanded', () => {
     expect(html(LIST)).toMatch(/class="todo-list" style="max-height:180px"/);
   });
 
+  it('the list does not scroll until its rows are measured to be taller than its box (no bar on first paint)', () => {
+    const out = html(LIST);
+    expect(out).toMatch(/class="todo-list" style="max-height:180px"/);
+    expect(out).not.toContain('is-scrollable');
+  });
+
+  it('a list of more than one item is marked multi: in a sized panel it keeps two rows before it gives way to the body', () => {
+    expect(html(LIST)).toMatch(/class="todo-panel expanded multi"/);
+    expect(html([t('only one')])).not.toContain('multi');
+  });
+
   it('the summary carries the full current task in the title, cut when it is long', () => {
     const long = 'y'.repeat(300);
     const out = html([t(long, 'in_progress')]);

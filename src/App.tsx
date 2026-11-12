@@ -13,7 +13,7 @@ import type { AgentRequest, IntegratePhase } from './lib/integrate';
 import { agentControlAfter, borderLevel, NO_CONTROL } from './lib/agentControl';
 import type { AgentControl, BorderLevel } from './lib/agentControl';
 import { EMPTY_TRANSCRIPT, firstPendingApproval, isBusy, transcriptReducer } from './lib/transcript';
-import { isSideDock, loadPanelLayout, panelReducer, panelView, savePanelLayout } from './lib/panelLayout';
+import { chatBodyShown, isSideDock, loadPanelLayout, panelReducer, panelView, savePanelLayout } from './lib/panelLayout';
 import type { Container } from './lib/panelLayout';
 import { defaultSizeStorage } from './lib/zoom';
 import { itemsFromMessages } from './lib/historyView';
@@ -25,6 +25,7 @@ import { recoveryKind } from './lib/settingsRecovery';
 import { TerminalView } from './components/TerminalView';
 import { InputBar } from './components/InputBar';
 import { Transcript } from './components/Transcript';
+import { TodoPanel } from './components/TodoPanel';
 import { ContextMeter } from './components/ContextMeter';
 import { StatusChip } from './components/StatusChip';
 import { FindBar } from './components/FindBar';
@@ -801,7 +802,6 @@ export default function App() {
               items={transcript.items}
               busy={busy}
               thinking={transcript.thinking}
-              todos={transcript.todos}
               open={panel.open}
               onToggle={() => dispatchPanel({ type: 'toggle' })}
               onApprove={answer}
@@ -842,6 +842,7 @@ export default function App() {
                 ) : null
               }
             />
+            {chatBodyShown(panel.open, panelBody) && <TodoPanel items={transcript.todos} />}
             <ContextMeter usage={transcript.context} />
             <InputBar
               mode={barMode}

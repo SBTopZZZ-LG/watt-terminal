@@ -66,6 +66,14 @@ export function isSideDock(dock: Dock): boolean {
   return dock === 'left' || dock === 'right';
 }
 
+/**
+ * Whether the chat body is on screen: the panel is open and the view is the chat, not the history. The transcript's body and
+ * banners follow it, and so does the todo panel, which sits under the transcript. Closed, or in the history view, all are hidden.
+ */
+export function chatBodyShown(open: boolean, view: 'chat' | 'history'): boolean {
+  return open && view === 'chat';
+}
+
 function isDock(value: unknown): value is Dock {
   return typeof value === 'string' && (DOCKS as readonly string[]).includes(value);
 }
