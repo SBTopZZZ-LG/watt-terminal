@@ -6,6 +6,8 @@
 
 *Whatever Agentic Terminal Thing.*
 
+[![CI](https://github.com/SBTopZZZ-LG/watt-terminal/actions/workflows/ci.yml/badge.svg)](https://github.com/SBTopZZZ-LG/watt-terminal/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A macOS terminal where you and an AI agent share one persistent shell session. You type commands as you always do. The agent sees the same session (commands, output, screen, working directory) and can run commands in it, with your approval. Built with Tauri v2, Rust, React and TypeScript, with xterm.js for rendering.
 
 <p align="center">
