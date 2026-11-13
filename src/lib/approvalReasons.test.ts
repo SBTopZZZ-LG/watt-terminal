@@ -34,6 +34,12 @@ describe('askedBecause', () => {
     expect(askedBecause('gate_path')).toContain('your rules do not apply');
   });
 
+  it('says approving send_keys latches typing until the user types, not that every keystroke needs approval', () => {
+    expect(askedBecause('send_keys')).toBe(
+      'Asked because approving lets the agent keep typing into that command until you type in the terminal.',
+    );
+  });
+
   it('is null without a reason', () => {
     expect(askedBecause(null)).toBeNull();
     expect(askedBecause(undefined)).toBeNull();

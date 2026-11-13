@@ -3,7 +3,9 @@
 //! Channels, per session: `on_data` carries raw PTY bytes (`InvokeResponseBody::Raw`, which the frontend
 //! receives as an ArrayBuffer) and must be acknowledged with `ack`. `on_events` carries JSON objects:
 //! session events (`state`, `integration`, `observer`, `cwd`, `record_started`, `record_finished`) and
-//! agent events (`text`, `tool_call`, `tool_result`, `approval_request`, `agent_control`, `done`), told apart by `type`.
+//! agent events (`text`, `text_delta`, `thinking`, `tool_call`, `tool_result`, `approval_request`,
+//! `question_request`, `integration_request`, `todo_update`, `context_usage`, `agent_control`, `notice`, `done`),
+//! told apart by `type`.
 
 use std::io;
 use std::path::PathBuf;
@@ -84,7 +86,9 @@ impl Channels {
 }
 
 /// Raw output to the terminal. With no window attached the bytes are dropped; the gate is then never
-/// acked for them, which only matters after a webview reload that loses more than the 2 MiB window.
+/// acked for them. Losing more than 512 KiB while detached is enough to set up the hang (the stale
+/// unacked count plus a later burst trips the 2 MiB pause with no acks coming); `attach_or_spawn`
+/// resets the gate on re-attach to clear it.
 struct RawSink(Arc<Channels>);
 
 impl OutputSink for RawSink {
@@ -115,6 +119,9 @@ pub struct Attached {
     turn_cancel: Mutex<Option<Arc<TurnCancel>>>,
     /// The conversation: its id (sent to the provider) and its history. `new_conversation` resets it.
     conversation: Conversation,
+    /// The project instructions already announced: the workspace root path and the rules text. A turn whose
+    /// loaded pair differs announces itself with an `AgentEvent::Notice`; a repeat stays quiet.
+    project_rules_seen: Mutex<Option<(String, String)>>,
 }
 
 impl Attached {
@@ -131,6 +138,40 @@ impl Attached {
     /// Cancels the running turn, if any, and denies its pending approvals. Harmless when no turn is running.
     fn cancel_turn(&self) {
         agent::cancel_turn(&self.turn_cancel, &self.approvals);
+    }
+
+    /// Whether the terminal's Ctrl-C belongs to the agent's turn, and so cancels it. Never when the agent is not
+    /// busy. Always when the agent holds the shell (a shell-acting call, or its own command on top). Otherwise
+    /// only at an idle prompt of the local shell (Prompt, Continuation, Submitted with no nested levels), where
+    /// Ctrl-C can only clear the line: a Ctrl-C typed into the user's own running command, the alternate screen,
+    /// a nested prompt, raw mode or a dead session stays with the shell.
+    fn interrupt_cancels_turn(&self) -> bool {
+        Self::interrupt_cancels(
+            self.agent_busy.load(Ordering::SeqCst),
+            self.agent_control.load(Ordering::SeqCst),
+            self.session.open_agent_records().iter().any(|r| r.on_top),
+            self.session.state(),
+            self.session.levels().len(),
+        )
+    }
+
+    /// The decision half of `interrupt_cancels_turn`, split out so the matrix is unit-testable without a live
+    /// session. `levels` is the count from `Session::levels`, which always includes the local shell: more than
+    /// one means a nested shell holds the prompt.
+    fn interrupt_cancels(
+        agent_busy: bool,
+        agent_control: bool,
+        agent_on_top: bool,
+        state: InputState,
+        levels: usize,
+    ) -> bool {
+        if !agent_busy {
+            return false;
+        }
+        if agent_control || agent_on_top {
+            return true;
+        }
+        matches!(state, InputState::Prompt | InputState::Continuation | InputState::Submitted) && levels <= 1
     }
 
     /// Marks the agent busy and installs the turn's cancel token. Returns the conversation's history, todo list and id for
@@ -295,11 +336,12 @@ async fn start_session(
     on_events: Channel<Value>,
     reg: State<'_, Reg>,
 ) -> Result<StartResult, String> {
-    attach_or_spawn(&reg, &session_id, &session_id, rows, cols, on_data, on_events)
+    attach_or_spawn(&reg, &session_id, &session_id, rows, cols, on_data, on_events, None)
 }
 
 /// Starts a new shell when the session has exited: the dead session is removed and a fresh one spawned, with a new
-/// nonce. Otherwise this is start_session (idempotent).
+/// nonce and the old conversation carried over, so the transcript the frontend keeps still matches the backend.
+/// Otherwise this is start_session (idempotent).
 #[tauri::command]
 async fn restart_session(
     session_id: String,
@@ -310,13 +352,31 @@ async fn restart_session(
     reg: State<'_, Reg>,
 ) -> Result<StartResult, String> {
     // Checked and removed under the registry lock, so two restarts cannot each remove the other's new session.
-    drop(reg.remove_if(&session_id, |att| att.session.state() == InputState::Exited));
+    let old = reg.remove_if(&session_id, |att| att.session.state() == InputState::Exited);
+    // The old turn may still be running: keep it cancelled (its approvals are denied and its `run_command` stops
+    // waiting), then wait for it to end so the carried conversation is final. Past the bound the restart goes on
+    // anyway with whatever the conversation holds.
+    let carry = match old {
+        Some(old) => {
+            old.cancel_turn();
+            for _ in 0..200 {
+                if !old.agent_busy.load(Ordering::SeqCst) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Some(old.conversation.follow())
+        }
+        None => None,
+    };
     // A new shim directory name: the dead session's drop removes its own directory, which must not be the new one.
     let shim_id = format!("{session_id}-{}", RESTARTS.fetch_add(1, Ordering::SeqCst));
-    attach_or_spawn(&reg, &session_id, &shim_id, rows, cols, on_data, on_events)
+    attach_or_spawn(&reg, &session_id, &shim_id, rows, cols, on_data, on_events, carry)
 }
 
 /// Attaches to `session_id`, spawning its shell first if there is none. `shim_id` names the shim directory on spawn.
+/// `carry` is the conversation a restarted session continues with; a fresh spawn starts a new one.
+#[allow(clippy::too_many_arguments)]
 fn attach_or_spawn(
     reg: &Reg,
     session_id: &str,
@@ -325,6 +385,7 @@ fn attach_or_spawn(
     cols: u16,
     on_data: Channel<InvokeResponseBody>,
     on_events: Channel<Value>,
+    carry: Option<Conversation>,
 ) -> Result<StartResult, String> {
     let mut pending = Some((on_data, on_events));
     let (att, spawned) = reg.get_or_insert_with(session_id, || -> Result<Attached, String> {
@@ -334,6 +395,10 @@ fn attach_or_spawn(
         let cfg = SpawnConfig { rows, cols, real_zdotdir: None, histfile: dev_histfile() };
         let session = Session::spawn(shim_id, cfg, Box::new(RawSink(channels.clone()))).map_err(io_err)?;
         session.set_event_sink(Arc::new(EventsSink(channels.clone())));
+        let conversation = match carry {
+            Some(conversation) => conversation,
+            None => Conversation::new().map_err(io_err)?,
+        };
         Ok(Attached {
             session,
             channels,
@@ -341,13 +406,28 @@ fn attach_or_spawn(
             agent_busy: AtomicBool::new(false),
             agent_control: AtomicBool::new(false),
             turn_cancel: Mutex::new(None),
-            conversation: Conversation::new().map_err(io_err)?,
+            conversation,
+            project_rules_seen: Mutex::new(None),
         })
     })?;
     if let Some((data, events)) = pending.take() {
-        att.channels.attach(data, events);
+        reattach_channels(&att.channels, data, events, || att.session.reset_flow_control());
     }
     Ok(StartResult { spawned, nonce: att.session.nonce().to_string() })
+}
+
+/// Swaps in the re-attached frontend's channels, then resets flow control so bytes the dead channel
+/// never acked cannot keep the pump paused. Runs only on re-attach (`pending` is still Some);
+/// initial spawn starts with a fresh gate. The reset runs after the swap, so newly rendered output
+/// is acked against a clean count.
+fn reattach_channels(
+    channels: &Arc<Channels>,
+    data: Channel<InvokeResponseBody>,
+    events: Channel<Value>,
+    reset_flow_control: impl FnOnce(),
+) {
+    channels.attach(data, events);
+    reset_flow_control();
 }
 
 #[tauri::command]
@@ -361,14 +441,17 @@ fn resize(session_id: String, rows: u16, cols: u16, reg: State<'_, Reg>) -> Resu
     session(&reg, &session_id)?.session.resize(rows, cols).map_err(io_err)
 }
 
-/// Keystrokes from the terminal, as text (sent as UTF-8). Ctrl-C also cancels the running agent turn and pending approvals.
+/// Keystrokes from the terminal, as text (sent as UTF-8). The terminal's Ctrl-C also cancels the running agent
+/// turn and its pending approvals, but only when it belongs to the agent (see `interrupt_cancels_turn`): a Ctrl-C
+/// typed into the user's own command stays with the shell.
 #[tauri::command]
 fn write_user(session_id: String, text: String, reg: State<'_, Reg>) -> Result<(), String> {
     let att = session(&reg, &session_id)?;
-    if text.contains('\u{3}') {
+    let interrupt = text.contains('\u{3}') && att.interrupt_cancels_turn();
+    if interrupt {
         att.cancel_turn();
     }
-    agent::user_input(&att.session, &att.approvals, &text).map_err(io_err)
+    agent::user_input(&att.session, &att.approvals, &text, interrupt).map_err(io_err)
 }
 
 /// Cancels the running agent turn, if any: its pending approvals are denied and its `run_command` stops waiting.
@@ -458,11 +541,12 @@ async fn agent_message(
     let att = session(&reg, &session_id)?;
     // The project instructions come from the session's live working directory, read once before the
     // turn starts. Anything unreadable just means no rules; it never fails the turn.
-    let project_rules = att
+    let project_rooted_rules = att
         .session
         .cwd()
         .and_then(|cwd| workspace_root_for_cwd(&app, &cwd))
-        .and_then(|root| instructions::load(&root));
+        .and_then(|root| instructions::load(&root).map(|rules| (root, rules)));
+    let project_rules = project_rooted_rules.as_ref().map(|(_, rules)| rules.clone());
     let prepared = prepare(&attachments.unwrap_or_default())?;
     // Reading a saved model touches the Keychain, so it runs on the blocking pool.
     let service = settings.0.clone();
@@ -475,6 +559,17 @@ async fn agent_message(
     .await?;
     let cancel = Arc::new(TurnCancel::new());
     let (history, todos, conversation_id) = att.begin_turn(&cancel)?;
+    // Announced once per root and rules text: a repeat stays quiet, and no file means no notice.
+    // Never stored in the history; the rules themselves ride the turn's system message only.
+    if let Some((root, rules)) = project_rooted_rules.as_ref() {
+        let seen = (root.display().to_string(), rules.clone());
+        if lock(&att.project_rules_seen).as_ref() != Some(&seen) {
+            *lock(&att.project_rules_seen) = Some(seen);
+            att.channels.send_json(&AgentEvent::Notice {
+                text: format!("Using project instructions from {}/AGENTS.md", root.display()),
+            });
+        }
+    }
     let store = persist.0.clone();
     // Only the LLM agent writes history, so only its turns are saved. The mock agent never touches the history, and it
     // ignores attachments.
@@ -757,7 +852,8 @@ fn project_commands_dir(app: &tauri::AppHandle, cwd: &Cwd) -> Option<PathBuf> {
 }
 
 /// Integrates the shell in the foreground (ssh, a nested shell, a container exec) as a new level. The handshake waits for
-/// the shell, so it runs on the blocking pool. See `Session::integrate_shell`. Nothing calls it from the UI yet (B4).
+/// the shell, so it runs on the blocking pool. See `Session::integrate_shell`. Called from the UI's Integrate dialog;
+/// the agent's `request_integration` tool integrates through the session instead (see `SessionTools::integrate_shell`).
 #[tauri::command]
 async fn integrate_shell(session_id: String, reg: State<'_, Reg>) -> Result<IntegrateOutcome, String> {
     let att = session(&reg, &session_id)?;
@@ -906,6 +1002,47 @@ async fn ask_btw(
         .await;
     drop(end);
     answer
+}
+
+/// Suggests a title for the live conversation: one model call outside a turn, never touching stored history or
+/// the transcript. Reserves the turn slot, so a second call is refused while one runs, and Ctrl-C/`cancel_agent`
+/// aborts it through the reserved turn's cancel token. Refused when the history has no user message yet, and when
+/// the model's reply cleans to nothing.
+#[tauri::command]
+async fn suggest_name(
+    session_id: String,
+    reg: State<'_, Reg>,
+    settings: State<'_, SettingsState>,
+) -> Result<String, String> {
+    let att = session(&reg, &session_id)?;
+    let cancel = Arc::new(TurnCancel::new());
+    let (history, _, old_id) = att.begin_turn(&cancel)?;
+    // Ends the turn on every return; dropped explicitly before success.
+    let end = OnDrop::new({ let att = att.clone(); move || att.end_turn() });
+    // The snapshot leaves the locks before any await.
+    let snapshot = lock(&history).snapshot();
+    let limit = lock(&att.conversation.last_usage()).clone().and_then(|u| u.limit);
+    let context = side::conversation_context(&snapshot, side::budget_chars(limit, 64));
+    if context.is_empty() {
+        return Err("There is nothing to name yet.".into());
+    }
+    // Reading a saved model touches the Keychain, so it runs on the blocking pool.
+    let service = settings.0.clone();
+    let (llm_settings, client) = blocking(move || {
+        let chosen =
+            choose_llm(service.as_deref())?.ok_or_else(|| "No model is configured. Add one in Settings.".to_string())?;
+        let client = agent_loop::shared_client().cloned()?;
+        Ok((chosen.0, client))
+    })
+    .await?;
+    let mut messages = context;
+    messages.push(json!({"role": "user", "content": "Name this conversation."}));
+    let reply = SideCall::new(&client, &llm_settings, &old_id, 64, cancel)
+        .ask(side::TITLE_SYSTEM, messages, Duration::from_secs(90))
+        .await;
+    drop(end);
+    let reply = reply?;
+    side::clean_title(&reply).ok_or_else(|| "the provider returned an unusable title".to_string())
 }
 
 /// Replaces the live conversation with a summary of itself: one model call outside a turn, saved as a new conversation
@@ -1371,6 +1508,7 @@ pub fn run() {
             cancel_agent,
             new_conversation,
             ask_btw,
+            suggest_name,
             compact_conversation,
             fork_conversation,
             approve_tool,
@@ -1415,4 +1553,107 @@ pub fn run() {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reattach_swaps_channels_and_resets_flow_control() {
+        let channels = Arc::new(Channels::default());
+        assert!(lock(&channels.data).is_none(), "no data channel before re-attach");
+        assert!(lock(&channels.events).is_none(), "no events channel before re-attach");
+        let data: Channel<InvokeResponseBody> = Channel::new(|_| Ok(()));
+        let events: Channel<Value> = Channel::new(|_| Ok(()));
+        let mut resets = 0;
+        reattach_channels(&channels, data, events, || resets += 1);
+        assert_eq!(resets, 1, "the re-attach path resets flow control");
+        assert!(lock(&channels.data).is_some(), "re-attach swaps the data channel");
+        assert!(lock(&channels.events).is_some(), "re-attach swaps the events channel");
+    }
+
+    #[test]
+    fn reattach_resets_only_after_the_channels_are_swapped() {
+        let channels = Arc::new(Channels::default());
+        let data: Channel<InvokeResponseBody> = Channel::new(|_| Ok(()));
+        let events: Channel<Value> = Channel::new(|_| Ok(()));
+        let swapped_at_reset = Mutex::new(None);
+        let probe = channels.clone();
+        reattach_channels(&channels, data, events, || {
+            *swapped_at_reset.lock().unwrap() = Some(lock(&probe.data).is_some());
+        });
+        assert_eq!(*swapped_at_reset.lock().unwrap(), Some(true), "reset runs after the channel swap");
+    }
+
+    /// The terminal's Ctrl-C cancels the agent's turn only when it belongs to the agent (see
+    /// `Attached::interrupt_cancels_turn`). Without a busy agent it never does, whatever the shell shows.
+    #[test]
+    fn interrupt_never_cancels_without_a_busy_agent() {
+        for state in [
+            InputState::Booting,
+            InputState::Prompt,
+            InputState::Submitted,
+            InputState::Running,
+            InputState::Continuation,
+            InputState::Unresponsive,
+            InputState::Alt,
+            InputState::Raw,
+            InputState::Exited,
+        ] {
+            assert!(!Attached::interrupt_cancels(false, false, false, state, 1), "idle agent at {state:?}");
+            assert!(!Attached::interrupt_cancels(false, true, true, state, 1), "idle agent at {state:?}");
+        }
+    }
+
+    /// While the agent holds the shell (a shell-acting call, or its own command on top), the terminal's Ctrl-C
+    /// is the agent's interrupt: it cancels whatever the shell shows, even a nested prompt or a user command.
+    #[test]
+    fn interrupt_cancels_whenever_the_agent_holds_the_shell() {
+        for state in [
+            InputState::Booting,
+            InputState::Prompt,
+            InputState::Submitted,
+            InputState::Running,
+            InputState::Continuation,
+            InputState::Unresponsive,
+            InputState::Alt,
+            InputState::Raw,
+            InputState::Exited,
+        ] {
+            assert!(Attached::interrupt_cancels(true, true, false, state, 1), "agent control at {state:?}");
+            assert!(Attached::interrupt_cancels(true, true, false, state, 3), "agent control nested at {state:?}");
+            assert!(Attached::interrupt_cancels(true, false, true, state, 1), "agent command on top at {state:?}");
+            assert!(Attached::interrupt_cancels(true, false, true, state, 3), "agent command on top nested at {state:?}");
+        }
+    }
+
+    /// Otherwise only an idle prompt of the local shell counts: there Ctrl-C can only clear the line. The user's
+    /// own running command, the alternate screen, a nested prompt, raw mode and a dead session keep the Ctrl-C.
+    #[test]
+    fn interrupt_cancels_only_at_idle_local_prompts() {
+        // (state, levels, cancels)
+        for (state, levels, cancels) in [
+            (InputState::Prompt, 1, true),
+            (InputState::Continuation, 1, true),
+            (InputState::Submitted, 1, true),
+            (InputState::Prompt, 2, false),
+            (InputState::Prompt, 3, false),
+            (InputState::Continuation, 2, false),
+            (InputState::Submitted, 2, false),
+            (InputState::Running, 1, false),
+            (InputState::Booting, 1, false),
+            (InputState::Unresponsive, 1, false),
+            (InputState::Unresponsive, 2, false),
+            (InputState::Alt, 1, false),
+            (InputState::Raw, 1, false),
+            (InputState::Exited, 1, false),
+        ] {
+            assert_eq!(
+                Attached::interrupt_cancels(true, false, false, state, levels),
+                cancels,
+                "busy agent, no control, no command on top at {state:?} with {levels} level(s)"
+            );
+        }
+    }
 }

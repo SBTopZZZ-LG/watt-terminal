@@ -22,6 +22,9 @@ pub const OSC_CAP: usize = 4096;
 pub const RETIRED_CAP: usize = 16;
 /// Longest value kept from a 633;Hello text field (sh, ver, user, host). Longer values are cut.
 pub const HELLO_FIELD_CAP: usize = 255;
+/// Longest CSI parameter string kept while deciding `ScreenClear`. A real clear is at most `1;1`,
+/// so anything longer can never match and stops being tracked.
+pub const CSI_PARAM_CAP: usize = 16;
 /// Longest token or shell name taken from a 633;Ready. A longer value, or any byte outside [A-Za-z0-9], drops the Ready.
 pub const READY_FIELD_CAP: usize = 64;
 
@@ -56,6 +59,9 @@ pub enum Event {
     Cwd { host: String, path: String },
     /// CSI ... r (DECSTBM). vt100 does not report rows scrolled inside a region, so records are marked approximate.
     ScrollRegion,
+    /// CSI 2J/3J (erase the display) or CUP home (H with no params or `1;1`). The cleared output is missing,
+    /// so records are marked approximate, like `ScrollRegion`. Private CSI (`?`, `>`, intermediates) never counts.
+    ScreenClear,
 }
 
 /// An event and the index just past its terminator, relative to the slice given to `feed`. `level` is the key of the
@@ -85,6 +91,8 @@ pub struct Scanner {
     state: State,
     buf: Vec<u8>,
     osc_overflow: bool,
+    /// CSI parameter bytes (`0-9;`) seen since `ESC [`, while still plain. Decides `ScreenClear` at the final byte.
+    csi: Vec<u8>,
     forged: u64,
     stale: u64,
 }
@@ -97,6 +105,7 @@ impl Scanner {
             state: State::Ground,
             buf: Vec::new(),
             osc_overflow: false,
+            csi: Vec::new(),
             forged: 0,
             stale: 0,
         }
@@ -138,6 +147,7 @@ impl Scanner {
         self.state = State::Ground;
         self.buf.clear();
         self.osc_overflow = false;
+        self.csi.clear();
     }
 
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<Found> {
@@ -165,7 +175,10 @@ impl Scanner {
                         self.osc_overflow = false;
                         State::Osc
                     }
-                    b'[' => State::Csi { plain: true },
+                    b'[' => {
+                        self.csi.clear();
+                        State::Csi { plain: true }
+                    }
                     ESC => State::Esc,
                     _ => State::Ground,
                 };
@@ -205,12 +218,22 @@ impl Scanner {
             },
             State::Csi { plain } => match b {
                 ESC => {
+                    self.csi.clear();
                     self.state = State::Esc;
                     None
                 }
                 0x30..=0x3f => {
                     let param = b.is_ascii_digit() || b == b';';
-                    self.state = State::Csi { plain: plain && param };
+                    let mut next_plain = plain && param;
+                    if next_plain {
+                        if self.csi.len() < CSI_PARAM_CAP {
+                            self.csi.push(b);
+                        } else {
+                            // Longer than any clear: stop tracking so it can never match one.
+                            next_plain = false;
+                        }
+                    }
+                    self.state = State::Csi { plain: next_plain };
                     None
                 }
                 0x20..=0x2f => {
@@ -219,7 +242,14 @@ impl Scanner {
                 }
                 0x40..=0x7e => {
                     self.state = State::Ground;
-                    (plain && b == b'r').then_some((Event::ScrollRegion, None))
+                    let event = match (plain, b) {
+                        (true, b'r') => Some(Event::ScrollRegion),
+                        (true, b'J') if self.csi == b"2" || self.csi == b"3" => Some(Event::ScreenClear),
+                        (true, b'H') if self.csi.is_empty() || self.csi == b"1;1" => Some(Event::ScreenClear),
+                        _ => None,
+                    };
+                    self.csi.clear();
+                    event.map(|event| (event, None))
                 }
                 _ => None,
             },
@@ -584,6 +614,30 @@ mod tests {
         assert_eq!(events(b"\x1b[r"), vec![Event::ScrollRegion]);
         assert!(events(b"\x1b[?1049h").is_empty());
         assert!(events(b"\x1b[2;3H").is_empty());
+    }
+
+    #[test]
+    fn full_screen_clears_are_detected_but_private_and_other_csi_are_not() {
+        assert_eq!(events(b"\x1b[2J"), vec![Event::ScreenClear]);
+        assert_eq!(events(b"\x1b[3J"), vec![Event::ScreenClear]);
+        assert_eq!(events(b"\x1b[H"), vec![Event::ScreenClear]);
+        assert_eq!(events(b"\x1b[1;1H"), vec![Event::ScreenClear]);
+        assert!(events(b"\x1b[?2J").is_empty(), "private CSI is never a clear");
+        assert!(events(b"\x1b[1;2H").is_empty());
+        assert!(events(b"\x1b[31m").is_empty());
+        // A clear split across reads still reports once.
+        let mut sc = Scanner::new(NONCE);
+        assert!(sc.feed(b"\x1b[2").is_empty());
+        let got: Vec<Event> = sc.feed(b"J").into_iter().map(|f| f.event).collect();
+        assert_eq!(got, vec![Event::ScreenClear]);
+    }
+
+    #[test]
+    fn reset_drops_a_partial_csi_sequence() {
+        let mut sc = Scanner::new(NONCE);
+        sc.feed(b"\x1b[2");
+        sc.reset();
+        assert!(sc.feed(b"J").is_empty(), "the buffered `2` must not pair with a later `J`");
     }
 
     #[test]

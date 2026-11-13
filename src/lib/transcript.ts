@@ -405,6 +405,8 @@ function applyAgentEvent(t: Transcript, ev: AgentEvent, at: number | undefined):
       return t;
     case 'todo_update':
       return { ...t, todos: ev.items };
+    case 'notice':
+      return add(t, (id) => ({ id, kind: 'notice', text: ev.text, muted: true }));
     case 'context_usage':
       return contextUsage(t, ev);
   }

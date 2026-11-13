@@ -648,7 +648,7 @@ impl AgentTools for SessionTools<'_> {
 
     fn send_keys_precheck(&self, plan: &KeyPlan) -> Result<SendTarget, String> {
         self.keys_budget()?;
-        self.keys_target_checked(plan.record)
+        self.keys_target_checked(plan.record, plan.is_interrupt_only())
     }
 
     fn user_writes(&self) -> u64 {
@@ -657,7 +657,7 @@ impl AgentTools for SessionTools<'_> {
 
     fn send_keys(&self, plan: &KeyPlan, record: Option<u64>, expected_level: Option<u64>) -> Result<SendKeysOutcome, String> {
         self.keys_budget()?;
-        let target = self.keys_target_checked(record)?;
+        let target = self.keys_target_checked(record, plan.is_interrupt_only())?;
         let before = self.session.activity().screen_gen;
         let started = Instant::now();
         // The writer checks the target again, under the lock, and binds the bytes to it: a command that changed since the
@@ -705,10 +705,12 @@ impl SessionTools<'_> {
         Ok(())
     }
 
-    /// The command `send_keys` may type into now, read under one lock, and the password refusal. The text is the model's.
-    fn keys_target_checked(&self, record: Option<u64>) -> Result<SendTarget, String> {
+    /// The command `send_keys` may type into now, read under one lock, and the password refusal. An interrupt-only
+    /// plan (only Ctrl-C, Ctrl-D or Esc, no text) skips the password refusal but still resolves the target: it can
+    /// only stop or leave the command, never type a secret into it.
+    fn keys_target_checked(&self, record: Option<u64>, interrupt_only: bool) -> Result<SendTarget, String> {
         let id = self.session.send_keys_target(record).map_err(|refusal| refusal.to_string())?;
-        if screen_waits_for_input(&self.session.screen_snapshot().rows) {
+        if !interrupt_only && screen_waits_for_input(&self.session.screen_snapshot().rows) {
             return Err(KEYS_PASSWORD_REFUSAL.to_string());
         }
         let command = self.session.open_agent_records().into_iter().find(|r| r.id == id).map(|r| r.command).unwrap_or_default();

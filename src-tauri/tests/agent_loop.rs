@@ -748,7 +748,7 @@ fn the_command_past_the_per_turn_cap_gets_the_limit_error() {
 
 #[test]
 fn the_model_call_cap_stops_the_turn_and_runs_nothing_after_it() {
-    let scripts: Vec<Script> = (1..=MAX_MODEL_CALLS)
+    let scripts: Vec<Script> = (1..=(MAX_MODEL_CALLS + 1))
         .map(|n| Script::json(tool_reply(&[(&format!("call_{n}"), "get_cwd", "{}")])))
         .collect();
     let provider = serve(scripts);
@@ -757,8 +757,8 @@ fn the_model_call_cap_stops_the_turn_and_runs_nothing_after_it() {
     let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
     let events = turn(&mut agent, &tools, &no_gate(), "keep looking");
 
-    assert_eq!(provider.requests().len(), MAX_MODEL_CALLS);
-    assert_eq!(tools.reached().len(), MAX_MODEL_CALLS - 1, "the last reply's calls are not run");
+    assert_eq!(provider.requests().len(), MAX_MODEL_CALLS + 1, "the cap lets MAX_MODEL_CALLS replies run");
+    assert_eq!(tools.reached().len(), MAX_MODEL_CALLS, "the last reply's calls are not run");
     assert_eq!(
         texts(&events),
         [format!("I stopped after {MAX_MODEL_CALLS} model calls in one turn. The limit can be changed in Settings > Limits.")]
@@ -775,13 +775,15 @@ fn open_on_top(id: u64) -> OpenAgentRecord {
     OpenAgentRecord { id, call_id: "run-1".into(), command: "sleep 30".into(), age: Duration::from_secs(20), on_top: true }
 }
 
-/// Model calls per turn: a lowered cap stops the turn at that many replies, and the notice names the cap and its value.
+/// Model calls per turn: a lowered cap lets that many replies run and stops the turn at the next one, and the
+/// notice names the cap and its value.
 #[test]
 fn a_lowered_model_call_cap_stops_at_that_many_replies() {
     let provider = serve(vec![
         Script::json(tool_reply(&[("call_1", "get_cwd", "{}")])),
         Script::json(tool_reply(&[("call_2", "get_cwd", "{}")])),
         Script::json(tool_reply(&[("call_3", "get_cwd", "{}")])),
+        Script::json(tool_reply(&[("call_4", "get_cwd", "{}")])),
         Script::json(text_reply("never asked for")),
     ]);
     let conv = Conversation::new().unwrap();
@@ -790,13 +792,13 @@ fn a_lowered_model_call_cap_stops_at_that_many_replies() {
     let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new())).with_limits(limits);
     let events = turn(&mut agent, &tools, &no_gate(), "keep looking");
 
-    assert_eq!(provider.requests().len(), 3, "the third reply reached the cap");
-    assert_eq!(tools.reached(), ["get_cwd", "get_cwd"], "the third reply's call is not run");
+    assert_eq!(provider.requests().len(), 4, "the fourth reply reached the cap");
+    assert_eq!(tools.reached(), ["get_cwd", "get_cwd", "get_cwd"], "the fourth reply's call is not run");
     assert_eq!(
         texts(&events),
         ["I stopped after 3 model calls in one turn. The limit can be changed in Settings > Limits."]
     );
-    assert!(tool_content(&stored(&conv.history()), "call_3").contains("model call limit"));
+    assert!(tool_content(&stored(&conv.history()), "call_4").contains("model call limit"));
     assert_paired(&stored(&conv.history()));
 }
 
@@ -851,6 +853,7 @@ fn polling_replies_stop_at_the_polling_cap() {
         Script::json(tool_reply(&[("call_1", "wait", "{\"seconds\":1}")])),
         Script::json(tool_reply(&[("call_2", "get_screen", "{}")])),
         Script::json(tool_reply(&[("call_3", "wait", "{\"seconds\":1}")])),
+        Script::json(tool_reply(&[("call_4", "wait", "{\"seconds\":1}")])),
         Script::json(text_reply("never asked for")),
     ]);
     let conv = Conversation::new().unwrap();
@@ -860,8 +863,8 @@ fn polling_replies_stop_at_the_polling_cap() {
     let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new())).with_limits(limits);
     let events = turn(&mut agent, &tools, &no_gate(), "watch it");
 
-    assert_eq!(provider.requests().len(), 3, "the third polling reply reached the polling cap");
-    assert_eq!(tools.reached(), ["wait", "get_screen"], "the third reply's call is not run");
+    assert_eq!(provider.requests().len(), 4, "the fourth polling reply reached the polling cap");
+    assert_eq!(tools.reached(), ["wait", "get_screen", "wait"], "the fourth reply's call is not run");
     assert_eq!(
         texts(&events),
         [
@@ -870,18 +873,19 @@ fn polling_replies_stop_at_the_polling_cap() {
         ]
     );
     let msgs = stored(&conv.history());
-    assert!(tool_content(&msgs, "call_3").contains("polling call limit"), "{msgs:?}");
+    assert!(tool_content(&msgs, "call_4").contains("polling call limit"), "{msgs:?}");
     assert_paired(&msgs);
 }
 
 /// A reply with any call that is not a polling call counts toward the model-call cap, not the polling cap. Here the middle reply
-/// mixes a wait with get_cwd, so the cap of two model calls stops the turn at the third reply.
+/// mixes a wait with get_cwd, so the cap of two model calls lets two counted replies run and stops the turn at the fourth reply.
 #[test]
 fn a_mixed_reply_counts_as_a_model_call() {
     let provider = serve(vec![
         Script::json(tool_reply(&[("call_1", "wait", "{\"seconds\":1}")])),
         Script::json(tool_reply(&[("call_2", "wait", "{\"seconds\":1}"), ("call_3", "get_cwd", "{}")])),
         Script::json(tool_reply(&[("call_4", "get_cwd", "{}")])),
+        Script::json(tool_reply(&[("call_5", "get_cwd", "{}")])),
         Script::json(text_reply("never asked for")),
     ]);
     let conv = Conversation::new().unwrap();
@@ -891,8 +895,8 @@ fn a_mixed_reply_counts_as_a_model_call() {
     let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new())).with_limits(limits);
     let events = turn(&mut agent, &tools, &no_gate(), "watch it");
 
-    assert_eq!(provider.requests().len(), 3);
-    assert_eq!(tools.reached(), ["wait", "wait", "get_cwd"], "the third reply's call is not run");
+    assert_eq!(provider.requests().len(), 4);
+    assert_eq!(tools.reached(), ["wait", "wait", "get_cwd", "get_cwd"], "the fourth reply's call is not run");
     assert_eq!(
         texts(&events),
         ["I stopped after 2 model calls in one turn. The limit can be changed in Settings > Limits."]
@@ -906,6 +910,7 @@ fn a_wait_with_no_agent_command_running_is_a_model_call() {
     let provider = serve(vec![
         Script::json(tool_reply(&[("call_1", "wait", "{\"seconds\":1}")])),
         Script::json(tool_reply(&[("call_2", "wait", "{\"seconds\":1}")])),
+        Script::json(tool_reply(&[("call_3", "wait", "{\"seconds\":1}")])),
         Script::json(text_reply("never asked for")),
     ]);
     let conv = Conversation::new().unwrap();
@@ -914,8 +919,8 @@ fn a_wait_with_no_agent_command_running_is_a_model_call() {
     let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new())).with_limits(limits);
     let events = turn(&mut agent, &tools, &no_gate(), "wait a bit");
 
-    assert_eq!(provider.requests().len(), 2, "the second reply reached the model-call cap");
-    assert_eq!(tools.reached(), ["wait"]);
+    assert_eq!(provider.requests().len(), 3, "the third reply reached the model-call cap");
+    assert_eq!(tools.reached(), ["wait", "wait"], "the third reply's call is not run");
     assert_eq!(
         texts(&events),
         ["I stopped after 2 model calls in one turn. The limit can be changed in Settings > Limits."]
@@ -1719,7 +1724,11 @@ fn the_stored_history_keeps_the_image_and_another_model_is_sent_it() {
 
 #[test]
 fn a_retried_reply_counts_once_against_the_model_call_cap() {
-    let provider = serve(vec![refused_images(), Script::json(tool_reply(&[("call_r", "get_cwd", "{}")]))]);
+    let provider = serve(vec![
+        refused_images(),
+        Script::json(tool_reply(&[("call_r", "get_cwd", "{}")])),
+        Script::json(tool_reply(&[("call_next", "get_cwd", "{}")])),
+    ]);
     let conv = Conversation::new().unwrap();
     let dir = StoreDir::new("cap");
     let store = dir.store();
@@ -1729,9 +1738,9 @@ fn a_retried_reply_counts_once_against_the_model_call_cap() {
         .with_limits(limits);
     let events = turn_message(&mut agent, &FakeTools::default(), &no_gate(), &image_message(&store, &conv, "look", 5));
 
-    // The refused call is not charged; the retry's reply asks for a tool, which is the one charged reply, so the cap of
-    // one is reached there and its call is not run.
-    assert_eq!(provider.requests().len(), 2);
+    // The refused call is not charged; the retry's reply asks for a tool, which is the one charged reply and runs, so
+    // the next reply reaches the cap of one and is not run.
+    assert_eq!(provider.requests().len(), 3);
     assert_eq!(
         texts(&events),
         [NO_VISION.to_string(), "I stopped after 1 model calls in one turn. The limit can be changed in Settings > Limits.".to_string()]

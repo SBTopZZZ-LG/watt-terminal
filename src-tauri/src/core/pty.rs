@@ -71,6 +71,16 @@ impl Gate {
         }
     }
 
+    /// Drops the unacked count and unpauses the pump, waking any waiter. Called when the frontend
+    /// re-attaches: bytes sent to the dead channel were never acked, so the stale count could pause
+    /// the pump forever on the next burst. Safe while the pump waits in `wait_for_room`.
+    pub fn reset(&self) {
+        let mut s = self.lock();
+        s.unacked = 0;
+        s.paused = false;
+        self.cv.notify_all();
+    }
+
     /// Wakes a blocked pump so it can exit (session teardown).
     pub fn close(&self) {
         self.lock().closed = true;
@@ -159,4 +169,55 @@ fn pump(rx: Receiver<ReadMsg>, gate: Arc<Gate>, sink: &mut dyn OutputSink, queue
         queue.push_bytes(batch);
     }
     queue.push_control(ObsMsg::Eof);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn gate_pauses_past_the_high_watermark_and_reset_clears_it() {
+        let gate = Gate::new();
+        gate.sent(HIGH_WATERMARK + 1);
+        {
+            let s = gate.lock();
+            assert!(s.paused, "sent past 2 MiB pauses the pump");
+            assert_eq!(s.unacked, HIGH_WATERMARK + 1);
+        }
+        gate.ack((HIGH_WATERMARK + 1) - (LOW_WATERMARK - 1));
+        {
+            let s = gate.lock();
+            assert!(!s.paused, "acked below 512 KiB resumes the pump");
+            assert_eq!(s.unacked, LOW_WATERMARK - 1);
+        }
+        gate.sent(HIGH_WATERMARK + 1);
+        assert!(gate.lock().paused, "a later burst pauses again on the stale count");
+        gate.reset();
+        {
+            let s = gate.lock();
+            assert_eq!(s.unacked, 0, "reset drops bytes the dead channel never acked");
+            assert!(!s.paused, "reset unpauses the pump");
+        }
+        assert!(gate.wait_for_room(), "reset wakes a waiting pump without closing it");
+    }
+
+    #[test]
+    fn reset_wakes_a_pump_blocked_in_wait_for_room() {
+        let gate = Arc::new(Gate::new());
+        gate.sent(HIGH_WATERMARK + 1);
+        let (tx, rx) = mpsc::channel();
+        let blocked = gate.clone();
+        thread::spawn(move || {
+            let open = blocked.wait_for_room();
+            let _ = tx.send(open);
+        });
+        // Usually enough for the spawned thread to block; harmless if it has not yet:
+        // either way `wait_for_room` must return true once the gate is reset.
+        thread::sleep(Duration::from_millis(50));
+        gate.reset();
+        let open = rx.recv_timeout(Duration::from_secs(2)).expect("blocked pump wakes on reset");
+        assert!(open, "reset wakes without closing");
+    }
 }

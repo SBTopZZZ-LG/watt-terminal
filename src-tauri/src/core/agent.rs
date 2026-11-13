@@ -226,9 +226,10 @@ impl IntegrationGate {
     }
 }
 
-/// Sends user keystrokes to the PTY. Ctrl-C (0x03) also denies every pending approval.
-pub fn user_input(session: &Session, approvals: &ApprovalGate, text: &str) -> io::Result<()> {
-    if text.contains('\u{3}') {
+/// Sends user keystrokes to the PTY. With `interrupt` (the terminal's Ctrl-C belongs to the agent's turn,
+/// see `Attached::interrupt_cancels_turn`), every pending approval is denied too.
+pub fn user_input(session: &Session, approvals: &ApprovalGate, text: &str, interrupt: bool) -> io::Result<()> {
+    if interrupt {
         approvals.cancel_all();
     }
     session.write_user(text.as_bytes())
@@ -328,6 +329,9 @@ pub enum AgentEvent {
     /// The context usage of a model request: emitted before the request is sent, and again with the provider's own count
     /// once a reply reports it. The wire type is `context_usage` (see core/chat/context).
     ContextUsage(ContextUsage),
+    /// A quiet note for the transcript (the project instructions in use, the trim note's backend cousin).
+    /// Shown muted, never stored in the history.
+    Notice { text: String },
     Done,
 }
 
@@ -1144,6 +1148,7 @@ mod tests {
             json!({"type": "tool_result", "call_id": "c1", "name": "run_command", "ok": true, "decision": "auto", "reason": "rule", "result": {"ok": true}})
         );
         assert_eq!(wire(AgentEvent::TextDelta { text: "Hel".into() }), json!({"type": "text_delta", "text": "Hel"}));
+        assert_eq!(wire(AgentEvent::Notice { text: "Using project instructions from /r/AGENTS.md".into() }), json!({"type": "notice", "text": "Using project instructions from /r/AGENTS.md"}));
         assert_eq!(wire(AgentEvent::Thinking { active: true }), json!({"type": "thinking", "active": true}));
         assert_eq!(wire(AgentEvent::Done), json!({"type": "done"}));
         assert_eq!(

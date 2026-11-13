@@ -1136,7 +1136,7 @@ impl Core {
                     self.finish_record(open, Some(exit), pipestatus, RecordStatus::Complete);
                 }
             }
-            Event::ScrollRegion => {
+            Event::ScrollRegion | Event::ScreenClear => {
                 if let Some(open) = self.parser.callbacks_mut().open.as_mut() {
                     open.approximate = true;
                 }
@@ -1998,6 +1998,20 @@ mod tests {
         assert_eq!(status(&c, "run-3"), "pending Running");
         c.handle(Event::CommandEnd { exit: 0, pipestatus: vec![0] });
         assert_eq!(status(&c, "run-3"), "finished");
+    }
+
+    /// A full-screen clear while a command runs marks its record approximate: the cleared output is missing.
+    #[test]
+    fn a_clear_during_an_open_record_marks_it_approximate() {
+        let mut c = running("sleep 1");
+        c.handle(Event::ScreenClear);
+        c.handle(Event::CommandEnd { exit: 0, pipestatus: vec![0] });
+        let rec = c.get_record(1).expect("the record");
+        assert_eq!(rec.status, RecordStatus::Approximate);
+        // With no record open a clear changes nothing.
+        let mut idle = core();
+        idle.handle(Event::ScreenClear);
+        assert!(idle.records().is_empty());
     }
 
     #[test]

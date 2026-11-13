@@ -53,5 +53,4 @@ tokio = { version = "1", features = ["rt", "macros"] }
 codegen-units = 1
 lto = true
 opt-level = 3
-panic = "abort"
 strip = true

@@ -27,6 +27,7 @@ use crate::core::observer::{
 use crate::core::pty::{self, Gate, OutputSink};
 use crate::core::record::{Cwd, Record, RecordSummary, Source};
 use crate::core::shim;
+use crate::core::term_reply;
 
 /// Ctrl-C is sent before the loader. The loader is typed once the output has been quiet this long (or the cap passes).
 const QUIET_FOR: Duration = Duration::from_millis(300);
@@ -128,8 +129,9 @@ pub struct SessionStats {
 /// Input to the writer thread.
 enum WriteCmd {
     /// Raw keystrokes or bytes from the user. A CR at the prompt starts a submitted line, so the gate closes until C
-    /// (or the submit timeout, for an empty line).
-    User(Vec<u8>),
+    /// (or the submit timeout, for an empty line). `reply` is a terminal reply (see `term_reply`): it is written as
+    /// it is, with no typed-text bookkeeping and no CR bookkeeping.
+    User { bytes: Vec<u8>, reply: bool },
     /// `expected_level` is the level key the command was approved for. None means the top level whatever it is.
     Submit { source: Source, text: String, expected_level: Option<u64>, reply: Sender<Result<(), SubmitError>> },
     /// Bytes for the injection (Ctrl-C, the loader, the blob lines). Written as they are: no submit gate, no typed-text
@@ -251,11 +253,16 @@ impl Session {
         self.shared.lock().user_typed_since_prompt()
     }
 
-    /// Raw bytes from the user (keystrokes). Only the frontend decides when these are allowed.
+    /// Raw bytes from the user (keystrokes). Only the frontend decides when these are allowed. Terminal
+    /// replies (see `term_reply`) are written through but do not count as typing: they set no flags and do not
+    /// bump `user_writes`.
     pub fn write_user(&self, bytes: &[u8]) -> io::Result<()> {
-        self.user_writes.fetch_add(1, Ordering::SeqCst);
+        let reply = term_reply::is_terminal_reply(bytes);
+        if !reply {
+            self.user_writes.fetch_add(1, Ordering::SeqCst);
+        }
         self.wtx
-            .send(WriteCmd::User(bytes.to_vec()))
+            .send(WriteCmd::User { bytes: bytes.to_vec(), reply })
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "session closed"))
     }
 
@@ -292,6 +299,14 @@ impl Session {
     /// Called by the renderer after it has rendered `bytes` of output.
     pub fn ack(&self, bytes: usize) {
         self.gate.ack(bytes);
+    }
+
+    /// Clears the PTY flow-control gate after the frontend re-attaches to a live session (for
+    /// example after a webview reload). While detached, bytes sent to the dead channel are never
+    /// acked, so the stale unacked count could pause the pump for good on the next burst; the
+    /// reset drops that count and wakes the pump. Only for re-attach, never on initial spawn.
+    pub fn reset_flow_control(&self) {
+        self.gate.reset();
     }
 
     /// Installs the listener for state, status, cwd and record events. Replaces any earlier one.
@@ -602,32 +617,36 @@ fn kill_hard(pid: u32) {
 fn run_writer(rx: Receiver<WriteCmd>, mut writer: Box<dyn Write + Send>, shared: Arc<Shared>) {
     for cmd in rx {
         match cmd {
-            WriteCmd::User(bytes) => {
-                // The lock is released before the write: a blocked PTY must not hold up the observer.
-                let submitted = {
-                    let mut core = shared.lock();
-                    core.note_user_bytes(&bytes);
-                    if bytes.contains(&b'\r') && !core.desynced() {
-                        match core.lifecycle_view() {
-                            // The first CR at an idle prompt closes the gate, so the agent cannot inject into the same
-                            // line. C (or the submit timeout, for an empty line) reopens it.
-                            InputState::Prompt => {
-                                core.begin_submit(Some((Source::User, None)));
-                                true
+            WriteCmd::User { bytes, reply } => {
+                // A terminal reply is the terminal answering the frontend's own query: it is written as it is,
+                // with no typed-text bookkeeping and no CR bookkeeping.
+                if !reply {
+                    // The lock is released before the write: a blocked PTY must not hold up the observer.
+                    let submitted = {
+                        let mut core = shared.lock();
+                        core.note_user_bytes(&bytes);
+                        if bytes.contains(&b'\r') && !core.desynced() {
+                            match core.lifecycle_view() {
+                                // The first CR at an idle prompt closes the gate, so the agent cannot inject into the same
+                                // line. C (or the submit timeout, for an empty line) reopens it.
+                                InputState::Prompt => {
+                                    core.begin_submit(Some((Source::User, None)));
+                                    true
+                                }
+                                // A CR completing a multi-line command the user is typing: attribute it to the user.
+                                InputState::Continuation => {
+                                    core.note_user_line();
+                                    false
+                                }
+                                _ => false,
                             }
-                            // A CR completing a multi-line command the user is typing: attribute it to the user.
-                            InputState::Continuation => {
-                                core.note_user_line();
-                                false
-                            }
-                            _ => false,
+                        } else {
+                            false
                         }
-                    } else {
-                        false
+                    };
+                    if submitted {
+                        shared.flush();
                     }
-                };
-                if submitted {
-                    shared.flush();
                 }
                 let _ = write_all(&mut writer, &bytes);
             }

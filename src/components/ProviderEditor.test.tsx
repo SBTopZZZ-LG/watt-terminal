@@ -227,7 +227,7 @@ describe('ProviderEditor: validation and save', () => {
       headers: [...SAVED.headers, { key: 'bad', name: 'Authorization', value: 'x', secret: false, clearStored: false, savedName: null, secretTouched: false }],
     };
     const problems: DraftProblems = {
-      headers: { bad: 'Authorization must be a secret header, so its value stays out of settings.json.' },
+      headers: { bad: '"Authorization" must be a secret header, so its value stays out of settings.json.' },
       models: { mini: 'Model "mini" is listed more than once.' },
       variants: {},
       chat_url: 'Chat URL must use http or https.',
@@ -236,7 +236,7 @@ describe('ProviderEditor: validation and save', () => {
     const out = html({ draft: d, saved: SAVED, problems });
     expect(out).toContain('Chat URL must use http or https.');
     expect(out).toContain('Max output tokens must be a whole number');
-    expect(out).toContain('Authorization must be a secret header');
+    expect(out).toContain('must be a secret header');
     expect(out).toContain('Model &quot;mini&quot; is listed more than once.');
     expect(buttonText(out, 'Save provider')).toContain('disabled=""');
     expect(out).toContain('Fix the fields marked above to save.');

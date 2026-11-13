@@ -397,12 +397,20 @@ describe('validateDraft', () => {
     expect(p.headers.n3).toBe('Header "x-team" is listed more than once.');
   });
 
-  it('Authorization must be a secret header', () => {
+  it('credential header names must be secret headers, and the error names the header', () => {
+    const names = ['Authorization', 'proxy-authorization', 'X-Api-Key', 'API-KEY', 'x-goog-api-key', 'X-Auth-Token'];
+    for (const name of names) {
+      const d = saved();
+      d.headers.push({ key: 'cred', name, value: 'v', secret: false, clearStored: false, savedName: null, secretTouched: false });
+      const problem = validateDraft(d, []).headers.cred;
+      expect(problem).toContain(`"${name}"`);
+      expect(problem).toMatch(/must be a secret header/);
+      d.headers[d.headers.length - 1].secret = true;
+      expect(validateDraft(d, []).headers.cred).toBeUndefined();
+    }
     const d = saved();
-    d.headers.push({ key: 'auth', name: 'Authorization', value: 'Bearer x', secret: false, clearStored: false, savedName: null, secretTouched: false });
-    expect(validateDraft(d, []).headers.auth).toMatch(/must be a secret header/);
-    d.headers[2].secret = true;
-    expect(validateDraft(d, []).headers.auth).toBeUndefined();
+    d.headers.push({ key: 'plain', name: 'X-Plain', value: 'v', secret: false, clearStored: false, savedName: null, secretTouched: false });
+    expect(validateDraft(d, []).headers.plain).toBeUndefined();
   });
 
   it('a plain header value is limited to 500 characters and no control characters; a secret value has no length rule', () => {

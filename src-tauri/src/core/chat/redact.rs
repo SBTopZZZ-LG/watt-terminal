@@ -34,10 +34,14 @@ static PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
         (r"\beyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]*", "[REDACTED:jwt]"),
         // `Authorization: Bearer <token>`. Case-insensitive; the 16-character minimum keeps ordinary words out.
         (r"(?i)\bbearer\s+[A-Za-z0-9._~+/=\-]{16,}", "Bearer [REDACTED:bearer]"),
-        // `NAME=value` and `export NAME=value` where NAME contains a credential word. The name stays, the value goes.
-        // The value is a quoted string (closed or cut at the end of the line) or a run of non-space characters.
+        // `NAME=value` and `export NAME=value` where NAME is underscore-separated segments ending in or containing
+        // a whole credential word (API_KEY/APIKEY, TOKEN, SECRET, PASSWORD, AUTHORIZATION, ...). The name stays, the
+        // value goes. The value is a quoted string (closed or cut at the end of the line) or a run of non-space
+        // characters. Bare KEY/AUTH never match, so GIT_AUTHOR_NAME, SSH_AUTH_SOCK, XAUTHORITY and OAUTH_CALLBACK_URL
+        // are left alone. A value that already starts with `[` (a redaction marker) is left alone, including quoted
+        // values, so redacting twice changes nothing.
         (
-            r#"(?i)\b(?P<name>[A-Za-z_][A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)[A-Za-z0-9_]*)=(?:"[^"\n]*"?|'[^'\n]*'?|[^\s"']+)"#,
+            r#"(?i)\b(?P<name>(?:[A-Za-z0-9]+_)*(?:API_?KEY|ACCESS_?KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|AUTHORIZATION)(?:_[A-Za-z0-9]+)*)=(?:"[^"\[\n][^"\n]*"?|'[^'\[\n][^'\n]*'?|[^\s"'\[][^\s"']*)"#,
             "${name}=[REDACTED:env]",
         ),
         // Credential headers, `x-api-key: value` or `Authorization: Basic value`: the header name and an optional
@@ -235,7 +239,41 @@ mod tests {
     fn env_assignment_with_a_quoted_value_redacts_the_whole_quote() {
         let r = none();
         assert_eq!(r.redact(r#"MY_SECRET="two words here" done"#), "MY_SECRET=[REDACTED:env] done");
-        assert_eq!(r.redact("API_AUTH='a b c"), "API_AUTH=[REDACTED:env]");
+        assert_eq!(r.redact("API_TOKEN='a b c"), "API_TOKEN=[REDACTED:env]");
+    }
+
+    #[test]
+    fn env_assignment_needs_a_whole_credential_segment() {
+        let r = none();
+        // True positives: the credential word is a whole underscore-separated segment.
+        for text in [
+            "OPENAI_API_KEY=abc123xyz",
+            "AWS_SECRET_ACCESS_KEY=abc123xyz",
+            "APIKEY=abc123xyz",
+            "TOKEN=abc123xyz",
+            "AUTHORIZATION=abc123xyz",
+            "API_TOKEN=abc123xyz next",
+        ] {
+            assert!(r.redact(text).ends_with("[REDACTED:env]") || r.redact(text).contains("[REDACTED:env]"), "missed: {text}");
+        }
+        // False positives: KEY/AUTH fragments that are not whole credential words are kept.
+        for text in [
+            "GIT_AUTHOR_NAME=alice",
+            "SSH_AUTH_SOCK=/tmp/sock",
+            "XAUTHORITY=/home/u/.Xauthority",
+            "OAUTH_CALLBACK_URL=https://example.com/cb",
+            "primary_key=12345",
+        ] {
+            assert_eq!(r.redact(text), text, "changed: {text}");
+        }
+    }
+
+    #[test]
+    fn env_assignment_markers_are_not_redacted_again() {
+        let r = none();
+        assert_eq!(r.redact("token=[REDACTED]"), "token=[REDACTED]");
+        assert_eq!(r.redact("TOKEN=\"[REDACTED:env]\""), "TOKEN=\"[REDACTED:env]\"");
+        assert_eq!(r.redact("TOKEN='[REDACTED:env]'"), "TOKEN='[REDACTED:env]'");
     }
 
     #[test]

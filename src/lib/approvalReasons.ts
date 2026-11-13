@@ -7,7 +7,10 @@ import type { ApprovalPreview, ApprovalReasonCode, ToolDecision } from './types'
 /** The reasons a call asks. The approval card and the tool row say these. */
 export type AskReasonCode = Exclude<ApprovalReasonCode, 'approve_all' | 'rule' | 'interrupt' | 'latched'>;
 
-/** Automatic approvals one turn may use before the rules stop running commands by themselves (MAX_AUTO_PER_TURN). */
+/**
+ * Automatic approvals one turn may use before the rules stop running commands by themselves. Mirrors the Rust
+ * `MAX_AUTO_PER_TURN` in `src-tauri/src/core/approval.rs`: both must change together.
+ */
 export const AUTO_PER_TURN = 8;
 
 /**
@@ -15,7 +18,7 @@ export const AUTO_PER_TURN = 8;
  */
 const ASK_CLAUSE: Record<Exclude<AskReasonCode, 'unintegrated_shell'>, string> = {
   manual_mode: 'manual approval is on, so every command waits for you.',
-  send_keys: 'sending keystrokes always needs your approval.',
+  send_keys: 'approving lets the agent keep typing into that command until you type in the terminal.',
   gate_chars: 'the command has a character outside letters, digits, spaces and _-./:=@+, so your rules do not apply to it.',
   gate_path: 'the command does not start with a plain command name (a path, a VAR=value prefix or a leading -), so your rules do not apply to it.',
   gate_denylist: 'its first word is on the built-in list of commands that always need approval.',

@@ -83,6 +83,23 @@ describe('AgentPanel', () => {
     expect(html).toContain('aria-label="Show the agent panel"');
     expect(html).toContain('agent-rail-label');
   });
+
+  it('shows a busy dot on the rail button while the agent works', () => {
+    const busy = renderToStaticMarkup(
+      <AgentPanel view={panelView(layoutFor('left', false), BIG)} onExpand={() => {}} busy>
+        <span />
+      </AgentPanel>,
+    );
+    expect(busy).toContain('agent-rail-busy');
+    expect(busy).toContain('aria-label="Agent is working"');
+
+    const idle = renderToStaticMarkup(
+      <AgentPanel view={panelView(layoutFor('left', false), BIG)} onExpand={() => {}}>
+        <span />
+      </AgentPanel>,
+    );
+    expect(idle).not.toContain('agent-rail-busy');
+  });
 });
 
 describe('PanelDivider', () => {

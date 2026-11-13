@@ -147,6 +147,8 @@ export type AgentEvent =
   | { type: 'question_request'; call_id: string; questions: QuestionSpec[] }
   /** The context usage of a model request: sent before the request, and again with the provider's count once a reply reports it. */
   | ({ type: 'context_usage' } & ContextUsage)
+  /** A quiet note for the transcript (the project instructions in use). Shown muted, never stored in history. */
+  | { type: 'notice'; text: string }
   | { type: 'done' };
 
 /** The context usage of one model request (core/chat/context). `used` is the estimate, or the provider's count once `calibrated`. */

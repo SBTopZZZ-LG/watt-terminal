@@ -10,6 +10,7 @@ const BASE = {
   hint: null as string | null,
   hintInline: false,
   hasPendingApproval: false,
+  canApprove: false,
   busy: false,
   locked: false,
   focusToken: 0,

@@ -197,13 +197,13 @@ describe('focusAfter', () => {
 });
 
 describe('barKeyIntent', () => {
-  const none = { inputEmpty: true, hasPendingApproval: false };
+  const none = { inputEmpty: true, hasPendingApproval: false, canApprove: false };
 
   it('Ctrl-C is an interrupt in every state, with or without text or approvals', () => {
     for (const s of ALL_STATES) {
       // The key mapping does not depend on the state, so the state is taken through effectiveState to show it.
       const eff = effectiveState(model(s));
-      for (const ctx of [none, { inputEmpty: false, hasPendingApproval: true }]) {
+      for (const ctx of [none, { inputEmpty: false, hasPendingApproval: true, canApprove: true }]) {
         expect(barKeyIntent('c', { ctrl: true, shift: false }, ctx), eff).toBe('interrupt');
       }
     }
@@ -213,30 +213,39 @@ describe('barKeyIntent', () => {
     expect(barKeyIntent('C', { ctrl: true, shift: true }, none)).toBe('none');
   });
 
-  it('Enter approves the first pending approval only when the input is empty', () => {
-    expect(barKeyIntent('Enter', { ctrl: false, shift: false }, { inputEmpty: true, hasPendingApproval: true })).toBe(
-      'approve_first',
-    );
-    expect(barKeyIntent('Enter', { ctrl: false, shift: false }, { inputEmpty: false, hasPendingApproval: true })).toBe(
-      'submit',
-    );
+  it('Enter approves the first pending approval only when the input is empty and approval is armed', () => {
+    expect(
+      barKeyIntent('Enter', { ctrl: false, shift: false }, { inputEmpty: true, hasPendingApproval: true, canApprove: true }),
+    ).toBe('approve_first');
+    expect(
+      barKeyIntent('Enter', { ctrl: false, shift: false }, { inputEmpty: false, hasPendingApproval: true, canApprove: true }),
+    ).toBe('submit');
     expect(barKeyIntent('Enter', { ctrl: false, shift: false }, none)).toBe('submit');
+  });
+
+  it('Enter submits while approval is unarmed, so a fresh or hidden card cannot be approved by Enter', () => {
+    expect(
+      barKeyIntent('Enter', { ctrl: false, shift: false }, { inputEmpty: true, hasPendingApproval: true, canApprove: false }),
+    ).toBe('submit');
   });
 
   it('Shift-Enter is not a submit or an approval: it is none, so the textarea inserts a newline', () => {
     expect(barKeyIntent('Enter', { ctrl: false, shift: true }, none)).toBe('none');
-    expect(barKeyIntent('Enter', { ctrl: false, shift: true }, { inputEmpty: false, hasPendingApproval: false })).toBe(
+    expect(barKeyIntent('Enter', { ctrl: false, shift: true }, { inputEmpty: false, hasPendingApproval: false, canApprove: false })).toBe(
       'none',
     );
-    expect(barKeyIntent('Enter', { ctrl: false, shift: true }, { inputEmpty: true, hasPendingApproval: true })).toBe(
+    expect(barKeyIntent('Enter', { ctrl: false, shift: true }, { inputEmpty: true, hasPendingApproval: true, canApprove: true })).toBe(
       'none',
     );
   });
 
-  it('Escape denies a pending approval, otherwise it closes the bar (focus back to the terminal)', () => {
-    expect(barKeyIntent('Escape', { ctrl: false, shift: false }, { inputEmpty: true, hasPendingApproval: true })).toBe(
-      'deny_first',
-    );
+  it('Escape denies a pending approval even when unarmed, otherwise it closes the bar (focus back to the terminal)', () => {
+    expect(
+      barKeyIntent('Escape', { ctrl: false, shift: false }, { inputEmpty: true, hasPendingApproval: true, canApprove: true }),
+    ).toBe('deny_first');
+    expect(
+      barKeyIntent('Escape', { ctrl: false, shift: false }, { inputEmpty: true, hasPendingApproval: true, canApprove: false }),
+    ).toBe('deny_first');
     expect(barKeyIntent('Escape', { ctrl: false, shift: false }, none)).toBe('close');
   });
 
@@ -270,7 +279,7 @@ describe('isFocusBarHotkey', () => {
 
   it('leaves Escape to the bar: Escape is not a focus hotkey, and the bar still closes on it', () => {
     expect(isFocusBarHotkey(press('Escape', { ctrl: true, shift: true }))).toBe(false);
-    expect(barKeyIntent('Escape', { ctrl: false, shift: false }, { inputEmpty: true, hasPendingApproval: false })).toBe(
+    expect(barKeyIntent('Escape', { ctrl: false, shift: false }, { inputEmpty: true, hasPendingApproval: false, canApprove: false })).toBe(
       'close',
     );
   });

@@ -26,13 +26,15 @@ import { effectiveState, focusAfter, inputReducer, INITIAL_INPUT, isFocusBarHotk
 import type { BarMode, Route } from './lib/inputState';
 import { agentDialogPhase, agentIntegratingQuietly, agentRequestAfter, agentRequestClosedBySession, agentRunning, canIntegrate, nestedLevels } from './lib/integrate';
 import type { AgentRequest, IntegratePhase } from './lib/integrate';
-import { agentControlAfter, borderLevel, NO_CONTROL, settleControl } from './lib/agentControl';
+import { agentControlAfter, borderActive, borderLevel, NO_CONTROL, settleControl } from './lib/agentControl';
 import type { AgentControl, BorderLevel } from './lib/agentControl';
-import { EMPTY_TRANSCRIPT, firstPendingApproval, isBusy, transcriptReducer } from './lib/transcript';
+import { EMPTY_TRANSCRIPT, MAX_ITEMS, firstPendingApproval, isBusy, transcriptReducer } from './lib/transcript';
+import type { TranscriptItem } from './lib/transcript';
 import { chatBodyShown, isSideDock, loadPanelLayout, panelReducer, panelView, savePanelLayout } from './lib/panelLayout';
 import type { Container } from './lib/panelLayout';
 import { defaultSizeStorage } from './lib/zoom';
 import { itemsFromMessages } from './lib/historyView';
+import { agentActivityText } from './lib/agentActivity';
 import { userAttachments } from './lib/attachments';
 import { defaultModelVision } from './lib/modelVision';
 import { createPatchSaver, fontPatch, panelPatch, reconcileFont, reconcileGroupBy, reconcilePanel, shouldRestoreLast } from './lib/uiState';
@@ -47,6 +49,8 @@ import { StatusChip } from './components/StatusChip';
 import { FindBar } from './components/FindBar';
 import { PanelDivider } from './components/PanelDivider';
 import { AgentPanel, Workspace } from './components/AgentPanel';
+import { AgentActivityToast } from './components/AgentActivityToast';
+import { ApprovalToast } from './components/ApprovalToast';
 import { HistoryView } from './components/HistoryView';
 import { HelpDialog } from './components/HelpDialog';
 import type { HelpLoad } from './components/HelpDialog';
@@ -326,6 +330,18 @@ export default function App() {
       live = false;
     };
   }, [llm.enabled, llm.model, llm.provider, settingsOpen]);
+
+  // Fades the loading splash (see public/splash.css) once React has mounted, then removes it. StrictMode mounts
+  // twice: the cleanup clears the first timer, and the second pass re-adds the class and re-arms the removal.
+  useEffect(() => {
+    const el = document.getElementById('splash');
+    if (el === null) {
+      return;
+    }
+    el.classList.add('splash-done');
+    const timer = setTimeout(() => el.remove(), 250);
+    return () => clearTimeout(timer);
+  }, []);
 
   // The UI state file: read once, reconciled with the localStorage values, and kept in step after that. The file wins when it
   // has a valid value; a missing value is filled in from localStorage (see uiState.ts). With no file (no store), nothing changes.
@@ -640,6 +656,13 @@ export default function App() {
     );
   };
 
+  /** Opens the agent panel on the chat view and moves focus to the bar. */
+  const showChat = () => {
+    dispatchPanel({ type: 'open', open: true });
+    setPanelBody('chat');
+    setFocusToken((t) => t + 1);
+  };
+
   /** The `/history` command. It opens the panel if collapsed and shows History; unlike the button it never toggles it closed. */
   const showHistory = () => {
     if (!panel.open) {
@@ -710,7 +733,9 @@ export default function App() {
           return { kind: 'handled' };
         }
         api.cancelAgent().catch(reportError);
-        if (!locked) {
+        // ^C only when the agent holds the shell, so stopping a thinking/waiting turn never kills the
+        // user's own foreground process.
+        if (!locked && borderActive(agentControl)) {
           sendRaw(CTRL_C);
         }
         return { kind: 'handled' };
@@ -772,7 +797,8 @@ export default function App() {
         return { kind: 'handled' };
       }
       case 'export': {
-        const md = conversationMarkdown(transcriptRef.current.items);
+        const items = transcriptRef.current.items;
+        const md = conversationMarkdown(items);
         if (md.trim() === '') {
           dispatchTranscript({ type: 'notice', text: 'There is nothing to export yet.', muted: true });
           return { kind: 'handled' };
@@ -780,7 +806,11 @@ export default function App() {
         const ok = await copyText(md, { clipboard: navigator.clipboard ?? undefined, document });
         dispatchTranscript({
           type: 'notice',
-          text: ok ? `Copied the conversation to the clipboard (${md.length} characters).` : 'Could not copy the conversation to the clipboard.',
+          text: ok
+            ? items.length >= MAX_ITEMS
+              ? `Copied the latest ${MAX_ITEMS} messages to the clipboard (${md.length} characters). Older messages were not included.`
+              : `Copied the conversation to the clipboard (${md.length} characters).`
+            : 'Could not copy the conversation to the clipboard.',
           ...(ok ? { muted: true } : {}),
         });
         return { kind: 'handled' };
@@ -800,8 +830,33 @@ export default function App() {
         return { kind: 'handled' };
       }
       case 'rename': {
+        // With no title the agent suggests one: a side call outside a turn, never stored. Only the notices below
+        // reach the transcript.
         if (args === '') {
-          dispatchTranscript({ type: 'notice', text: 'Usage: /rename <title>.', muted: true });
+          if (conversationId === null) {
+            dispatchTranscript({ type: 'notice', text: 'There is no conversation to rename yet.', muted: true });
+            return { kind: 'handled' };
+          }
+          if (sideBusy) {
+            dispatchTranscript({ type: 'notice', text: 'A side command is still running. Wait for it to finish, or stop it first.', muted: true });
+            return { kind: 'handled' };
+          }
+          if (isBusy(transcriptRef.current)) {
+            dispatchTranscript({ type: 'notice', text: 'The agent is busy. Wait for the turn to finish, or stop it first.', muted: true });
+            return { kind: 'handled' };
+          }
+          setSideBusy(true);
+          dispatchTranscript({ type: 'notice', text: 'Naming the conversation...', muted: true });
+          try {
+            const name = await api.suggestName();
+            const meta = await api.renameConversation(conversationId, name);
+            setHistoryKey((k) => k + 1);
+            dispatchTranscript({ type: 'notice', text: `Renamed the conversation to "${meta.title}".`, muted: true });
+          } catch (e) {
+            dispatchTranscript({ type: 'notice', text: errorText(e) });
+          } finally {
+            setSideBusy(false);
+          }
           return { kind: 'handled' };
         }
         if (conversationId === null) {
@@ -1001,6 +1056,26 @@ export default function App() {
   };
 
   const pendingApproval = firstPendingApproval(transcript);
+  // The waiting card itself, for the toast while the chat body is hidden. Null when no card waits.
+  const pendingApprovalItem =
+    pendingApproval !== null
+      ? (transcript.items.find(
+          (i): i is Extract<TranscriptItem, { kind: 'approval' }> => i.kind === 'approval' && i.callId === pendingApproval,
+        ) ?? null)
+      : null;
+  // Enter approves only once the card has been on screen a beat and the chat body is visible: a fresh card,
+  // or a hidden/history-view card, cannot be approved by Enter. Escape still denies on the pending card alone.
+  const [approvalArmed, setApprovalArmed] = useState(false);
+  useEffect(() => {
+    if (pendingApproval === null) {
+      setApprovalArmed(false);
+      return;
+    }
+    setApprovalArmed(false);
+    const timer = setTimeout(() => setApprovalArmed(true), 500);
+    return () => clearTimeout(timer);
+  }, [pendingApproval]);
+  const canApprove = approvalArmed && chatBodyShown(panel.open, panelBody);
   const busy = isBusy(transcript);
   // The border is 'working' for the whole agent turn, but an exited shell takes it off even if a turn is still open.
   const border: BorderLevel = borderLevel(agentControl, busy && effective !== 'exited');
@@ -1162,7 +1237,13 @@ export default function App() {
           ) : null
         }
         panel={
-          <AgentPanel ref={panelRef} view={view} onExpand={() => dispatchPanel({ type: 'toggle' })}>
+          <AgentPanel
+            ref={panelRef}
+            view={view}
+            onExpand={() => dispatchPanel({ type: 'toggle' })}
+            busy={busy || sideBusy}
+            thinking={transcript.thinking}
+          >
             <Transcript
               items={transcript.items}
               busy={busy}
@@ -1217,6 +1298,7 @@ export default function App() {
               hintInline={locked ? false : route.hintInline}
               locked={locked}
               hasPendingApproval={pendingApproval !== null}
+              canApprove={canApprove}
               busy={busy || sideBusy}
               focusToken={focusToken}
               onFocusChange={setBarOpen}
@@ -1231,7 +1313,14 @@ export default function App() {
                   api.cancelAgent().catch(reportError);
                   return;
                 }
-                if (!locked) {
+                // At an idle prompt there is nothing to stop: no cancel, and no ^C into the user's shell.
+                if (!busy) {
+                  return;
+                }
+                api.cancelAgent().catch(reportError);
+                // ^C only when the agent holds the shell, so stopping a thinking/waiting turn never kills
+                // the user's own foreground process.
+                if (!locked && borderActive(agentControl)) {
                   sendRaw(CTRL_C);
                 }
               }}
@@ -1242,6 +1331,16 @@ export default function App() {
           </AgentPanel>
         }
       />
+      {(busy || sideBusy) && pendingApprovalItem === null && !chatBodyShown(panel.open, panelBody) && (
+        <AgentActivityToast
+          dock={panel.dock}
+          text={agentActivityText(transcript.items, transcript.thinking, sideBusy)}
+          onOpen={showChat}
+        />
+      )}
+      {pendingApprovalItem !== null && !chatBodyShown(panel.open, panelBody) && (
+        <ApprovalToast approval={pendingApprovalItem} dock={panel.dock} onApprove={answer} onOpen={showChat} />
+      )}
       {settingsOpen && <SettingsDialog focusModel={settingsFocusModel} onClose={closeSettings} onChanged={refreshStatus} onViewLoaded={refreshSettingsState} />}
       {helpOpen && <HelpDialog load={helpState} onRetry={loadHelp} onClose={closeHelp} />}
       {agentPhase !== null ? (

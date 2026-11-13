@@ -119,6 +119,13 @@ export const api = {
   askBtw(text: string) {
     return invoke<string>('ask_btw', { sessionId: SESSION_ID, text });
   },
+  /**
+   * Suggests a title for the live conversation. One model call outside a turn; nothing is stored and the
+   * transcript only gets notices. Refused while the agent is busy, and when there is nothing to name yet.
+   */
+  suggestName() {
+    return invoke<string>('suggest_name', { sessionId: SESSION_ID });
+  },
   /** Summarizes the live conversation into a new conversation and switches to it. The old one stays in history. */
   compactConversation() {
     return invoke<LoadedConversation>('compact_conversation', { sessionId: SESSION_ID });

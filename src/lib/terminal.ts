@@ -80,6 +80,11 @@ export const term = new Terminal({
   fontSize: loadFontSize(defaultSizeStorage()),
   scrollback: 5000,
   theme: THEME,
+  // OSC 8 links never navigate: activation is ignored, matching the Markdown "nothing navigates" rule.
+  // A future opener command can route links to the system browser from here.
+  linkHandler: {
+    activate() {},
+  },
 });
 
 export const fit = new FitAddon();

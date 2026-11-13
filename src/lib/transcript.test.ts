@@ -63,6 +63,14 @@ describe('transcriptReducer: agent events', () => {
     const finished = transcriptReducer(t, { type: 'agent_event', event: { type: 'done' } });
     expect(isBusy(finished)).toBe(false);
   });
+
+  it('a notice event adds a muted notice item', () => {
+    const t = run([
+      { type: 'agent_event', event: { type: 'notice', text: 'Using project instructions from /r/AGENTS.md' } },
+    ]);
+    expect(t.items).toHaveLength(1);
+    expect(t.items[0]).toMatchObject({ kind: 'notice', text: 'Using project instructions from /r/AGENTS.md', muted: true });
+  });
 });
 
 describe('transcriptReducer: context usage', () => {

@@ -4014,3 +4014,207 @@ input {
 .context-seg-6 {
   background: var(--ink-strong);
 }
+
+/*
+ * Hidden-agent activity: a fixed toast shown while the agent works and the chat body is hidden. It sits against the
+ * agent dock, clear of the status strip at the top and of the terminal content. Small, blueprint tokens, accent edge.
+ */
+.agent-activity {
+  position: fixed;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 360px;
+  padding: 8px 12px;
+  border: 1px solid var(--rule-strong);
+  border-left: 2px solid var(--accent);
+  border-radius: 4px;
+  background: var(--panel);
+  box-shadow: 0 4px 16px var(--shadow);
+  color: var(--text);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.agent-activity.dock-right,
+.agent-activity.dock-bottom {
+  right: 12px;
+  bottom: 12px;
+}
+
+.agent-activity.dock-left {
+  left: 12px;
+  bottom: 12px;
+}
+
+/* Below the status strip, which stays on top. */
+.agent-activity.dock-top {
+  right: 12px;
+  top: 44px;
+}
+
+.agent-activity-title {
+  flex: 0 0 auto;
+  color: var(--ink-strong);
+  white-space: nowrap;
+}
+
+.agent-activity-text {
+  min-width: 0;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  line-clamp: 2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+}
+
+.agent-activity-spinner {
+  flex: 0 0 auto;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid var(--rule-strong);
+  border-top-color: var(--accent);
+  animation: agent-activity-spin 1s linear infinite;
+}
+
+@keyframes agent-activity-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/*
+ * Hidden-approval toast: a fixed pop-up shown while an approval card waits and the chat body is hidden. Same dock
+ * positions as .agent-activity (and above it), clear of the status strip at the top. Warn edge like the approval
+ * card; no animation, so prefers-reduced-motion needs nothing here.
+ */
+.approval-toast {
+  position: fixed;
+  z-index: 41;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-width: 380px;
+  padding: 8px 12px;
+  border: 1px solid var(--warn);
+  border-left: 2px solid var(--warn);
+  border-radius: 4px;
+  background: var(--panel);
+  box-shadow: 0 4px 16px var(--shadow);
+  color: var(--text);
+  font-size: 12px;
+  text-align: left;
+}
+
+.approval-toast.dock-right,
+.approval-toast.dock-bottom {
+  right: 12px;
+  bottom: 12px;
+}
+
+.approval-toast.dock-left {
+  left: 12px;
+  bottom: 12px;
+}
+
+/* Below the status strip, which stays on top. */
+.approval-toast.dock-top {
+  right: 12px;
+  top: 44px;
+}
+
+.approval-toast-title {
+  color: var(--warn);
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.approval-toast-command {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink-strong);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.approval-toast-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.approval-toast-actions button {
+  padding: 4px 10px;
+  border: 1px dashed var(--line);
+  border-radius: 2px;
+  background: var(--bg);
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.approval-toast-actions .approve {
+  border-color: var(--ok);
+  color: var(--ok);
+}
+
+.approval-toast-actions .deny {
+  border-color: var(--fail);
+  color: var(--fail);
+}
+
+.approval-toast-actions button:hover {
+  border-style: solid;
+}
+
+.approval-toast-actions button:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* The rail's busy dot: a small pulsing green dot on the collapsed side panel's button. */
+.agent-rail {
+  position: relative;
+}
+
+.agent-rail-busy {
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--ok);
+  box-shadow: 0 0 6px var(--ok-glow);
+  transform: translateX(-50%);
+  animation: agent-rail-pulse 2s ease-in-out infinite;
+}
+
+@keyframes agent-rail-pulse {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* No spin, no pulse: the toast keeps its spinner ring and the rail its static green dot. */
+  .agent-activity-spinner,
+  .agent-rail-busy {
+    animation: none;
+  }
+}

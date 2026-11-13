@@ -20,7 +20,7 @@ ignore_updates when only the end of the command matters. \
 For work with three or more steps, keep a todo list with todo_write: keep exactly one item in_progress and mark items \
 completed as you go. Don't use it for a trivial one-step request. \
 Every run_command and send_keys call includes a summary of at most 10 words describing what it does \
-(for example \"Check the working tree\" or \"Answer the sudo prompt\"): the app shows it in the transcript. \
+(for example \"Check the working tree\" or \"Confirm the install prompt\"): the app shows it in the transcript. \
 When you need the user's preference or a choice between implementations, ask with ask_user: give 2 to 4 short \
 options, at most one recommended, and never ask for permission (approval handles that) or for facts a read tool \
 can answer. If the user skips, or the question times out or is cancelled, don't ask the same question again: \

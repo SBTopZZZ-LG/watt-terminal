@@ -38,6 +38,8 @@ interface Props {
   /** Show the hint as the input's placeholder instead of a row under it, so the bar's height does not change. */
   hintInline: boolean;
   hasPendingApproval: boolean;
+  /** Enter may approve the pending card only when armed (500ms visible in the chat body). Escape denies regardless. */
+  canApprove: boolean;
   /** The agent is mid-turn. The button becomes Stop, and the field's border shows a light while it lasts. */
   busy: boolean;
   /** An integration is running: the input takes no text and sends nothing until it answers. */
@@ -361,7 +363,7 @@ export function InputBar(props: Props) {
       e.key,
       { ctrl: e.ctrlKey, shift: e.shiftKey },
       // Staged attachments are not an empty input: Enter sends them rather than approving a pending call.
-      { inputEmpty: text === '' && drafts.length === 0, hasPendingApproval },
+      { inputEmpty: text === '' && drafts.length === 0, hasPendingApproval, canApprove: props.canApprove },
     );
     switch (intent) {
       case 'interrupt':

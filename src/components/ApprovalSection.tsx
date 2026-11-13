@@ -76,6 +76,9 @@ export function ApprovalSection(p: ApprovalSectionProps) {
       <p className="settings-hint">
         {`Regex rules run a command without asking only when an allow rule matches all of it and no deny rule does. At most ${AUTO_PER_TURN} commands run this way in one turn; after that a command asks.`}
       </p>
+      <p className="settings-hint">
+        Changes apply from the next message; a running turn keeps the policy it started with.
+      </p>
 
       <div className="settings-field settings-field-wide">
         <label htmlFor={`${uid}-allow`}>Allow rules</label>

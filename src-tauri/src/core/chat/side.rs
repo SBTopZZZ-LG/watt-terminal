@@ -22,6 +22,9 @@ pub const BTW_SYSTEM: &str = "This is a side question about the conversation bel
 /// The system prompt for a compaction summary: a summary only, nothing else.
 pub const SUMMARY_SYSTEM: &str =
     "You summarize conversations for context compaction. Reply with a concise summary only.";
+/// The system prompt for a title suggestion: a title only, nothing else.
+pub const TITLE_SYSTEM: &str =
+    "You name conversations. Reply with a short, descriptive title of at most six words, and nothing else.";
 
 /// The context budget when the model's limit is not known, in characters.
 const DEFAULT_BUDGET: usize = 60_000;
@@ -351,6 +354,48 @@ pub fn compact_seed(summary: &str) -> String {
     format!("Compacted summary (from the previous conversation; not a new request):\n\n{summary}")
 }
 
+/// Cleans a model's title reply: the first non-empty line, without surrounding quotes or backticks, a leading
+/// `Title:` label or trailing punctuation, with runs of whitespace collapsed. `None` when nothing usable remains:
+/// empty, over 60 characters, or holding control characters.
+pub fn clean_title(reply: &str) -> Option<String> {
+    for line in reply.lines() {
+        let mut title = line.trim();
+        if title.is_empty() {
+            continue;
+        }
+        // A leading `Title:` label (any case), e.g. `Title: Fix the build`.
+        title = strip_title_label(title);
+        // Surrounding quotes or backticks, e.g. `"Fix the build"`. One layer at a time, so nested layers unwrap fully.
+        loop {
+            let bytes = title.as_bytes();
+            if bytes.len() >= 2 {
+                let (first, last) = (bytes[0], bytes[bytes.len() - 1]);
+                if first == last && (first == b'"' || first == b'\'' || first == b'`') {
+                    title = title[1..title.len() - 1].trim();
+                    continue;
+                }
+            }
+            break;
+        }
+        title = strip_title_label(title);
+        let title = title.trim_end_matches(['.', '!', '?', ',', ';', ':']).trim();
+        let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+        if title.is_empty() || title.chars().count() > 60 || title.chars().any(|c| c.is_control()) {
+            continue;
+        }
+        return Some(title);
+    }
+    None
+}
+
+/// Strips a leading `Title:` label (any case). `get` keeps this safe for titles starting in multibyte text.
+fn strip_title_label(title: &str) -> &str {
+    match title.get(..6) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("title:") => title[6..].trim(),
+        _ => title,
+    }
+}
+
 /// The title for a derived conversation: the trimmed old title (or a fallback when it is empty) plus the suffix,
 /// capped at 120 characters while keeping the suffix whole.
 pub fn suffixed_title(old: &str, suffix: &str) -> String {
@@ -530,6 +575,32 @@ mod tests {
         assert_eq!(titled.chars().count(), 120);
         assert!(titled.ends_with(" (fork)"));
         assert!(titled.starts_with("日"));
+    }
+
+    #[test]
+    fn suggested_titles_take_the_first_line_cleaned() {
+        assert_eq!(clean_title("Fix the build"), Some("Fix the build".to_string()));
+        assert_eq!(clean_title("\n\n  Fix the build  \nsecond line\n"), Some("Fix the build".to_string()));
+        assert_eq!(clean_title("\"Fix the build\""), Some("Fix the build".to_string()));
+        assert_eq!(clean_title("`Fix the build`"), Some("Fix the build".to_string()));
+        assert_eq!(clean_title("'Fix the build'"), Some("Fix the build".to_string()));
+        assert_eq!(clean_title("Title: Fix the build"), Some("Fix the build".to_string()));
+        assert_eq!(clean_title("\"Title: Fix the build.\""), Some("Fix the build".to_string()));
+        assert_eq!(clean_title("Fix the build!"), Some("Fix the build".to_string()));
+        assert_eq!(clean_title("Fix   the\nbuild"), Some("Fix the".to_string()), "only the first line is kept");
+        assert_eq!(clean_title("  Fix\t the   build  "), Some("Fix the build".to_string()));
+    }
+
+    #[test]
+    fn suggested_titles_reject_empty_long_and_controlled_replies() {
+        assert_eq!(clean_title(""), None);
+        assert_eq!(clean_title("   \n  \n"), None);
+        assert_eq!(clean_title("\"\""), None, "quotes alone leave nothing");
+        assert_eq!(clean_title("Title:"), None, "a label alone leaves nothing");
+        assert_eq!(clean_title(&"t".repeat(60)), Some("t".repeat(60)));
+        assert_eq!(clean_title(&"t".repeat(61)), None, "over 60 characters is rejected");
+        assert_eq!(clean_title("Fix\x07the build"), None, "control characters are rejected");
+        assert_eq!(clean_title("ok\x7f"), None, "DEL is a control character");
     }
 
     #[test]

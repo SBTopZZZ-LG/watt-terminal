@@ -31,6 +31,10 @@ interface AgentPanelProps {
   view: PanelView;
   /** The rail button: reopens a collapsed side panel. */
   onExpand: () => void;
+  /** True while the agent works (a turn or a side command). Shows the rail's busy dot. */
+  busy?: boolean;
+  /** True while the model has not produced output yet. Kept for the rail's future use. */
+  thinking?: boolean;
   children: ReactNode;
 }
 
@@ -39,7 +43,7 @@ interface AgentPanelProps {
  * children stay mounted and CSS hides them, so typed text and the transcript's state survive a collapse. The rail button is
  * the only thing shown then. The button sits in the same child slot whether or not the rail is shown.
  */
-export function AgentPanel({ ref, view, onExpand, children }: AgentPanelProps) {
+export function AgentPanel({ ref, view, onExpand, busy = false, children }: AgentPanelProps) {
   return (
     <div className={view.panelClass} style={view.style} ref={ref}>
       {view.rail ? (
@@ -51,6 +55,9 @@ export function AgentPanel({ ref, view, onExpand, children }: AgentPanelProps) {
           aria-label="Show the agent panel"
         >
           <img className="brand-mark" src={wattMark} width={212} height={256} alt="" aria-hidden="true" />
+          {busy ? (
+            <span className="agent-rail-busy" role="img" aria-label="Agent is working" title="Agent is working" />
+          ) : null}
           <span className="agent-rail-label">Agent</span>
         </button>
       ) : null}

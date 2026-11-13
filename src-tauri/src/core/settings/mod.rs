@@ -466,15 +466,23 @@ fn validate_url(label: &str, field: &str, url: &str, problems: &mut Vec<String>)
     }
 }
 
+/// Header names whose values are credentials, so they must be secret headers (the value lives in the
+/// `SecretStore`, never in settings.json). Compared case-insensitively, like the duplicate check.
+fn is_credential_header_name(name: &str) -> bool {
+    ["authorization", "proxy-authorization", "x-api-key", "api-key", "x-goog-api-key", "x-auth-token"]
+        .iter()
+        .any(|known| name.eq_ignore_ascii_case(known))
+}
+
 fn validate_header(label: &str, header: &HeaderEntry, problems: &mut Vec<String>) {
     let name = &header.name;
     if name.is_empty() || !name.bytes().all(is_token_byte) {
         problems.push(format!("{label}: header name {name:?} is not a valid HTTP header name"));
         return;
     }
-    if name.eq_ignore_ascii_case("authorization") && !header.secret {
+    if is_credential_header_name(name) && !header.secret {
         problems.push(format!(
-            "{label}: the Authorization header must be a secret so its value stays out of settings.json"
+            "{label}: header {name:?} must be a secret so its value stays out of settings.json"
         ));
     }
     if header.secret {
@@ -871,7 +879,7 @@ mod tests {
             (
                 "plain Authorization header",
                 Box::new(|s| s.providers[0].headers = vec![header("authorization", "Bearer x", false)]),
-                "Authorization",
+                "must be a secret",
             ),
             (
                 "secret header with a value in the file",
@@ -986,6 +994,36 @@ mod tests {
         for (label, change) in cases {
             assert_eq!(problems_after(|s| change(s)), Vec::<String>::new(), "{label} should be valid");
         }
+    }
+
+    #[test]
+    fn credential_header_names_must_be_secret_and_the_error_names_the_header() {
+        // Every credential name is refused as a plain header, in any case, and the message names it.
+        for name in ["authorization", "Proxy-Authorization", "X-API-Key", "api-key", "X-Goog-Api-Key", "x-auth-token"] {
+            let problems = problems_after(|s| {
+                s.providers[0].headers = vec![header(name, "v", false)];
+            });
+            assert_eq!(problems.len(), 1, "{name}: expected one problem, got {problems:?}");
+            assert!(problems[0].contains(name), "{name}: error does not name the header: {:?}", problems[0]);
+            assert!(problems[0].contains("must be a secret"), "{name}: {:?}", problems[0]);
+        }
+        // The same names pass as secret headers with an empty value; other names pass as plain headers.
+        for name in ["Authorization", "PROXY-AUTHORIZATION", "x-api-key", "API-KEY", "x-goog-api-key", "X-Auth-Token"] {
+            assert_eq!(
+                problems_after(|s| {
+                    s.providers[0].headers = vec![header(name, "", true)];
+                }),
+                Vec::<String>::new(),
+                "{name} as a secret header should be valid"
+            );
+        }
+        assert_eq!(
+            problems_after(|s| {
+                s.providers[0].headers = vec![header("X-Team", "v", false)];
+            }),
+            Vec::<String>::new(),
+            "an ordinary header should be valid"
+        );
     }
 
     #[test]

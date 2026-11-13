@@ -182,11 +182,17 @@ export type BarKey =
 export interface BarKeyContext {
   inputEmpty: boolean;
   hasPendingApproval: boolean;
+  /**
+   * Enter may approve only when armed: the pending card has been visible in the chat body for 500ms
+   * (see App.tsx). Escape still denies on `hasPendingApproval` alone.
+   */
+  canApprove: boolean;
 }
 
 /**
  * What a key pressed in the input bar means. Ctrl-C is always `interrupt` (the caller sends ^C to the PTY),
- * whatever the state. Enter approves the first pending approval when the input is empty; Escape denies it.
+ * whatever the state. Enter approves the first pending approval when the input is empty and approval is armed;
+ * otherwise it submits. Escape denies a pending approval, armed or not.
  * Otherwise Escape closes the bar's focus (back to the terminal). Shift-Enter is `none`, so the textarea
  * inserts a newline.
  */
@@ -203,7 +209,7 @@ export function barKeyIntent(
       if (mods.shift) {
         return 'none';
       }
-      return ctx.inputEmpty && ctx.hasPendingApproval ? 'approve_first' : 'submit';
+      return ctx.inputEmpty && ctx.hasPendingApproval && ctx.canApprove ? 'approve_first' : 'submit';
     case 'Escape':
       return ctx.hasPendingApproval ? 'deny_first' : 'close';
     case 'ArrowUp':

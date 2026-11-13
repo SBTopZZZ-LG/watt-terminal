@@ -21,4 +21,5 @@ pub mod scanner;
 pub mod session;
 pub mod settings;
 pub mod shim;
+pub mod term_reply;
 pub mod tools;

@@ -49,6 +49,15 @@ const PROTECTED_BODY_KEYS = new Set([
 ]);
 /** RFC 7230 tchar: the characters a header name may use. */
 const TOKEN_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+/** Header names whose values are credentials: they must be secret headers. Compared in lower case. */
+const CREDENTIAL_HEADERS = new Set([
+  'authorization',
+  'proxy-authorization',
+  'x-api-key',
+  'api-key',
+  'x-goog-api-key',
+  'x-auth-token',
+]);
 /** Header names that look like they carry a credential. Such a row's Secret toggle is ticked until the user touches it. */
 const CREDENTIAL_NAME_RE = /key|token|secret|auth|password|cookie/i;
 /** Control characters (Rust char::is_control): C0, DEL and C1. */
@@ -590,8 +599,8 @@ export function validateDraft(draft: ProviderDraft, takenIds: readonly string[])
       problems.headers[h.key] = `"${name}" is not a valid HTTP header name.`;
     } else if (seenHeaders.has(lower)) {
       problems.headers[h.key] = `Header "${name}" is listed more than once.`;
-    } else if (lower === 'authorization' && !h.secret) {
-      problems.headers[h.key] = 'Authorization must be a secret header, so its value stays out of settings.json.';
+    } else if (CREDENTIAL_HEADERS.has(lower) && !h.secret) {
+      problems.headers[h.key] = `"${name}" must be a secret header, so its value stays out of settings.json.`;
     } else if (CONTROL_RE.test(h.value)) {
       problems.headers[h.key] = 'Header value must not contain control characters.';
     } else if (!h.secret && [...h.value].length > MAX_HEADER_VALUE_CHARS) {

@@ -48,8 +48,8 @@ export const BUILTIN_COMMANDS: BuiltinCommand[] = [
   { name: 'btw', description: 'Ask a side question about the conversation; the answer is not stored.', hint: '<question>' },
   { name: 'compact', description: 'Summarize the conversation into a new one; the old one stays in history.', hint: null },
   { name: 'fork', description: 'Copy the conversation into a new one and switch to it.', hint: null },
-  { name: 'plan', description: 'Ask for a plan first: no edits until it is approved.', hint: '[task]' },
-  { name: 'review', description: 'Ask for a review of the working tree: nothing is changed.', hint: '[focus]' },
+  { name: 'plan', description: 'Ask for a plan first (guidance only; approvals still apply).', hint: '[task]' },
+  { name: 'review', description: 'Ask for a review of the working tree (guidance only; approvals still apply).', hint: '[focus]' },
   { name: 'init', description: 'Ask the agent to create or update AGENTS.md at the workspace root.', hint: '[focus]' },
 ];
 

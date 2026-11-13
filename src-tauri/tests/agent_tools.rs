@@ -732,7 +732,7 @@ fn ctrl_c_cancels_a_pending_approval() {
     let approvals = Arc::new(ApprovalGate::new());
     let (h, log) = turn_in_thread(s.arc(), approvals.clone(), "run `echo cancelled-cmd`");
     wait_approval(&s, &log);
-    user_input(&s, &approvals, "\u{3}").expect("ctrl-c");
+    user_input(&s, &approvals, "\u{3}", true).expect("ctrl-c");
     h.join().expect("turn");
     assert!(!s.records().iter().any(|r| r.command == "echo cancelled-cmd"), "cancelled command ran");
     assert_eq!(run_command_ok(&log), Some(false));
@@ -760,8 +760,8 @@ fn user_input_without_ctrl_c_keeps_approvals_pending() {
     let approvals = Arc::new(ApprovalGate::new());
     let (h, log) = turn_in_thread(s.arc(), approvals.clone(), "run `echo still-pending`");
     let (id, _) = wait_approval(&s, &log);
-    user_input(&s, &approvals, "x").expect("typing");
-    user_input(&s, &approvals, "\u{8}").expect("backspace");
+    user_input(&s, &approvals, "x", false).expect("typing");
+    user_input(&s, &approvals, "\u{8}", false).expect("backspace");
     assert!(approvals.decide(&id, false));
     h.join().expect("turn");
     assert_eq!(run_command_ok(&log), Some(false));
@@ -1642,6 +1642,25 @@ fn send_keys_refuses_a_password_prompt() {
     assert!(err.contains("asking for a password or secret"), "error: {err}");
     assert!(!snapshot(&s).rows.iter().any(|r| r.contains("hunter2")), "nothing was typed: {:?}", snapshot(&s).rows);
     tools.call("wait", &json!({"id": id, "seconds": 20, "ignore_updates": true}), None).expect("wait for the sleep to end");
+}
+
+/// An interrupt-only `send_keys` (Ctrl-C, no text) still goes through at a password prompt: it can only stop the
+/// command, never type a secret into it. Esc passes the same way; text is still refused (see above).
+#[test]
+fn send_keys_interrupt_passes_at_a_password_prompt() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let tools = SessionTools::new(&s);
+    let v = tools
+        .call("run_command", &json!({"command": "printf 'Password: '; sleep 30", "wait_seconds": 1}), None)
+        .expect("run_command");
+    assert_eq!(v["outcome"], "running", "{v}");
+    let id = v["record_id"].as_u64().expect("the record id");
+    tools.call("send_keys", &json!({"keys": ["Ctrl-C"]}), None).expect("ctrl-c interrupts at a password prompt");
+    let w = tools.call("wait", &json!({"id": id, "seconds": 10, "ignore_updates": true}), None).expect("wait");
+    assert_eq!(w["reason"], "command_finished", "{w}");
+    assert_eq!(w["record"]["exit_code"], 130, "{w}");
 }
 
 /// Through the approval gate on a real shell: the first write shows a card, the next one runs without it, and Ctrl-D needs

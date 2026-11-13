@@ -366,6 +366,22 @@ impl Conversation {
         *lock_usage(&self.last_usage) = None;
     }
 
+    /// Another attached session continues this conversation: the id is copied and the history, todo list,
+    /// no-vision memo, calibration, learned limits and last usage are shared, so both conversations see the same
+    /// live state. The resume note is copied, so a note no turn has taken yet is still taken once.
+    pub fn follow(&self) -> Self {
+        Conversation {
+            id: Mutex::new(lock_string(&self.id).clone()),
+            history: self.history.clone(),
+            todos: self.todos.clone(),
+            resume_note: Mutex::new(lock_note(&self.resume_note).clone()),
+            no_vision: self.no_vision.clone(),
+            calibration: self.calibration.clone(),
+            learned_limits: self.learned_limits.clone(),
+            last_usage: self.last_usage.clone(),
+        }
+    }
+
     /// The resume note, once: a turn that calls the model takes it, and the next turn gets none. `None` for a
     /// conversation that was not resumed, or after a turn has taken it.
     pub fn take_resume_note(&self) -> Option<String> {
@@ -750,6 +766,8 @@ impl LlmAgent {
         };
         let thinking = Cell::new(true);
         let streamed = Cell::new(false);
+        // The raw streamed text, kept for the partial redaction below.
+        let mut streamed_raw = String::new();
         ctx.emit(AgentEvent::Thinking { active: true });
         let before = ContextUsage {
             trimmed,
@@ -764,7 +782,8 @@ impl LlmAgent {
                 {
                     stop_thinking(ctx, &thinking);
                     streamed.set(true);
-                    ctx.emit(AgentEvent::TextDelta { text });
+                    streamed_raw.push_str(&text);
+                    ctx.emit(AgentEvent::TextDelta { text: redact_stream_fragment(&self.redactor, &text) });
                 }
             };
             block(llm::stream(&self.client, &self.cfg, &req, &mut on_delta, &self.cancel))
@@ -772,6 +791,11 @@ impl LlmAgent {
             block(llm::complete(&self.client, &self.cfg, &req, &self.cancel))
         };
         stop_thinking(ctx, &thinking);
+        // A stream that failed after showing text leaves a partial reply: the next request must see what the
+        // user saw. Nothing is pushed when nothing streamed, when the stream finished, or when not streaming.
+        if result.is_err() && streamed.get() && !streamed_raw.is_empty() {
+            lock(&self.history).push_assistant(interrupted_message(&self.redactor, &streamed_raw));
+        }
         if let Ok(reply) = &result
             && let Some(actual) = reply.usage.as_ref().map(|usage| usage.prompt_tokens).filter(|&n| n > 0)
         {
@@ -919,10 +943,10 @@ impl LlmAgent {
     fn charge(&self, polling: bool, general: &mut u32, polls: &mut u32) -> Option<Cap> {
         if polling {
             *polls += 1;
-            return (*polls >= self.limits.max_poll_calls).then_some(Cap::Polls(self.limits.max_poll_calls));
+            return (*polls > self.limits.max_poll_calls).then_some(Cap::Polls(self.limits.max_poll_calls));
         }
         *general += 1;
-        self.limits.model_call_cap().filter(|&cap| *general >= cap).map(Cap::Model)
+        self.limits.model_call_cap().filter(|&cap| *general > cap).map(Cap::Model)
     }
 }
 
@@ -998,6 +1022,19 @@ fn has_image_part(messages: &[Value]) -> bool {
 /// statuses and transport problems say nothing about the images.
 fn rejects_images(e: &LlmError) -> bool {
     matches!(e, LlmError::Http { status: 400 | 404 | 422, .. } | LlmError::Provider { .. })
+}
+
+/// Redacts one streamed text fragment before it is shown. A fragment is redacted on its own, so a
+/// credential split across two fragments is only caught by the whole-text redaction of the stored message.
+fn redact_stream_fragment(redactor: &Redactor, text: &str) -> String {
+    redactor.redact(text)
+}
+
+/// The assistant message stored when a streamed reply fails after text arrived: the accumulated text,
+/// redacted as a whole, with a marker that the reply was interrupted. Redacting the whole text catches a
+/// credential split across two deltas, which the per-delta redaction above cannot see.
+fn interrupted_message(redactor: &Redactor, raw: &str) -> Value {
+    json!({"role": "assistant", "content": format!("{}\n\n[reply interrupted]", redactor.redact(raw))})
 }
 
 /// The notice for a failed model call. Provider text is already free of the key (the adapter scrubs it).
@@ -1465,6 +1502,37 @@ mod tests {
         assert!(lock_usage(&conversation.last_usage()).is_none());
     }
 
+    #[test]
+    fn follow_shares_the_conversation_with_another_attached_session() {
+        let conversation = Conversation::new().unwrap();
+        let mut history = History::new();
+        history.push_user("carried message");
+        conversation.restore(
+            conversation.id(),
+            history,
+            vec![Todo { content: "carried step".to_string(), status: todo::TodoStatus::InProgress }],
+            false,
+        );
+        let usage = context::usage(&context::breakdown("abcd", &[], &[]), &Calibrator::default(), Some(100), None);
+        conversation.set_last_usage(Some(usage.clone()));
+        lock_calibration(&conversation.calibration()).observe(1000, 500);
+
+        let carried = conversation.follow();
+        assert_eq!(carried.id(), conversation.id(), "a restart keeps the conversation id");
+        assert_eq!(carried.take_resume_note().as_deref(), Some(RESUME_NOTE), "the resume note is cloned");
+        assert!(carried.take_resume_note().is_none(), "taking the note clears it");
+
+        lock(&carried.history()).push_user("after restart");
+        assert_eq!(lock(&conversation.history()).snapshot().len(), 2, "the history is shared");
+        assert_eq!(
+            *lock_todos(&conversation.todos()),
+            vec![Todo { content: "carried step".to_string(), status: todo::TodoStatus::InProgress }],
+            "the todo list is shared"
+        );
+        assert_eq!(*lock_usage(&carried.last_usage()), Some(usage), "the last usage is shared");
+        assert!(lock_calibration(&carried.calibration()).observed(), "the calibration is shared");
+    }
+
     fn hint(kind: ForegroundKind, command: &str) -> Foreground {
         Foreground { kind, command: command.to_string() }
     }
@@ -1577,6 +1645,40 @@ mod tests {
             error_text(&LlmError::Transport("could not connect: refused".into())),
             "I could not reach the provider: could not connect: refused"
         );
+    }
+
+    /// A streamed secret fragment is emitted redacted, never as written.
+    #[test]
+    fn a_streamed_secret_delta_is_emitted_redacted() {
+        let redactor = Redactor::new(vec!["tok-value-123456".to_string()]);
+        assert_eq!(
+            redact_stream_fragment(&redactor, "the key is tok-value-123456 done"),
+            "the key is [REDACTED] done"
+        );
+    }
+
+    /// An interrupted stream leaves exactly one partial message, redacted as a whole, and the next request
+    /// carries it. Per-delta redaction cannot see a secret split across two fragments; the whole-text
+    /// redaction of the stored message can.
+    #[test]
+    fn an_interrupted_stream_leaves_one_partial_message_for_the_next_request() {
+        let redactor = Redactor::new(vec!["tok-value-123456".to_string()]);
+        let first = redact_stream_fragment(&redactor, "the key is tok-value-");
+        let second = redact_stream_fragment(&redactor, "123456 done");
+        assert!(
+            (first.clone() + &second).contains("tok-value-123456"),
+            "per-delta redaction cannot see the split secret: {first:?} + {second:?}"
+        );
+        let mut history = History::new();
+        history.push_user("go on");
+        history.push_assistant(interrupted_message(&redactor, "the key is tok-value-123456 done"));
+        assert_eq!(history.len(), 2, "exactly one partial message was pushed");
+        let stored = history.snapshot()[1]["content"].as_str().unwrap().to_string();
+        assert!(!stored.contains("tok-value-123456"), "{stored}");
+        assert!(stored.ends_with("\n\n[reply interrupted]"), "{stored}");
+        let wire = history.messages_with("sys", &mut Resolver::none(), &TrimPlan::none());
+        assert_eq!(wire.len(), 3);
+        assert_eq!(wire[2]["content"], json!(stored), "the next request contains the partial reply");
     }
 
     /// The `Debug` text names the variant overlay's keys but never its values.

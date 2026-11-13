@@ -34,24 +34,26 @@ const REGEX_SIZE_LIMIT: usize = 256 * 1024;
 const SAFE_PUNCTUATION: &str = " _-./:=@+,";
 
 /// First words that are never auto-approved, whatever the rules say: privilege, shell and exec primitives, and
-/// destructive or network tools, and the zsh reserved words, precommand modifiers and builtins that run another word or
-/// change the shell's state. Matched exactly against the first word, ASCII-lowercased (macOS paths are
-/// case-insensitive, so `RM` runs `rm`). Kept sorted (byte order), all lowercase and unique: a unit test checks it, and
-/// `binary_search` relies on it.
+/// destructive, remote-execution or package-running tools, and the zsh reserved words, precommand modifiers and builtins
+/// that run another word or change the shell's state. Matched exactly against the first word, ASCII-lowercased (macOS
+/// paths are case-insensitive, so `RM` runs `rm`), plus versioned interpreter names (`python3.12`, `node20`: a base name
+/// from the list followed by version characters). Kept sorted (byte order), all lowercase and unique: a unit test checks
+/// it, and `binary_search` relies on it.
 pub const BUILTIN_DENY: &[&str] = &[
-    ".", "alias", "autoload", "awk", "bash", "bindkey", "builtin", "bun", "bye", "caffeinate", "case", "chgrp", "chmod",
-    "chown", "command", "compdef", "coproc", "cp", "csh", "curl", "dash", "dd", "declare", "defaults", "deno",
-    "disable", "diskutil", "do", "doas", "done", "ed", "elif", "else", "emacs", "emulate", "enable", "end", "env",
-    "esac", "eval", "ex", "exec", "exit", "expect", "export", "fc", "fi", "find", "fish", "float", "for", "foreach",
-    "ftp", "function", "functions", "gawk", "gopass", "hash", "if", "install", "integer", "kill", "killall", "ksh",
-    "launchctl", "less", "ln", "local", "logout", "lua", "man", "mkfs", "more", "mount", "mv", "nano", "nc", "ncat",
-    "nice", "nmap", "nocorrect", "node", "noglob", "nohup", "nvim", "op", "open", "osascript", "parallel", "pass",
-    "perl", "php", "pkill", "printenv", "python", "python3", "r", "read", "readonly", "rehash", "repeat", "rm", "rmdir",
-    "rsync", "ruby", "sched", "scp", "screen", "security", "sed", "select", "set", "setopt", "sftp", "sh", "shred",
-    "source", "sqlite3", "ssh", "stdbuf", "su", "sudo", "tar", "tclsh", "tcsh", "tee", "telnet", "then", "time",
-    "timeout", "tmux", "trap", "truncate", "typeset", "umount", "unalias", "unlink", "unset", "unsetopt", "until",
-    "unzip", "vi", "view", "vim", "watch", "wget", "while", "xargs", "zftp", "zip", "zle", "zmodload", "zpty", "zsh",
-    "ztcp",
+    ".", "alias", "arch", "at", "autoload", "awk", "bash", "bindkey", "builtin", "bun", "bye", "caffeinate", "case",
+    "chgrp", "chmod", "chown", "command", "compdef", "coproc", "cp", "crontab", "csh", "curl", "dash", "dd", "declare",
+    "defaults", "deno", "disable", "diskutil", "do", "doas", "docker", "done", "ed", "elif", "else", "emacs", "emulate",
+    "enable", "end", "env", "esac", "eval", "ex", "exec", "exit", "expect", "export", "fc", "fi", "find", "fish",
+    "float", "for", "foreach", "ftp", "function", "functions", "gawk", "gopass", "hash", "if", "install", "integer",
+    "kill", "killall", "ksh", "kubectl", "launchctl", "less", "ln", "local", "logout", "lua", "man", "mkfs", "more",
+    "mount", "mv", "nano", "nc", "ncat", "nice", "nmap", "nocorrect", "node", "noglob", "nohup", "npx", "nvim", "op",
+    "open", "osascript", "parallel", "pass", "perl", "php", "pip", "pipx", "pkill", "pnpm", "podman", "printenv",
+    "python", "python3", "r", "read", "readonly", "reboot", "rehash", "repeat", "rm", "rmdir", "rsync", "ruby",
+    "sandbox-exec", "sched", "scp", "screen", "script", "security", "sed", "select", "set", "setopt", "sftp", "sh",
+    "shred", "shutdown", "source", "sqlite3", "ssh", "stdbuf", "su", "sudo", "tar", "taskpolicy", "tclsh", "tcsh",
+    "tee", "telnet", "then", "time", "timeout", "tmutil", "tmux", "trap", "truncate", "typeset", "umount", "unalias",
+    "unlink", "unset", "unsetopt", "until", "unzip", "uvx", "vi", "view", "vim", "watch", "wget", "while", "xargs",
+    "yarn", "zftp", "zip", "zle", "zmodload", "zpty", "zsh", "ztcp",
 ];
 
 /// Why a call asks or runs without asking. The code is the wire string in the events and in `test_approval`.
@@ -335,10 +337,31 @@ fn hard_gate(command: &str) -> Option<Reason> {
         return Some(Reason::GatePath);
     }
     // macOS file systems are case-insensitive, so `RM` runs `rm`.
-    if BUILTIN_DENY.binary_search(&first.to_ascii_lowercase().as_str()).is_ok() {
+    let lower = first.to_ascii_lowercase();
+    if BUILTIN_DENY.binary_search(&lower.as_str()).is_ok() {
+        return Some(Reason::GateDenylist);
+    }
+    // A versioned interpreter name (`python3.12`, `node20`) runs the denied interpreter.
+    if is_versioned_interpreter(&lower) {
         return Some(Reason::GateDenylist);
     }
     None
+}
+
+/// Base names whose versioned forms also run the denied interpreter. Each base is on the deny list, so the exact
+/// names are refused above; this catches the suffixed ones (`python3.12`, `node20`).
+const VERSIONED_INTERPRETERS: &[&str] =
+    &["bun", "deno", "lua", "node", "perl", "php", "python", "python3", "ruby"];
+
+/// True when `first` (already lowercased) is a versioned interpreter name: a base name from
+/// `VERSIONED_INTERPRETERS` followed by one or more version characters (digits and dots). `node_modules` does not
+/// match: `_` is not a version character.
+fn is_versioned_interpreter(first: &str) -> bool {
+    VERSIONED_INTERPRETERS.iter().any(|base| {
+        first.len() > base.len()
+            && first.starts_with(base)
+            && first[base.len()..].chars().all(|c| c.is_ascii_digit() || c == '.')
+    })
 }
 
 fn is_safe_char(c: char) -> bool {
@@ -555,6 +578,18 @@ mod tests {
         assert_eq!(gate("SUDO ls"), Some(Reason::GateDenylist));
         assert_eq!(gate("Rm x"), Some(Reason::GateDenylist));
         assert_eq!(gate("Git status"), None, "only the deny list is case-insensitive");
+    }
+
+    /// Versioned interpreter names run the denied interpreter, so the gate refuses them. The exact names are
+    /// already on the list; these are the suffixed forms. A name that merely starts with a base is fine.
+    #[test]
+    fn versioned_interpreter_names_are_refused() {
+        for command in ["python", "Python3.12", "python3.12", "perl5.34", "ruby3.2", "node20", "php8.2", "lua5.4"] {
+            assert_eq!(gate(command), Some(Reason::GateDenylist), "{command:?} runs a denied interpreter");
+        }
+        for command in ["node_modules", "nodejs", "python-3", "pythonx", "denoising"] {
+            assert_eq!(gate(command), None, "{command:?} is not a versioned interpreter");
+        }
     }
 
     #[test]
