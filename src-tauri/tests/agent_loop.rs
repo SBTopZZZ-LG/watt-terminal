@@ -19,6 +19,7 @@ use watt_terminal_lib::core::persist::attachments::{sha256_hex, AttachmentStore}
 use watt_terminal_lib::core::settings::LimitsSettings;
 use watt_terminal_lib::core::chat::history::History;
 use watt_terminal_lib::core::chat::prompt;
+use watt_terminal_lib::core::chat::questions;
 use watt_terminal_lib::core::chat::redact::Redactor;
 use watt_terminal_lib::core::chat::todo;
 use watt_terminal_lib::core::foreground::{Foreground, ForegroundKind};
@@ -314,6 +315,7 @@ fn settings(url: &str, stream: bool) -> LlmSettings {
         stream,
         max_tokens: None,
         context_limit: None,
+        extra: None,
     }
 }
 
@@ -1124,6 +1126,213 @@ fn an_invalid_todo_write_changes_nothing_and_the_model_reads_why() {
     assert_paired(&msgs);
     let text = tool_content(&msgs, "call_bad");
     assert!(text.starts_with("error: ") && text.contains("exactly one in_progress"), "{text}");
+}
+
+// ask_user clarification questions: the model asks, a test thread answers through the gate, the next model request
+// carries the result JSON, and the turn finishes. No real shell is involved.
+
+/// The arguments of an `ask_user` call, as the model sends them (a JSON string): one question, two options.
+fn ask_args() -> String {
+    json!({"questions": [{"question": "Which capa?", "header": "Capa",
+        "options": [{"label": "a", "description": "first"}, {"label": "b", "description": "second"}]}]})
+    .to_string()
+}
+
+/// Runs one turn with an emit hook that answers every question request with `answer`, and returns the events.
+fn turn_answering(
+    agent: &mut LlmAgent,
+    tools: &FakeTools,
+    gate: &ApprovalGate,
+    text: &str,
+    answer: impl Fn(&str) -> Vec<questions::AnswerInput>,
+) -> Vec<AgentEvent> {
+    let log: Mutex<Vec<AgentEvent>> = Mutex::new(Vec::new());
+    // The ask is registered before its event goes out, so an answer given here is already waiting.
+    let emit = |ev: AgentEvent| {
+        if let AgentEvent::QuestionRequest { call_id, .. } = &ev {
+            gate.questions().decide(call_id, answer(call_id)).expect("the ask is waiting");
+        }
+        log.lock().unwrap().push(ev);
+    };
+    let ctx = AgentCtx::new(tools, gate, &emit);
+    agent::run_turn(agent, &UserMessage::text(text), &ctx);
+    log.into_inner().unwrap()
+}
+
+fn answered() -> Vec<questions::AnswerInput> {
+    vec![questions::AnswerInput { question_id: "q1".into(), selected: vec![1], other: None, skipped: false }]
+}
+
+fn skipped() -> Vec<questions::AnswerInput> {
+    vec![questions::AnswerInput { question_id: "q1".into(), selected: Vec::new(), other: None, skipped: true }]
+}
+
+/// The question requests of the events, with their call ids.
+fn question_calls(events: &[AgentEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::QuestionRequest { call_id, questions } => {
+                assert_eq!(questions.len(), 1);
+                assert_eq!(questions[0].id, "q1");
+                Some(call_id.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The tool message the second request carries for the `ask_user` call, and the advertised tool names.
+fn second_request_tool(provider: &Provider) -> (Vec<Value>, Vec<String>) {
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2, "the turn goes on after the question settles");
+    let second = body_of(&requests[1]);
+    let messages = second["messages"].as_array().expect("messages").clone();
+    let names: Vec<String> = body_of(&requests[0])["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+        .collect();
+    (messages, names)
+}
+
+#[test]
+fn ask_user_answered_continues_the_turn_with_the_result() {
+    let provider = serve(vec![
+        Script::json(tool_reply(&[("call_q", "ask_user", &ask_args())])),
+        Script::json(text_reply("On it.")),
+    ]);
+    let conv = Conversation::new().unwrap();
+    let tools = FakeTools::default();
+    let gate = no_gate();
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
+    let events = turn_answering(&mut agent, &tools, &gate, "which capa?", |_| answered());
+
+    // Handled inside the loop: no backend call, no approval card, no shell bracket, and no command counted.
+    assert!(tools.reached().is_empty(), "ask_user reached the backend: {:?}", tools.reached());
+    assert!(!events.iter().any(|e| matches!(
+        e, AgentEvent::ApprovalRequest { .. } | AgentEvent::AgentControl { .. } | AgentEvent::Integration { .. }
+    )));
+    assert_eq!(decisions(&events), [("ask_user".to_string(), "read", true)]);
+    assert_eq!(question_calls(&events).len(), 1);
+    assert_eq!(texts(&events), ["On it."]);
+    let (messages, names) = second_request_tool(&provider);
+    assert!(names.contains(&"ask_user".to_string()), "ask_user is advertised: {names:?}");
+    let content = tool_content(&messages, "call_q");
+    assert!(content.contains(r#""status":"answered""#) && content.contains(r#""selected":["b"]"#), "{content}");
+    assert_paired(&stored(&conv.history()));
+}
+
+#[test]
+fn ask_user_skipped_continues_the_turn() {
+    let provider = serve(vec![
+        Script::json(tool_reply(&[("call_q", "ask_user", &ask_args())])),
+        Script::json(text_reply("I will pick one.")),
+    ]);
+    let conv = Conversation::new().unwrap();
+    let tools = FakeTools::default();
+    let gate = no_gate();
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
+    let events = turn_answering(&mut agent, &tools, &gate, "which capa?", |_| skipped());
+
+    assert_eq!(decisions(&events), [("ask_user".to_string(), "read", true)]);
+    assert_eq!(texts(&events), ["I will pick one."]);
+    let (messages, _) = second_request_tool(&provider);
+    let content = tool_content(&messages, "call_q");
+    assert!(content.contains(r#""status":"skipped""#) && !content.contains("selected"), "{content}");
+    assert_paired(&stored(&conv.history()));
+}
+
+/// Nobody answers, and the question times out: the result still goes back to the model and the turn goes on.
+#[test]
+fn ask_user_timeout_continues_the_turn() {
+    let provider = serve(vec![
+        Script::json(tool_reply(&[("call_q", "ask_user", &ask_args())])),
+        Script::json(text_reply("Going with my best guess.")),
+    ]);
+    let conv = Conversation::new().unwrap();
+    let tools = FakeTools::default();
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
+    let events = turn(&mut agent, &tools, &no_gate(), "which capa?");
+
+    assert_eq!(decisions(&events), [("ask_user".to_string(), "read", true)]);
+    assert_eq!(texts(&events), ["Going with my best guess."]);
+    let (messages, _) = second_request_tool(&provider);
+    let content = tool_content(&messages, "call_q");
+    assert!(content.contains(r#""status":"timed_out""#), "{content}");
+    assert_paired(&stored(&conv.history()));
+}
+
+/// Cancelling while the question waits settles it as cancelled, as Ctrl-C does through `cancel_all`, and the turn
+/// still goes on.
+#[test]
+fn ask_user_cancel_continues_the_turn() {
+    let provider = serve(vec![
+        Script::json(tool_reply(&[("call_q", "ask_user", &ask_args())])),
+        Script::json(text_reply("No problem, moving on.")),
+    ]);
+    let conv = Conversation::new().unwrap();
+    let tools = FakeTools::default();
+    let gate = no_gate();
+    let log: Mutex<Vec<AgentEvent>> = Mutex::new(Vec::new());
+    let emit = |ev: AgentEvent| {
+        if matches!(ev, AgentEvent::QuestionRequest { .. }) {
+            gate.cancel_all();
+        }
+        log.lock().unwrap().push(ev);
+    };
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
+    let ctx = AgentCtx::new(&tools, &gate, &emit);
+    agent::run_turn(&mut agent, &UserMessage::text("which capa?"), &ctx);
+    let events = log.into_inner().unwrap();
+
+    assert_eq!(decisions(&events), [("ask_user".to_string(), "read", true)]);
+    assert_eq!(texts(&events), ["No problem, moving on."]);
+    let (messages, _) = second_request_tool(&provider);
+    let content = tool_content(&messages, "call_q");
+    assert!(content.contains(r#""status":"cancelled""#), "{content}");
+    assert_paired(&stored(&conv.history()));
+}
+
+/// A checkpoint is saved with the tool call pending, before the tools run: restarting from it loads the unanswered
+/// call, which the history repair then closes. Uses `todo_write`, so no shell or waiting is involved.
+#[test]
+fn a_checkpoint_before_the_tool_run_sees_the_pending_call() {
+    let args = todo_args(&[("read the code", "completed")]);
+    let provider = serve(vec![
+        Script::json(tool_reply(&[("call_t", "todo_write", &args)])),
+        Script::json(text_reply("noted")),
+    ]);
+    let conv = Conversation::new().unwrap();
+    let seen: Arc<Mutex<Vec<Vec<Value>>>> = Arc::new(Mutex::new(Vec::new()));
+    let checkpoint = {
+        let history = conv.history();
+        let seen = seen.clone();
+        move |_: &Redactor| {
+            seen.lock().unwrap().push(history.lock().unwrap().snapshot());
+        }
+    };
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()))
+        .with_checkpoint(checkpoint);
+    turn(&mut agent, &FakeTools::default(), &no_gate(), "plan the work");
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 3, "after the user message, with the call pending, and after the tool round: {seen:?}");
+    assert_eq!(seen[0].len(), 1, "the user message alone: {seen:?}");
+    // The middle checkpoint holds the call but no result yet.
+    assert_eq!(seen[1].len(), 2, "the user message and the unanswered call: {seen:?}");
+    let calls = seen[1][1].get("tool_calls").and_then(Value::as_array).cloned().unwrap_or_default();
+    assert!(calls.iter().any(|c| c["id"] == "call_t"), "the pending call is on record: {seen:?}");
+    assert!(
+        !seen[1].iter().any(|m| m["role"] == "tool"),
+        "no result has been recorded yet: {seen:?}"
+    );
+    assert_eq!(seen[2].len(), 3, "the user message, the call, and its result: {seen:?}");
+    assert!(
+        seen[2].iter().any(|m| m["role"] == "tool" && m["tool_call_id"] == "call_t"),
+        "the post-run checkpoint has the result: {seen:?}"
+    );
 }
 
 /// The agent's own open command is described in every model call of the turn, with its id, command and age.
@@ -2006,7 +2215,8 @@ fn an_overflow_naming_a_limit_that_is_not_below_the_one_in_force_is_not_retried(
 #[test]
 fn an_overflow_with_images_is_not_taken_for_a_refusal_and_the_images_are_still_sent() {
     let provider = serve(vec![
-        overflow_400("This model's maximum context length is 8192 tokens."),
+        // The limit stays above the minimum request so the retry can be sent.
+        overflow_400("This model's maximum context length is 32768 tokens."),
         Script::json(text_reply("seen")),
     ]);
     let conv = Conversation::new().unwrap();
@@ -2025,7 +2235,8 @@ fn an_overflow_with_images_is_not_taken_for_a_refusal_and_the_images_are_still_s
 #[test]
 fn an_image_refusal_after_the_overflow_retry_still_gets_the_image_retry_and_the_notice() {
     let provider = serve(vec![
-        overflow_400("This model's maximum context length is 8192 tokens."),
+        // The limit stays above the minimum request so the retry can be sent.
+        overflow_400("This model's maximum context length is 32768 tokens."),
         refused_images(),
         Script::json(text_reply("text only")),
     ]);

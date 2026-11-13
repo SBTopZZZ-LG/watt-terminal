@@ -13,6 +13,11 @@ const call = (callId: string, name = 'get_cwd'): TranscriptAction => ({
   event: { type: 'tool_call', call_id: callId, name, args: {} },
 });
 
+const callArgs = (callId: string, name: string, args: unknown): TranscriptAction => ({
+  type: 'agent_event',
+  event: { type: 'tool_call', call_id: callId, name, args },
+});
+
 const result = (
   callId: string,
   name: string,
@@ -199,6 +204,29 @@ describe('toolGroupSummary', () => {
   it('escapes a tool name the model made up', () => {
     const g = group([...finished('c1', 'x‮y'), ...finished('c2', 'x‮y')]);
     expect(toolGroupSummary(g)).toBe('2 tool calls: x\\u{202E}y ×2');
+  });
+
+  it('appends the first caption after the tool names', () => {
+    const g = group([
+      callArgs('c1', 'run_command', { command: 'git status', summary: 'Check the working tree' }),
+      result('c1', 'run_command', true),
+      ...finished('c2', 'get_cwd'),
+    ]);
+    expect(toolGroupSummary(g)).toBe('2 tool calls: run_command, get_cwd · Check the working tree');
+  });
+
+  it('marks hidden captions with an ellipsis, before the running note', () => {
+    const g = group([
+      callArgs('c1', 'run_command', { command: 'git status', summary: 'Check the working tree' }),
+      result('c1', 'run_command', true),
+      callArgs('c2', 'run_command', { command: 'git push', summary: 'Push the branch' }),
+    ]);
+    expect(toolGroupSummary(g)).toBe('2 tool calls: run_command ×2 · Check the working tree … · running run_command');
+  });
+
+  it('a group without captions is unchanged', () => {
+    const g = group([...finished('c1', 'get_cwd'), ...finished('c2', 'get_cwd')]);
+    expect(toolGroupSummary(g)).toBe('2 tool calls: get_cwd ×2');
   });
 });
 

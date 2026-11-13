@@ -69,6 +69,12 @@ describe('StatusChip: the model chip is a label, not a button', () => {
   it('ok: the hover text is the provider and the model', () => {
     expect(modelChip(chip(LLM_ON, OK))).toContain('title="Acme · model: big"');
   });
+
+  it('ok with a variant: the label and the hover text carry #variant', () => {
+    const out = chip({ ...LLM_ON, variant: 'high' }, OK);
+    expect(modelChip(out)).toContain('model: big#high');
+    expect(modelChip(out)).toContain('title="Acme · model: big#high"');
+  });
 });
 
 describe('StatusChip: the AI settings button', () => {

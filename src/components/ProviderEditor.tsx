@@ -8,12 +8,13 @@ import {
   isLocalHttp,
   modelsUrlFor,
   newHeaderDraft,
+  newVariantDraft,
   renameHeader,
   toggleSecret,
   withId,
   withName,
 } from '../lib/settingsForm';
-import type { DraftProblems, HeaderDraft, ProviderDraft } from '../lib/settingsForm';
+import type { DraftProblems, HeaderDraft, ModelDraft, ProviderDraft, VariantDraft } from '../lib/settingsForm';
 
 /** One model's connection test: running, the backend's answer, or a failed call. */
 export type TestState = { kind: 'running' } | { kind: 'done'; result: TestResult } | { kind: 'failed'; message: string };
@@ -34,6 +35,11 @@ export interface ProviderEditorProps {
   saveError: string | null;
   /** The id of this provider's model that is the default, if any. It cannot be removed. */
   defaultModelId: string | null;
+  /**
+   * The variant of the default model, when this provider holds it. That manual variant cannot be removed: choose
+   * another default variant first. Null when this provider does not hold the default model, or the base model runs.
+   */
+  defaultVariantId: string | null;
   fetching: boolean;
   fetchNote: string | null;
   fetchError: string | null;
@@ -70,6 +76,58 @@ function TestLine({ state }: { state: TestState }) {
     <span className={`settings-test ${ok ? 'settings-test-ok' : 'settings-test-fail'}`} role="status">
       {`${ok ? 'ok' : 'failed'} · ${millis} ms · ${message}`}
     </span>
+  );
+}
+
+/**
+ * The per-model "add variant" form. It holds only its own three fields; adding passes a manual row up with a fresh key.
+ */
+function AddVariantForm({ modelId, off, onAdd }: { modelId: string; off: boolean; onAdd(v: VariantDraft): void }) {
+  const [id, setId] = useState('');
+  const [label, setLabel] = useState('');
+  const [body, setBody] = useState('');
+  const add = () => {
+    if (id.trim() === '') {
+      return;
+    }
+    onAdd({ ...newVariantDraft('manual'), id, label, body });
+    setId('');
+    setLabel('');
+    setBody('');
+  };
+  return (
+    <div className="settings-variant-add">
+      <input
+        type="text"
+        aria-label={`New variant id for ${modelId}`}
+        placeholder="Variant id"
+        value={id}
+        disabled={off}
+        spellCheck={false}
+        onChange={(e) => setId(e.target.value)}
+      />
+      <input
+        type="text"
+        aria-label={`New variant label for ${modelId}`}
+        placeholder="Label"
+        value={label}
+        disabled={off}
+        spellCheck={false}
+        onChange={(e) => setLabel(e.target.value)}
+      />
+      <textarea
+        aria-label={`New variant body for ${modelId}`}
+        placeholder='{"reasoning":{"effort":"high"}}'
+        value={body}
+        disabled={off}
+        spellCheck={false}
+        rows={2}
+        onChange={(e) => setBody(e.target.value)}
+      />
+      <button type="button" disabled={off || id.trim() === ''} onClick={add}>
+        Add variant
+      </button>
+    </div>
   );
 }
 
@@ -117,9 +175,18 @@ export function ProviderEditor(p: ProviderEditorProps) {
     if (newModelId === '' || newModelTaken) {
       return;
     }
-    set({ models: [...draft.models, { id: newModelId, source: 'custom', context_limit: '', provider_context: null }] });
+    set({ models: [...draft.models, { id: newModelId, source: 'custom', context_limit: '', provider_context: null, variants: [] }] });
     setNewModel('');
   };
+
+  const setModel = (modelId: string, patch: (m: ModelDraft) => ModelDraft) =>
+    set({ models: draft.models.map((m) => (m.id === modelId ? patch(m) : m)) });
+
+  const setVariant = (modelId: string, key: string, patch: Partial<VariantDraft>) =>
+    setModel(modelId, (m) => ({ ...m, variants: m.variants.map((v) => (v.key === key ? { ...v, ...patch } : v)) }));
+
+  const removeVariant = (modelId: string, key: string) =>
+    setModel(modelId, (m) => ({ ...m, variants: m.variants.filter((v) => v.key !== key) }));
 
   return (
     <section className="settings-editor" aria-label={draft.isNew ? 'New provider' : `Provider ${draft.name}`}>
@@ -385,6 +452,7 @@ export function ProviderEditor(p: ProviderEditorProps) {
           {draft.models.map((m) => {
             const isDefault = p.defaultModelId === m.id;
             const error = p.problems.models[m.id];
+            const manualIds = new Set(m.variants.filter((v) => v.source === 'manual').map((v) => v.id.trim()));
             return (
               <li key={m.id} className="settings-model">
                 <div className="settings-inline">
@@ -433,6 +501,97 @@ export function ProviderEditor(p: ProviderEditorProps) {
                 </div>
                 {error && <span className="settings-error">{error}</span>}
                 {p.tests[m.id] && <TestLine state={p.tests[m.id]} />}
+                <details className="settings-variants">
+                  <summary>{`Variants (${m.variants.length})`}</summary>
+                  {m.variants.length === 0 ? (
+                    <p className="settings-hint">No variants. Fetched ones appear here; add a manual one below.</p>
+                  ) : (
+                    <ul className="settings-variants-list">
+                      {m.variants.map((v) => {
+                        const problem = p.problems.variants[v.key];
+                        if (v.source === 'auto') {
+                          return (
+                            <li key={v.key} className="settings-variant">
+                              <div className="settings-inline">
+                                <span className="settings-tag">auto</span>
+                                <span className="settings-variant-id">{v.id}</span>
+                                <span className="settings-dim">{v.label}</span>
+                              </div>
+                              {manualIds.has(v.id.trim()) && (
+                                <span className="settings-hint">Overridden by the manual variant with this id.</span>
+                              )}
+                              <pre className="settings-variant-body">{v.body}</pre>
+                              {problem && <span className="settings-error">{problem}</span>}
+                            </li>
+                          );
+                        }
+                        const isDefaultVariant = isDefault && p.defaultVariantId !== null && v.id.trim() === p.defaultVariantId;
+                        return (
+                          <li key={v.key} className="settings-variant">
+                            <div className="settings-inline">
+                              <span className="settings-tag">manual</span>
+                            </div>
+                            <div className="settings-variant-fields">
+                              <label className="settings-inline-label">
+                                Id
+                                <input
+                                  type="text"
+                                  aria-label={`Variant id in ${m.id}`}
+                                  value={v.id}
+                                  disabled={off || isDefaultVariant}
+                                  title={
+                                    isDefaultVariant
+                                      ? 'This is the default variant. Change the default variant first.'
+                                      : undefined
+                                  }
+                                  spellCheck={false}
+                                  onChange={(e) => setVariant(m.id, v.key, { id: e.target.value })}
+                                />
+                              </label>
+                              <label className="settings-inline-label">
+                                Label
+                                <input
+                                  type="text"
+                                  aria-label={`Variant label in ${m.id}`}
+                                  value={v.label}
+                                  disabled={off}
+                                  spellCheck={false}
+                                  onChange={(e) => setVariant(m.id, v.key, { label: e.target.value })}
+                                />
+                              </label>
+                              <label className="settings-inline-label settings-variant-body-label">
+                                Body
+                                <textarea
+                                  aria-label={`Variant body in ${m.id}`}
+                                  value={v.body}
+                                  disabled={off}
+                                  spellCheck={false}
+                                  rows={3}
+                                  onChange={(e) => setVariant(m.id, v.key, { body: e.target.value })}
+                                />
+                              </label>
+                            </div>
+                            <button
+                              type="button"
+                              disabled={off || isDefaultVariant}
+                              aria-label={`Remove variant ${v.id} from ${m.id}`}
+                              title={
+                                isDefaultVariant
+                                  ? 'This is the default variant. Choose another default variant first.'
+                                  : 'Remove this variant'
+                              }
+                              onClick={() => removeVariant(m.id, v.key)}
+                            >
+                              Remove
+                            </button>
+                            {problem && <span className="settings-error">{problem}</span>}
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  )}
+                  <AddVariantForm modelId={m.id} off={off} onAdd={(v) => setModel(m.id, (x) => ({ ...x, variants: [...x.variants, v] }))} />
+                </details>
               </li>
             );
           })}

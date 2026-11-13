@@ -12,7 +12,7 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use serde_json::Value;
 
-use super::{MAX_MODEL_ID_CHARS, Model, ModelSource, Provider};
+use super::{MAX_MODEL_ID_CHARS, MAX_VARIANTS_PER_MODEL, Model, ModelSource, ModelVariant, Provider, VariantSource, valid_variant_id};
 use crate::core::chat::redact::Redactor;
 use crate::core::llm::{self, LlmError, ProviderConfig};
 
@@ -30,11 +30,13 @@ const MESSAGE_LIMIT: usize = 300;
 /// One model from a provider's list. `context` is the size the provider reported, if it reported one. `vision` says
 /// whether the provider lists image input among the model's input modalities: Some(true) with "image" in
 /// `architecture.input_modalities`, Some(false) when that list is there without it, None when the entry has no list.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `variants` are the auto effort variants read from the entry (see `variants_of`), empty when it lists none.
+#[derive(Debug, Clone, PartialEq)]
 pub struct FetchedModel {
     pub id: String,
     pub context: Option<u32>,
     pub vision: Option<bool>,
+    pub variants: Vec<ModelVariant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,7 +97,12 @@ pub fn parse_model_list(body: &str) -> Result<Vec<FetchedModel>, ModelsError> {
         if !seen.insert(id.clone()) {
             continue;
         }
-        models.push(FetchedModel { context: context_of(entry), vision: vision_of(entry), id });
+        models.push(FetchedModel {
+            context: context_of(entry),
+            vision: vision_of(entry),
+            variants: variants_of(entry),
+            id,
+        });
     }
     Ok(models)
 }
@@ -142,6 +149,67 @@ fn context_of(entry: &Value) -> Option<u32> {
 fn vision_of(entry: &Value) -> Option<bool> {
     let modalities = entry.get("architecture")?.get("input_modalities")?.as_array()?;
     Some(modalities.iter().any(|m| m.as_str() == Some("image")))
+}
+
+/// Effort names that describe the list rather than a selectable effort. Never become variants.
+const SKIPPED_EFFORTS: &[&str] = &["toggle", "budget", "default_effort", "mandatory"];
+
+/// The auto effort variants of one entry, built only from validated scalars. OpenRouter lists its efforts at
+/// `reasoning.supported_efforts` (body `{"reasoning":{"effort":e}}`); OpenCode/Zen lists them at
+/// `capabilities.reasoning.effort` (body `{"reasoning_effort":e}`). When `reasoning.supported_efforts` is an array it
+/// wins, whatever else the entry holds; otherwise the OpenCode path is tried. Names are lowercased, validated like a
+/// variant id, and deduplicated first-wins; at most `MAX_VARIANTS_PER_MODEL` are kept. All are `VariantSource::Auto`.
+fn variants_of(entry: &Value) -> Vec<ModelVariant> {
+    let openrouter = entry.get("reasoning").and_then(|r| r.get("supported_efforts")).and_then(Value::as_array);
+    let efforts: &[Value] = match openrouter {
+        Some(list) => list,
+        None => entry
+            .get("capabilities")
+            .and_then(|c| c.get("reasoning"))
+            .and_then(|r| r.get("effort"))
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
+    };
+    let nested = openrouter.is_some();
+    let mut seen = HashSet::new();
+    let mut variants = Vec::new();
+    for effort in efforts {
+        if variants.len() == MAX_VARIANTS_PER_MODEL {
+            break;
+        }
+        let Some(raw) = effort.as_str() else { continue };
+        let id = raw.to_ascii_lowercase();
+        if !valid_variant_id(&id) || SKIPPED_EFFORTS.contains(&id.as_str()) || !seen.insert(id.clone()) {
+            continue;
+        }
+        let body = if nested {
+            serde_json::json!({"reasoning": {"effort": id}})
+        } else {
+            serde_json::json!({"reasoning_effort": id})
+        };
+        let Value::Object(body) = body else { continue };
+        variants.push(ModelVariant { id: id.clone(), label: effort_label(&id), body, source: VariantSource::Auto });
+    }
+    variants
+}
+
+/// The display name of an effort id: title-cased words, with `xhigh` as "X High".
+fn effort_label(id: &str) -> String {
+    if id == "xhigh" {
+        return "X High".to_string();
+    }
+    id.split(['-', '_'])
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Fetches and parses a model list. `url` is the full list URL. `headers` are the caller's header values with
@@ -240,15 +308,20 @@ fn from_llm(err: LlmError) -> ModelsError {
 /// Folds a fetched list into a provider's models.
 ///
 /// Custom models are kept exactly as they are. A fetched model that is still listed is updated: its provider context
-/// becomes the newly reported value, and its user override (`context_limit`) is kept. A fetched model that is no
-/// longer listed is removed. Models that are new are appended, sorted by id. An existing model keeps its place. A
-/// fetched id that a custom model already uses is ignored, so ids stay unique. The settings default is not checked
-/// here; the caller decides what to do about a removed default.
+/// becomes the newly reported value, its user override (`context_limit`) is kept, and its auto variants are replaced
+/// by the newly reported ones while its manual variants are kept (a manual variant shadows an auto one with the same
+/// id at resolution). The merged variants are capped at `MAX_VARIANTS_PER_MODEL`: manual variants are always kept and
+/// auto variants beyond the cap are dropped in incoming order, so the merged model always validates. A fetched model
+/// that is no longer listed is removed. Models that are new are appended with the fetched auto variants (also capped), sorted by id. An existing model keeps its place. A fetched id that a custom model already
+/// uses is ignored, so ids stay unique. The settings default is not checked here; the caller decides what to do about
+/// a removed default.
 pub fn merge_fetched(provider: &mut Provider, fetched: Vec<FetchedModel>) {
     // First occurrence wins, and sorting gives the append order.
-    let mut fresh: BTreeMap<String, (Option<u32>, Option<bool>)> = BTreeMap::new();
+    let mut fresh: BTreeMap<String, FetchedModel> = BTreeMap::new();
     for model in fetched {
-        fresh.entry(model.id).or_insert((model.context, model.vision));
+        if !fresh.contains_key(&model.id) {
+            fresh.insert(model.id.clone(), model);
+        }
     }
     let existing: HashSet<String> = provider.models.iter().map(|m| m.id.clone()).collect();
 
@@ -257,20 +330,32 @@ pub fn merge_fetched(provider: &mut Provider, fetched: Vec<FetchedModel>) {
         match model.source {
             ModelSource::Custom => merged.push(model),
             ModelSource::Fetched => {
-                if let Some((context, vision)) = fresh.get(&model.id).copied() {
-                    merged.push(Model { provider_context: context, vision, ..model });
+                if let Some(new) = fresh.remove(&model.id) {
+                    let mut kept: Vec<ModelVariant> =
+                        model.variants.into_iter().filter(|v| v.source == VariantSource::Manual).collect();
+                    let room = MAX_VARIANTS_PER_MODEL.saturating_sub(kept.len());
+                    kept.extend(new.variants.into_iter().take(room));
+                    merged.push(Model {
+                        provider_context: new.context,
+                        vision: new.vision,
+                        variants: kept,
+                        ..model
+                    });
                 }
             }
         }
     }
-    for (id, (context, vision)) in fresh {
+    for (id, new) in fresh {
         if !existing.contains(&id) {
+            let mut variants = new.variants;
+            variants.truncate(MAX_VARIANTS_PER_MODEL);
             merged.push(Model {
                 id,
                 context_limit: None,
-                provider_context: context,
-                vision,
+                provider_context: new.context,
+                vision: new.vision,
                 source: ModelSource::Fetched,
+                variants,
             });
         }
     }
@@ -295,7 +380,24 @@ mod tests {
     }
 
     fn fetched(id: &str, context: Option<u32>) -> FetchedModel {
-        FetchedModel { id: id.into(), context, vision: None }
+        FetchedModel { id: id.into(), context, vision: None, variants: Vec::new() }
+    }
+
+    fn fetched_with(id: &str, variants: Vec<ModelVariant>) -> FetchedModel {
+        FetchedModel { id: id.into(), context: None, vision: None, variants }
+    }
+
+    fn auto_variant(id: &str) -> ModelVariant {
+        ModelVariant {
+            id: id.into(),
+            label: format!("{id} label"),
+            body: serde_json::from_str(r#"{"reasoning":{"effort":"high"}}"#).unwrap(),
+            source: VariantSource::Auto,
+        }
+    }
+
+    fn manual_variant(id: &str) -> ModelVariant {
+        ModelVariant { source: VariantSource::Manual, ..auto_variant(id) }
     }
 
     fn provider_with(models: Vec<Model>) -> Provider {
@@ -438,6 +540,7 @@ mod tests {
                 provider_context: None,
                 vision: None,
                 source: ModelSource::Custom,
+                variants: Vec::new(),
             },
             Model {
                 id: "kept".into(),
@@ -445,6 +548,7 @@ mod tests {
                 provider_context: Some(1),
                 vision: None,
                 source: ModelSource::Fetched,
+                variants: Vec::new(),
             },
             Model {
                 id: "gone".into(),
@@ -452,6 +556,7 @@ mod tests {
                 provider_context: Some(3),
                 vision: None,
                 source: ModelSource::Fetched,
+                variants: Vec::new(),
             },
         ]);
         merge_fetched(
@@ -510,10 +615,11 @@ mod tests {
     #[test]
     fn merge_carries_the_modality_and_leaves_custom_models_alone() {
         let mut provider = provider_with(vec![
-            Model { id: "mine".into(), context_limit: None, provider_context: None, vision: None, source: ModelSource::Custom },
-            Model { id: "kept".into(), context_limit: None, provider_context: None, vision: Some(true), source: ModelSource::Fetched },
+            Model { id: "mine".into(), context_limit: None, provider_context: None, vision: None, source: ModelSource::Custom, variants: Vec::new() },
+            Model { id: "kept".into(), context_limit: None, provider_context: None, vision: Some(true), source: ModelSource::Fetched, variants: Vec::new() },
         ]);
-        let fresh = |id: &str, vision| FetchedModel { id: id.into(), context: None, vision };
+        let fresh =
+            |id: &str, vision| FetchedModel { id: id.into(), context: None, vision, variants: Vec::new() };
         merge_fetched(&mut provider, vec![fresh("kept", Some(false)), fresh("new", Some(true)), fresh("mine", Some(true))]);
 
         let vision: Vec<(&str, Option<bool>)> = provider.models.iter().map(|m| (m.id.as_str(), m.vision)).collect();
@@ -523,12 +629,267 @@ mod tests {
     #[test]
     fn merge_with_an_empty_list_removes_fetched_models_only() {
         let mut provider = provider_with(vec![
-            Model { id: "c".into(), context_limit: None, provider_context: None, vision: None, source: ModelSource::Custom },
-            Model { id: "f".into(), context_limit: None, provider_context: None, vision: None, source: ModelSource::Fetched },
+            Model { id: "c".into(), context_limit: None, provider_context: None, vision: None, source: ModelSource::Custom, variants: Vec::new() },
+            Model { id: "f".into(), context_limit: None, provider_context: None, vision: None, source: ModelSource::Fetched, variants: Vec::new() },
         ]);
         merge_fetched(&mut provider, Vec::new());
         assert_eq!(provider.models.len(), 1);
         assert_eq!(provider.models[0].id, "c");
+    }
+
+    fn variant_ids(model: &FetchedModel) -> Vec<&str> {
+        model.variants.iter().map(|v| v.id.as_str()).collect()
+    }
+
+    #[test]
+    fn openrouter_efforts_become_reasoning_variants() {
+        let body = r#"{"data":[{
+            "id": "m",
+            "reasoning": {"supported_efforts": ["low", "high", "xhigh", "none", "Minimal"]}
+        }]}"#;
+        let models = parse_model_list(body).unwrap();
+        assert_eq!(variant_ids(&models[0]), vec!["low", "high", "xhigh", "none", "minimal"]);
+        for variant in &models[0].variants {
+            assert_eq!(variant.source, VariantSource::Auto, "{:?}", variant.id);
+            assert_eq!(variant.body["reasoning"]["effort"], serde_json::Value::String(variant.id.clone()));
+        }
+        let labels: Vec<&str> = models[0].variants.iter().map(|v| v.label.as_str()).collect();
+        assert_eq!(labels, vec!["Low", "High", "X High", "None", "Minimal"]);
+    }
+
+    #[test]
+    fn opencode_efforts_become_reasoning_effort_variants() {
+        let body = r#"{"data":[{
+            "id": "m",
+            "capabilities": {"reasoning": {"effort": ["low", "medium"]}}
+        }]}"#;
+        let models = parse_model_list(body).unwrap();
+        assert_eq!(variant_ids(&models[0]), vec!["low", "medium"]);
+        assert_eq!(models[0].variants[0].body, serde_json::from_str(r#"{"reasoning_effort":"low"}"#).unwrap());
+        assert_eq!(models[0].variants[1].label, "Medium");
+        assert!(models[0].variants.iter().all(|v| v.source == VariantSource::Auto));
+    }
+
+    #[test]
+    fn openrouter_shape_wins_over_the_opencode_shape() {
+        let body = r#"{"data":[{
+            "id": "m",
+            "reasoning": {"supported_efforts": ["high"]},
+            "capabilities": {"reasoning": {"effort": ["low"]}}
+        }]}"#;
+        let models = parse_model_list(body).unwrap();
+        assert_eq!(variant_ids(&models[0]), vec!["high"]);
+        assert_eq!(models[0].variants[0].body["reasoning"]["effort"], serde_json::Value::String("high".into()));
+    }
+
+    #[test]
+    fn non_array_effort_fields_fall_through_to_the_opencode_shape() {
+        // `reasoning.supported_efforts` is not an array here, so the OpenCode path applies.
+        let body = r#"{"data":[{
+            "id": "m",
+            "reasoning": {"supported_efforts": "high"},
+            "capabilities": {"reasoning": {"effort": ["low"]}}
+        }]}"#;
+        assert_eq!(variant_ids(&parse_model_list(body).unwrap()[0]), vec!["low"]);
+
+        let body = r#"{"data":[{
+            "id": "m",
+            "reasoning": {"supported_efforts": "high"}
+        }]}"#;
+        assert!(parse_model_list(body).unwrap()[0].variants.is_empty());
+    }
+
+    #[test]
+    fn skipped_malformed_and_repeated_efforts_are_dropped() {
+        let long = "e".repeat(33);
+        let body = serde_json::json!({"data": [{
+            "id": "m",
+            "reasoning": {"supported_efforts": [
+                "toggle", "budget", "default_effort", "mandatory", "TOGGLE",
+                "High", "HIGH", "high",
+                "", "bad id!", &long, "0",
+                42, true, null, {"effort": "low"}, ["low"],
+                "none",
+            ]},
+        }]});
+        let models = parse_model_list(&body.to_string()).unwrap();
+        assert_eq!(variant_ids(&models[0]), vec!["high", "0", "none"]);
+    }
+
+    #[test]
+    fn at_most_sixteen_effort_variants_are_kept() {
+        let efforts: Vec<serde_json::Value> =
+            (0..20).map(|i| serde_json::Value::String(format!("effort-{i:02}"))).collect();
+        let body = serde_json::json!({"data": [{
+            "id": "m",
+            "capabilities": {"reasoning": {"effort": efforts}},
+        }]});
+        let models = parse_model_list(&body.to_string()).unwrap();
+        assert_eq!(models[0].variants.len(), 16);
+        assert_eq!(models[0].variants[15].id, "effort-15");
+        assert_eq!(models[0].variants[15].label, "Effort 15");
+    }
+
+    #[test]
+    fn entries_without_effort_metadata_have_no_variants() {
+        let body = r#"{"data":[{"id":"plain"},{"id":"other","reasoning":{}}]}"#;
+        let models = parse_model_list(body).unwrap();
+        assert!(models.iter().all(|m| m.variants.is_empty()));
+    }
+
+    #[test]
+    fn merge_replaces_auto_variants_and_keeps_manual_ones() {
+        let mut provider = provider_with(vec![
+            Model {
+                id: "mine".into(),
+                context_limit: None,
+                provider_context: None,
+                vision: None,
+                source: ModelSource::Custom,
+                variants: vec![manual_variant("custom")],
+            },
+            Model {
+                id: "kept".into(),
+                context_limit: None,
+                provider_context: None,
+                vision: None,
+                source: ModelSource::Fetched,
+                variants: vec![manual_variant("mine"), auto_variant("old")],
+            },
+        ]);
+        merge_fetched(
+            &mut provider,
+            vec![
+                fetched_with("kept", vec![auto_variant("new")]),
+                fetched_with("fresh", vec![auto_variant("auto")]),
+                fetched_with("mine", vec![auto_variant("ignored")]),
+            ],
+        );
+
+        let mine = provider.model("mine").unwrap();
+        assert_eq!(mine.source, ModelSource::Custom);
+        assert_eq!(mine.variants, vec![manual_variant("custom")], "custom models are untouched");
+
+        let kept = provider.model("kept").unwrap();
+        let summary: Vec<(&str, VariantSource)> =
+            kept.variants.iter().map(|v| (v.id.as_str(), v.source)).collect();
+        assert_eq!(
+            summary,
+            vec![("mine", VariantSource::Manual), ("new", VariantSource::Auto)],
+            "manual variants are kept, auto ones replaced"
+        );
+
+        let fresh = provider.model("fresh").unwrap();
+        assert_eq!(fresh.variants, vec![auto_variant("auto")], "new models get the fetched variants");
+    }
+
+    #[test]
+    fn a_manual_variant_survives_when_the_auto_list_disappears() {
+        let mut provider = provider_with(vec![Model {
+            id: "kept".into(),
+            context_limit: None,
+            provider_context: None,
+            vision: None,
+            source: ModelSource::Fetched,
+            variants: vec![manual_variant("mine"), auto_variant("old")],
+        }]);
+        merge_fetched(&mut provider, vec![fetched("kept", None)]);
+        assert_eq!(provider.model("kept").unwrap().variants, vec![manual_variant("mine")]);
+    }
+
+    #[test]
+    fn merge_keeps_all_manual_and_truncates_auto_to_the_cap() {
+        let manuals = vec![manual_variant("m0"), manual_variant("m1"), manual_variant("m2")];
+        let mut provider = provider_with(vec![Model {
+            id: "kept".into(),
+            context_limit: None,
+            provider_context: None,
+            vision: None,
+            source: ModelSource::Fetched,
+            variants: manuals.clone(),
+        }]);
+        let incoming: Vec<ModelVariant> = (0..20).map(|i| auto_variant(&format!("v{i:02}"))).collect();
+        merge_fetched(&mut provider, vec![fetched_with("kept", incoming)]);
+
+        let kept = provider.model("kept").unwrap();
+        assert_eq!(kept.variants.len(), MAX_VARIANTS_PER_MODEL);
+        assert_eq!(&kept.variants[..manuals.len()], &manuals[..], "all manual variants are kept");
+        let auto_ids: Vec<&str> = kept.variants[manuals.len()..].iter().map(|v| v.id.as_str()).collect();
+        let expected: Vec<String> = (0..MAX_VARIANTS_PER_MODEL - manuals.len()).map(|i| format!("v{i:02}")).collect();
+        assert_eq!(
+            auto_ids,
+            expected.iter().map(String::as_str).collect::<Vec<_>>(),
+            "auto variants are kept in incoming order up to the cap"
+        );
+        assert!(kept.variants[manuals.len()..].iter().all(|v| v.source == VariantSource::Auto));
+    }
+
+    #[test]
+    fn merged_variant_totals_never_exceed_the_cap() {
+        let mut provider = provider_with(vec![Model {
+            id: "kept".into(),
+            context_limit: None,
+            provider_context: None,
+            vision: None,
+            source: ModelSource::Fetched,
+            variants: vec![manual_variant("m0")],
+        }]);
+        let many: Vec<ModelVariant> = (0..20).map(|i| auto_variant(&format!("v{i:02}"))).collect();
+        let fresh_many: Vec<ModelVariant> = (0..20).map(|i| auto_variant(&format!("n{i:02}"))).collect();
+        merge_fetched(
+            &mut provider,
+            vec![fetched_with("kept", many), fetched_with("fresh", fresh_many)],
+        );
+
+        for model in &provider.models {
+            assert!(
+                model.variants.len() <= MAX_VARIANTS_PER_MODEL,
+                "model {:?} has {} variants",
+                model.id,
+                model.variants.len()
+            );
+        }
+        assert_eq!(provider.model("kept").unwrap().variants.len(), MAX_VARIANTS_PER_MODEL);
+        assert_eq!(provider.model("fresh").unwrap().variants.len(), MAX_VARIANTS_PER_MODEL);
+        let fresh_ids: Vec<&str> =
+            provider.model("fresh").unwrap().variants.iter().map(|v| v.id.as_str()).collect();
+        let expected: Vec<String> = (0..MAX_VARIANTS_PER_MODEL).map(|i| format!("n{i:02}")).collect();
+        assert_eq!(fresh_ids, expected.iter().map(String::as_str).collect::<Vec<_>>());
+
+        let settings = crate::core::settings::Settings {
+            providers: vec![provider],
+            ..Default::default()
+        };
+        assert_eq!(settings.validate(), Ok(()), "the capped merge still validates");
+    }
+
+    #[test]
+    fn default_variant_survives_truncation_when_kept_and_is_gone_when_truncated() {
+        let manuals = vec![manual_variant("m0"), manual_variant("m1")];
+        let mut provider = provider_with(vec![Model {
+            id: "kept".into(),
+            context_limit: None,
+            provider_context: None,
+            vision: None,
+            source: ModelSource::Fetched,
+            variants: manuals.clone(),
+        }]);
+        // Two manuals leave room for 14 autos: v00..v13 survive, v14.. are dropped.
+        let incoming: Vec<ModelVariant> = (0..20).map(|i| auto_variant(&format!("v{i:02}"))).collect();
+        merge_fetched(&mut provider, vec![fetched_with("kept", incoming)]);
+        let kept = provider.model("kept").unwrap();
+
+        assert!(kept.variant("m0").is_some(), "a manual default always survives");
+        assert!(kept.variant("v05").is_some(), "a default auto variant within the cap survives");
+        assert_eq!(kept.variant("v05").unwrap().source, VariantSource::Auto);
+        assert!(kept.variant("v19").is_none(), "a default auto variant beyond the cap is gone");
+
+        // What `apply_fetched` checks before clearing: the surviving default still resolves, so it is kept;
+        // the truncated one no longer does, so the existing clearing logic drops it.
+        let survives = kept.variant("v05").is_none();
+        let truncated = kept.variant("v19").is_none();
+        assert!(!survives, "the surviving default would be kept by apply_fetched");
+        assert!(truncated, "the truncated default would be cleared by apply_fetched");
     }
 
     #[test]

@@ -9,6 +9,7 @@ import {
   NO_RESULT_TEXT,
   relativeTime,
   safeText,
+  UNANSWERED_NOTE,
   UNKNOWN_DATE,
 } from './historyView';
 import type { ChatMessage, ConversationMeta, Workspace } from './types';
@@ -391,8 +392,7 @@ describe('itemsFromMessages: todo_write', () => {
   });
 });
 
-describe('itemsFromMessages: a user message with attachments (array content)', () => {
-  const PNG_THUMB = 'data:image/png;base64,iVBORw0KGgo=';
+describe('itemsFromMessages: a user message with attachments (array content)', () => {  const PNG_THUMB = 'data:image/png;base64,iVBORw0KGgo=';
   const sha = 'a'.repeat(64);
   /** The first attachment of the first item, as a plain record (the item is a union, so it is read through unknown). */
   const firstAttachment = (item: unknown): Record<string, unknown> => (item as { attachments: Array<Record<string, unknown>> }).attachments[0];
@@ -459,5 +459,81 @@ describe('itemsFromMessages: a user message with attachments (array content)', (
 
   it('a plain string message has no attachments key', () => {
     expect(itemsFromMessages([{ role: 'user', content: 'plain' }])).toEqual([{ kind: 'user', clientId: 0, text: 'plain' }]);
+  });
+});
+
+describe('itemsFromMessages: ask_user', () => {
+  const ARGS = JSON.stringify({
+    questions: [{ question: 'Which capa?', header: 'Capa', options: [{ label: 'a', description: 'first' }, { label: 'b' }] }],
+  });
+  const RESULT = JSON.stringify({
+    answers: [{ question_id: 'q1', question: 'Which capa?', header: 'Capa', status: 'answered', selected: ['a'] }],
+  });
+  const call = (id: string) => ({
+    role: 'assistant',
+    content: null,
+    tool_calls: [{ id, type: 'function', function: { name: 'ask_user', arguments: ARGS } }],
+  });
+
+  it('a settled call is a resolved question card, and no tool row', () => {
+    const items = itemsFromMessages([call('c1'), { role: 'tool', tool_call_id: 'c1', content: RESULT }]);
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      kind: 'question',
+      callId: 'c1',
+      state: 'resolved',
+      questions: [{ id: 'q1', question: 'Which capa?', header: 'Capa' }],
+      result: { answers: [{ status: 'answered', selected: ['a'] }] },
+      answers: null,
+      error: null,
+    });
+    expect(items[0]).not.toMatchObject({ kind: 'tool' });
+  });
+
+  it('an interrupted call is a closed card, never a tool row and never answerable', () => {
+    // No tool message, the repair close text, the fallback text, or an error text: the turn never settled the call.
+    const contents = [undefined, 'skipped: not recorded', 'skipped: turn ended', NO_RESULT_TEXT, 'error: not_approved: nope'];
+    for (const content of contents) {
+      const messages: ChatMessage[] =
+        content === undefined ? [call('c1')] : [call('c1'), { role: 'tool', tool_call_id: 'c1', content }];
+      const items = itemsFromMessages(messages);
+      expect(items).toHaveLength(1);
+      expect(items[0]).toMatchObject({
+        kind: 'question',
+        callId: 'c1',
+        state: 'closed',
+        questions: [{ id: 'q1', question: 'Which capa?', header: 'Capa' }],
+        result: { answers: [{ question_id: 'q1', question: 'Which capa?', header: 'Capa', status: 'cancelled' }] },
+        answers: null,
+        error: null,
+        note: UNANSWERED_NOTE,
+      });
+      expect(items[0]).not.toMatchObject({ kind: 'tool' });
+    }
+  });
+
+  it('an unreadable call falls back to a generic tool row', () => {
+    // Bad arguments are a generic row, never both a card and a row.
+    const badArgs = itemsFromMessages([
+      { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'ask_user', arguments: '{"questions": []}' } }] },
+      { role: 'tool', tool_call_id: 'c1', content: RESULT },
+    ]);
+    expect(badArgs).toHaveLength(1);
+    expect(badArgs[0]).toMatchObject({ kind: 'tool', name: 'ask_user' });
+    // A present result that is not a result is a generic row too.
+    const badResult = itemsFromMessages([call('c1'), { role: 'tool', tool_call_id: 'c1', content: '{"answers": []}' }]);
+    expect(badResult).toHaveLength(1);
+    expect(badResult[0]).toMatchObject({ kind: 'tool', name: 'ask_user' });
+  });
+
+  it('other calls are still shown next to a question card', () => {
+    const items = itemsFromMessages([
+      call('c1'),
+      { role: 'assistant', content: null, tool_calls: [{ id: 'c2', type: 'function', function: { name: 'get_cwd', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'c1', content: RESULT },
+      { role: 'tool', tool_call_id: 'c2', content: '/' },
+    ]);
+    expect(items.map((i) => i.kind)).toEqual(['question', 'tool']);
+    expect(items[1]).toMatchObject({ kind: 'tool', name: 'get_cwd', status: 'ok' });
   });
 });

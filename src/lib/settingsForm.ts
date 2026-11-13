@@ -12,11 +12,13 @@ import type {
   Model,
   ModelRef,
   ModelSource,
+  ModelVariant,
   Provider,
   ProviderPreset,
   SaveProviderInput,
   SecretsPresent,
   Settings,
+  VariantSource,
 } from './types';
 
 /** The largest value the backend stores for a token count or a context limit (Rust u32). */
@@ -29,6 +31,22 @@ const CHAT_SUFFIX = '/chat/completions';
 const LOCAL_HOSTS = ['localhost', '127.0.0.1', '[::1]'];
 
 const ID_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/;
+const VARIANT_ID_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
+const MAX_VARIANT_LABEL_CHARS = 80;
+const MAX_VARIANTS_PER_MODEL = 16;
+const MAX_VARIANT_BODY_BYTES = 4096;
+const MAX_VARIANT_DEPTH = 8;
+/** Body keys a variant must never carry. The backend skips them again if one slips through. */
+const PROTECTED_BODY_KEYS = new Set([
+  'model',
+  'messages',
+  'stream',
+  'tools',
+  'stream_options',
+  'max_tokens',
+  'max_completion_tokens',
+  'models',
+]);
 /** RFC 7230 tchar: the characters a header name may use. */
 const TOKEN_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 /** Header names that look like they carry a credential. Such a row's Secret toggle is ticked until the user touches it. */
@@ -65,6 +83,17 @@ export interface ModelDraft {
   context_limit: string;
   /** What the provider reported when the list was fetched. Shown, never edited. */
   provider_context: number | null;
+  variants: VariantDraft[];
+}
+
+/** One variant row. `body` is the typed JSON text; the parsed object is what is saved. */
+export interface VariantDraft {
+  /** Stable React key. Not sent. */
+  key: string;
+  id: string;
+  label: string;
+  body: string;
+  source: VariantSource;
 }
 
 /** The editable state of one provider. Numbers are text while typing and parsed in buildSaveInput. */
@@ -103,6 +132,8 @@ export interface DraftProblems {
   headers: Record<string, string>;
   /** Keyed by model id. */
   models: Record<string, string>;
+  /** Keyed by variant row key. */
+  variants: Record<string, string>;
 }
 
 export interface ModelOption {
@@ -114,10 +145,17 @@ export interface ModelOption {
 
 let headerKeySeq = 0;
 const nextHeaderKey = () => `h${++headerKeySeq}`;
+let variantKeySeq = 0;
+const nextVariantKey = () => `v${++variantKeySeq}`;
 
 /** An empty header row, with a key no other row has. */
 export function newHeaderDraft(): HeaderDraft {
   return { key: nextHeaderKey(), name: '', value: '', secret: false, clearStored: false, savedName: null, secretTouched: false };
+}
+
+/** An empty variant row of the given source, with a key no other row has. The body starts as blank text. */
+export function newVariantDraft(source: VariantSource): VariantDraft {
+  return { key: nextVariantKey(), id: '', label: '', body: '', source };
 }
 
 /** Whether a header name looks like it carries a credential (key, token, secret, auth, password or cookie). */
@@ -202,6 +240,10 @@ function headerDraft(h: HeaderEntry): HeaderDraft {
   };
 }
 
+/** A saved variant as an editable row. The body is stringified with a 2-space indent; the save parses it back. */
+function variantDraft(v: ModelVariant): VariantDraft {
+  return { key: nextVariantKey(), id: v.id, label: v.label, body: JSON.stringify(v.body, null, 2), source: v.source };
+}
 /** A row from a preset's header. Untouched, so a credential-looking name ticks its Secret toggle. */
 function presetHeaderDraft(h: HeaderEntry): HeaderDraft {
   return { ...newHeaderDraft(), name: h.name, value: h.value, secret: h.secret || isCredentialName(h.name) };
@@ -224,6 +266,7 @@ export function draftFromProvider(provider: Provider, present?: SecretsPresent):
       source: m.source,
       context_limit: m.context_limit === null ? '' : String(m.context_limit),
       provider_context: m.provider_context,
+      variants: (m.variants ?? []).map(variantDraft),
     })),
     apiKey: '',
     clearKey: false,
@@ -299,6 +342,39 @@ function apiKeyField(draft: ProviderDraft): string | null {
 }
 
 /**
+ * A variant body text back as an object. Invalid JSON, and JSON that is not an object (an array, a string, a number,
+ * null), is `{}`: the save is blocked by validation, which reports the problem.
+ */
+export function parseVariantBody(text: string): Record<string, unknown> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return {};
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return {};
+  }
+  return parsed as Record<string, unknown>;
+}
+
+/** How deep a parsed JSON value nests: a scalar is 0, an object or array is 1 over its deepest member. Mirrors the backend. */
+function jsonDepth(value: unknown): number {
+  if (Array.isArray(value)) {
+    return 1 + value.map(jsonDepth).reduce((a, b) => Math.max(a, b), 0);
+  }
+  if (typeof value === 'object' && value !== null) {
+    return 1 + Object.values(value).map(jsonDepth).reduce((a, b) => Math.max(a, b), 0);
+  }
+  return 0;
+}
+
+/** The UTF-8 byte length of text, as the backend's serialized-bytes cap counts it. */
+function utf8Length(text: string): number {
+  return new TextEncoder().encode(text).length;
+}
+
+/**
  * The save request for a draft. Untouched secrets are not sent: api_key is null unless the key was typed or removed, and
  * header_secrets only has the secret headers the user typed a value for or asked to clear. A secret header's entry in
  * `provider.headers` always has value "". The models list is sent whole, since the backend replaces it.
@@ -324,12 +400,22 @@ export function buildSaveInput(draft: ProviderDraft): SaveProviderInput {
       header_secrets[h.name.trim()] = '';
     }
   }
-  const models: Model[] = draft.models.map((m) => ({
-    id: m.id.trim(),
-    context_limit: parsePositiveInt(m.context_limit),
-    provider_context: m.provider_context,
-    source: m.source,
-  }));
+  const models: Model[] = draft.models.map((m) => {
+    const variants: ModelVariant[] = m.variants.map((v) => ({
+      id: v.id.trim(),
+      label: v.label.trim(),
+      body: parseVariantBody(v.body),
+      source: v.source,
+    }));
+    return {
+      id: m.id.trim(),
+      context_limit: parsePositiveInt(m.context_limit),
+      provider_context: m.provider_context,
+      source: m.source,
+      // Left out when empty, so a file from before variants round-trips byte-identical.
+      ...(variants.length > 0 ? { variants } : {}),
+    };
+  });
   const modelsUrl = draft.models_url.trim();
   return {
     provider: {
@@ -461,7 +547,7 @@ export function hostChangeNotice(saved: ProviderDraft | null, draft: ProviderDra
 
 /** Field problems for a draft. `takenIds` are the ids of the other providers. Mirrors the rules in Rust settings validate(). */
 export function validateDraft(draft: ProviderDraft, takenIds: readonly string[]): DraftProblems {
-  const problems: DraftProblems = { headers: {}, models: {} };
+  const problems: DraftProblems = { headers: {}, models: {}, variants: {} };
 
   const id = draft.id.trim();
   if (!ID_RE.test(id)) {
@@ -533,9 +619,74 @@ export function validateDraft(draft: ProviderDraft, takenIds: readonly string[])
     if (message !== undefined) {
       problems.models[m.id] = message;
     }
+    if (m.variants.length > MAX_VARIANTS_PER_MODEL) {
+      const cap = `Model "${id}" has ${m.variants.length} variants, at most ${MAX_VARIANTS_PER_MODEL} are allowed.`;
+      problems.models[m.id] = problems.models[m.id] === undefined ? cap : `${problems.models[m.id]} ${cap}`;
+    }
+    const seenManual = new Set<string>();
+    for (const v of m.variants) {
+      const variantMessage = validateVariantDraft(v, seenManual);
+      if (variantMessage !== undefined) {
+        problems.variants[v.key] = variantMessage;
+      }
+    }
   }
 
   return problems;
+}
+
+/**
+ * The problem with one variant row, or undefined when it checks out. Mirrors the backend's `validate_variant`: the id
+ * slug, a short label without control characters, a non-empty JSON object body with no protected keys that serializes
+ * small and nests shallow. Duplicate ids are an error only among manual variants: a manual and an auto may share an
+ * id, and the manual wins. One string per row; a row with several problems reports the first.
+ */
+function validateVariantDraft(v: VariantDraft, seenManual: Set<string>): string | undefined {
+  const id = v.id.trim();
+  if (!VARIANT_ID_RE.test(id)) {
+    return 'Variant id must be 1 to 32 characters of a-z, 0-9, \'-\' or \'_\', starting with a letter or digit.';
+  }
+  if (v.label.trim() === '') {
+    return 'Variant label is required.';
+  }
+  if ([...v.label].length > MAX_VARIANT_LABEL_CHARS) {
+    return `Variant label must be at most ${MAX_VARIANT_LABEL_CHARS} characters.`;
+  }
+  if (CONTROL_RE.test(v.label)) {
+    return 'Variant label must not contain control characters.';
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(v.body);
+  } catch {
+    return 'Variant body must be a JSON object.';
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return 'Variant body must be a JSON object.';
+  }
+  const body = parsed as Record<string, unknown>;
+  if (Object.keys(body).length === 0) {
+    return 'Variant body must be a non-empty JSON object.';
+  }
+  for (const key of Object.keys(body)) {
+    if (PROTECTED_BODY_KEYS.has(key)) {
+      return `Variant body must not set ${JSON.stringify(key)}.`;
+    }
+  }
+  if (utf8Length(JSON.stringify(body)) > MAX_VARIANT_BODY_BYTES) {
+    return `Variant body must serialize to at most ${MAX_VARIANT_BODY_BYTES} bytes.`;
+  }
+  const depth = Object.values(body).map(jsonDepth).reduce((a, b) => Math.max(a, b), 0) + 1;
+  if (depth > MAX_VARIANT_DEPTH) {
+    return `Variant body must nest at most ${MAX_VARIANT_DEPTH} levels deep.`;
+  }
+  if (v.source === 'manual') {
+    if (seenManual.has(id)) {
+      return `Variant "${id}" is listed more than once.`;
+    }
+    seenManual.add(id);
+  }
+  return undefined;
 }
 
 /** Whether validateDraft found anything. Save stays disabled while it did. */
@@ -547,7 +698,8 @@ export function hasProblems(p: DraftProblems): boolean {
     p.models_url !== undefined ||
     p.max_tokens !== undefined ||
     Object.keys(p.headers).length > 0 ||
-    Object.keys(p.models).length > 0
+    Object.keys(p.models).length > 0 ||
+    Object.keys(p.variants).length > 0
   );
 }
 
@@ -556,9 +708,53 @@ export function fetchSummaryText(s: FetchSummary): string {
   return `+${s.added} new, ${s.updated} updated, ${s.removed} removed. ${s.total} models in the list.`;
 }
 
-/** A stable string for a model reference, for select values. Provider ids cannot contain a quote or a comma, but JSON keeps it unambiguous anyway. */
+/** A stable string for a model reference, for select values. Provider ids cannot contain a quote or a comma, but JSON keeps it unambiguous anyway. The variant is never part of it: the model select names the base model. */
 export function modelRefKey(ref: ModelRef): string {
   return JSON.stringify([ref.provider_id, ref.model_id]);
+}
+
+/**
+ * A model's variants with manual and auto entries sharing an id merged: the manual one wins. First wins within one
+ * source. Mirrors the backend's `Model::variant` lookup.
+ */
+export function effectiveVariants(model: Model): ModelVariant[] {
+  const variants = model.variants ?? [];
+  const out: ModelVariant[] = [];
+  const seen = new Set<string>();
+  for (const v of variants) {
+    if (v.source === 'manual' && !seen.has(v.id)) {
+      seen.add(v.id);
+      out.push(v);
+    }
+  }
+  for (const v of variants) {
+    if (v.source !== 'manual' && !seen.has(v.id)) {
+      seen.add(v.id);
+      out.push(v);
+    }
+  }
+  return out;
+}
+
+/** One variant option of the default-model variant select: its id, and its label (manual ones are tagged). */
+export interface VariantOption {
+  id: string;
+  label: string;
+}
+
+/**
+ * The variant options for a default-model ref: the effective variants of its model, with manual ones tagged. Empty
+ * when there is no default, or its model is gone.
+ */
+export function variantOptions(settings: Settings, ref: ModelRef | null): VariantOption[] {
+  if (ref === null) {
+    return [];
+  }
+  const model = settings.providers.find((p) => p.id === ref.provider_id)?.models.find((m) => m.id === ref.model_id);
+  if (model === undefined) {
+    return [];
+  }
+  return effectiveVariants(model).map((v) => ({ id: v.id, label: v.source === 'manual' ? `${v.label} (manual)` : v.label }));
 }
 
 /** Every model of every provider, in provider order, for the default-model select. */

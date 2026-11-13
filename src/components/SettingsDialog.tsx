@@ -17,10 +17,11 @@ import {
   modelOptions,
   modelRefKey,
   validateDraft,
+  variantOptions,
 } from '../lib/settingsForm';
 import type { ProviderDraft } from '../lib/settingsForm';
 import { RECOVERY_BUSY_LABEL, REVERT_CONFIRM, reasonText, recoveryExplanation, recoveryKind } from '../lib/settingsRecovery';
-import type { AgentRequests, ProviderPreset, RecoverAction, SettingsStateView, SettingsView } from '../lib/types';
+import type { AgentRequests, ModelRef, ProviderPreset, RecoverAction, SettingsStateView, SettingsView } from '../lib/types';
 import { AboutSection } from './AboutSection';
 import { ApprovalSection } from './ApprovalSection';
 import { LimitsSection } from './LimitsSection';
@@ -225,6 +226,11 @@ export interface SettingsBodyProps {
   load: LoadState;
   /** The settings file is broken: every change is disabled. */
   locked: boolean;
+  /**
+   * Bare `/model` opened the dialog: focus the default-model select once the view is ready, so Space opens its
+   * list. A normal open leaves focus alone. One-shot: later saves and re-renders never steal focus back.
+   */
+  focusModel?: boolean;
   presets: ProviderPreset[];
   defaults: { busy: boolean; error: string | null };
   limit: { text: string; error: string | null; busy: boolean };
@@ -234,6 +240,8 @@ export interface SettingsBodyProps {
   editor: { forId: string | null; node: ReactNode } | null;
   onRetry(): void;
   onDefault(key: string): void;
+  /** A variant id, or "" for the base model. Ignored with no default model. */
+  onVariant(variant: string): void;
   onLimitText(text: string): void;
   onLimitCommit(): void;
   onLimitClear(): void;
@@ -249,6 +257,16 @@ export interface SettingsBodyProps {
 export function SettingsBody(p: SettingsBodyProps) {
   const uid = useId();
   const [preset, setPreset] = useState(BLANK_PRESET);
+  // Bare `/model` focuses the default-model select. The ref guards the one shot; the effect fires only once the
+  // view is ready (the first render is still loading, after the dialog's own mount focus), and never again.
+  const modelRef = useRef<HTMLSelectElement>(null);
+  const focusedModel = useRef(false);
+  useEffect(() => {
+    if (p.focusModel === true && !focusedModel.current && p.load.kind === 'ready') {
+      focusedModel.current = true;
+      modelRef.current?.focus();
+    }
+  }, [p.focusModel, p.load]);
 
   if (p.load.kind === 'loading') {
     return <div className="settings-state">Loading settings...</div>;
@@ -267,9 +285,13 @@ export function SettingsBody(p: SettingsBodyProps) {
   const { view } = p.load;
   const { settings } = view;
   const options = modelOptions(settings);
-  const defaultKey = settings.default_model ? modelRefKey(settings.default_model) : BLANK_PRESET;
-  const defaultProviderId = settings.default_model?.provider_id ?? null;
+  const def = settings.default_model;
+  const defaultKey = def ? modelRefKey(def) : BLANK_PRESET;
+  const defaultProviderId = def?.provider_id ?? null;
   const off = p.locked;
+  const variantOpts = variantOptions(settings, def);
+  const variantValue = def?.variant ?? '';
+  const variantOff = off || p.defaults.busy || def === null || variantOpts.length === 0;
 
   return (
     <>
@@ -283,6 +305,7 @@ export function SettingsBody(p: SettingsBodyProps) {
           <label htmlFor={`${uid}-default`}>Model</label>
           <select
             id={`${uid}-default`}
+            ref={modelRef}
             value={defaultKey}
             disabled={off || p.defaults.busy}
             onChange={(e) => p.onDefault(e.target.value)}
@@ -290,6 +313,23 @@ export function SettingsBody(p: SettingsBodyProps) {
             <option value={BLANK_PRESET}>None (mock agent)</option>
             {options.map((o) => (
               <option key={o.key} value={o.key}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+          {p.defaults.busy && <span className="settings-hint">Saving...</span>}
+        </div>
+        <div className="settings-inline">
+          <label htmlFor={`${uid}-variant`}>Variant</label>
+          <select
+            id={`${uid}-variant`}
+            value={variantValue}
+            disabled={variantOff}
+            onChange={(e) => p.onVariant(e.target.value)}
+          >
+            <option value="">Model default</option>
+            {variantOpts.map((o) => (
+              <option key={o.id} value={o.id}>
                 {o.label}
               </option>
             ))}
@@ -410,6 +450,11 @@ export function SettingsBody(p: SettingsBodyProps) {
 }
 
 export interface SettingsDialogProps {
+  /**
+   * Bare `/model` opened the dialog: focus the default-model select once the view is ready. A normal open
+   * leaves focus alone.
+   */
+  focusModel?: boolean;
   onClose(): void;
   /** A change was saved: the caller refreshes the status (the chip shows the default model). */
   onChanged(): void;
@@ -424,7 +469,7 @@ export interface SettingsDialogProps {
  * and goes back to where it was on close. Esc closes; a click on the backdrop closes. Unsaved changes are asked about
  * before they are dropped.
  */
-export function SettingsDialog({ onClose, onChanged, onViewLoaded }: SettingsDialogProps) {
+export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded }: SettingsDialogProps) {
   const titleId = useId();
   const dialogRef = useRef<HTMLDivElement>(null);
   const backdropPressed = useRef(false);
@@ -622,7 +667,20 @@ export function SettingsDialog({ onClose, onChanged, onViewLoaded }: SettingsDia
     }
   };
 
-  // Changes the default model. The chip in the status strip follows through onChanged.
+  // Saves the default model. The chip in the status strip follows through onChanged.
+  const saveDefault = (ref: ModelRef | null) => {
+    setDefaults({ busy: true, error: null });
+    api.setDefaultModel(ref).then(
+      (v) => {
+        applyView(v);
+        setDefaults({ busy: false, error: null });
+        onChanged();
+      },
+      (e: unknown) => setDefaults({ busy: false, error: errorText(e) }),
+    );
+  };
+
+  // Changes the default model, clearing any variant: a new base model runs with the provider defaults.
   const setDefault = (key: string) => {
     if (view === null) {
       return;
@@ -631,15 +689,23 @@ export function SettingsDialog({ onClose, onChanged, onViewLoaded }: SettingsDia
     if (key !== BLANK_PRESET && option === undefined) {
       return;
     }
-    setDefaults({ busy: true, error: null });
-    api.setDefaultModel(option ? option.ref : null).then(
-      (v) => {
-        applyView(v);
-        setDefaults({ busy: false, error: null });
-        onChanged();
-      },
-      (e: unknown) => setDefaults({ busy: false, error: errorText(e) }),
-    );
+    saveDefault(option ? { ...option.ref, variant: null } : null);
+  };
+
+  // Changes the default model's variant ("" is the base model). The busy, error and applyView path is the model's.
+  const setDefaultVariant = (variant: string) => {
+    if (view === null) {
+      return;
+    }
+    const current = view.settings.default_model;
+    if (current === null) {
+      return;
+    }
+    const next = variant === '' ? null : variant;
+    if ((current.variant ?? null) === next) {
+      return;
+    }
+    saveDefault({ ...current, variant: next });
   };
 
   // A commit in flight blocks the next one. The field is disabled while busy, and the blur that follows the focus moving off
@@ -928,7 +994,10 @@ export function SettingsDialog({ onClose, onChanged, onViewLoaded }: SettingsDia
           locked={locked}
           saving={editor.saving}
           saveError={editor.saveError}
-          defaultModelId={defaultModel && defaultModel.provider_id === editor.forId ? defaultModel.model_id : null}
+            defaultModelId={defaultModel && defaultModel.provider_id === editor.forId ? defaultModel.model_id : null}
+            defaultVariantId={
+              defaultModel && defaultModel.provider_id === editor.forId ? (defaultModel.variant ?? null) : null
+            }
           fetching={editor.fetching}
           fetchNote={editor.fetchNote}
           fetchError={editor.fetchError}
@@ -964,6 +1033,7 @@ export function SettingsDialog({ onClose, onChanged, onViewLoaded }: SettingsDia
     <SettingsBody
       load={load}
       locked={locked}
+      focusModel={focusModel}
       presets={presets}
       defaults={defaults}
       limit={limit}
@@ -974,6 +1044,7 @@ export function SettingsDialog({ onClose, onChanged, onViewLoaded }: SettingsDia
         setAttempt((a) => a + 1);
       }}
       onDefault={setDefault}
+      onVariant={setDefaultVariant}
       onLimitText={(text) => setLimit((l) => ({ ...l, text, error: null }))}
       onLimitCommit={() => commitLimit(limit.text)}
       onLimitClear={() => {

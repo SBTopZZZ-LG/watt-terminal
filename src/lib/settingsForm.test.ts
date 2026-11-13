@@ -5,6 +5,7 @@ import {
   draftFromPreset,
   draftFromProvider,
   draftNew,
+  effectiveVariants,
   fetchSummaryText,
   hasProblems,
   hostChangeNotice,
@@ -18,17 +19,20 @@ import {
   limitCommit,
   modelsUrlFor,
   newHeaderDraft,
+  newVariantDraft,
   parsePositiveInt,
+  parseVariantBody,
   renameHeader,
   slugify,
   toggleSecret,
   urlProblem,
   validateDraft,
+  variantOptions,
   withId,
   withName,
 } from './settingsForm';
-import type { ProviderDraft } from './settingsForm';
-import type { Provider, ProviderPreset, Settings } from './types';
+import type { ProviderDraft, VariantDraft } from './settingsForm';
+import type { Model, Provider, ProviderPreset, Settings } from './types';
 
 const SAVED: Provider = {
   id: 'acme',
@@ -185,7 +189,7 @@ describe('preset and new drafts', () => {
     expect(isDirty({ ...start, chat_url: 'https://openrouter.ai/api/v2/chat/completions' }, start)).toBe(true);
     expect(isDirty({ ...start, apiKey: 'sk-live' }, start)).toBe(true);
     expect(isDirty({ ...start, headers: [...start.headers, newHeaderDraft()] }, start)).toBe(true);
-    expect(isDirty({ ...start, models: [{ id: 'gpt', source: 'custom', context_limit: '', provider_context: null }] }, start)).toBe(
+    expect(isDirty({ ...start, models: [{ id: 'gpt', source: 'custom', context_limit: '', provider_context: null, variants: [] }] }, start)).toBe(
       true,
     );
   });
@@ -414,7 +418,7 @@ describe('validateDraft', () => {
 
   it('model ids are listed once, and a context limit must be blank or a positive whole number', () => {
     const d = saved();
-    d.models.push({ id: 'mini', source: 'custom', context_limit: '', provider_context: null });
+    d.models.push({ id: 'mini', source: 'custom', context_limit: '', provider_context: null, variants: [] });
     d.models[0].context_limit = '0';
     const p = validateDraft(d, []);
     expect(p.models.mini).toBe('Model "mini" is listed more than once.');
@@ -422,9 +426,10 @@ describe('validateDraft', () => {
   });
 
   it('hasProblems reports any entry', () => {
-    expect(hasProblems({ headers: {}, models: {} })).toBe(false);
-    expect(hasProblems({ headers: {}, models: { m: 'x' } })).toBe(true);
-    expect(hasProblems({ headers: { h: 'x' }, models: {} })).toBe(true);
+    expect(hasProblems({ headers: {}, models: {}, variants: {} })).toBe(false);
+    expect(hasProblems({ headers: {}, models: { m: 'x' }, variants: {} })).toBe(true);
+    expect(hasProblems({ headers: { h: 'x' }, models: {}, variants: {} })).toBe(true);
+    expect(hasProblems({ headers: {}, models: {}, variants: { v1: 'x' } })).toBe(true);
   });
 });
 
@@ -490,6 +495,69 @@ describe('modelOptions and modelRefKey', () => {
     const keys = modelOptions(settings).map((o) => o.key);
     expect(new Set(keys).size).toBe(keys.length);
     expect(modelRefKey({ provider_id: 'acme', model_id: 'big/one' })).not.toBe(modelRefKey({ provider_id: 'acme/big', model_id: 'one' }));
+  });
+
+  it('the key stays base-only: a variant never changes it', () => {
+    expect(modelRefKey({ provider_id: 'acme', model_id: 'big/one', variant: 'high' })).toBe(
+      modelRefKey({ provider_id: 'acme', model_id: 'big/one' }),
+    );
+    expect(modelRefKey({ provider_id: 'acme', model_id: 'big/one', variant: null })).toBe(
+      modelRefKey({ provider_id: 'acme', model_id: 'big/one' }),
+    );
+  });
+});
+
+describe('effectiveVariants and variantOptions', () => {
+  const model: Model = {
+    id: 'big/one',
+    context_limit: null,
+    provider_context: null,
+    source: 'fetched',
+    variants: [
+      { id: 'high', label: 'High effort', body: { reasoning: { effort: 'high' } }, source: 'manual' },
+      { id: 'high', label: 'High', body: { reasoning: { effort: 'high' } }, source: 'auto' },
+      { id: 'low', label: 'Low', body: { reasoning: { effort: 'low' } }, source: 'auto' },
+    ],
+  };
+
+  it('manual wins over an auto variant with the same id', () => {
+    expect(effectiveVariants(model).map((v) => [v.id, v.label, v.source])).toEqual([
+      ['high', 'High effort', 'manual'],
+      ['low', 'Low', 'auto'],
+    ]);
+  });
+
+  it('duplicates within one source keep the first, and a model without variants has none', () => {
+    const dupes: Model = {
+      ...model,
+      variants: [
+        { id: 'low', label: 'Low', body: { a: 1 }, source: 'auto' },
+        { id: 'low', label: 'Low again', body: { a: 2 }, source: 'auto' },
+      ],
+    };
+    expect(effectiveVariants(dupes).map((v) => v.label)).toEqual(['Low']);
+    expect(effectiveVariants({ ...model, variants: undefined })).toEqual([]);
+    expect(effectiveVariants({ ...model, variants: [] })).toEqual([]);
+  });
+
+  it('variantOptions tags the manual labels, and is empty with no default or a missing model', () => {
+    const settings: Settings = {
+      version: 1,
+      providers: [{ ...SAVED, models: [model] }],
+      default_model: null,
+      global_context_limit: null,
+      approval: { mode: 'manual', allow: [], deny: [], nested: 'ask' },
+      integration: { agent_requests: 'ask' },
+      limits: { max_model_calls: 50, model_calls_unlimited: false, max_poll_calls: 60, max_commands_per_turn: 30, max_wait_minutes: 30 },
+    };
+    const ref = { provider_id: 'acme', model_id: 'big/one' };
+    expect(variantOptions(settings, ref)).toEqual([
+      { id: 'high', label: 'High effort (manual)' },
+      { id: 'low', label: 'Low' },
+    ]);
+    expect(variantOptions(settings, null)).toEqual([]);
+    expect(variantOptions(settings, { provider_id: 'acme', model_id: 'gone' })).toEqual([]);
+    expect(variantOptions(settings, { provider_id: 'gone', model_id: 'big/one' })).toEqual([]);
   });
 });
 
@@ -611,6 +679,210 @@ describe('buildSaveInput: previous_name and the UI-only flag', () => {
     const touchedOnly = { ...d, headers: d.headers.map((h) => ({ ...h, secretTouched: false, savedName: null })) };
     expect(JSON.stringify(buildSaveInput(touchedOnly))).not.toMatch(/secretTouched|savedName/);
     expect(isDirty(touchedOnly, d)).toBe(false);
+  });
+});
+
+describe('parseVariantBody', () => {
+  it('parses a JSON object, nested values kept', () => {
+    expect(parseVariantBody('{"reasoning":{"effort":"high"},"temperature":0.5}')).toEqual({
+      reasoning: { effort: 'high' },
+      temperature: 0.5,
+    });
+  });
+
+  it('invalid JSON is {}, so the save is blocked and validation reports it', () => {
+    expect(parseVariantBody('{"reasoning":')).toEqual({});
+    expect(parseVariantBody('')).toEqual({});
+    expect(parseVariantBody('not json')).toEqual({});
+  });
+
+  it('JSON that is not an object is {}', () => {
+    for (const text of ['[1,2]', '"x"', '42', 'true', 'null']) {
+      expect(parseVariantBody(text), text).toEqual({});
+    }
+  });
+});
+
+describe('newVariantDraft', () => {
+  it('starts blank with the given source and a fresh key each time', () => {
+    const a = newVariantDraft('manual');
+    const b = newVariantDraft('manual');
+    expect(a).toMatchObject({ id: '', label: '', body: '', source: 'manual' });
+    expect(a.key).not.toBe(b.key);
+    expect(newVariantDraft('auto').source).toBe('auto');
+  });
+});
+
+/** A variant row with a fixed key, for validation tests. */
+function variant(over: Partial<VariantDraft> & { key: string }): VariantDraft {
+  return { id: 'high', label: 'High', body: '{"reasoning":{"effort":"high"}}', source: 'manual', ...over };
+}
+
+/** A saved draft whose first model carries the given variant rows. */
+function withVariants(rows: VariantDraft[]): ProviderDraft {
+  const d = saved();
+  d.models[0].variants = rows;
+  return d;
+}
+
+describe('draftFromProvider and buildSaveInput: variants', () => {
+  it('a saved variant becomes a row with a 2-space-indented body', () => {
+    const d = draftFromProvider({
+      ...SAVED,
+      models: [
+        {
+          ...SAVED.models[0],
+          variants: [{ id: 'high', label: 'High', body: { reasoning: { effort: 'high' } }, source: 'manual' }],
+        },
+        SAVED.models[1],
+      ],
+    });
+    expect(d.models[0].variants).toHaveLength(1);
+    expect(d.models[0].variants[0]).toMatchObject({ id: 'high', label: 'High', source: 'manual' });
+    expect(d.models[0].variants[0].body).toBe(JSON.stringify({ reasoning: { effort: 'high' } }, null, 2));
+    expect(d.models[1].variants).toEqual([]);
+  });
+
+  it('variants round-trip: trimmed ids and labels, parsed bodies, sources kept', () => {
+    const d = withVariants([
+      variant({ key: 'v1', id: '  high ', label: ' High effort ', body: '{"reasoning":{"effort":"high"}}', source: 'manual' }),
+      variant({ key: 'v2', id: 'low', label: 'Low', body: '{"reasoning":{"effort":"low"}}', source: 'auto' }),
+    ]);
+    expect(buildSaveInput(d).provider.models[0].variants).toEqual([
+      { id: 'high', label: 'High effort', body: { reasoning: { effort: 'high' } }, source: 'manual' },
+      { id: 'low', label: 'Low', body: { reasoning: { effort: 'low' } }, source: 'auto' },
+    ]);
+  });
+
+  it('models without variants save without the key, so old files round-trip byte-identical', () => {
+    const models = buildSaveInput(saved()).provider.models;
+    for (const m of models) {
+      expect(m).not.toHaveProperty('variants');
+    }
+    expect(JSON.stringify(buildSaveInput(saved()).provider)).toBe(JSON.stringify(SAVED));
+  });
+
+  it('a variant edit makes the draft dirty, but row keys alone never do', () => {
+    const d = withVariants([variant({ key: 'v1' })]);
+    const base = withVariants([variant({ key: 'v1' })]);
+    expect(isDirty(d, base)).toBe(false);
+    expect(isDirty(withVariants([variant({ key: 'other' })]), base)).toBe(false);
+    const edited = withVariants([variant({ key: 'v1', label: 'Higher' })]);
+    expect(isDirty(edited, base)).toBe(true);
+    const added = withVariants([variant({ key: 'v1' }), variant({ key: 'v2', id: 'low' })]);
+    expect(isDirty(added, base)).toBe(true);
+  });
+});
+
+describe('validateDraft: variants', () => {
+  it('a clean manual variant has no problems', () => {
+    expect(hasProblems(validateDraft(withVariants([variant({ key: 'v1' })]), []))).toBe(false);
+  });
+
+  it('a variant id matches the backend slug: lower-case start, 1 to 32 of a-z 0-9 - _', () => {
+    for (const id of ['', '  ', 'High', '-low', 'has space', 'a'.repeat(33), 'UPPER', 'dot.name']) {
+      const p = validateDraft(withVariants([variant({ key: 'v1', id })]), []);
+      expect(p.variants.v1, id).toMatch(/Variant id must be 1 to 32 characters/);
+    }
+    expect(validateDraft(withVariants([variant({ key: 'v1', id: 'a'.repeat(32) })]), []).variants).toEqual({});
+    expect(validateDraft(withVariants([variant({ key: 'v1', id: ' x-high_2 ' })]), []).variants).toEqual({});
+  });
+
+  it('a label is required, at most 80 characters, without control characters', () => {
+    expect(validateDraft(withVariants([variant({ key: 'v1', label: '  ' })]), []).variants.v1).toBe('Variant label is required.');
+    expect(validateDraft(withVariants([variant({ key: 'v1', label: 'l'.repeat(81) })]), []).variants.v1).toBe(
+      'Variant label must be at most 80 characters.',
+    );
+    expect(validateDraft(withVariants([variant({ key: 'v1', label: 'a\u0007b' })]), []).variants.v1).toBe(
+      'Variant label must not contain control characters.',
+    );
+  });
+
+  it('a body must parse to a non-empty JSON object', () => {
+    expect(validateDraft(withVariants([variant({ key: 'v1', body: '{"a":' })]), []).variants.v1).toBe(
+      'Variant body must be a JSON object.',
+    );
+    expect(validateDraft(withVariants([variant({ key: 'v1', body: '[1]' })]), []).variants.v1).toBe(
+      'Variant body must be a JSON object.',
+    );
+    expect(validateDraft(withVariants([variant({ key: 'v1', body: '{}' })]), []).variants.v1).toBe(
+      'Variant body must be a non-empty JSON object.',
+    );
+    expect(validateDraft(withVariants([variant({ key: 'v1', body: '  {"a":1}  ' })]), []).variants).toEqual({});
+  });
+
+  it('a body must not set a protected key', () => {
+    for (const key of ['model', 'messages', 'stream', 'tools', 'stream_options', 'max_tokens', 'max_completion_tokens', 'models']) {
+      const p = validateDraft(withVariants([variant({ key: 'v1', body: JSON.stringify({ [key]: 1, reasoning: { effort: 'x' } }) })]), []);
+      expect(p.variants.v1, key).toBe(`Variant body must not set "${key}".`);
+    }
+    expect(validateDraft(withVariants([variant({ key: 'v1' })]), []).variants).toEqual({});
+  });
+
+  it('a body must serialize to at most 4096 bytes', () => {
+    const big = JSON.stringify({ pad: 'x'.repeat(4100) });
+    expect(validateDraft(withVariants([variant({ key: 'v1', body: big })]), []).variants.v1).toBe(
+      'Variant body must serialize to at most 4096 bytes.',
+    );
+    const small = JSON.stringify({ pad: 'x'.repeat(100) });
+    expect(validateDraft(withVariants([variant({ key: 'v1', body: small })]), []).variants).toEqual({});
+  });
+
+  it('a body must nest at most 8 levels deep, matching the backend count', () => {
+    const nest = (n: number) => {
+      let body: unknown = 1;
+      for (let i = 0; i < n; i += 1) {
+        body = { n: body };
+      }
+      return JSON.stringify(body);
+    };
+    expect(validateDraft(withVariants([variant({ key: 'v1', body: nest(8) })]), []).variants).toEqual({});
+    expect(validateDraft(withVariants([variant({ key: 'v1', body: nest(9) })]), []).variants.v1).toBe(
+      'Variant body must nest at most 8 levels deep.',
+    );
+  });
+
+  it('duplicate ids are an error only among manual variants; a manual may shadow an auto', () => {
+    const dupes = withVariants([
+      variant({ key: 'v1', id: 'high', source: 'manual' }),
+      variant({ key: 'v2', id: 'high', source: 'manual' }),
+    ]);
+    const p = validateDraft(dupes, []);
+    expect(p.variants.v1).toBeUndefined();
+    expect(p.variants.v2).toBe('Variant "high" is listed more than once.');
+    expect(hasProblems(p)).toBe(true);
+
+    const shadow = withVariants([
+      variant({ key: 'v1', id: 'high', source: 'manual' }),
+      variant({ key: 'v2', id: 'high', label: 'High', body: '{"a":1}', source: 'auto' }),
+    ]);
+    expect(validateDraft(shadow, []).variants).toEqual({});
+
+    const autoDupes = withVariants([
+      variant({ key: 'v1', id: 'high', body: '{"a":1}', source: 'auto' }),
+      variant({ key: 'v2', id: 'high', label: 'High again', body: '{"b":2}', source: 'auto' }),
+    ]);
+    expect(validateDraft(autoDupes, []).variants).toEqual({});
+  });
+
+  it('more than 16 variants on one model is the model row problem', () => {
+    const rows = Array.from({ length: 17 }, (_, i) => variant({ key: `v${i}`, id: `e${i}` }));
+    const p = validateDraft(withVariants(rows), []);
+    expect(p.models[SAVED.models[0].id]).toBe(
+      `Model "${SAVED.models[0].id}" has 17 variants, at most 16 are allowed.`,
+    );
+    expect(hasProblems(p)).toBe(true);
+    const sixteen = withVariants(rows.slice(0, 16));
+    expect(validateDraft(sixteen, []).models).toEqual({});
+  });
+
+  it('problems are keyed by variant row key, so each row shows its own', () => {
+    const p = validateDraft(
+      withVariants([variant({ key: 'v1', body: 'nope' }), variant({ key: 'v2' })]),
+      [],
+    );
+    expect(p.variants.v1).toBe('Variant body must be a JSON object.');
+    expect(p.variants.v2).toBeUndefined();
   });
 });
 

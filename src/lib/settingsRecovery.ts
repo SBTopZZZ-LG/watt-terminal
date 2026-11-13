@@ -39,7 +39,10 @@ export function chipLabel(state: SettingsStateView | null | undefined, llm: LlmS
   if (kind === 'last_good') {
     return 'last good';
   }
-  return llm.enabled ? `model: ${llm.model ?? 'unknown'}` : 'mock agent';
+  if (!llm.enabled) {
+    return 'mock agent';
+  }
+  return `model: ${llm.model ?? 'unknown'}${llm.variant ? `#${llm.variant}` : ''}`;
 }
 
 /** The model chip's hover text while the settings are broken; null otherwise, and the caller keeps its own. */

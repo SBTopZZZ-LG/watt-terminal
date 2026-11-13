@@ -2,6 +2,22 @@ import { useCallback, useEffect, useLayoutEffect, useReducer, useRef, useState }
 import type { RefObject } from 'react';
 import './App.css';
 import { api, errorText } from './lib/api';
+import { copyText } from './lib/clipboard';
+import {
+  INIT_TEMPLATE,
+  PLAN_TEMPLATE,
+  REVIEW_TEMPLATE,
+  conversationMarkdown,
+  expandTemplate,
+  findBuiltin,
+  matchModel,
+  parseCommand,
+  renderContext,
+  renderHelp,
+  splitModelVariant,
+} from './lib/commands';
+import type { ModelChoice } from './lib/commands';
+import { effectiveVariants } from './lib/settingsForm';
 import { connect, reportError, restart, setSessionNonces, subscribe } from './lib/session';
 import type { Incoming } from './lib/session';
 import { clearTerminal, currentFontSize, fitToContainer, markConnected, marks, onFontSizeChange, receiveBytes, resetForNewSession, setFontSize, term, terminalSize, zoomFont } from './lib/terminal';
@@ -10,7 +26,7 @@ import { effectiveState, focusAfter, inputReducer, INITIAL_INPUT, isFocusBarHotk
 import type { BarMode, Route } from './lib/inputState';
 import { agentDialogPhase, agentIntegratingQuietly, agentRequestAfter, agentRequestClosedBySession, agentRunning, canIntegrate, nestedLevels } from './lib/integrate';
 import type { AgentRequest, IntegratePhase } from './lib/integrate';
-import { agentControlAfter, borderLevel, NO_CONTROL } from './lib/agentControl';
+import { agentControlAfter, borderLevel, NO_CONTROL, settleControl } from './lib/agentControl';
 import type { AgentControl, BorderLevel } from './lib/agentControl';
 import { EMPTY_TRANSCRIPT, firstPendingApproval, isBusy, transcriptReducer } from './lib/transcript';
 import { chatBodyShown, isSideDock, loadPanelLayout, panelReducer, panelView, savePanelLayout } from './lib/panelLayout';
@@ -20,7 +36,7 @@ import { itemsFromMessages } from './lib/historyView';
 import { userAttachments } from './lib/attachments';
 import { defaultModelVision } from './lib/modelVision';
 import { createPatchSaver, fontPatch, panelPatch, reconcileFont, reconcileGroupBy, reconcilePanel, shouldRestoreLast } from './lib/uiState';
-import type { AttachmentInput, Cwd, HistoryGroupBy, InputState, IntegrationStatus, LevelInfo, LlmStatus, LoadedConversation, ObserverStatus, SettingsStateView, Status, UiState, UiStatePatch, WireEvent } from './lib/types';
+import type { AttachmentInput, Cwd, HistoryGroupBy, InputState, IntegrationStatus, LevelInfo, LlmStatus, LoadedConversation, ObserverStatus, QuestionAnswerInput, SettingsStateView, Status, UiState, UiStatePatch, WireEvent } from './lib/types';
 import { recoveryKind } from './lib/settingsRecovery';
 import { TerminalView } from './components/TerminalView';
 import { InputBar } from './components/InputBar';
@@ -32,6 +48,8 @@ import { FindBar } from './components/FindBar';
 import { PanelDivider } from './components/PanelDivider';
 import { AgentPanel, Workspace } from './components/AgentPanel';
 import { HistoryView } from './components/HistoryView';
+import { HelpDialog } from './components/HelpDialog';
+import type { HelpLoad } from './components/HelpDialog';
 import { SettingsDialog } from './components/SettingsDialog';
 import { SettingsBanner } from './components/SettingsBanner';
 import { AutoApproveNotice } from './components/AutoApproveNotice';
@@ -93,12 +111,22 @@ export default function App() {
   const [findToken, setFindToken] = useState(0);
   // The AI settings dialog (Cmd+, / Ctrl+, or the gear button in the status strip).
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // Bare `/model` opens Settings with the default-model select focused. Any other open leaves focus alone.
+  const [settingsFocusModel, setSettingsFocusModel] = useState(false);
+  // The `/help` dialog. It loads fresh on each open and never writes to the transcript.
+  const [helpOpen, setHelpOpen] = useState(false);
+  const [helpState, setHelpState] = useState<HelpLoad>({ kind: 'loading' });
   // The state of settings.json, from the status. The banner in the chat view can be dismissed until the next status says so again.
   const [settingsState, setSettingsState] = useState<SettingsStateView | null>(null);
   const [settingsBannerHidden, setSettingsBannerHidden] = useState(false);
   // Which view the agent panel's body shows, the id of the live conversation, and how History is grouped.
   const [panelBody, setPanelBody] = useState<'chat' | 'history'>('chat');
   const [conversationId, setConversationId] = useState<string | null>(null);
+  // A side command (`/btw`, `/compact`, `/fork`) is running: one model call outside a turn, or none at all. The bar
+  // and History stay busy until it answers, and a send is refused so the text is kept.
+  const [sideBusy, setSideBusy] = useState(false);
+  // Bumped when the live conversation is renamed, so an open HistoryView remounts and refetches its rows.
+  const [historyKey, setHistoryKey] = useState(0);
   const [historyGroupBy, setHistoryGroupBy] = useState<HistoryGroupBy>('date');
   // The UI state file, read at startup. Nothing is written to it until that read has been reconciled (see uiReady).
   const uiLoaded = useRef<Promise<UiState | null> | null>(null);
@@ -158,7 +186,7 @@ export default function App() {
     if (recoveryKind(s.settings_state) !== 'ok') {
       setSettingsBannerHidden(false);
     }
-    setAgentControl((c) => ({ ...c, call: s.agent_control }));
+    setAgentControl((c) => settleControl(c, s));
     setConversationId(s.conversation_id);
     dispatchTranscript({ type: 'sync_busy', busy: s.agent_busy });
     if (s.observer === 'desynced') {
@@ -170,6 +198,23 @@ export default function App() {
   const refreshStatus = () => {
     api.getStatus().then(applyStatus).catch(reportError);
   };
+
+  /**
+   * Re-reads the control hold after `done`. `done` is emitted by `run_turn` before the worker's `OnDrop` calls
+   * `end_turn`, so the first fetch can still see `agent_busy: true` and `settleControl` keeps the stale command id.
+   * Retry while busy (up to 4 retries, ~250ms apart) so the later read settles it; errors are ignored.
+   */
+  const refreshControl = useCallback(function refresh(attempt = 0): void {
+    api.getStatus().then(
+      (s) => {
+        setAgentControl((c) => settleControl(c, s));
+        if (s.agent_busy && attempt < 4) {
+          setTimeout(() => refresh(attempt + 1), 250);
+        }
+      },
+      () => undefined,
+    );
+  }, []);
 
   /**
    * Reads approve-all as the shell on top sees it. Only its two fields change: a levels event is not a full status read (see
@@ -226,14 +271,38 @@ export default function App() {
 
   /** Opens the AI settings, and reads the settings state again on the way in, so the chip and the banner match the file. */
   const openSettings = () => {
+    setSettingsFocusModel(false);
+    setSettingsOpen(true);
+    refreshSettingsState();
+  };
+
+  /** Bare `/model`: the settings open with the default-model select focused, so Space opens its list. */
+  const openSettingsForModel = () => {
+    setSettingsFocusModel(true);
     setSettingsOpen(true);
     refreshSettingsState();
   };
 
   /** Closes the AI settings, and reads the settings state again: the dialog may have changed the file. */
   const closeSettings = () => {
+    setSettingsFocusModel(false);
     setSettingsOpen(false);
     refreshSettingsState();
+  };
+
+  /** Reads the command catalog again for the `/help` dialog. Errors show in the dialog, never the transcript. */
+  const loadHelp = () => {
+    setHelpState({ kind: 'loading' });
+    api.listCommands().then(
+      (catalog) => setHelpState({ kind: 'ready', text: renderHelp(catalog) }),
+      (e: unknown) => setHelpState({ kind: 'error', message: errorText(e) }),
+    );
+  };
+
+  /** Closes the `/help` dialog. Focus goes back to the bar through the token. */
+  const closeHelp = () => {
+    setHelpOpen(false);
+    setFocusToken((t) => t + 1);
   };
 
   // Whether the selected model takes images. The status names the model; the saved settings say what it takes. Read again when
@@ -354,6 +423,9 @@ export default function App() {
           // The turn ended: a question still waiting for an answer is closed (nobody can answer it now).
           setAgentReq((cur) => agentRequestAfter(cur, ev));
           dispatchTranscript({ type: 'agent_event', event: ev });
+          // Reconcile with the status: a lost finish event leaves a stale command id holding the border on,
+          // but at a local idle prompt no agent command can still be running.
+          refreshControl();
           return;
         case 'observer':
           setObserver(ev.status);
@@ -408,7 +480,7 @@ export default function App() {
       .then(() => fitToContainer())
       .catch(reportError);
     return unsubscribe;
-  }, [applyStatus, refreshAutoState]);
+  }, [applyStatus, refreshAutoState, refreshControl]);
 
   // Focus follows the shell's end, not its commands (see focusAfter): the bar takes it when the shell exits, the
   // terminal when a new one starts.
@@ -538,7 +610,7 @@ export default function App() {
     api.writeUser(text).catch(reportError);
   };
 
-  const onAgent = async (text: string, attachments: AttachmentInput[]): Promise<string | null> => {
+  const sendAgent = async (text: string, attachments: AttachmentInput[]): Promise<string | null> => {
     epoch.current += 1;
     clientIds.current += 1;
     const clientId = clientIds.current;
@@ -566,6 +638,288 @@ export default function App() {
       },
       (e) => dispatchTranscript({ type: 'notice', text: errorText(e) }),
     );
+  };
+
+  /** The `/history` command. It opens the panel if collapsed and shows History; unlike the button it never toggles it closed. */
+  const showHistory = () => {
+    if (!panel.open) {
+      dispatchPanel({ type: 'open', open: true });
+    }
+    // Remount, so the search field takes focus even when History is already shown.
+    setHistoryKey((k) => k + 1);
+    setPanelBody('history');
+  };
+
+  /**
+   * Switches to a conversation the backend already adopted (`/compact`, `/fork`): the loaded messages, todos and
+   * context become the live transcript at once. Never `openConversation`: that would reload from the store and race
+   * a send, while this result is already the backend's live state.
+   */
+  const applyLoaded = (loaded: LoadedConversation) => {
+    epoch.current += 1;
+    dispatchTranscript({ type: 'conversation_loaded', items: itemsFromMessages(loaded.messages), todos: loaded.todos, context: loaded.context });
+    setConversationId(loaded.id);
+    setPanelBody('chat');
+    refreshStatus();
+  };
+
+  /**
+   * Runs a parsed slash command. `handled` means a local action ran (nothing is sent); `send` means the expanded
+   * text goes to the agent as a normal user message; `unknown` means the name is not a command, so the original
+   * text goes to the agent. Built-ins win over custom commands of the same name.
+   */
+  const runCommand = async (
+    name: string,
+    args: string,
+    original: string,
+  ): Promise<{ kind: 'send'; text: string } | { kind: 'handled' } | { kind: 'unknown' }> => {
+    const builtin = findBuiltin(name);
+    // Not a built-in: fetch the catalog fresh (the cwd can change) and expand the template.
+    if (builtin === null) {
+      let catalog;
+      try {
+        catalog = await api.listCommands();
+      } catch {
+        // The lookup failed: send the original text rather than swallow it.
+        return { kind: 'send', text: original };
+      }
+      const cmd = catalog.commands.find((c) => c.name === name);
+      if (cmd === undefined) {
+        return { kind: 'unknown' };
+      }
+      return { kind: 'send', text: expandTemplate(cmd.template, args) };
+    }
+    switch (builtin.name) {
+      case 'help': {
+        loadHelp();
+        setHelpOpen(true);
+        return { kind: 'handled' };
+      }
+      case 'new': {
+        newConversation();
+        return { kind: 'handled' };
+      }
+      case 'stop': {
+        // A side command holds no shell command: cancel it without touching the terminal.
+        if (sideBusy) {
+          api.cancelAgent().catch(reportError);
+          return { kind: 'handled' };
+        }
+        if (!isBusy(transcriptRef.current)) {
+          dispatchTranscript({ type: 'notice', text: 'No turn is running.', muted: true });
+          return { kind: 'handled' };
+        }
+        api.cancelAgent().catch(reportError);
+        if (!locked) {
+          sendRaw(CTRL_C);
+        }
+        return { kind: 'handled' };
+      }
+      case 'model': {
+        // Bare `/model` opens Settings; with an argument the default model is switched.
+        if (args === '') {
+          openSettingsForModel();
+          return { kind: 'handled' };
+        }
+        try {
+          const view = await api.getSettings();
+          const options: ModelChoice[] = view.settings.providers.flatMap((p) =>
+            p.models.map((m) => ({
+              ref: { provider_id: p.id, model_id: m.id },
+              label: `${p.name} · ${m.id}`,
+              provider: p.name,
+              variants: effectiveVariants(m).map((v) => ({ id: v.id, label: v.label })),
+            })),
+          );
+          const matched = matchModel(options, args);
+          if (matched.status === 'match') {
+            await api.setDefaultModel(matched.choice.ref);
+            refreshStatus();
+            refreshSettingsState();
+            const variant = matched.choice.ref.variant ?? null;
+            dispatchTranscript({
+              type: 'notice',
+              text: `Default model: ${matched.choice.label}${variant ? `#${variant}` : ''}.`,
+              muted: true,
+            });
+          } else if (matched.status === 'ambiguous') {
+            const list = matched.candidates
+              .slice(0, 8)
+              .map((c) => `${c.ref.provider_id}/${c.ref.model_id}${c.ref.variant ? `#${c.ref.variant}` : ''}`)
+              .join(', ');
+            dispatchTranscript({ type: 'notice', text: `Multiple models match "${args}": ${list}.`, muted: true });
+          } else if (matched.variants.length > 0) {
+            const { base, variant } = splitModelVariant(args);
+            dispatchTranscript({
+              type: 'notice',
+              text: `No variant "${variant ?? ''}" on "${base}". Available: ${matched.variants.slice(0, 8).join(', ')}.`,
+              muted: true,
+            });
+          } else {
+            const list = options
+              .slice(0, 8)
+              .map((c) => `${c.ref.provider_id}/${c.ref.model_id}`)
+              .join(', ');
+            dispatchTranscript({
+              type: 'notice',
+              text: options.length === 0 ? `No model matches "${args}".` : `No model matches "${args}". Available: ${list}.`,
+              muted: true,
+            });
+          }
+        } catch (e) {
+          dispatchTranscript({ type: 'notice', text: errorText(e) });
+        }
+        return { kind: 'handled' };
+      }
+      case 'export': {
+        const md = conversationMarkdown(transcriptRef.current.items);
+        if (md.trim() === '') {
+          dispatchTranscript({ type: 'notice', text: 'There is nothing to export yet.', muted: true });
+          return { kind: 'handled' };
+        }
+        const ok = await copyText(md, { clipboard: navigator.clipboard ?? undefined, document });
+        dispatchTranscript({
+          type: 'notice',
+          text: ok ? `Copied the conversation to the clipboard (${md.length} characters).` : 'Could not copy the conversation to the clipboard.',
+          ...(ok ? { muted: true } : {}),
+        });
+        return { kind: 'handled' };
+      }
+      case 'plan':
+        return { kind: 'send', text: expandTemplate(PLAN_TEMPLATE, args) };
+      case 'review':
+        return { kind: 'send', text: expandTemplate(REVIEW_TEMPLATE, args) };
+      case 'init':
+        return { kind: 'send', text: expandTemplate(INIT_TEMPLATE, args) };
+      case 'context': {
+        dispatchTranscript({ type: 'notice', text: renderContext(transcriptRef.current.context), muted: true });
+        return { kind: 'handled' };
+      }
+      case 'history': {
+        showHistory();
+        return { kind: 'handled' };
+      }
+      case 'rename': {
+        if (args === '') {
+          dispatchTranscript({ type: 'notice', text: 'Usage: /rename <title>.', muted: true });
+          return { kind: 'handled' };
+        }
+        if (conversationId === null) {
+          dispatchTranscript({ type: 'notice', text: 'There is no conversation to rename yet.', muted: true });
+          return { kind: 'handled' };
+        }
+        try {
+          const meta = await api.renameConversation(conversationId, args);
+          setHistoryKey((k) => k + 1);
+          dispatchTranscript({ type: 'notice', text: `Renamed the conversation to "${meta.title}".`, muted: true });
+        } catch (e) {
+          dispatchTranscript({ type: 'notice', text: errorText(e) });
+        }
+        return { kind: 'handled' };
+      }
+      case 'btw': {
+        // A side question: one model call outside a turn. The answer is only a muted notice, never stored.
+        if (sideBusy) {
+          dispatchTranscript({ type: 'notice', text: 'A side command is still running. Wait for it to finish, or stop it first.', muted: true });
+          return { kind: 'handled' };
+        }
+        if (isBusy(transcriptRef.current)) {
+          dispatchTranscript({ type: 'notice', text: 'The agent is busy. Wait for the turn to finish, or stop it first.', muted: true });
+          return { kind: 'handled' };
+        }
+        if (args === '') {
+          dispatchTranscript({ type: 'notice', text: 'Usage: /btw <question>.', muted: true });
+          return { kind: 'handled' };
+        }
+        setSideBusy(true);
+        try {
+          const answer = await api.askBtw(args);
+          dispatchTranscript({ type: 'notice', text: `Side note:\n${answer}`, muted: true });
+        } catch (e) {
+          dispatchTranscript({ type: 'notice', text: errorText(e) });
+        } finally {
+          setSideBusy(false);
+        }
+        return { kind: 'handled' };
+      }
+      case 'compact': {
+        // Summarize the conversation into a new one and switch to it atomically. The old one stays in history.
+        if (sideBusy) {
+          dispatchTranscript({ type: 'notice', text: 'A side command is still running. Wait for it to finish, or stop it first.', muted: true });
+          return { kind: 'handled' };
+        }
+        if (isBusy(transcriptRef.current)) {
+          dispatchTranscript({ type: 'notice', text: 'The agent is busy. Wait for the turn to finish, or stop it first.', muted: true });
+          return { kind: 'handled' };
+        }
+        if (args !== '') {
+          dispatchTranscript({ type: 'notice', text: 'Usage: /compact takes no arguments.', muted: true });
+          return { kind: 'handled' };
+        }
+        setSideBusy(true);
+        dispatchTranscript({ type: 'notice', text: 'Compacting the conversation...', muted: true });
+        try {
+          applyLoaded(await api.compactConversation());
+          dispatchTranscript({ type: 'notice', text: 'Compacted into a new conversation.', muted: true });
+        } catch (e) {
+          dispatchTranscript({ type: 'notice', text: errorText(e) });
+        } finally {
+          setSideBusy(false);
+        }
+        return { kind: 'handled' };
+      }
+      case 'fork': {
+        // Copy the conversation into a new one and switch to it atomically. The old one stays untouched.
+        if (sideBusy) {
+          dispatchTranscript({ type: 'notice', text: 'A side command is still running. Wait for it to finish, or stop it first.', muted: true });
+          return { kind: 'handled' };
+        }
+        if (isBusy(transcriptRef.current)) {
+          dispatchTranscript({ type: 'notice', text: 'The agent is busy. Wait for the turn to finish, or stop it first.', muted: true });
+          return { kind: 'handled' };
+        }
+        if (args !== '') {
+          dispatchTranscript({ type: 'notice', text: 'Usage: /fork takes no arguments.', muted: true });
+          return { kind: 'handled' };
+        }
+        setSideBusy(true);
+        try {
+          applyLoaded(await api.forkConversation());
+          dispatchTranscript({ type: 'notice', text: 'Forked into a new conversation.', muted: true });
+        } catch (e) {
+          dispatchTranscript({ type: 'notice', text: errorText(e) });
+        } finally {
+          setSideBusy(false);
+        }
+        return { kind: 'handled' };
+      }
+      default:
+        return { kind: 'unknown' };
+    }
+  };
+
+  /**
+   * The bar's send: while a side command runs, every send is refused with an error so the InputBar keeps the text.
+   * Otherwise a slash command runs locally or expands into a user message, anything else (including unknown
+   * `/...`) is sent as it was typed. Template commands send the expanded text, so that is what the transcript and
+   * the stored history hold.
+   */
+  const onAgent = async (text: string, attachments: AttachmentInput[]): Promise<string | null> => {
+    if (sideBusy) {
+      return 'A side command is still running.';
+    }
+    const parsed = parseCommand(text);
+    if (parsed === null) {
+      return sendAgent(text, attachments);
+    }
+    const outcome = await runCommand(parsed.name, parsed.args, text);
+    if (outcome.kind === 'send') {
+      return sendAgent(outcome.text, attachments);
+    }
+    if (outcome.kind === 'unknown') {
+      return sendAgent(text, attachments);
+    }
+    return null;
   };
 
   /**
@@ -632,6 +986,17 @@ export default function App() {
     dispatchTranscript({ type: 'approval_answering', callId, approve });
     api.approveTool(callId, approve).catch((e) => {
       dispatchTranscript({ type: 'approval_failed', callId, message: errorText(e) });
+    });
+  };
+
+  /**
+   * Answers the agent's clarification question. The answers go back through `answer_questions` only: they never reach
+   * the shell or the approval paths. A refused send fails the card, so the user can retry it.
+   */
+  const answerQuestions = (callId: string, answers: QuestionAnswerInput[]) => {
+    dispatchTranscript({ type: 'question_answering', callId, answers });
+    api.answerQuestions(callId, answers).catch((e) => {
+      dispatchTranscript({ type: 'question_failed', callId, message: errorText(e) });
     });
   };
 
@@ -805,6 +1170,7 @@ export default function App() {
               open={panel.open}
               onToggle={() => dispatchPanel({ type: 'toggle' })}
               onApprove={answer}
+              onAnswerQuestions={answerQuestions}
               onNewConversation={newConversation}
               warning={
                 autoApprove ? (
@@ -831,8 +1197,9 @@ export default function App() {
               history={
                 panelBody === 'history' ? (
                   <HistoryView
+                    key={historyKey}
                     currentId={conversationId}
-                    busy={busy}
+                    busy={busy || sideBusy}
                     groupBy={historyGroupBy}
                     onGroupBy={setGroupBy}
                     onOpen={openConversation}
@@ -850,14 +1217,20 @@ export default function App() {
               hintInline={locked ? false : route.hintInline}
               locked={locked}
               hasPendingApproval={pendingApproval !== null}
-              busy={busy}
+              busy={busy || sideBusy}
               focusToken={focusToken}
               onFocusChange={setBarOpen}
+              loadCommands={() => api.listCommands()}
               onRestart={restartShell}
               restarting={restarting}
               onAgent={onAgent}
               modelVision={modelVision}
               onInterrupt={() => {
+                // A side command holds no shell command: cancel it without touching the terminal.
+                if (sideBusy) {
+                  api.cancelAgent().catch(reportError);
+                  return;
+                }
                 if (!locked) {
                   sendRaw(CTRL_C);
                 }
@@ -869,7 +1242,8 @@ export default function App() {
           </AgentPanel>
         }
       />
-      {settingsOpen && <SettingsDialog onClose={closeSettings} onChanged={refreshStatus} onViewLoaded={refreshSettingsState} />}
+      {settingsOpen && <SettingsDialog focusModel={settingsFocusModel} onClose={closeSettings} onChanged={refreshStatus} onViewLoaded={refreshSettingsState} />}
+      {helpOpen && <HelpDialog load={helpState} onRetry={loadHelp} onClose={closeHelp} />}
       {agentPhase !== null ? (
         <IntegrateDialog key="agent" phase={agentPhase} agent={{ onDecline: declineAgent }} onStart={acceptAgent} onClose={closeAgent} />
       ) : (

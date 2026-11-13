@@ -1,7 +1,7 @@
 // Whether the agent is in control of the shell. It drives the green border around the terminal. Pure: App feeds every
 // WireEvent through it, in order.
 
-import type { WireEvent } from './types';
+import type { InputState, WireEvent } from './types';
 
 export interface AgentControl {
   /** An approved run_command or send_keys is executing. Rust sends agent_control true before the call, false after. */
@@ -48,6 +48,30 @@ export function agentControlAfter(c: AgentControl, ev: WireEvent): AgentControl 
     default:
       return c;
   }
+}
+
+/** The narrow status slice settleControl reads. `levels` is only its length: any nesting keeps the hold. */
+export interface ControlSnapshot {
+  state: InputState;
+  levels: readonly unknown[];
+  agent_busy: boolean;
+  agent_control: boolean;
+}
+
+/**
+ * Reconciles the hold with a status snapshot (from `get_status`). The call flag follows the snapshot, and stale
+ * command ids are dropped only when nothing can still be running: the agent is idle, the shell is at a local
+ * prompt, and no nested level is open. A running state, a raw/alt state, an approval/question wait (`agent_busy`),
+ * or a nested level keeps the hold; an exited shell clears everything. Returns the input when nothing changes.
+ */
+export function settleControl(c: AgentControl, snapshot: ControlSnapshot): AgentControl {
+  if (snapshot.state === 'exited') {
+    return c.call || c.commands.size > 0 ? NO_CONTROL : c;
+  }
+  if (!snapshot.agent_busy && snapshot.state === 'prompt' && snapshot.levels.length === 0) {
+    return c.call === snapshot.agent_control && c.commands.size === 0 ? c : { call: snapshot.agent_control, commands: NO_COMMANDS };
+  }
+  return c.call === snapshot.agent_control ? c : { ...c, call: snapshot.agent_control };
 }
 
 /** The agent holds the shell: the border is on while either hold is. */

@@ -76,6 +76,7 @@ function props(over: Partial<SettingsBodyProps> = {}): SettingsBodyProps {
     editor: null,
     onRetry: NOOP,
     onDefault: NOOP,
+    onVariant: NOOP,
     onLimitText: NOOP,
     onLimitCommit: NOOP,
     onLimitClear: NOOP,
@@ -195,6 +196,64 @@ describe('SettingsBody: default model', () => {
     const out = html({ defaults: { busy: false, error: 'the default model cannot be used' } });
     expect(out).toContain('role="alert"');
     expect(out).toContain('the default model cannot be used');
+  });
+});
+
+describe('SettingsBody: variant select', () => {
+  const VARIANTS = {
+    ...SETTINGS,
+    providers: [
+      {
+        ...ACME,
+        models: [
+          {
+            id: 'big/one',
+            context_limit: null,
+            provider_context: 128000,
+            source: 'fetched' as const,
+            variants: [
+              { id: 'high', label: 'High effort', body: { reasoning: { effort: 'high' } }, source: 'manual' as const },
+              { id: 'low', label: 'Low', body: { reasoning: { effort: 'low' } }, source: 'auto' as const },
+            ],
+          },
+        ],
+      },
+    ],
+    default_model: { provider_id: 'acme', model_id: 'big/one', variant: 'high' },
+  };
+
+  /** The variant select's opening tag, or ''. */
+  function variantTag(out: string): string {
+    return out.match(/<select[^>]*id="[^"]*-variant"[^>]*>/)?.[0] ?? '';
+  }
+
+  it('lists Model default and the effective variants, tagging the manual ones, with the current one selected', () => {
+    const out = html({ load: { kind: 'ready', view: view({ settings: VARIANTS }) } });
+    expect(variantTag(out)).not.toContain('disabled');
+    expect(out).toContain('>Model default</option>');
+    expect(out).toContain('>High effort (manual)</option>');
+    expect(out).toContain('>Low</option>');
+    expect(optionTag(out, 'high')).toContain('selected=""');
+    expect(optionTag(out, 'low')).not.toContain('selected');
+    expect(optionTag(out, '')).not.toContain('selected');
+  });
+
+  it('with no default model it is disabled with only Model default', () => {
+    const out = html({ load: { kind: 'ready', view: view({ settings: { ...VARIANTS, default_model: null } }) } });
+    expect(variantTag(out)).toContain('disabled');
+    expect(out).toContain('>Model default</option>');
+    expect(out).not.toContain('(manual)</option>');
+  });
+
+  it('with a model without variants it is disabled', () => {
+    const out = html();
+    expect(variantTag(out)).toContain('disabled');
+    expect(out).toContain('>Model default</option>');
+  });
+
+  it('busy and locked disable it, like the model select', () => {
+    expect(variantTag(html({ defaults: { busy: true, error: null } }))).toContain('disabled');
+    expect(variantTag(html({ load: { kind: 'ready', view: view() }, locked: true }))).toContain('disabled');
   });
 });
 
@@ -352,6 +411,24 @@ describe('SettingsBody: recovery panel (settings.json cannot be used)', () => {
     const out = withState(BROKEN_STATE, { recovery: { busy: null, confirming: false, error: 'there are no last working settings' } });
     expect(out).toContain('there are no last working settings');
     expect(out.match(/role="alert"/g)?.length ?? 0).toBeGreaterThanOrEqual(2);
+  });
+});
+
+describe('SettingsBody: focusModel', () => {
+  it('bare /model renders the same default-model select; the focus itself is runtime-only', () => {
+    const out = html({ focusModel: true });
+    expect(out).toMatch(/<select[^>]*id="[^"]*-default"/);
+    expect(out).toContain('None (mock agent)');
+  });
+
+  it('the dialog takes focusModel without changing the card', () => {
+    vi.stubGlobal('document', { activeElement: null });
+    try {
+      const out = renderToStaticMarkup(<SettingsDialog focusModel onClose={NOOP} onChanged={NOOP} />);
+      expect(out).toMatch(/<div class="modal-backdrop"><div class="settings-dialog" role="dialog"/);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
 

@@ -1,5 +1,6 @@
 // Input bar text rules. The bar sends agent messages only, so every line is text for the agent (a leading `!` has no
-// meaning here). Shell input is typed in the terminal.
+// meaning here), unless it is a registered slash command (see commands.ts), which the app runs locally or expands
+// into a message. Shell input is typed in the terminal.
 
 /** The message to send for the bar's text: trimmed, or null when there is nothing to send. */
 export function messageFor(text: string): string | null {

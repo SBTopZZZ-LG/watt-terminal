@@ -4,10 +4,14 @@
 
 pub mod agent_loop;
 pub mod attachments;
+pub mod commands;
 pub mod context;
 pub mod history;
+pub mod instructions;
 pub mod project;
 pub mod prompt;
+pub mod questions;
 pub mod redact;
+pub mod side;
 pub mod todo;
 pub mod trim;

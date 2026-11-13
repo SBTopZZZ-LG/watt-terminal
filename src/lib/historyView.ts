@@ -8,6 +8,7 @@
 
 import type { ChatMessage, ConversationMeta } from './types';
 import type { NewItem, ToolStatus, UserAttachment } from './transcript';
+import { ASK_USER_TOOL, closedResult, parseQuestions, parseResult } from './questions';
 import { TODO_TOOL } from './todoView';
 
 /**
@@ -119,6 +120,31 @@ interface ToolCall {
   args: unknown;
 }
 
+/** Why a rebuilt question card can no longer be answered: its saved call never settled. */
+export const UNANSWERED_NOTE = 'This question was not answered.';
+
+/**
+ * The card for a saved `ask_user` call: its questions rebuilt from the saved arguments. A settled call is a resolved
+ * card with its outcome from the saved result. A call that never settled (no result, a denied or skipped close text,
+ * or an error text) is a closed card with every question cancelled, so the history never shows an answerable card for
+ * a turn that is over. Null only when the questions themselves cannot be read, or a present result is unreadable (the
+ * caller falls back to a generic tool row then).
+ */
+function questionItem(callId: string, args: unknown, content: string | undefined): NewItem | null {
+  const questions = parseQuestions(args);
+  if (questions === null) {
+    return null;
+  }
+  if (content === undefined || content === NO_RESULT_TEXT || isFailure(content)) {
+    return { kind: 'question', callId, questions, state: 'closed', answers: null, result: closedResult(questions), error: null, note: UNANSWERED_NOTE };
+  }
+  const result = parseResult(content);
+  if (result === null) {
+    return null;
+  }
+  return { kind: 'question', callId, questions, state: 'resolved', answers: null, result, error: null, note: null };
+}
+
 /** The well-formed tool calls of an assistant message. A call without a string id cannot be joined, so it is skipped. */
 function callsOf(toolCalls: unknown): ToolCall[] {
   if (!Array.isArray(toolCalls)) {
@@ -150,6 +176,9 @@ function callsOf(toolCalls: unknown): ToolCall[] {
  * message with the same tool_call_id: failed when that content starts with `error:`, the DENIED prefix or `skipped:`, ok otherwise.
  * A call with no tool message is failed, with NO_RESULT_TEXT. Tool messages that answer no call are dropped. Empty
  * assistant text is skipped. A todo_write call gets no item (nor its tool message): the todo panel shows the list instead.
+ * A settled ask_user call gives a resolved question item (rebuilt from its saved arguments and result); an unsettled
+ * one gives a closed card (never a tool row, and never answerable). Only an unreadable call gives a generic tool row,
+ * like any other call.
  * Ids are not set here; the transcript reducer gives them (conversation_loaded).
  */
 export function itemsFromMessages(messages: ChatMessage[]): NewItem[] {
@@ -177,6 +206,16 @@ export function itemsFromMessages(messages: ChatMessage[]): NewItem[] {
           continue;
         }
         const content = results.get(call.id);
+        // A settled question is its resolved card, rebuilt from the saved arguments and result; an unsettled one is
+        // a closed card. A call that cannot be rebuilt (or whose present result cannot be read) is a generic tool row,
+        // as any other call is.
+        if (call.name === ASK_USER_TOOL) {
+          const question = questionItem(call.id, call.args, content);
+          if (question !== null) {
+            items.push(question);
+            continue;
+          }
+        }
         const status: ToolStatus = content !== undefined && !isFailure(content) ? 'ok' : 'failed';
         items.push({
           kind: 'tool',

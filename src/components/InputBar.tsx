@@ -3,18 +3,24 @@ import type { ChangeEvent, ClipboardEvent as ReactClipboardEvent, DragEvent as R
 import { barKeyIntent } from '../lib/inputState';
 import type { BarMode } from '../lib/inputState';
 import { History, historyKeyTakesLine, messageFor, sendButtonFor } from '../lib/barInput';
+import { acceptMenuItem, commandMenuItems, filterCommandMenu, menuAcceptRuns, menuKeyIntent, menuQuery, moveMenuIndex } from '../lib/commandMenu';
+import type { CommandMenuItem } from '../lib/commandMenu';
 import { admitRefusal, countRefusal, filesFromPaste, loadOf, prepareFile } from '../lib/attachments';
 import type { Prepared } from '../lib/attachments';
 import { carriesFiles } from '../lib/dropGuard';
 import { showsVisionWarning } from '../lib/modelVision';
 import { visibleEscapes } from '../lib/visibleEscapes';
-import type { AttachmentInput } from '../lib/types';
+import type { AttachmentInput, CommandCatalog } from '../lib/types';
 import { AttachmentChips } from './AttachmentChips';
 import type { ChipItem } from './AttachmentChips';
+import { CommandMenu, commandMenuItemId, COMMAND_MENU_ID } from './CommandMenu';
 
 const DEFAULT_PLACEHOLDER = 'Ask the agent…';
 /** The shortcut hint, kept as the input's tooltip so the placeholder stays one line at every panel width. */
 const SHORTCUT_HINT = 'Ctrl/Cmd+Shift+A to focus, Esc to return';
+
+/** No customs: the menu still shows the built-ins while the catalog loads. */
+const EMPTY_CATALOG: CommandCatalog = { commands: [], project_dir: null, global_dir: null };
 
 /** An attachment on the bar. `input` is null while the file is still being prepared. */
 interface Draft {
@@ -40,6 +46,8 @@ interface Props {
   focusToken: number;
   /** Reports when the input gains or loses focus. */
   onFocusChange: (focused: boolean) => void;
+  /** Fetches the custom slash commands. Called fresh on every menu opening; built-ins show without it. */
+  loadCommands: () => Promise<CommandCatalog>;
   /** The shell exited: starts a new session. */
   onRestart: () => void;
   restarting: boolean;
@@ -70,6 +78,56 @@ export function InputBar(props: Props) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const restartRef = useRef<HTMLButtonElement>(null);
   const history = useRef(new History());
+  // The autocomplete menu: the catalog (null until the first opening fetches it), the selected row, and whether
+  // the user shut the menu for this text. The caret lands at the end after an accept, once the text commits.
+  const [catalog, setCatalog] = useState<CommandCatalog | null>(null);
+  const [menuIndex, setMenuIndex] = useState(0);
+  const [menuDismissed, setMenuDismissed] = useState(false);
+  const placeCaretEnd = useRef(false);
+
+  // The menu's rows: built-ins at once, customs when the catalog loads. Visible while the whole text is a slash
+  // prefix, unless dismissed, and there is a row to show.
+  const query = menuQuery(text);
+  const menuItems = filterCommandMenu(commandMenuItems(catalog ?? EMPTY_CATALOG), query ?? '');
+  const menuOpen = mode === 'chat' && query !== null && !menuDismissed && menuItems.length > 0;
+  const selectedIndex = menuItems.length === 0 ? 0 : menuIndex % menuItems.length;
+
+  // Fetches the customs once per slash session (the transition into a command token, not the menu
+  // opening, which can shut when a filter has no matches). A failure leaves the built-ins: the menu stays
+  // useful, and the next session tries again. Typing within a session neither retriggers nor cancels.
+  const inCommandToken = mode === 'chat' && query !== null;
+  const loadCommandsRef = useRef(props.loadCommands);
+  loadCommandsRef.current = props.loadCommands;
+  useEffect(() => {
+    if (!inCommandToken) {
+      return;
+    }
+    let live = true;
+    loadCommandsRef
+      .current()
+      .then((c) => {
+        if (live) {
+          setCatalog(c);
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      live = false;
+    };
+  }, [inCommandToken]);
+
+  // After an accept commits, the caret goes to the end of the new text. Focus is kept throughout.
+  useEffect(() => {
+    if (!placeCaretEnd.current) {
+      return;
+    }
+    placeCaretEnd.current = false;
+    const el = inputRef.current;
+    if (el) {
+      el.focus();
+      el.setSelectionRange(text.length, text.length);
+    }
+  }, [text]);
 
   // A new token moves focus. The effect reads the mode at that moment, when the input is rendered.
   useEffect(() => {
@@ -160,6 +218,16 @@ export function InputBar(props: Props) {
 
   function removeDraft(key: number) {
     commit(draftsRef.current.filter((d) => d.key !== key));
+    setError(null);
+    inputRef.current?.focus();
+  }
+
+  /** Takes a menu row: the text becomes `/name` (plus a space when it takes arguments) and the menu shuts, so it does not reopen for the new text. */
+  function acceptItem(item: CommandMenuItem) {
+    placeCaretEnd.current = true;
+    setText(acceptMenuItem(item));
+    setMenuIndex(0);
+    setMenuDismissed(true);
     setError(null);
     inputRef.current?.focus();
   }
@@ -256,6 +324,38 @@ export function InputBar(props: Props) {
   function onKeyDown(e: ReactKeyboardEvent<HTMLTextAreaElement>) {
     if (e.nativeEvent.isComposing) {
       return;
+    }
+    // The menu first: plain keys move, accept or dismiss it. A Ctrl/Meta/Alt chord is not the menu's: it falls
+    // through to the bar's own handling (Ctrl-C still interrupts), as do Shift+Enter (a newline) and Shift+Tab
+    // (focus moves on). Escape dismisses the menu instead of denying or closing.
+    if (menuOpen && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      const intent = menuKeyIntent(e.key, { shift: e.shiftKey, ctrl: false, meta: false, alt: false });
+      if (intent === 'next' || intent === 'prev') {
+        e.preventDefault();
+        setMenuIndex(moveMenuIndex(selectedIndex, intent === 'next' ? 1 : -1, menuItems.length));
+        return;
+      }
+      if (intent === 'accept') {
+        e.preventDefault();
+        const item = menuItems[selectedIndex];
+        if (item === undefined) {
+          return;
+        }
+        // Enter on a fully typed command runs it; Tab (or Enter on a partial name) completes it.
+        if (e.key === 'Enter' && menuAcceptRuns(text, item)) {
+          if (!sending && !props.locked) {
+            void submit();
+          }
+          return;
+        }
+        acceptItem(item);
+        return;
+      }
+      if (intent === 'dismiss') {
+        e.preventDefault();
+        setMenuDismissed(true);
+        return;
+      }
     }
     const intent = barKeyIntent(
       e.key,
@@ -368,14 +468,20 @@ export function InputBar(props: Props) {
           disabled={props.locked}
           onChange={(e) => {
             setText(e.currentTarget.value);
+            setMenuIndex(0);
+            setMenuDismissed(false);
             setError(null);
           }}
           onKeyDown={onKeyDown}
           onPaste={onPaste}
           onFocus={() => props.onFocusChange(true)}
           onBlur={() => props.onFocusChange(false)}
+          aria-expanded={menuOpen}
+          aria-controls={menuOpen ? COMMAND_MENU_ID : undefined}
+          aria-activedescendant={menuOpen ? commandMenuItemId(selectedIndex) : undefined}
         />
       </div>
+      {menuOpen && <CommandMenu items={menuItems} index={selectedIndex} onAccept={acceptItem} onHover={setMenuIndex} />}
       {/* mousedown keeps focus in the input: a blur closes the bar on the alternate screen. */}
       <button
         type="button"

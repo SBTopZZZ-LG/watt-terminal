@@ -2,7 +2,7 @@
 
 use serde_json::{Value, json};
 
-use crate::core::chat::todo;
+use crate::core::chat::{questions, todo};
 use crate::core::tools::{self, ToolSchema};
 
 /// Tools the model is never offered. None now: `send_keys` is offered, with its own approval (core/approval).
@@ -19,17 +19,24 @@ If run_command comes back with the command still running, use wait rather than r
 ignore_updates when only the end of the command matters. \
 For work with three or more steps, keep a todo list with todo_write: keep exactly one item in_progress and mark items \
 completed as you go. Don't use it for a trivial one-step request. \
+Every run_command and send_keys call includes a summary of at most 10 words describing what it does \
+(for example \"Check the working tree\" or \"Answer the sudo prompt\"): the app shows it in the transcript. \
+When you need the user's preference or a choice between implementations, ask with ask_user: give 2 to 4 short \
+options, at most one recommended, and never ask for permission (approval handles that) or for facts a read tool \
+can answer. If the user skips, or the question times out or is cancelled, don't ask the same question again: \
+continue on your best judgment or stop. \
 Answer concisely.";
 
 pub fn system_prompt() -> String {
     SYSTEM_PROMPT.to_string()
 }
 
-/// Every tool the model may be offered before the hidden ones are removed: the backend tools, then `todo_write`, which
-/// the agent loop handles itself.
+/// Every tool the model may be offered before the hidden ones are removed: the backend tools, then `todo_write` and
+/// `ask_user`, which the agent loop handles itself.
 fn all_schemas() -> Vec<ToolSchema> {
     let mut all = tools::schemas();
     all.push(todo::schema());
+    all.push(questions::schema());
     all
 }
 
@@ -80,6 +87,23 @@ mod tests {
     }
 
     #[test]
+    fn ask_user_is_advertised_once_and_the_backend_list_is_unchanged() {
+        let defs = tool_definitions();
+        let ask_defs = defs.iter().filter(|d| d["function"]["name"] == "ask_user").count();
+        assert_eq!(ask_defs, 1);
+        assert_eq!(tools::schemas().len(), 8, "ask_user is not a backend tool");
+        assert!(defs.iter().any(|d| d["function"]["name"] == "todo_write"), "todo_write is still advertised");
+    }
+
+    #[test]
+    fn system_prompt_asks_for_a_short_summary_caption_on_write_calls() {
+        let prompt = system_prompt();
+        for phrase in ["summary", "at most 10 words", "run_command", "send_keys", "transcript"] {
+            assert!(prompt.contains(phrase), "system prompt lacks `{phrase}`");
+        }
+    }
+
+    #[test]
     fn definitions_have_the_openai_function_shape() {
         for d in tool_definitions() {
             assert_eq!(d["type"], "function");
@@ -96,8 +120,11 @@ mod tests {
         for phrase in ["untrusted", "approval", "denial", "secrets"] {
             assert!(prompt.contains(phrase), "system prompt lacks `{phrase}`");
         }
-        assert!(!prompt.contains('\\'), "line continuations must not leak into the prompt");
-        // Approve-all and the rules can run a command without a card, so the prompt must not say every command asks.
+        assert!(!prompt.contains('\\'), "line continuations must not leak into the prompt");        // Approve-all and the rules can run a command without a card, so the prompt must not say every command asks.
         assert!(!prompt.contains("must approve each command"), "the prompt claims every command asks");
+        // The model is told when to ask the user, and what not to ask for.
+        for phrase in ["ask_user", "don't ask the same question again"] {
+            assert!(prompt.contains(phrase), "system prompt lacks `{phrase}`");
+        }
     }
 }

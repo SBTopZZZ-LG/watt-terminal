@@ -10,9 +10,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
+use std::time::Duration;
 
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{Manager, RunEvent, State};
 use tauri_plugin_window_state::StateFlags;
@@ -24,6 +25,10 @@ use crate::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate, AutoState, Mo
 use crate::core::env::env_setting;
 use crate::core::approval::{self, ApprovalPolicy, ManualPolicy};
 use crate::core::chat::agent_loop::{self, Conversation, LastUsage, LlmAgent, LlmSettings, USER_AGENT};
+use crate::core::chat::commands::{self, CommandCatalog};
+use crate::core::chat::instructions;
+use crate::core::chat::questions;
+use crate::core::chat::side::{self, SideCall};
 use crate::core::chat::attachments::{AttachmentInput, ImageFile, prepare};
 use crate::core::chat::context::ContextUsage;
 use crate::core::chat::history::History;
@@ -32,7 +37,8 @@ use crate::core::chat::todo::{Todo, TodoList};
 use crate::core::foreground::Foreground;
 use crate::core::llm::TurnCancel;
 use crate::core::observer::{EventSink, InputState, IntegrationStatus, LevelInfo, ObserverStatus, SessionEvent};
-use crate::core::persist::conversations::ConversationMeta;
+use crate::core::persist::conversations::{self, ConversationMeta};
+use crate::core::persist::workspace::workspace_for;
 use crate::core::persist::turn::{FinishedTurn, TurnEnv, resume, save_turn};
 use crate::core::persist::ui_state::{UiState, UiStatePatch};
 use crate::core::persist::{Persist, now_secs};
@@ -444,11 +450,19 @@ async fn agent_message(
     session_id: String,
     text: String,
     attachments: Option<Vec<AttachmentInput>>,
+    app: tauri::AppHandle,
     reg: State<'_, Reg>,
     persist: State<'_, PersistState>,
     settings: State<'_, SettingsState>,
 ) -> Result<(), String> {
     let att = session(&reg, &session_id)?;
+    // The project instructions come from the session's live working directory, read once before the
+    // turn starts. Anything unreadable just means no rules; it never fails the turn.
+    let project_rules = att
+        .session
+        .cwd()
+        .and_then(|cwd| workspace_root_for_cwd(&app, &cwd))
+        .and_then(|root| instructions::load(&root));
     let prepared = prepare(&attachments.unwrap_or_default())?;
     // Reading a saved model touches the Keychain, so it runs on the blocking pool.
     let service = settings.0.clone();
@@ -484,6 +498,7 @@ async fn agent_message(
                 let mut agent = LlmAgent::new(client, llm_settings, &conversation_id, history, todos, cancel.clone())
                     // The note is taken only by a turn that calls the model: a turn that fails to start keeps it.
                     .with_resume_note(att.conversation.take_resume_note())
+                    .with_project_rules(project_rules)
                     .with_checkpoint(checkpoint)
                     .with_limits(limits)
                     .with_no_vision(att.conversation.no_vision())
@@ -580,6 +595,18 @@ fn answer_integration(session_id: String, call_id: String, accept: bool, reg: St
     }
 }
 
+/// Answers a waiting `ask_user` call. Invalid answers are refused with the reason, so the UI can fix them and retry;
+/// an unknown call id means the question already settled (answered, timed out or cancelled).
+#[tauri::command]
+fn answer_questions(
+    session_id: String,
+    call_id: String,
+    answers: Vec<questions::AnswerInput>,
+    reg: State<'_, Reg>,
+) -> Result<(), String> {
+    session(&reg, &session_id)?.approvals.questions().decide(&call_id, answers)
+}
+
 #[tauri::command]
 fn set_auto_approve(session_id: String, on: bool, reg: State<'_, Reg>) -> Result<(), String> {
     // The shell on top is the level approve-all is tied to. The session supplies it, not the frontend.
@@ -607,13 +634,14 @@ fn auto_approve_state(
     Ok(AutoApproveState { auto: state != AutoState::Off, suspended: state == AutoState::Suspended })
 }
 
-/// Whether the LLM agent is configured, which model, and from which saved provider. `provider` is null for the
-/// environment settings. Never the key or the URL.
+/// Whether the LLM agent is configured, which model and variant, and from which saved provider. `provider` and
+/// `variant` are null for the environment settings. Never the key or the URL.
 #[derive(Serialize)]
 struct LlmStatus {
     enabled: bool,
     model: Option<String>,
     provider: Option<String>,
+    variant: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -647,7 +675,7 @@ struct Status {
 /// The environment settings as the status shows them.
 fn env_llm() -> LlmStatus {
     let env = agent_loop::settings();
-    LlmStatus { enabled: env.is_some(), model: env.map(|s| s.model.clone()), provider: None }
+    LlmStatus { enabled: env.is_some(), model: env.map(|s| s.model.clone()), provider: None, variant: None }
 }
 
 #[tauri::command]
@@ -658,11 +686,11 @@ fn get_status(session_id: String, reg: State<'_, Reg>, settings: State<'_, Setti
     let (llm, settings_state) = match settings.0.as_ref() {
         Some(service) => {
             let llm = match service.default_label() {
-                Ok(Some((provider, model))) => {
-                    LlmStatus { enabled: true, model: Some(model), provider: Some(provider) }
+                Ok(Some((provider, model, variant))) => {
+                    LlmStatus { enabled: true, model: Some(model), provider: Some(provider), variant }
                 }
                 Ok(None) => env_llm(),
-                Err(_) => LlmStatus { enabled: false, model: None, provider: None },
+                Err(_) => LlmStatus { enabled: false, model: None, provider: None, variant: None },
             };
             (llm, Some(service.settings_state()))
         }
@@ -689,6 +717,43 @@ fn get_status(session_id: String, reg: State<'_, Reg>, settings: State<'_, Setti
         conversation_id: att.conversation.id(),
         settings_state,
     })
+}
+
+/// The slash-command catalog: custom prompt templates from `<config>/commands` (global) and
+/// `<workspace>/.watt/commands` (project), plus the two directories so `/help` can show where to
+/// create them. The project directory comes from the session's live working directory; it is skipped
+/// for shells on another machine, whose filesystem cannot be read. Missing directories are not an error.
+#[tauri::command]
+fn list_commands(
+    session_id: String,
+    app: tauri::AppHandle,
+    reg: State<'_, Reg>,
+) -> Result<CommandCatalog, String> {
+    let global_dir = resolve_config_dir(&app).map(|dir| dir.join("commands"));
+    let project_dir =
+        session(&reg, &session_id)?.session.cwd().and_then(|cwd| project_commands_dir(&app, &cwd));
+    Ok(commands::catalog(project_dir.as_deref(), global_dir.as_deref()))
+}
+
+/// The workspace root for a shell working directory. None without a usable root, or when the
+/// shell runs on another machine, whose filesystem cannot be read.
+fn workspace_root_for_cwd(app: &tauri::AppHandle, cwd: &Cwd) -> Option<PathBuf> {
+    if !cwd.host.is_empty() && cwd.host != "localhost" && cwd.host != local_host() {
+        return None;
+    }
+    let home = app.path().home_dir().ok();
+    let workspace =
+        workspace_for(Some((cwd.host.as_str(), cwd.path.as_str())), local_host(), home.as_deref(), &[]);
+    if workspace.root.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(workspace.root))
+}
+
+/// The project's command directory for a shell working directory: `<workspace root>/.watt/commands`.
+/// None without a usable root, or when the shell runs on another machine.
+fn project_commands_dir(app: &tauri::AppHandle, cwd: &Cwd) -> Option<PathBuf> {
+    workspace_root_for_cwd(app, cwd).map(|root| root.join(".watt").join("commands"))
 }
 
 /// Integrates the shell in the foreground (ssh, a nested shell, a container exec) as a new level. The handshake waits for
@@ -767,6 +832,218 @@ async fn load_conversation(
         eprintln!("watt: the last conversation was not remembered ({e})");
     }
     Ok(LoadedConversation { id, title, messages, todos, context })
+}
+
+/// What a derived conversation (compact/fork) hands to `save_side`: its id, model-facing history, todo list, model
+/// and context usage.
+struct SideSave {
+    id: String,
+    messages: Vec<Value>,
+    todos: Vec<Todo>,
+    model: Option<String>,
+    context: Option<ContextUsage>,
+}
+
+/// Saves a derived conversation (compact/fork) via `save_turn`, never a raw store save: redacted, pruned and
+/// remembered as the last conversation like a finished turn, but marked finished (`in_turn: false`). `None` from
+/// `save_turn` (no user message) is an error; the callers refuse empty histories first.
+fn save_side(
+    store: &Persist,
+    cwd: Option<(String, String)>,
+    save: SideSave,
+    redactor: &Redactor,
+) -> Result<ConversationMeta, String> {
+    let pair = cwd.as_ref().map(|(host, path)| (host.as_str(), path.as_str()));
+    let turn = FinishedTurn {
+        conversation_id: &save.id,
+        messages: save.messages,
+        todos: save.todos,
+        model: save.model,
+        cwd: pair,
+        in_turn: false,
+        context: save.context,
+    };
+    let home = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
+    let env = TurnEnv { local_host: local_host(), home: home.as_deref() };
+    save_turn(store, turn, redactor, env, now_secs())
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "the conversation has no user message".to_string())
+}
+
+/// A side question about the live conversation: one model call outside a turn, never touching stored history or the
+/// transcript. Reserves the turn slot, so a second call is refused while one runs, and Ctrl-C/`cancel_agent` aborts
+/// it through the reserved turn's cancel token.
+#[tauri::command]
+async fn ask_btw(
+    session_id: String,
+    text: String,
+    reg: State<'_, Reg>,
+    settings: State<'_, SettingsState>,
+) -> Result<String, String> {
+    if text.trim().is_empty() {
+        return Err("Usage: /btw <question>".into());
+    }
+    let att = session(&reg, &session_id)?;
+    let cancel = Arc::new(TurnCancel::new());
+    let (history, _, old_id) = att.begin_turn(&cancel)?;
+    // Ends the turn on every return; dropped explicitly before success.
+    let end = OnDrop::new({ let att = att.clone(); move || att.end_turn() });
+    // The snapshot leaves the locks before any await.
+    let snapshot = lock(&history).snapshot();
+    // Reading a saved model touches the Keychain, so it runs on the blocking pool.
+    let service = settings.0.clone();
+    let (llm_settings, client) = blocking(move || {
+        let chosen =
+            choose_llm(service.as_deref())?.ok_or_else(|| "No model is configured. Add one in Settings.".to_string())?;
+        let client = agent_loop::shared_client().cloned()?;
+        Ok((chosen.0, client))
+    })
+    .await?;
+    let mut messages = side::conversation_context(&snapshot, side::budget_chars(llm_settings.context_limit, 1200));
+    messages.push(json!({"role": "user", "content": text}));
+    let answer = SideCall::new(&client, &llm_settings, &old_id, 1200, cancel)
+        .ask(side::BTW_SYSTEM, messages, Duration::from_secs(90))
+        .await;
+    drop(end);
+    answer
+}
+
+/// Replaces the live conversation with a summary of itself: one model call outside a turn, saved as a new conversation
+/// and adopted atomically. The old conversation stays untouched in storage. Refused while busy, and when the history
+/// has no user message yet.
+#[tauri::command]
+async fn compact_conversation(
+    session_id: String,
+    reg: State<'_, Reg>,
+    persist: State<'_, PersistState>,
+    settings: State<'_, SettingsState>,
+) -> Result<LoadedConversation, String> {
+    let att = session(&reg, &session_id)?;
+    let store = persist.get()?;
+    let cancel = Arc::new(TurnCancel::new());
+    let (history, todos, old_id) = att.begin_turn(&cancel)?;
+    // Ends the turn on every return; dropped explicitly before success.
+    let end = OnDrop::new({ let att = att.clone(); move || att.end_turn() });
+    // The snapshot leaves the locks before any await.
+    let snapshot = lock(&history).snapshot();
+    let current_todos = lock(&todos).clone();
+    if !snapshot.iter().any(|m| m.get("role").and_then(Value::as_str) == Some("user")) {
+        return Err("Nothing to compact yet.".into());
+    }
+    // Reading a saved model touches the Keychain and the store reads files, so both run on the blocking pool.
+    let service = settings.0.clone();
+    let reader = store.clone();
+    let reader_id = old_id.clone();
+    let (llm_settings, model, old_title, client) = blocking(move || {
+        let chosen =
+            choose_llm(service.as_deref())?.ok_or_else(|| "No model is configured. Add one in Settings.".to_string())?;
+        let old_title = reader.conversations.load(&reader_id).ok().map(|m| m.title);
+        let client = agent_loop::shared_client().cloned()?;
+        Ok((chosen.0, chosen.1, old_title, client))
+    })
+    .await?;
+    let old_title = old_title.unwrap_or_else(|| conversations::derive_title(&snapshot));
+    let input = side::summarizer_input(&snapshot, side::budget_chars(llm_settings.context_limit, 1024));
+    let request = format!(
+        "Summarize this conversation for context compaction: goals, decisions, files/commands touched, current state, open questions.\n\n{input}"
+    );
+    let summary = SideCall::new(&client, &llm_settings, &old_id, 1024, cancel)
+        .ask(side::SUMMARY_SYSTEM, vec![json!({"role": "user", "content": request})], Duration::from_secs(90))
+        .await?;
+    let new_id = agent_loop::new_conversation_id().map_err(io_err)?;
+    let mut seeded = History::new();
+    seeded.push_user_content(Value::String(side::compact_seed(&summary)));
+    let messages = seeded.snapshot();
+    // The header values resolve with the old conversation id, as the side call did.
+    let redactor = llm_settings.redactor(&old_id);
+    let cwd = att.session.cwd().map(|c| (c.host, c.path));
+    let saver = store.clone();
+    let saver_id = new_id.clone();
+    let saver_messages = messages.clone();
+    let saver_todos = current_todos.clone();
+    let title = side::suffixed_title(&old_title, " (compacted)");
+    let saved_title = blocking(move || {
+        let save =
+            SideSave { id: saver_id.clone(), messages: saver_messages, todos: saver_todos, model: Some(model), context: None };
+        let meta = save_side(&saver, cwd, save, &redactor)?;
+        // A rename failure keeps the derived title and still succeeds.
+        match saver.conversations.rename(&saver_id, &title) {
+            Ok(renamed) => Ok(renamed.title),
+            Err(_) => Ok(meta.title),
+        }
+    })
+    .await?;
+    let out_todos = current_todos.clone();
+    att.conversation.adopt(new_id.clone(), seeded, current_todos);
+    att.conversation.set_last_usage(None);
+    drop(end);
+    Ok(LoadedConversation { id: new_id, title: saved_title, messages, todos: out_todos, context: None })
+}
+
+/// Forks the live conversation: the same messages, todos and context usage under a new id, with the old
+/// conversation's attachment files copied. No model call, so no model needs to be configured. The old conversation
+/// stays untouched. Refused while busy, and when the history has no user message yet.
+#[tauri::command]
+async fn fork_conversation(
+    session_id: String,
+    reg: State<'_, Reg>,
+    persist: State<'_, PersistState>,
+) -> Result<LoadedConversation, String> {
+    let att = session(&reg, &session_id)?;
+    let store = persist.get()?;
+    let cancel = Arc::new(TurnCancel::new());
+    let (history, todos, old_id) = att.begin_turn(&cancel)?;
+    // Ends the turn on every return; dropped explicitly before success.
+    let end = OnDrop::new({ let att = att.clone(); move || att.end_turn() });
+    // The snapshot leaves the locks before any await.
+    let snapshot = lock(&history).snapshot();
+    let current_todos = lock(&todos).clone();
+    if !snapshot.iter().any(|m| m.get("role").and_then(Value::as_str) == Some("user")) {
+        return Err("Nothing to fork yet.".into());
+    }
+    let context = lock(&att.conversation.last_usage()).clone();
+    let reader = store.clone();
+    let reader_id = old_id.clone();
+    let old_meta = blocking(move || Ok(reader.conversations.load(&reader_id).ok().map(|m| (m.title, m.model)))).await?;
+    let (old_title, old_model) = old_meta.unwrap_or_else(|| (conversations::derive_title(&snapshot), None));
+    let new_id = agent_loop::new_conversation_id().map_err(io_err)?;
+    // The attachments are copied before the save, so a saved fork never names a missing file. A missing source
+    // directory is fine: a conversation without attachments forks to one without them. A copy failure aborts.
+    let copier = store.clone();
+    let (from, to) = (old_id.clone(), new_id.clone());
+    blocking(move || copier.conversations.attachments().copy_conversation(&from, &to).map_err(io_err)).await?;
+    let cwd = att.session.cwd().map(|c| (c.host, c.path));
+    let saver = store.clone();
+    let saver_id = new_id.clone();
+    let saver_messages = snapshot.clone();
+    let saver_todos = current_todos.clone();
+    let saver_context = context.clone();
+    let title = side::suffixed_title(&old_title, " (fork)");
+    let saved_title = blocking(move || {
+        // No model is configured for a fork, so nothing secret is known: the credential-shaped patterns still apply,
+        // and anything already stored was scrubbed when it was first saved.
+        let redactor = Redactor::new(Vec::new());
+        let save = SideSave {
+            id: saver_id.clone(),
+            messages: saver_messages,
+            todos: saver_todos,
+            model: old_model,
+            context: saver_context,
+        };
+        let meta = save_side(&saver, cwd, save, &redactor)?;
+        // A rename failure keeps the derived title and still succeeds.
+        match saver.conversations.rename(&saver_id, &title) {
+            Ok(renamed) => Ok(renamed.title),
+            Err(_) => Ok(meta.title),
+        }
+    })
+    .await?;
+    let out_todos = current_todos.clone();
+    let out_context = context.clone();
+    att.conversation.adopt(new_id.clone(), History::from_messages(snapshot.clone()), current_todos);
+    att.conversation.set_last_usage(out_context.clone());
+    drop(end);
+    Ok(LoadedConversation { id: new_id, title: saved_title, messages: snapshot, todos: out_todos, context: out_context })
 }
 
 /// What a delete reports: whether a live conversation was among those deleted and was reset to a new one.
@@ -1093,10 +1370,14 @@ pub fn run() {
             agent_message,
             cancel_agent,
             new_conversation,
+            ask_btw,
+            compact_conversation,
+            fork_conversation,
             approve_tool,
             set_auto_approve,
             auto_approve_state,
             get_status,
+            list_commands,
             integrate_shell,
             kill_session,
             list_conversations,
@@ -1117,6 +1398,7 @@ pub fn run() {
             set_integration_settings,
             set_limits_settings,
             answer_integration,
+            answer_questions,
             test_approval,
             approval_builtin_deny,
             provider_presets,

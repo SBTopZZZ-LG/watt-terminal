@@ -14,6 +14,7 @@ function render(actions: TranscriptAction[]): string {
       open
       onToggle={() => {}}
       onApprove={() => {}}
+      onAnswerQuestions={() => {}}
       onNewConversation={() => {}}
     />,
   );
@@ -94,6 +95,7 @@ describe('Transcript: history button', () => {
         open
         onToggle={() => {}}
         onApprove={() => {}}
+        onAnswerQuestions={() => {}}
         onNewConversation={() => {}}
         view="history"
         onToggleHistory={() => {}}
@@ -106,7 +108,7 @@ describe('Transcript: history button', () => {
 });
 
 describe('Transcript: todo panel', () => {
-  const base = { items: [], busy: false, thinking: false, onToggle: () => {}, onApprove: () => {}, onNewConversation: () => {} };
+  const base = { items: [], busy: false, thinking: false, onToggle: () => {}, onApprove: () => {}, onAnswerQuestions: () => {}, onNewConversation: () => {} };
 
   // The todo panel sits between the transcript and the context meter, rendered by App (see App.tsx), so it is never in here.
   it('is not rendered by the transcript, open or not', () => {
@@ -184,7 +186,7 @@ describe('Transcript: a request_integration row', () => {
     ]);
     expect(html).toContain('class="tool tool-declined"');
     expect(html).toContain('request_integration');
-    expect(html).toContain(': declined</summary>');
+    expect(html).toContain(': declined</span>');
     expect(html).not.toContain('decision-denied');
     expect(html).not.toContain('tool-failed');
   });
@@ -196,7 +198,7 @@ describe('Transcript: a request_integration row', () => {
     ]);
     expect(html).toContain('class="tool tool-ok"');
     expect(html).toContain('decision decision-manual');
-    expect(html).toContain(': ok</summary>');
+    expect(html).toContain(': ok</span>');
   });
 
   it('a request run without a dialog (auto) shows auto, like any other tool', () => {
@@ -276,9 +278,37 @@ describe('Transcript: interactive command groups', () => {
     const html = render([{ type: 'agent_event', event: { type: 'tool_call', call_id: 'k2', name: 'send_keys', args: { text: long } } }]);
     // The summary is cut; the full text stays in the row's details (its <pre>).
     const summary = /<summary>([^]*?)<\/summary>/.exec(html)?.[1] ?? '';
-    expect(summary).toContain(`${'x'.repeat(39)}…`);
-    expect(summary).not.toContain('x'.repeat(40));
+    expect(summary).toContain(`${'x'.repeat(59)}…`);
+    expect(summary).not.toContain('x'.repeat(60));
     expect(html).toContain('x'.repeat(80));
+  });
+
+  it('a run_command row is two lines: the name and caption, then the command', () => {
+    const html = render([
+      { type: 'agent_event', event: { type: 'tool_call', call_id: 'c1', name: 'run_command', args: { command: 'git status', summary: 'Check the working tree' } } },
+      { type: 'agent_event', event: { type: 'tool_result', call_id: 'c1', name: 'run_command', ok: true, decision: 'read', result: {} } },
+    ]);
+    expect(html).toContain('<span class="tool-line">run_command<span class="tool-caption"> · Check the working tree</span>');
+    expect(html).toContain('<span class="tool-detail">git status</span>');
+  });
+
+  it('a tool row without a caption or preview is one line with the bare name', () => {
+    const html = render([
+      { type: 'agent_event', event: { type: 'tool_call', call_id: 'c1', name: 'get_cwd', args: {} } },
+      { type: 'agent_event', event: { type: 'tool_result', call_id: 'c1', name: 'get_cwd', ok: true, decision: 'read', result: {} } },
+    ]);
+    expect(html).toContain('<span class="tool-line">get_cwd<span class="decision decision-read"> read</span>: ok</span>');
+    expect(html).not.toContain('tool-detail');
+  });
+
+  it('a send_keys row shows the bare name with the typed input on the detail line', () => {
+    const html = render([
+      { type: 'agent_event', event: { type: 'tool_call', call_id: 'k1', name: 'send_keys', args: { text: 'echo hi', keys: ['Enter'] } } },
+      { type: 'agent_event', event: { type: 'tool_result', call_id: 'k1', name: 'send_keys', ok: true, decision: 'read', result: {} } },
+    ]);
+    expect(html).toContain('<span class="tool-line">send_keys<span class="decision decision-read"> read</span>: ok</span>');
+    expect(html).toContain('<span class="tool-detail">echo hi⏎</span>');
+    expect(html).not.toContain('send_keys &quot;');
   });
 });
 
@@ -345,5 +375,190 @@ describe('Transcript: the trim note', () => {
     const html = render([{ type: 'user_sent', clientId: 1, text: 'hi' }, usage(false)]);
     expect(html).not.toContain('notice');
     expect(html).not.toContain('context-meter');
+  });
+});
+
+describe('Transcript: a clarification question card', () => {
+  const ask = (callId: string): TranscriptAction => ({
+    type: 'agent_event',
+    event: {
+      type: 'question_request',
+      call_id: callId,
+      questions: [
+        {
+          id: 'q1',
+          question: 'Which capa?',
+          header: 'Capa',
+          options: [
+            { label: 'a', description: 'the first', recommended: true },
+            { label: 'b', description: '', recommended: false },
+          ],
+          multiple: false,
+        },
+        {
+          id: 'q2',
+          question: 'Which sizes?',
+          header: 'Size',
+          options: [
+            { label: 's', description: '', recommended: false },
+            { label: 'm', description: '', recommended: false },
+          ],
+          multiple: true,
+        },
+      ],
+    },
+  });
+  const result = (callId: string, ok = true): TranscriptAction => ({
+    type: 'agent_event',
+    event: {
+      type: 'tool_result',
+      call_id: callId,
+      name: 'ask_user',
+      ok,
+      decision: 'read',
+      result: ok
+        ? { answers: [{ question_id: 'q1', question: 'Which capa?', header: 'Capa', status: 'answered', selected: ['a'], other: 'typed' }] }
+        : { error: 'no questions' },
+    },
+  });
+
+  it('a pending card shows the first question only, with a counter and a disabled Next', () => {
+    const html = render([ask('q-call')]);
+    expect(html).toContain('<div class="question">');
+    expect(html).toContain('<span class="question-counter">1 / 2</span>');
+    expect(html).toContain('<span class="question-chip">Capa</span>');
+    expect(html).toContain('Which capa?');
+    expect(html).toContain('type="radio"');
+    expect(html).not.toContain('type="checkbox"');
+    expect(html).not.toContain('Which sizes?');
+    expect(html).toContain('the first');
+    expect(html).toContain('<span class="question-recommended">Recommended</span>');
+    expect(html).toContain('placeholder="Other..."');
+    expect(html).toContain('>Next</button>');
+    expect(html).toContain('Skip all');
+    // Next starts disabled: the first question is not settled yet. Submit is only on the last step.
+    expect(html).toContain('disabled=""');
+    expect(html).not.toContain('>Submit</button>');
+    // The question is a plain group container: no fieldset/legend (whose border crossed the wrapped question text)
+    // and no inner scroll (the transcript body scrolls). Radios stay grouped by name.
+    expect(html).not.toContain('<fieldset');
+    expect(html).not.toContain('<legend');
+    expect(html).toContain('role="group"');
+    expect(html).toContain('aria-labelledby="question-q-call-q0-label"');
+    expect(html).toContain('name="question-q-call-q0"');
+    // A single-select question carries no multi-select hint.
+    expect(html).not.toContain('Select all that apply');
+    // The call itself never renders as a tool row.
+    expect(html).not.toContain('class="tool');
+  });
+
+  it('a multi-select question shows the select-all hint with checkboxes', () => {
+    const html = render([
+      {
+        type: 'agent_event',
+        event: {
+          type: 'question_request',
+          call_id: 'multi',
+          questions: [
+            {
+              id: 'q1',
+              question: 'Which sizes?',
+              header: 'Size',
+              options: [
+                { label: 's', description: '', recommended: false },
+                { label: 'm', description: '', recommended: false },
+              ],
+              multiple: true,
+            },
+          ],
+        },
+      },
+    ]);
+    expect(html).toContain('type="checkbox"');
+    expect(html).toContain('<div class="question-hint">Select all that apply</div>');
+    expect(html).not.toContain('<fieldset');
+    expect(html).not.toContain('<legend');
+    expect(html).toContain('role="group"');
+  });
+
+  it('a failed send keeps the form, shows the error, and offers a retry on the last step', () => {
+    const html = render([ask('q-call'), result('q-call', false)]);
+    expect(html).toContain('<div class="question question-failed">');
+    expect(html).toContain('<div class="question-error">no questions</div>');
+    expect(html).toContain('>Next</button>');
+    expect(html).toContain('type="radio"');
+    expect(html).not.toContain('<fieldset');
+    expect(html).not.toContain('<legend');
+  });
+
+  it('a failed send restores its answers and starts at the first unsettled question', () => {
+    const answers = [
+      { question_id: 'q1', selected: [0], skipped: false },
+      { question_id: 'q2', selected: [], skipped: true },
+    ];
+    const html = render([
+      ask('q-call'),
+      { type: 'question_answering', callId: 'q-call', answers },
+      { type: 'question_failed', callId: 'q-call', message: 'gone' },
+    ]);
+    expect(html).toContain('<div class="question question-failed">');
+    // The first question is settled by the restored answer, so the card starts on the second one.
+    expect(html).toContain('<span class="question-counter">2 / 2</span>');
+    // The restored skip shows, and the restored answers settle every question, so Retry is enabled.
+    expect(html).toContain('aria-pressed="true"');
+    expect(html).toContain('>Unskip</button>');
+    expect(html).toContain('class="question-submit">Retry</button>');
+    // One retry button, not a Submit plus a Retry: the last step's Submit is the retry.
+    expect(html.split('>Retry</button>').length - 1).toBe(1);
+    expect(html).not.toContain('>Submit</button>');
+    expect(html).not.toContain('<fieldset');
+  });
+
+  it('a failed Skip all (sent from the first step) restores to a single enabled Retry', () => {
+    const answers = [
+      { question_id: 'q1', selected: [], skipped: true },
+      { question_id: 'q2', selected: [], skipped: true },
+    ];
+    const html = render([
+      ask('q-call'),
+      { type: 'question_answering', callId: 'q-call', answers },
+      { type: 'question_failed', callId: 'q-call', message: 'gone' },
+    ]);
+    // Every draft is skipped, so every question is settled: the retry submits the whole payload at once.
+    expect(html).toContain('<span class="question-counter">2 / 2</span>');
+    expect(html).toContain('<div class="question-error">gone</div>');
+    // Enabled (no disabled attribute on it): the restored skips settle every question.
+    expect(html).toContain('class="question-submit">Retry</button>');
+    expect(html.split('>Retry</button>').length - 1).toBe(1);
+  });
+
+  it('a closed card shows the summaries and the note, with no inputs or buttons', () => {
+    const html = render([ask('q-call'), done]);
+    expect(html).toContain('<div class="question question-closed">');
+    expect(html).toContain('<span class="question-status question-status-cancelled">Cancelled</span>');
+    expect(html).toContain('<div class="question-note">The turn ended before this question was answered.</div>');
+    expect(html).not.toContain('type="radio"');
+    expect(html).not.toContain('type="checkbox"');
+    expect(html).not.toContain('question-other');
+    expect(html).not.toContain('question-actions');
+    expect(html).not.toContain('class="tool');
+  });
+
+  it('an answering card shows the wait, and no form', () => {
+    const html = render([ask('q-call'), { type: 'question_answering', callId: 'q-call', answers: [{ question_id: 'q1', selected: [0], skipped: false }] }]);
+    expect(html).toContain('<div class="question question-answering">');
+    expect(html).toContain('Sending the answers...');
+    expect(html).not.toContain('type="radio"');
+  });
+
+  it('a resolved card shows the outcome grouped by question', () => {
+    const html = render([ask('q-call'), result('q-call')]);
+    expect(html).toContain('<div class="question question-resolved">');
+    expect(html).toContain('<span class="question-chip">Capa</span>');
+    expect(html).toContain('<span class="question-status question-status-answered">Answered</span>');
+    expect(html).toContain('<div class="question-line">a</div>');
+    expect(html).toContain('<div class="question-line">Other: typed</div>');
+    expect(html).not.toContain('type="radio"');
+    expect(html).not.toContain('class="tool');
   });
 });

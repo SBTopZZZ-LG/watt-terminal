@@ -36,6 +36,19 @@ const MAX_MODEL_ID_CHARS: usize = 200;
 const MAX_HEADER_VALUE_CHARS: usize = 500;
 /// Longest accepted provider id, in characters.
 const MAX_PROVIDER_ID_CHARS: usize = 40;
+/// Longest accepted variant id, in characters.
+const MAX_VARIANT_ID_CHARS: usize = 32;
+/// Longest accepted variant label, in characters.
+const MAX_VARIANT_LABEL_CHARS: usize = 80;
+/// Most variants kept on one model.
+const MAX_VARIANTS_PER_MODEL: usize = 16;
+/// Largest variant body, in serialized bytes.
+const MAX_VARIANT_BODY_BYTES: usize = 4096;
+/// Deepest variant body nesting, in levels of objects and arrays.
+const MAX_VARIANT_DEPTH: usize = 8;
+/// Body keys a variant must never carry. They are also skipped by `request_body` if one slips through.
+const PROTECTED_BODY_KEYS: &[&str] =
+    &["model", "messages", "stream", "tools", "stream_options", "max_tokens", "max_completion_tokens", "models"];
 
 /// The whole settings document. Written to `settings.json` by `save`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -199,6 +212,36 @@ pub enum AgentRequests {
 pub struct ModelRef {
     pub provider_id: String,
     pub model_id: String,
+    /// A variant of the model (see `Model::variant`). `None` is the base model with the provider defaults.
+    /// Left out of the file when unset, so a file from before variants is written as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
+}
+
+/// Where a model variant came from: typed in by the user, or read from a provider's model list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VariantSource {
+    /// Read from a provider's model list (see core/settings/models). Replaced on every fetch.
+    Auto,
+    /// Typed in by the user. Kept across fetches; wins over an auto variant with the same id.
+    #[default]
+    Manual,
+}
+
+/// One named request overlay for a model: extra top-level body keys sent with every request to it
+/// (see core/llm `request_body`). Which keys may appear is checked by validation (see `validate_variant`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelVariant {
+    /// Slug: `[a-z0-9][a-z0-9_-]{0,31}`. Unique among the model's variants from the same source.
+    pub id: String,
+    /// Shown in the UI. 1 to 80 characters, no control characters.
+    pub label: String,
+    /// The overlay: a non-empty JSON object. Never dumped into an error message.
+    pub body: serde_json::Map<String, serde_json::Value>,
+    /// Missing in older files: manual.
+    #[serde(default)]
+    pub source: VariantSource,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -239,7 +282,7 @@ pub struct HeaderEntry {
     pub previous_name: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Model {
     pub id: String,
     /// The user's override, in tokens.
@@ -253,6 +296,9 @@ pub struct Model {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision: Option<bool>,
     pub source: ModelSource,
+    /// The model's variants. Left out of the file when empty, so a file from before variants is written as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub variants: Vec<ModelVariant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -293,11 +339,22 @@ impl Settings {
         if let Some(default) = &self.default_model {
             match self.provider(&default.provider_id) {
                 None => problems.push(format!("default model refers to unknown provider {:?}", default.provider_id)),
-                Some(provider) if provider.model(&default.model_id).is_none() => problems.push(format!(
-                    "default model {:?} is not listed by provider {:?}",
-                    default.model_id, default.provider_id
-                )),
-                Some(_) => {}
+                Some(provider) => match provider.model(&default.model_id) {
+                    None => problems.push(format!(
+                        "default model {:?} is not listed by provider {:?}",
+                        default.model_id, default.provider_id
+                    )),
+                    Some(model) => {
+                        if let Some(variant) = &default.variant
+                            && model.variant(variant).is_none()
+                        {
+                            problems.push(format!(
+                                "default model {:?} of provider {:?} has no variant {:?}",
+                                default.model_id, default.provider_id, variant
+                            ));
+                        }
+                    }
+                },
             }
         }
 
@@ -312,11 +369,19 @@ impl Settings {
     }
 }
 
+impl Model {
+    /// The variant with `id`. A manual variant wins over an auto one with the same id.
+    pub fn variant(&self, id: &str) -> Option<&ModelVariant> {
+        self.variants.iter().find(|v| v.id == id && v.source == VariantSource::Manual).or_else(|| {
+            self.variants.iter().find(|v| v.id == id)
+        })
+    }
+}
+
 impl Provider {
     pub fn model(&self, id: &str) -> Option<&Model> {
         self.models.iter().find(|m| m.id == id)
     }
-
     /// The context limit that applies to `model_id`: the smallest of the global cap, the user's override and the
     /// provider's reported size, counting only the values that are set. `None` when none of them is set.
     pub fn effective_context_limit(&self, model_id: &str, global: Option<u32>) -> Option<u32> {
@@ -441,6 +506,82 @@ fn validate_model(label: &str, model: &Model, problems: &mut Vec<String>) {
     }
     if model.provider_context == Some(0) {
         problems.push(format!("{label}: provider context of model {:?} must be at least 1", model.id));
+    }
+    let model_label = format!("{label}: model {:?}", model.id);
+    if model.variants.len() > MAX_VARIANTS_PER_MODEL {
+        problems.push(format!(
+            "{model_label}: has {} variants, at most {MAX_VARIANTS_PER_MODEL} are allowed",
+            model.variants.len()
+        ));
+    }
+    let mut seen_manual = HashSet::new();
+    let mut seen_auto = HashSet::new();
+    for variant in &model.variants {
+        validate_variant(&model_label, variant, problems);
+        let seen = match variant.source {
+            VariantSource::Manual => &mut seen_manual,
+            VariantSource::Auto => &mut seen_auto,
+        };
+        if !seen.insert(variant.id.as_str()) {
+            problems.push(format!(
+                "{model_label}: variant {:?} is listed more than once",
+                variant.id
+            ));
+        }
+    }
+}
+
+/// Checks one variant. Problems name the provider, model and variant, and never include the body.
+fn validate_variant(label: &str, variant: &ModelVariant, problems: &mut Vec<String>) {
+    let variant_label = format!("{label}: variant {:?}", variant.id);
+    if !valid_variant_id(&variant.id) {
+        problems.push(format!(
+            "{variant_label}: id must be 1 to {MAX_VARIANT_ID_CHARS} characters of a-z, 0-9, '-' or '_', \
+             starting with a-z or 0-9"
+        ));
+    }
+    if variant.label.is_empty()
+        || variant.label.chars().count() > MAX_VARIANT_LABEL_CHARS
+        || variant.label.chars().any(char::is_control)
+    {
+        problems.push(format!(
+            "{variant_label}: label must be 1 to {MAX_VARIANT_LABEL_CHARS} characters with no control characters"
+        ));
+    }
+    if variant.body.is_empty() {
+        problems.push(format!("{variant_label}: body must be a non-empty JSON object"));
+    }
+    for key in variant.body.keys() {
+        if PROTECTED_BODY_KEYS.contains(&key.as_str()) {
+            problems.push(format!("{variant_label}: body must not set {key:?}"));
+        }
+    }
+    let serialized = serde_json::to_string(&variant.body).unwrap_or_default();
+    if serialized.len() > MAX_VARIANT_BODY_BYTES {
+        problems.push(format!(
+            "{variant_label}: body must serialize to at most {MAX_VARIANT_BODY_BYTES} bytes"
+        ));
+    }
+    let depth = variant.body.values().map(value_depth).max().unwrap_or(0) + 1;
+    if depth > MAX_VARIANT_DEPTH {
+        problems.push(format!("{variant_label}: body must nest at most {MAX_VARIANT_DEPTH} levels deep"));
+    }
+}
+
+/// `[a-z0-9][a-z0-9_-]{0,31}`
+fn valid_variant_id(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    (1..=MAX_VARIANT_ID_CHARS).contains(&bytes.len())
+        && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+        && bytes.iter().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-' || *b == b'_')
+}
+
+/// How deep `value` nests: a scalar is 0, an object or array is 1 over its deepest member.
+fn value_depth(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Object(map) => 1 + map.values().map(value_depth).max().unwrap_or(0),
+        serde_json::Value::Array(items) => 1 + items.iter().map(value_depth).max().unwrap_or(0),
+        _ => 0,
     }
 }
 
@@ -619,7 +760,14 @@ mod tests {
     use super::*;
 
     fn model(id: &str) -> Model {
-        Model { id: id.into(), context_limit: None, provider_context: None, vision: None, source: ModelSource::Custom }
+        Model {
+            id: id.into(),
+            context_limit: None,
+            provider_context: None,
+            vision: None,
+            source: ModelSource::Custom,
+            variants: Vec::new(),
+        }
     }
 
     fn provider(id: &str) -> Provider {
@@ -639,7 +787,7 @@ mod tests {
         Settings {
             version: SETTINGS_VERSION,
             providers: vec![provider("example")],
-            default_model: Some(ModelRef { provider_id: "example".into(), model_id: "big-1".into() }),
+            default_model: Some(ModelRef { provider_id: "example".into(), model_id: "big-1".into(), variant: None }),
             global_context_limit: Some(32_000),
             approval: ApprovalSettings::default(),
             integration: IntegrationSettings::default(),
@@ -762,13 +910,13 @@ mod tests {
             ("zero global limit", Box::new(|s| s.global_context_limit = Some(0)), "global context limit"),
             (
                 "default model with unknown provider",
-                Box::new(|s| s.default_model = Some(ModelRef { provider_id: "nope".into(), model_id: "big-1".into() })),
+                Box::new(|s| s.default_model = Some(ModelRef { provider_id: "nope".into(), model_id: "big-1".into(), variant: None })),
                 "unknown provider",
             ),
             (
                 "default model not listed",
                 Box::new(|s| {
-                    s.default_model = Some(ModelRef { provider_id: "example".into(), model_id: "nope".into() })
+                    s.default_model = Some(ModelRef { provider_id: "example".into(), model_id: "nope".into(), variant: None })
                 }),
                 "not listed",
             ),
@@ -859,6 +1007,7 @@ mod tests {
             provider_context: None,
             vision: None,
             source: ModelSource::Fetched,
+            variants: Vec::new(),
         }];
         assert_eq!(p.effective_context_limit("m", None), None);
         assert_eq!(p.effective_context_limit("m", Some(8_000)), Some(8_000));
@@ -1228,5 +1377,269 @@ mod tests {
             assert!(matches!(load(dir.path()), Err(SettingsError::Invalid(_))), "{}", String::from_utf8_lossy(json));
             assert_eq!(fs::read(settings_path(dir.path())).unwrap(), json);
         }
+    }
+
+    fn variant(id: &str, source: VariantSource) -> ModelVariant {
+        ModelVariant {
+            id: id.into(),
+            label: format!("{id} label"),
+            body: serde_json::from_str(r#"{"reasoning":{"effort":"high"}}"#).unwrap(),
+            source,
+        }
+    }
+
+    fn nested_body(levels: usize) -> serde_json::Map<String, serde_json::Value> {
+        let mut value = serde_json::Value::from(1);
+        for i in (0..levels).rev() {
+            value = serde_json::json!({ format!("l{i}"): value });
+        }
+        serde_json::from_str(&format!(r#"{{"top":{value}}}"#)).unwrap()
+    }
+
+    #[test]
+    fn variant_lookup_prefers_a_manual_variant_over_an_auto_one() {
+        let mut m = model("big-1");
+        assert_eq!(m.variant("fast"), None);
+        m.variants.push(variant("fast", VariantSource::Auto));
+        assert_eq!(m.variant("fast").unwrap().source, VariantSource::Auto);
+        m.variants.push(variant("fast", VariantSource::Manual));
+        assert_eq!(m.variant("fast").unwrap().source, VariantSource::Manual, "manual shadows auto");
+        assert_eq!(m.variant("missing"), None);
+    }
+
+    #[test]
+    fn variant_validation_cases_are_reported() {
+        // Each case: a change to the first model's variants, and a fragment the problem message must contain.
+        type Case = (&'static str, Box<dyn Fn(&mut Vec<ModelVariant>)>, &'static str);
+        let cases: Vec<Case> = vec![
+            ("empty id", Box::new(|v| v.push(ModelVariant { id: "".into(), ..variant("x", VariantSource::Manual) })), "id must be"),
+            ("upper case id", Box::new(|v| v.push(variant("Fast", VariantSource::Manual))), "id must be"),
+            ("id starts with dash", Box::new(|v| v.push(variant("-fast", VariantSource::Manual))), "id must be"),
+            (
+                "id too long",
+                Box::new(|v| v.push(variant(&"a".repeat(33), VariantSource::Manual))),
+                "id must be",
+            ),
+            (
+                "id with a space",
+                Box::new(|v| v.push(variant("fa st", VariantSource::Manual))),
+                "id must be",
+            ),
+            (
+                "empty label",
+                Box::new(|v| v.push(ModelVariant { label: "".into(), ..variant("fast", VariantSource::Manual) })),
+                "label must be",
+            ),
+            (
+                "long label",
+                Box::new(|v| v.push(ModelVariant { label: "l".repeat(81), ..variant("fast", VariantSource::Manual) })),
+                "label must be",
+            ),
+            (
+                "control in label",
+                Box::new(|v| v.push(ModelVariant { label: "fa\nst".into(), ..variant("fast", VariantSource::Manual) })),
+                "label must be",
+            ),
+            (
+                "empty body",
+                Box::new(|v| {
+                    v.push(ModelVariant { body: serde_json::Map::new(), ..variant("fast", VariantSource::Manual) });
+                }),
+                "non-empty JSON object",
+            ),
+            (
+                "protected model key",
+                Box::new(|v| {
+                    v.push(ModelVariant {
+                        body: serde_json::from_str(r#"{"model":"other"}"#).unwrap(),
+                        ..variant("fast", VariantSource::Manual)
+                    });
+                }),
+                r#"must not set "model""#,
+            ),
+            (
+                "protected stream key",
+                Box::new(|v| {
+                    v.push(ModelVariant {
+                        body: serde_json::from_str(r#"{"stream":true}"#).unwrap(),
+                        ..variant("fast", VariantSource::Manual)
+                    });
+                }),
+                r#"must not set "stream""#,
+            ),
+            (
+                "protected max_tokens key",
+                Box::new(|v| {
+                    v.push(ModelVariant {
+                        body: serde_json::from_str(r#"{"max_tokens":64}"#).unwrap(),
+                        ..variant("fast", VariantSource::Manual)
+                    });
+                }),
+                r#"must not set "max_tokens""#,
+            ),
+            (
+                "oversized body",
+                Box::new(|v| {
+                    v.push(ModelVariant {
+                        body: serde_json::from_str(&format!(r#"{{"pad":{:?}}}"#, "x".repeat(5000))).unwrap(),
+                        ..variant("fast", VariantSource::Manual)
+                    });
+                }),
+                "at most 4096 bytes",
+            ),
+            (
+                "too deep a body",
+                Box::new(|v| {
+                    v.push(ModelVariant { body: nested_body(8), ..variant("fast", VariantSource::Manual) });
+                }),
+                "at most 8 levels deep",
+            ),
+            (
+                "duplicate manual ids",
+                Box::new(|v| {
+                    v.push(variant("fast", VariantSource::Manual));
+                    v.push(variant("fast", VariantSource::Manual));
+                }),
+                "listed more than once",
+            ),
+            (
+                "duplicate auto ids",
+                Box::new(|v| {
+                    v.push(variant("fast", VariantSource::Auto));
+                    v.push(variant("fast", VariantSource::Auto));
+                }),
+                "listed more than once",
+            ),
+            (
+                "too many variants",
+                Box::new(|v| {
+                    for i in 0..17 {
+                        v.push(variant(&format!("v{i:02}"), VariantSource::Manual));
+                    }
+                }),
+                "at most 16",
+            ),
+        ];
+        for (label, change, fragment) in cases {
+            let problems = problems_after(|s| change(&mut s.providers[0].models[0].variants));
+            assert!(!problems.is_empty(), "{label}: expected a problem");
+            assert!(
+                problems.iter().any(|p| p.contains(fragment)),
+                "{label}: no problem mentions {fragment:?}: {problems:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_protected_body_key_is_rejected() {
+        for key in PROTECTED_BODY_KEYS {
+            let body: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(&format!(r#"{{"{key}":1}}"#)).unwrap();
+            let problems = problems_after(|s| {
+                s.providers[0].models[0].variants.push(ModelVariant {
+                    id: "fast".into(),
+                    label: "Fast".into(),
+                    body: body.clone(),
+                    source: VariantSource::Manual,
+                });
+            });
+            assert!(
+                problems.iter().any(|p| p.contains(key)),
+                "{key}: no problem names the key: {problems:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn variant_validation_accepts_the_edges() {
+        // 32-character id, 80-character label, 16 variants, 8 levels, a manual/auto id clash.
+        let mut variants = Vec::new();
+        for i in 0..13 {
+            variants.push(variant(&format!("v{i:02}"), VariantSource::Manual));
+        }
+        variants.push(ModelVariant {
+            id: "a".repeat(32),
+            label: "l".repeat(80),
+            body: nested_body(7),
+            source: VariantSource::Manual,
+        });
+        variants.push(variant("shared", VariantSource::Auto));
+        variants.push(ModelVariant {
+            id: "shared".into(),
+            label: "Shared manual".into(),
+            body: serde_json::from_str(r#"{"reasoning":{"effort":"low"}}"#).unwrap(),
+            source: VariantSource::Manual,
+        });
+        assert_eq!(variants.len(), 16, "13 fillers, the edged one, and the auto/manual pair");
+        let problems = problems_after(|s| {
+            s.providers[0].models[0].variants = variants.clone();
+        });
+        assert_eq!(problems, Vec::<String>::new(), "the edges should be valid: {problems:?}");
+    }
+
+    #[test]
+    fn variant_problems_name_the_variant_but_never_the_body() {
+        let marker = "DUMMY-variant-body-marker-0123456789";
+        let problems = problems_after(|s| {
+            s.providers[0].models[0].variants.push(ModelVariant {
+                id: "fast".into(),
+                label: "Fast".into(),
+                body: serde_json::from_str(&format!(r#"{{"reasoning":{{"effort":{marker:?}}},"model":"x"}}"#))
+                    .unwrap(),
+                source: VariantSource::Manual,
+            });
+        });
+        assert!(!problems.is_empty());
+        assert!(problems.iter().all(|p| !p.contains(marker)), "a problem echoed the body: {problems:?}");
+        assert!(
+            problems.iter().any(|p| p.contains("example") && p.contains("big-1") && p.contains("fast")),
+            "a problem names the provider, model and variant: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_default_variant_must_be_on_the_default_model() {
+        // Unknown variant on a known model.
+        let problems = problems_after(|s| {
+            s.providers[0].models[0].variants.push(variant("fast", VariantSource::Manual));
+            s.default_model.as_mut().unwrap().variant = Some("missing".into());
+        });
+        assert!(problems.iter().any(|p| p.contains("missing")), "{problems:?}");
+
+        // A known variant passes.
+        let mut settings = valid();
+        settings.providers[0].models[0].variants.push(variant("fast", VariantSource::Manual));
+        settings.default_model.as_mut().unwrap().variant = Some("fast".into());
+        assert_eq!(settings.validate(), Ok(()));
+
+        // Clearing the default model clears the check.
+        settings.default_model = None;
+        assert_eq!(settings.validate(), Ok(()));
+    }
+
+    #[test]
+    fn settings_without_variants_round_trip_byte_identical() {
+        let dir = TempDir::new();
+        save(dir.path(), &valid()).unwrap();
+        let before = fs::read(settings_path(dir.path())).unwrap();
+        let text = String::from_utf8(before.clone()).unwrap();
+        assert!(!text.contains("variant"), "nothing variant-shaped is written: {text}");
+        assert_eq!(load(dir.path()).unwrap(), valid());
+        save(dir.path(), &load(dir.path()).unwrap()).unwrap();
+        assert_eq!(fs::read(settings_path(dir.path())).unwrap(), before, "loading and saving adds no keys");
+    }
+
+    #[test]
+    fn settings_with_variants_round_trip_through_the_file() {
+        let dir = TempDir::new();
+        let mut settings = valid();
+        settings.providers[0].models[0].variants =
+            vec![variant("fast", VariantSource::Manual), variant("low", VariantSource::Auto)];
+        settings.default_model.as_mut().unwrap().variant = Some("fast".into());
+        save(dir.path(), &settings).unwrap();
+        let text = fs::read_to_string(settings_path(dir.path())).unwrap();
+        assert!(text.contains(r#""variants""#), "{text}");
+        assert!(text.contains(r#""variant": "fast""#), "{text}");
+        assert_eq!(load(dir.path()).unwrap(), settings);
     }
 }

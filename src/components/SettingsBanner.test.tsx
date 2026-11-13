@@ -50,6 +50,7 @@ describe('Transcript: the banner sits above the chat body, in the chat view only
         view={over.view ?? 'chat'}
         onToggle={NOOP}
         onApprove={NOOP}
+        onAnswerQuestions={NOOP}
         onNewConversation={NOOP}
         banner={banner}
       />,

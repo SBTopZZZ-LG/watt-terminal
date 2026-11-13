@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 use crate::core::approval::{self, ApprovalPolicy, ManualPolicy, Reason, SendKeysCall, SendKeysMemory, Verdict};
 use crate::core::chat::attachments::Attachment;
 use crate::core::chat::context::ContextUsage;
+use crate::core::chat::questions::{self, QuestionGate};
 use crate::core::chat::todo::Todo;
 use crate::core::foreground::{self, Foreground, ForegroundKind};
 use crate::core::keys::KeyPlan;
@@ -90,11 +91,15 @@ impl Pending {
     }
 }
 
-/// Pending approvals for `run_command` and `send_keys`, keyed by call id. Also holds the `request_integration` asks.
+/// Pending approvals for `run_command` and `send_keys`, keyed by call id. Also holds the `request_integration` asks
+/// and the `ask_user` questions.
 pub struct ApprovalGate {
     pending: Pending,
     /// The `request_integration` asks. Cancelled together with the approvals (Ctrl-C, cancel).
     integrations: IntegrationGate,
+    /// The `ask_user` questions. Cancelled together with the approvals, so Ctrl-C, `cancel_turn`, a new shell and the
+    /// cancel command all settle them as cancelled instead of leaving them waiting.
+    questions: QuestionGate,
     /// Approve-all: None when off. When on, the key of the shell level it was switched on in. It applies only while that
     /// level is on top (see `auto_state`), so it never carries into a nested shell or back out of one unseen.
     auto: Mutex<Option<u64>>,
@@ -110,13 +115,21 @@ impl Default for ApprovalGate {
 
 impl ApprovalGate {
     pub fn new() -> Self {
-        Self::with_timeout(APPROVAL_TIMEOUT)
+        ApprovalGate {
+            pending: Pending::new(APPROVAL_TIMEOUT),
+            integrations: IntegrationGate::with_timeout(APPROVAL_TIMEOUT),
+            // Questions wait five minutes, not two: the user may need a moment to choose.
+            questions: QuestionGate::new(),
+            auto: Mutex::new(None),
+            keys: Mutex::new(SendKeysMemory::default()),
+        }
     }
 
     pub fn with_timeout(timeout: Duration) -> Self {
         ApprovalGate {
             pending: Pending::new(timeout),
             integrations: IntegrationGate::with_timeout(timeout),
+            questions: QuestionGate::with_timeout(timeout),
             auto: Mutex::new(None),
             keys: Mutex::new(SendKeysMemory::default()),
         }
@@ -173,10 +186,17 @@ impl ApprovalGate {
         &self.integrations
     }
 
-    /// Denies every pending request, approvals and integration asks alike. Called when the user presses Ctrl-C.
+    /// The gate for `ask_user` questions.
+    pub fn questions(&self) -> &QuestionGate {
+        &self.questions
+    }
+
+    /// Denies every pending request, approvals and integration asks alike. Cancels the pending questions too, whose
+    /// waits then return a cancelled result. Called when the user presses Ctrl-C.
     pub fn cancel_all(&self) {
         self.pending.cancel_all();
         self.integrations.cancel_all();
+        self.questions.cancel_all();
     }
 }
 
@@ -291,6 +311,10 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         outcome: Option<Value>,
     },
+    /// A clarification question waits for the user. `call_id` is the `ask_user` call, answered by `answer_questions`;
+    /// a skipped, timed-out or cancelled question still returns a result, so the turn goes on. The wire type is
+    /// `question_request`.
+    QuestionRequest { call_id: String, questions: Vec<questions::Question> },
     /// Streamed assistant text. `Text` is still used for whole messages.
     TextDelta { text: String },
     /// The model is working on a reply (true) or has produced its first output (false).
@@ -423,6 +447,41 @@ impl<'a> AgentCtx<'a> {
             result: value,
         });
         result
+    }
+
+    /// Asks the user clarification questions (`ask_user`, core/chat/questions): reports the call, waits for the
+    /// answer, and reports the result with the "read" decision, since no approval was asked. Like `local_tool` it
+    /// never touches the shell; unlike an approval, every settled outcome is a result the model reads (answered,
+    /// skipped, timed_out or cancelled), never an error, so the turn goes on. Only an invalid call is an error.
+    pub fn ask_user(&self, args: &Value) -> Result<Value, String> {
+        let call_id = new_call_id();
+        self.emit(AgentEvent::ToolCall { call_id: call_id.clone(), name: questions::TOOL_NAME.to_string(), args: args.clone() });
+        let parsed = match questions::parse(args) {
+            Ok(questions) => questions,
+            Err(problem) => {
+                self.emit(AgentEvent::ToolResult {
+                    call_id,
+                    name: questions::TOOL_NAME.to_string(),
+                    ok: false,
+                    decision: "read",
+                    reason: None,
+                    result: json!({"error": problem.clone()}),
+                });
+                return Err(problem);
+            }
+        };
+        let result = self.approvals.questions().ask(&call_id, parsed.clone(), || {
+            self.emit(AgentEvent::QuestionRequest { call_id: call_id.clone(), questions: parsed.clone() })
+        });
+        self.emit(AgentEvent::ToolResult {
+            call_id,
+            name: questions::TOOL_NAME.to_string(),
+            ok: true,
+            decision: "read",
+            reason: None,
+            result: result.clone(),
+        });
+        Ok(result)
     }
 
     fn run(&self, name: &str, args: Value, gated: bool) -> Result<Value, String> {
@@ -2114,5 +2173,151 @@ mod tests {
         assert!(asking.call_tool("run_command", json!({"command": "pwd"})).is_err());
         assert_eq!(reasons(&log)[1], ("run_command".to_string(), "denied", Some("approve_all_suspended")));
         assert_eq!(tools.reached(), ["run_command"]);
+    }
+
+    // ---------- ask_user clarification questions ----------
+
+    fn question_args() -> Value {
+        json!({"questions": [{"question": "Which capa?", "header": "Capa",
+            "options": [{"label": "a", "description": "first"}, {"label": "b"}]}]})
+    }
+
+    /// The `QuestionRequest` events of a log: the call id and the questions each carries.
+    fn question_requests(log: &Mutex<Vec<AgentEvent>>) -> Vec<(String, Vec<questions::Question>)> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::QuestionRequest { call_id, questions } => Some((call_id.clone(), questions.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_question_request_serializes_with_its_call_and_questions() {
+        let event = AgentEvent::QuestionRequest {
+            call_id: "call-3".into(),
+            questions: questions::parse(&question_args()).unwrap(),
+        };
+        let wire = serde_json::to_value(&event).unwrap();
+        assert_eq!(wire["type"], "question_request");
+        assert_eq!(wire["call_id"], "call-3");
+        assert_eq!(wire["questions"][0]["id"], "q1");
+        assert_eq!(wire["questions"][0]["options"][0]["label"], "a");
+    }
+
+    /// An answered question is a read result the model sees: no approval card, no shell bracket, no error.
+    #[test]
+    fn an_answered_question_is_a_read_result() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_secs(5));
+        let log = Mutex::new(Vec::new());
+        // The ask is registered before its event goes out, so an answer given there is already waiting.
+        let emit = |ev: AgentEvent| {
+            if let AgentEvent::QuestionRequest { call_id, questions } = &ev {
+                assert_eq!(questions.len(), 1);
+                let answers = vec![questions::AnswerInput {
+                    question_id: "q1".into(),
+                    selected: vec![1],
+                    other: None,
+                    skipped: false,
+                }];
+                assert!(gate.questions().decide(call_id, answers).is_ok());
+            }
+            log.lock().unwrap().push(ev);
+        };
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        let result = ctx.ask_user(&question_args()).expect("answered");
+        assert_eq!(
+            result,
+            json!({"answers": [{"question_id": "q1", "question": "Which capa?", "header": "Capa",
+                "status": "answered", "selected": ["b"]}]})
+        );
+        assert_eq!(question_requests(&log).len(), 1);
+        assert_eq!(decisions(&log), [named("ask_user", "read", true)]);
+        assert!(!log.lock().unwrap().iter().any(|e| matches!(
+            e, AgentEvent::ApprovalRequest { .. } | AgentEvent::AgentControl { .. } | AgentEvent::Integration { .. }
+        )));
+        assert!(tools.reached().is_empty(), "a question never reaches the backend: {:?}", tools.reached());
+    }
+
+    /// An invalid call is the one error: it reports like any tool error and never asks the user.
+    #[test]
+    fn an_invalid_question_is_an_error_without_a_card() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_secs(5));
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        let err = ctx.ask_user(&json!({"questions": []})).expect_err("no questions");
+        assert!(!err.starts_with(DENIED), "an invalid question is not a denial: {err}");
+        assert_eq!(decisions(&log), [named("ask_user", "read", false)]);
+        assert!(question_requests(&log).is_empty(), "an invalid call never asks");
+    }
+
+    /// A question nobody answers is a timed-out result, not an error: the turn goes on.
+    #[test]
+    fn an_unanswered_question_times_out_as_a_result() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(30));
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        let result = ctx.ask_user(&question_args()).expect("a timeout is still a result");
+        assert_eq!(result["answers"][0]["status"], "timed_out");
+        assert_eq!(decisions(&log), [named("ask_user", "read", true)]);
+    }
+
+    /// Cancelling while the question waits settles it as cancelled, like Ctrl-C does through `cancel_all`.
+    #[test]
+    fn a_cancelled_question_is_a_cancelled_result() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_secs(5));
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| {
+            if matches!(ev, AgentEvent::QuestionRequest { .. }) {
+                gate.cancel_all();
+            }
+            log.lock().unwrap().push(ev);
+        };
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        let result = ctx.ask_user(&question_args()).expect("a cancel is still a result");
+        assert_eq!(result["answers"][0]["status"], "cancelled");
+        assert_eq!(decisions(&log), [named("ask_user", "read", true)]);
+    }
+
+    /// The gates do not answer each other: an approval answer cannot settle a question, and a question answer cannot
+    /// settle an approval. The commands (`approve_tool`, `answer_questions`) only call these, so they fail the same way.
+    #[test]
+    fn approvals_and_questions_do_not_answer_each_other() {
+        let gate = ApprovalGate::with_timeout(Duration::from_secs(5));
+        let stored = questions::parse(&question_args()).unwrap();
+        thread::scope(|s| {
+            let gate_ref = &gate;
+            let (question_tx, question_rx) = mpsc::channel();
+            let question_waiter = s.spawn(move || {
+                gate_ref.questions().ask("q-call", stored.clone(), move || question_tx.send(()).unwrap())
+            });
+            question_rx.recv().unwrap();
+            assert!(!gate.decide("q-call", true), "an approval answer cannot settle a question");
+            assert!(!gate.integrations().decide("q-call", true));
+            let answers = vec![questions::AnswerInput {
+                question_id: "q1".into(),
+                selected: vec![0],
+                other: None,
+                skipped: false,
+            }];
+            assert!(gate.questions().decide("q-call", answers).is_ok());
+            assert_eq!(question_waiter.join().unwrap()["answers"][0]["status"], "answered");
+
+            let (approval_tx, approval_rx) = mpsc::channel();
+            let approval_waiter = s.spawn(move || gate_ref.ask("a-call", move || approval_tx.send(()).unwrap()));
+            approval_rx.recv().unwrap();
+            assert!(gate_ref.questions().decide("a-call", Vec::new()).is_err(), "a question answer cannot settle an approval");
+            gate_ref.cancel_all();
+            assert!(!approval_waiter.join().unwrap(), "the cancelled approval counts as denied");
+            assert!(gate_ref.questions().decide("a-call", Vec::new()).is_err());
+        });
     }
 }

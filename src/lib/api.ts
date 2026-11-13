@@ -7,6 +7,7 @@ import type {
   ApprovalSettings,
   AttachmentInput,
   AutoApproveState,
+  CommandCatalog,
   ConversationMeta,
   DeleteResult,
   FetchOutcome,
@@ -16,6 +17,7 @@ import type {
   LoadedConversation,
   ModelRef,
   ProviderPreset,
+  QuestionAnswerInput,
   RecoverAction,
   SaveProviderInput,
   SettingsView,
@@ -85,6 +87,13 @@ export const api = {
   answerIntegration(callId: string, accept: boolean) {
     return invoke<void>('answer_integration', { sessionId: SESSION_ID, callId, accept });
   },
+  /**
+   * Answers the agent's clarification question (its `question_request` event). Errors when the answers are invalid
+   * (the card stays and can retry) or no such question is pending (it already settled).
+   */
+  answerQuestions(callId: string, answers: QuestionAnswerInput[]) {
+    return invoke<void>('answer_questions', { sessionId: SESSION_ID, callId, answers });
+  },
   /** Approve-all as the shell on top sees it. Read again after a levels event or a toggle. */
   autoApproveState() {
     return invoke<AutoApproveState>('auto_approve_state', { sessionId: SESSION_ID });
@@ -98,6 +107,25 @@ export const api = {
   },
   getStatus() {
     return invoke<Status>('get_status', { sessionId: SESSION_ID });
+  },
+  /** The custom slash-command templates (global and project dirs), plus the two dirs so `/help` can show them. */
+  listCommands() {
+    return invoke<CommandCatalog>('list_commands', { sessionId: SESSION_ID });
+  },
+  /**
+   * Asks a one-off side question about the live conversation. One model call outside a turn; the answer is not
+   * stored and the transcript only gets a notice. Refused while the agent is busy.
+   */
+  askBtw(text: string) {
+    return invoke<string>('ask_btw', { sessionId: SESSION_ID, text });
+  },
+  /** Summarizes the live conversation into a new conversation and switches to it. The old one stays in history. */
+  compactConversation() {
+    return invoke<LoadedConversation>('compact_conversation', { sessionId: SESSION_ID });
+  },
+  /** Copies the live conversation into a new one and switches to it. The old one stays untouched. */
+  forkConversation() {
+    return invoke<LoadedConversation>('fork_conversation', { sessionId: SESSION_ID });
   },
   /** The saved conversations, most recently updated first. */
   listConversations() {

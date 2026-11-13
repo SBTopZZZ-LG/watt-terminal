@@ -176,6 +176,7 @@ fn settings(url: &str) -> LlmSettings {
         stream: false,
         max_tokens: None,
         context_limit: None,
+        extra: None,
     }
 }
 
@@ -677,8 +678,9 @@ fn a_turn_is_checkpointed_after_the_user_message_and_after_each_tool_round() {
     let (checkpoint, seen) = recording_checkpoint(&persist, &conv);
     let mut agent = agent_for(&s, &conv).with_checkpoint(checkpoint);
     run(&mut agent, "plan it");
-    // After the user message (one message stored), then after the tool round (user, the call, its result).
-    assert_eq!(*seen.lock().unwrap(), vec![(true, 1), (true, 3)]);
+    // After the user message (one message stored), with the call pending but not yet run (user, the call), then
+    // after the tool round (user, the call, its result).
+    assert_eq!(*seen.lock().unwrap(), vec![(true, 1), (true, 2), (true, 3)]);
     assert!(conversation_file(&tmp, &id).exists());
 
     // The end-of-turn save finishes the turn: the flag is cleared and the whole reply is stored.

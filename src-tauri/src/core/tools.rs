@@ -1089,9 +1089,10 @@ pub fn schemas() -> Vec<ToolSchema> {
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "minLength": 1},
+                    "summary": {"type": "string", "minLength": 1, "maxLength": 120, "description": "A caption of at most 10 words describing what the command does, for the user; not a repeat of the command."},
                     "wait_seconds": {"type": "integer", "minimum": 1, "maximum": MAX_WAIT_SECONDS, "default": DEFAULT_RUN_WAIT_SECONDS},
                 },
-                "required": ["command"],
+                "required": ["command", "summary"],
             }),
         },
         ToolSchema {
@@ -1116,6 +1117,7 @@ pub fn schemas() -> Vec<ToolSchema> {
                     "text": {"type": "string", "description": "Literal text to type. No control characters."},
                     "keys": {"type": "array", "items": {"type": "string"}, "description": "Named keys, in order."},
                     "id": {"type": "integer", "minimum": 1, "description": "The record_id of the command, if you want to be sure it is the one running."},
+                    "summary": {"type": "string", "minLength": 1, "maxLength": 120, "description": "A caption of at most 10 words describing what the command does, for the user; not a repeat of the command."},
                 },
             }),
         },
@@ -1574,6 +1576,30 @@ mod tests {
         assert_eq!(age_text(Duration::from_secs(42)), "42s");
         assert_eq!(age_text(Duration::from_secs(180)), "3m");
         assert_eq!(age_text(Duration::from_secs(7300)), "2h");
+    }
+
+    /// The `summary` caption both write tools carry: required for `run_command`, optional for `send_keys`. It is
+    /// display-only: `call` reads `command`/`wait_seconds` and `KeyPlan::from_args` reads `text`/`keys`/`id`, so a
+    /// summary is never executed or used by policy.
+    #[test]
+    fn run_command_requires_a_summary_caption_and_send_keys_offers_it() {
+        let by_name = |n: &str| schemas().into_iter().find(|s| s.name == n).expect("offered");
+        let run = by_name("run_command");
+        let summary = &run.parameters["properties"]["summary"];
+        assert!(summary.is_object(), "{}", run.parameters);
+        assert_eq!(summary["type"], "string");
+        assert_eq!(summary["minLength"], 1);
+        assert_eq!(summary["maxLength"], 120);
+        assert!(summary["description"].as_str().is_some_and(|d| d.contains("at most 10 words")), "{}", summary);
+        assert_eq!(run.parameters["required"], json!(["command", "summary"]));
+        let keys = by_name("send_keys").parameters;
+        let key_summary = &keys["properties"]["summary"];
+        assert!(key_summary.is_object(), "{keys}");
+        assert_eq!(key_summary["type"], "string");
+        assert_eq!(key_summary["minLength"], 1);
+        assert_eq!(key_summary["maxLength"], 120);
+        assert!(key_summary["description"].as_str().is_some_and(|d| d.contains("at most 10 words")), "{keys}");
+        assert!(keys.get("required").is_none_or(|r| !r.as_array().is_some_and(|r| r.contains(&json!("summary")))), "{keys}");
     }
 
     /// The schemas offer the new arguments, and run_command no longer promises a 30 s wait.

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { agentControlAfter, borderActive, borderLevel, NO_CONTROL } from './agentControl';
-import type { AgentControl } from './agentControl';
+import { agentControlAfter, borderActive, borderLevel, NO_CONTROL, settleControl } from './agentControl';
+import type { AgentControl, ControlSnapshot } from './agentControl';
 import { EMPTY_TRANSCRIPT, isBusy, transcriptReducer } from './transcript';
 import type { TranscriptAction } from './transcript';
 import type { Source, WireEvent } from './types';
@@ -137,6 +137,56 @@ describe('agentControlAfter', () => {
 
   it('keeps the flag through unrelated events', () => {
     expect(trace([{ type: 'text', text: 'hi' }, toolResult], { call: true, commands: new Set() })).toEqual([true, true]);
+  });
+});
+
+describe('settleControl', () => {
+  const idlePrompt: ControlSnapshot = { state: 'prompt', levels: [], agent_busy: false, agent_control: false };
+
+  it('clears stale commands at a local idle prompt', () => {
+    const c: AgentControl = { call: false, commands: new Set([7]) };
+    expect(settleControl(c, idlePrompt)).toEqual(NO_CONTROL);
+  });
+
+  it('keeps commands while a command runs, in raw/alt states, with a nested level, or while the agent is busy', () => {
+    const c: AgentControl = { call: false, commands: new Set([7]) };
+    const snapshots: ControlSnapshot[] = [
+      // A command still running.
+      { state: 'running', levels: [], agent_busy: false, agent_control: false },
+      // raw/alt states keep the hold: the shell is not back at a local prompt.
+      { state: 'raw', levels: [], agent_busy: false, agent_control: false },
+      { state: 'alt', levels: [], agent_busy: false, agent_control: false },
+      // A nested integrated shell keeps the hold: a parked command may still be open inside it.
+      { state: 'prompt', levels: [{ key: 1 }], agent_busy: false, agent_control: false },
+      // An approval/question wait keeps the hold: the turn may still resume.
+      { state: 'prompt', levels: [], agent_busy: true, agent_control: false },
+    ];
+    for (const snapshot of snapshots) {
+      const next = settleControl(c, snapshot);
+      expect(next.commands).toEqual(new Set([7]));
+    }
+  });
+
+  it('sets call from the snapshot', () => {
+    expect(settleControl(NO_CONTROL, { ...idlePrompt, agent_control: true })).toEqual({
+      call: true,
+      commands: new Set(),
+    });
+    expect(settleControl({ call: true, commands: new Set([7]) }, idlePrompt).call).toBe(false);
+  });
+
+  it('clears everything when the shell exited', () => {
+    const c: AgentControl = { call: true, commands: new Set([7]) };
+    expect(settleControl(c, { state: 'exited', levels: [], agent_busy: false, agent_control: false })).toBe(NO_CONTROL);
+  });
+
+  it('returns the input when nothing changes', () => {
+    const idle: AgentControl = { call: false, commands: new Set() };
+    expect(settleControl(idle, idlePrompt)).toBe(idle);
+    const held: AgentControl = { call: false, commands: new Set([7]) };
+    const running: ControlSnapshot = { state: 'running', levels: [], agent_busy: false, agent_control: false };
+    expect(settleControl(held, running)).toBe(held);
+    expect(settleControl(NO_CONTROL, { state: 'exited', levels: [], agent_busy: false, agent_control: false })).toBe(NO_CONTROL);
   });
 });
 

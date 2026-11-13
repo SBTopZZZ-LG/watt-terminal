@@ -17,6 +17,7 @@ const SESSION_PLACEHOLDER: &str = "{session_id}";
 pub enum ResolveError {
     UnknownProvider { provider: String },
     UnknownModel { provider: String, model: String },
+    UnknownVariant { provider: String, model: String, variant: String },
     /// No key is stored, and the chat URL is not a plain-http local address that may run without one.
     MissingApiKey { provider: String },
     MissingHeaderSecret { provider: String, header: String },
@@ -29,6 +30,9 @@ impl fmt::Display for ResolveError {
             ResolveError::UnknownProvider { provider } => write!(f, "no provider {provider:?} is saved"),
             ResolveError::UnknownModel { provider, model } => {
                 write!(f, "provider {provider:?} does not list model {model:?}")
+            }
+            ResolveError::UnknownVariant { provider, model, variant } => {
+                write!(f, "provider {provider:?} does not list variant {variant:?} for model {model:?}")
             }
             ResolveError::MissingApiKey { provider } => {
                 write!(f, "provider {provider:?} needs an API key, and none is stored")
@@ -49,9 +53,20 @@ pub fn resolve(settings: &Settings, secrets: &Secrets, model: &ModelRef) -> Resu
     let provider = settings
         .provider(&model.provider_id)
         .ok_or_else(|| ResolveError::UnknownProvider { provider: model.provider_id.clone() })?;
-    if provider.model(&model.model_id).is_none() {
-        return Err(ResolveError::UnknownModel { provider: provider.id.clone(), model: model.model_id.clone() });
-    }
+    let entry = provider.model(&model.model_id).ok_or_else(|| {
+        ResolveError::UnknownModel { provider: provider.id.clone(), model: model.model_id.clone() }
+    })?;
+    let extra = match &model.variant {
+        None => None,
+        Some(variant) => {
+            let found = entry.variant(variant).ok_or_else(|| ResolveError::UnknownVariant {
+                provider: provider.id.clone(),
+                model: entry.id.clone(),
+                variant: variant.clone(),
+            })?;
+            Some(found.body.clone())
+        }
+    };
 
     Ok(LlmSettings {
         chat_url: provider.chat_url.clone(),
@@ -61,6 +76,7 @@ pub fn resolve(settings: &Settings, secrets: &Secrets, model: &ModelRef) -> Resu
         stream: provider.stream,
         max_tokens: provider.max_tokens,
         context_limit: provider.effective_context_limit(&model.model_id, settings.global_context_limit),
+        extra,
     })
 }
 
@@ -146,6 +162,7 @@ mod tests {
                 provider_context: Some(100_000),
                 vision: None,
                 source: ModelSource::Fetched,
+                variants: Vec::new(),
             }],
         }
     }
@@ -160,7 +177,7 @@ mod tests {
     }
 
     fn model_ref(provider_id: &str, model_id: &str) -> ModelRef {
-        ModelRef { provider_id: provider_id.into(), model_id: model_id.into() }
+        ModelRef { provider_id: provider_id.into(), model_id: model_id.into(), variant: None }
     }
 
     fn secrets_with(pairs: &[(&str, &str)]) -> Secrets {
@@ -211,6 +228,49 @@ mod tests {
             resolve(&settings_for(REMOTE), &secrets, &model_ref("acme", "small")).unwrap_err(),
             ResolveError::UnknownModel { provider: "acme".into(), model: "small".into() }
         );
+    }
+
+    fn variant_settings() -> Settings {
+        use super::super::{ModelVariant, VariantSource};
+        let mut settings = settings_for(REMOTE);
+        let body: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"reasoning":{"effort":"high"}}"#).unwrap();
+        settings.providers[0].models[0].variants = vec![
+            ModelVariant { id: "fast".into(), label: "Fast".into(), body: body.clone(), source: VariantSource::Auto },
+            ModelVariant { id: "fast".into(), label: "Fast manual".into(), body, source: VariantSource::Manual },
+        ];
+        settings
+    }
+
+    #[test]
+    fn resolve_copies_the_manual_variant_body_over_the_auto_one() {
+        let resolved = resolve(
+            &variant_settings(),
+            &full_secrets(),
+            &ModelRef { provider_id: "acme".into(), model_id: "big".into(), variant: Some("fast".into()) },
+        )
+        .unwrap();
+        let extra = resolved.extra.expect("the variant body is the extra");
+        assert_eq!(extra["reasoning"]["effort"], serde_json::Value::String("high".into()));
+
+        let base = resolve(&settings_for(REMOTE), &full_secrets(), &model_ref("acme", "big")).unwrap();
+        assert_eq!(base.extra, None, "no variant means no extra");
+    }
+
+    #[test]
+    fn an_unknown_variant_names_the_provider_model_and_variant() {
+        let err = resolve(
+            &variant_settings(),
+            &full_secrets(),
+            &ModelRef { provider_id: "acme".into(), model_id: "big".into(), variant: Some("missing".into()) },
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ResolveError::UnknownVariant { provider: "acme".into(), model: "big".into(), variant: "missing".into() }
+        );
+        let text = err.to_string();
+        assert!(text.contains("acme") && text.contains("big") && text.contains("missing"), "{text}");
     }
 
     #[test]

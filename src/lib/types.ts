@@ -139,6 +139,12 @@ export type AgentEvent =
   | { type: 'integration_request'; call_id: string; phase: 'asking' | 'running' | 'done'; label?: string; outcome?: AgentIntegrationOutcome }
   /** The conversation's todo list was replaced by a successful todo_write. `items` is the whole list. */
   | { type: 'todo_update'; items: TodoItem[] }
+  /**
+   * The agent asks the user clarification questions (the `ask_user` tool, src-tauri/src/core/chat/questions.rs).
+   * `call_id` is the waiting call, answered by the `answer_questions` command. The questions carry the ids the
+   * backend assigned (`q1` and up).
+   */
+  | { type: 'question_request'; call_id: string; questions: QuestionSpec[] }
   /** The context usage of a model request: sent before the request, and again with the provider's count once a reply reports it. */
   | ({ type: 'context_usage' } & ContextUsage)
   | { type: 'done' };
@@ -181,6 +187,8 @@ export interface LlmStatus {
   enabled: boolean;
   model: string | null;
   provider?: string | null;
+  /** The default model's variant, or null when the base model runs. Absent or null for the dev environment settings. */
+  variant?: string | null;
 }
 
 export interface Status {
@@ -237,6 +245,48 @@ export type TodoStatus = 'pending' | 'in_progress' | 'completed';
 export interface TodoItem {
   content: string;
   status: TodoStatus;
+}
+
+/** One option of an `ask_user` question, as the model sent it and the card shows it. Free text ("Other") is always available and is not an option. */
+export interface QuestionOption {
+  label: string;
+  description: string;
+  recommended: boolean;
+}
+
+/** One clarification question. `id` is assigned by the backend in order (`q1` and up). */
+export interface QuestionSpec {
+  id: string;
+  question: string;
+  header: string;
+  options: QuestionOption[];
+  multiple: boolean;
+}
+
+/** The UI's answer to one question: the chosen option indices, free text, or skipped. An empty `other` counts as absent. */
+export interface QuestionAnswerInput {
+  question_id: string;
+  selected: number[];
+  other?: string;
+  skipped: boolean;
+}
+
+/** How a question settled: answered by the user, skipped by the user, or unsettled (timed out, cancelled). */
+export type QuestionStatus = 'answered' | 'skipped' | 'timed_out' | 'cancelled';
+
+/** One entry of an `ask_user` result: the settled answer to one question. `selected` holds labels, and is left out when empty; `other` when absent. */
+export interface QuestionAnswer {
+  question_id: string;
+  question: string;
+  header: string;
+  status: QuestionStatus;
+  selected?: string[];
+  other?: string;
+}
+
+/** The model-facing result of answered questions, stored in history as compact JSON. */
+export interface QuestionResult {
+  answers: QuestionAnswer[];
 }
 
 /** A saved conversation opened as the live one. `messages` are the repaired messages, as the backend now holds them. */
@@ -306,6 +356,17 @@ export interface HeaderEntry {
 /** `fetched` came from the provider's model list; `custom` was added by hand. */
 export type ModelSource = 'fetched' | 'custom';
 
+/** Where a model variant came from: typed in by the user (`manual`), or read from a provider's model list (`auto`). */
+export type VariantSource = 'auto' | 'manual';
+
+/** One named request overlay for a model: extra top-level body keys sent with every request to it. */
+export interface ModelVariant {
+  id: string;
+  label: string;
+  body: Record<string, unknown>;
+  source: VariantSource;
+}
+
 export interface Model {
   id: string;
   /** The user's override, in tokens. */
@@ -315,6 +376,8 @@ export interface Model {
   /** Whether the provider reported image input. Absent or null when unknown. */
   vision?: boolean | null;
   source: ModelSource;
+  /** The model's variants. Absent or empty when it has none. */
+  variants?: ModelVariant[];
 }
 
 export interface Provider {
@@ -334,6 +397,8 @@ export interface Provider {
 export interface ModelRef {
   provider_id: string;
   model_id: string;
+  /** A variant of the model. Absent or null is the base model with the provider defaults. */
+  variant?: string | null;
 }
 
 /** `manual`: every run_command waits for the user. `regex`: the hard gate, then the deny and allow rules, decide. */
@@ -464,6 +529,31 @@ export interface TestResult {
   ok: boolean;
   message: string;
   millis: number;
+}
+
+/** Where a custom slash command came from. Project commands win over global ones of the same name. */
+export type CommandSource = 'project' | 'global';
+
+/**
+ * One custom slash command: a prompt template from a Markdown file (src-tauri/src/core/chat/commands.rs).
+ * `hint` is the file's `argument-hint:`, null when it has none.
+ */
+export interface CommandInfo {
+  name: string;
+  description: string;
+  hint: string | null;
+  source: CommandSource;
+  template: string;
+}
+
+/**
+ * The custom slash commands plus the two directories, so `/help` can show where to create them. Each dir is
+ * reported even when it does not exist; null only when it cannot apply (no project for a remote shell).
+ */
+export interface CommandCatalog {
+  commands: CommandInfo[];
+  project_dir: string | null;
+  global_dir: string | null;
 }
 
 /**

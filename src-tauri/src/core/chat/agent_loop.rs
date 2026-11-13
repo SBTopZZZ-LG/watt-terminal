@@ -5,8 +5,9 @@
 //! gate are the same as for the mock. Every result is projected and redacted (core/chat/project) before it enters the
 //! history. A denial or a cancel stops the turn: the calls not yet run are closed in the history, and no further
 //! model call is made. Every exit path keeps the pairing that `History` checks: no call is left without a result.
-//! The caller can ask for a save at each checkpoint (`LlmAgent::with_checkpoint`): after the user message is recorded
-//! and after each completed round of tool calls, when the history is paired.
+//! The caller can ask for a save at each checkpoint (`LlmAgent::with_checkpoint`): after the user message is recorded,
+//! once a reply's tool calls are recorded but before they run, and after each completed round of tool calls. The
+//! middle checkpoint may hold calls without results yet; loading it repairs them into closed calls.
 //!
 //! Dev configuration (replaced by a config file later): `WATT_LLM_URL` (full chat-completions URL),
 //! `WATT_LLM_KEY` and `WATT_LLM_MODEL` must all be set, or the mock agent is used. Optional:
@@ -32,8 +33,10 @@ use crate::core::foreground::{Foreground, ForegroundKind};
 use crate::core::chat::attachments::{Resolver, user_content};
 use crate::core::chat::context::{self, Calibrator, ContextUsage};
 use crate::core::chat::history::History;
+use crate::core::chat::instructions;
 use crate::core::chat::project::project;
 use crate::core::chat::prompt;
+use crate::core::chat::questions;
 use crate::core::chat::redact::Redactor;
 use crate::core::chat::todo::{self, Todo, TodoList};
 use crate::core::chat::trim::{self, TrimPlan};
@@ -95,6 +98,9 @@ pub struct LlmSettings {
     /// reports it with the context usage (core/chat/context), and trims the wire copy of a request to fit it
     /// (core/chat/trim). Without a known limit, nothing is trimmed.
     pub context_limit: Option<u32>,
+    /// The selected model variant's request overlay (see `ModelVariant::body`), or None for the base model.
+    /// Carried into every `ChatRequest` this turn sends (see `LlmAgent::send`).
+    pub extra: Option<serde_json::Map<String, Value>>,
 }
 
 impl LlmSettings {
@@ -105,11 +111,32 @@ impl LlmSettings {
             .map(|(name, value)| (name.clone(), value.replace(SESSION_PLACEHOLDER, conversation_id)))
             .collect()
     }
+
+    /// The provider config for one conversation: this conversation's resolved headers and the shared User-Agent.
+    pub fn provider_config(&self, conversation_id: &str) -> ProviderConfig {
+        ProviderConfig {
+            chat_url: self.chat_url.clone(),
+            api_key: self.api_key.clone(),
+            headers: self.resolved_headers(conversation_id),
+            user_agent: USER_AGENT.to_string(),
+        }
+    }
+
+    /// The redactor for one conversation: the key and this conversation's resolved header values are the secrets the
+    /// output must never show.
+    pub fn redactor(&self, conversation_id: &str) -> Redactor {
+        let mut known = vec![self.api_key.clone()];
+        known.extend(self.resolved_headers(conversation_id).into_iter().map(|(_, value)| value));
+        Redactor::new(known)
+    }
 }
 
 impl fmt::Debug for LlmSettings {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let header_names: Vec<&str> = self.headers.iter().map(|(name, _)| name.as_str()).collect();
+        // The overlay's values stay out of the debug text; only its key names are shown.
+        let extra_keys: Vec<&str> =
+            self.extra.iter().flat_map(|extra| extra.keys().map(String::as_str)).collect();
         f.debug_struct("LlmSettings")
             .field("chat_url", &self.chat_url)
             .field("api_key", &"<redacted>")
@@ -118,6 +145,7 @@ impl fmt::Debug for LlmSettings {
             .field("stream", &self.stream)
             .field("max_tokens", &self.max_tokens)
             .field("context_limit", &self.context_limit)
+            .field("extra_keys", &extra_keys)
             .finish()
     }
 }
@@ -145,7 +173,7 @@ pub fn settings_from_env(lookup: impl Fn(&str) -> Option<String>) -> Result<Opti
             Some(n.ok_or_else(|| format!("{ENV_MAX_TOKENS} must be a positive whole number"))?)
         }
     };
-    Ok(Some(LlmSettings { chat_url, api_key, model, headers, stream, max_tokens, context_limit: None }))
+    Ok(Some(LlmSettings { chat_url, api_key, model, headers, stream, max_tokens, context_limit: None, extra: None }))
 }
 
 /// `Name: value` entries, one per line or separated by `;`. Each name and value is checked now, with the placeholder
@@ -325,6 +353,19 @@ impl Conversation {
         *lock_usage(&self.last_usage) = None;
     }
 
+    /// Makes a new conversation the live one: its id, history and todo list replace the current ones. The history and
+    /// todo objects stay the same, so holders of `history()` and `todos()` see the new contents. Unlike `restore`,
+    /// there is no resume note: the new conversation continues the work, so the next turn gets none. The calibration
+    /// and the last usage belonged to the old content and do not carry over. The caller makes sure no turn is running.
+    pub fn adopt(&self, id: String, history: History, todos: Vec<Todo>) {
+        *lock_string(&self.id) = id;
+        *lock(&self.history) = history;
+        *lock_todos(&self.todos) = todos;
+        *lock_note(&self.resume_note) = None;
+        *lock_calibration(&self.calibration) = Calibrator::default();
+        *lock_usage(&self.last_usage) = None;
+    }
+
     /// The resume note, once: a turn that calls the model takes it, and the next turn gets none. `None` for a
     /// conversation that was not resumed, or after a turn has taken it.
     pub fn take_resume_note(&self) -> Option<String> {
@@ -368,6 +409,8 @@ pub struct LlmAgent {
     model: String,
     max_tokens: Option<u32>,
     stream: bool,
+    /// The selected variant's request overlay, sent with every model call (see `LlmSettings::extra`).
+    extra: Option<serde_json::Map<String, Value>>,
     redactor: Redactor,
     history: Arc<Mutex<History>>,
     /// The conversation's id, which names the directory its attachment files are read from.
@@ -378,6 +421,8 @@ pub struct LlmAgent {
     tools: Vec<Value>,
     /// The resume note of a restored conversation, for this turn's model calls (see `with_resume_note`).
     resume_note: Option<String>,
+    /// The workspace root's AGENTS.md for this turn (see `with_project_rules`).
+    project_rules: Option<String>,
     /// Saves the conversation at each checkpoint (see `with_checkpoint`).
     checkpoint: Option<Checkpoint>,
     /// The caps this turn runs under (see `with_limits`).
@@ -405,22 +450,15 @@ impl LlmAgent {
         todos: TodoList,
         cancel: Arc<TurnCancel>,
     ) -> Self {
-        let headers = settings.resolved_headers(conversation_id);
-        // The key and the header values are the secrets the output must never show.
-        let mut known = vec![settings.api_key.clone()];
-        known.extend(headers.iter().map(|(_, value)| value.clone()));
+        let redactor = settings.redactor(conversation_id);
         LlmAgent {
             client: client.clone(),
-            cfg: ProviderConfig {
-                chat_url: settings.chat_url,
-                api_key: settings.api_key,
-                headers,
-                user_agent: USER_AGENT.to_string(),
-            },
+            cfg: settings.provider_config(conversation_id),
             model: settings.model,
             max_tokens: settings.max_tokens,
             stream: settings.stream,
-            redactor: Redactor::new(known),
+            extra: settings.extra,
+            redactor,
             history,
             conversation_id: conversation_id.to_string(),
             todos,
@@ -428,6 +466,7 @@ impl LlmAgent {
             system: prompt::system_prompt(),
             tools: prompt::tool_definitions(),
             resume_note: None,
+            project_rules: None,
             checkpoint: None,
             limits: LimitsSettings::default(),
             attachments: None,
@@ -489,8 +528,18 @@ impl LlmAgent {
         self
     }
 
-    /// Calls `save` at each checkpoint: once the user message is recorded, and after each completed round of tool
-    /// calls. The history is paired at those points. The end-of-turn save is the caller's, after the turn returns.
+    /// The workspace root's AGENTS.md for this turn. It goes into the system message of every model
+    /// call right after the base prompt and is never stored in the history. Missing or unreadable
+    /// means no rules.
+    pub fn with_project_rules(mut self, rules: Option<String>) -> Self {
+        self.project_rules = rules;
+        self
+    }
+
+    /// Calls `save` at each checkpoint: once the user message is recorded, once a reply's tool calls are recorded
+    /// but before they run, and after each completed round of tool calls. The history is paired at the first and last
+    /// of those points; the middle one may hold calls without results yet (a restart then repairs them into closed
+    /// calls, see `History::from_messages`). The end-of-turn save is the caller's, after the turn returns.
     pub fn with_checkpoint(mut self, save: impl FnMut(&Redactor) + Send + 'static) -> Self {
         self.checkpoint = Some(Box::new(save));
         self
@@ -512,6 +561,9 @@ impl LlmAgent {
     /// added here only, and none of them is stored in the history. The todo block comes last.
     fn system_text(&self, ctx: &AgentCtx<'_>, finished: Option<&str>) -> String {
         let mut system = self.system.clone();
+        if let Some(rules) = &self.project_rules {
+            system = format!("{system}\n\n{}", instructions::note(rules));
+        }
         if let Some(note) = &self.resume_note {
             system = format!("{system}\n\n{note}");
         }
@@ -694,6 +746,7 @@ impl LlmAgent {
             messages,
             tools: Some(self.tools.clone()),
             max_tokens: self.max_tokens,
+            extra: self.extra.clone(),
         };
         let thinking = Cell::new(true);
         let streamed = Cell::new(false);
@@ -787,6 +840,9 @@ impl LlmAgent {
                 ctx.call_tool("run_command", args)
             }
             todo::TOOL_NAME => ctx.local_tool(name, &args, |args| self.write_todos(args, ctx)),
+            // Chat-local like `todo_write`: answered by the user, never by the shell or an approval card. It counts
+            // against neither the command cap nor the read names, and its result never stops the turn.
+            questions::TOOL_NAME => ctx.ask_user(&args),
             _ if READ_NAMES.contains(&name) => ctx.read_tool(name, args),
             "request_integration" => ctx.call_tool("request_integration", args),
             "send_keys" => ctx.call_tool("send_keys", args),
@@ -834,6 +890,9 @@ impl Agent for LlmAgent {
             if reply.tool_calls.is_empty() {
                 return;
             }
+            // The calls are on record but not yet run: a restart from this checkpoint loads the unanswered call, and
+            // the repair closes it (see `History::from_messages`). The post-run checkpoint below still saves the results.
+            self.save_checkpoint();
             let polling = is_polling(&ctx.open_agent_records(), &reply.tool_calls);
             if let Some(cap) = self.charge(polling, &mut general, &mut polls) {
                 // The calls of the reply that reached the cap are not run, so nothing happens after the limit.
@@ -1376,6 +1435,36 @@ mod tests {
         assert!(conversation.take_resume_note().is_none());
     }
 
+    #[test]
+    fn adopt_replaces_the_conversation_and_clears_the_note_calibration_and_usage() {
+        let conversation = Conversation::new().unwrap();
+        lock(&conversation.history()).push_user("old message");
+        *lock_todos(&conversation.todos()) =
+            vec![Todo { content: "old step".to_string(), status: todo::TodoStatus::Pending }];
+        conversation.restore(conversation.id(), History::new(), Vec::new(), false);
+        let usage = context::usage(&context::breakdown("abcd", &[], &[]), &Calibrator::default(), Some(100), None);
+        conversation.set_last_usage(Some(usage));
+        lock_calibration(&conversation.calibration()).observe(1000, 500);
+        assert!(lock_calibration(&conversation.calibration()).observed());
+
+        let mut history = History::new();
+        history.push_user("new message");
+        let todos = vec![Todo { content: "new step".to_string(), status: todo::TodoStatus::InProgress }];
+        let id = new_conversation_id().unwrap();
+        conversation.adopt(id.clone(), history, todos);
+
+        assert_eq!(conversation.id(), id);
+        assert_eq!(lock(&conversation.history()).snapshot().len(), 1);
+        assert_eq!(lock(&conversation.history()).snapshot()[0]["content"], json!("new message"));
+        assert_eq!(
+            *lock_todos(&conversation.todos()),
+            vec![Todo { content: "new step".to_string(), status: todo::TodoStatus::InProgress }]
+        );
+        assert!(conversation.take_resume_note().is_none(), "adopt leaves no resume note");
+        assert_eq!(*lock_calibration(&conversation.calibration()), Calibrator::default());
+        assert!(lock_usage(&conversation.last_usage()).is_none());
+    }
+
     fn hint(kind: ForegroundKind, command: &str) -> Foreground {
         Foreground { kind, command: command.to_string() }
     }
@@ -1488,5 +1577,22 @@ mod tests {
             error_text(&LlmError::Transport("could not connect: refused".into())),
             "I could not reach the provider: could not connect: refused"
         );
+    }
+
+    /// The `Debug` text names the variant overlay's keys but never its values.
+    #[test]
+    fn debug_shows_extra_keys_but_not_body_values() {
+        let mut with_extra = settings_from_env(with_env(&[])).unwrap().unwrap();
+        with_extra.extra =
+            Some(serde_json::from_str(r#"{"reasoning":{"effort":"DUMMY-effort-marker-987654321"}}"#).unwrap());
+        let debug = format!("{with_extra:?}");
+        assert!(debug.contains("reasoning"), "the key names are shown: {debug}");
+        assert!(!debug.contains("DUMMY-effort-marker-987654321"), "a body value leaked: {debug}");
+        assert!(!debug.contains("sk-test-SECRETVALUE-0123456789"), "{debug}");
+
+        let plain = settings_from_env(with_env(&[])).unwrap().unwrap();
+        let debug = format!("{plain:?}");
+        assert!(debug.contains("extra_keys"), "{debug}");
+        assert!(!debug.contains("DUMMY"), "{debug}");
     }
 }

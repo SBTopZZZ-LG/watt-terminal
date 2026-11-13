@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { ProviderEditor } from './ProviderEditor';
 import type { ProviderEditorProps, TestState } from './ProviderEditor';
 import { draftFromPreset, draftFromProvider, draftNew, newHeaderDraft, renameHeader, toggleSecret } from '../lib/settingsForm';
-import type { DraftProblems } from '../lib/settingsForm';
+import type { DraftProblems, ProviderDraft, VariantDraft } from '../lib/settingsForm';
 import type { Provider } from '../lib/types';
 
 const PROVIDER: Provider = {
@@ -26,7 +26,7 @@ const PROVIDER: Provider = {
 /** A saved provider with its key and one secret header stored. */
 const SAVED = draftFromProvider(PROVIDER, { api_key: true, headers: ['X-Key'] });
 
-const NO_PROBLEMS: DraftProblems = { headers: {}, models: {} };
+const NO_PROBLEMS: DraftProblems = { headers: {}, models: {}, variants: {} };
 const NOOP = () => undefined;
 
 /** Props for the editor. The draft is clean unless a test gives a changed draft; `saved` is then the clean one. */
@@ -42,6 +42,7 @@ function props(over: Partial<ProviderEditorProps> = {}): ProviderEditorProps {
     saving: false,
     saveError: null,
     defaultModelId: null,
+    defaultVariantId: null,
     fetching: false,
     fetchNote: null,
     fetchError: null,
@@ -228,6 +229,7 @@ describe('ProviderEditor: validation and save', () => {
     const problems: DraftProblems = {
       headers: { bad: 'Authorization must be a secret header, so its value stays out of settings.json.' },
       models: { mini: 'Model "mini" is listed more than once.' },
+      variants: {},
       chat_url: 'Chat URL must use http or https.',
       max_tokens: 'Max output tokens must be a whole number of at least 1, or blank.',
     };
@@ -327,14 +329,14 @@ describe('ProviderEditor: models', () => {
   });
 
   it('a model id is shown as text, not markup', () => {
-    const d = { ...SAVED, models: [{ id: '<b>x</b>', source: 'custom' as const, context_limit: '', provider_context: null }] };
+    const d = { ...SAVED, models: [{ id: '<b>x</b>', source: 'custom' as const, context_limit: '', provider_context: null, variants: [] }] };
     const out = html({ draft: d, saved: d });
     expect(out).toContain('&lt;b&gt;x&lt;/b&gt;');
     expect(out).not.toContain('<b>x</b>');
   });
 
   it('a model listed twice is reported next to it', () => {
-    const out = html({ problems: { headers: {}, models: { mini: 'Model "mini" is listed more than once.' } } });
+    const out = html({ problems: { headers: {}, models: { mini: 'Model "mini" is listed more than once.' }, variants: {} } });
     expect(out).toContain('Model &quot;mini&quot; is listed more than once.');
   });
 
@@ -422,5 +424,146 @@ describe('ProviderEditor: saving', () => {
   it('the save button is disabled while a save is in flight, and says so', () => {
     const out = html({ saving: true, draft: { ...SAVED, name: 'Acme Prod' } });
     expect(out).toMatch(/<button[^>]*disabled=""[^>]*>Saving\.\.\.<\/button>/);
+  });
+});
+
+/** The mini model with one manual and one auto variant. */
+function withVariants(): ProviderDraft {
+  const manual: VariantDraft = {
+    key: 'v1',
+    id: 'high',
+    label: 'High effort',
+    body: '{\n  "reasoning": {\n    "effort": "high"\n  }\n}',
+    source: 'manual',
+  };
+  const auto: VariantDraft = {
+    key: 'v2',
+    id: 'low',
+    label: 'Low',
+    body: '{"reasoning":{"effort":"low"}}',
+    source: 'auto',
+  };
+  return { ...SAVED, models: SAVED.models.map((m) => (m.id === 'mini' ? { ...m, variants: [manual, auto] } : m)) };
+}
+
+/** The tag of the textarea with this aria-label, or ''. */
+function areaLabelled(out: string, label: string): string {
+  return out.match(new RegExp(`<textarea[^>]*aria-label="${escapeRe(label)}"[^>]*>`))?.[0] ?? '';
+}
+
+describe('ProviderEditor: variants', () => {
+  it('each model has an expandable Variants list with the count', () => {
+    const d = withVariants();
+    const out = html({ draft: d, saved: d });
+    expect(out).toContain('Variants (2)');
+    expect(out).toContain('Variants (0)');
+    expect(out).toContain('<details');
+    expect(out).toContain('<summary>');
+  });
+
+  it('a manual row is editable and removable, tagged manual; an auto row is read-only, tagged auto', () => {
+    const d = withVariants();
+    const out = html({ draft: d, saved: d });
+    expect(out).toContain('>manual</span>');
+    expect(out).toContain('>auto</span>');
+    expect(inputLabelled(out, 'Variant id in mini')).toContain('value="high"');
+    expect(inputLabelled(out, 'Variant label in mini')).toContain('value="High effort"');
+    expect(areaLabelled(out, 'Variant body in mini')).not.toBe('');
+    expect(out).toContain('effort');
+    expect(buttonLabelled(out, 'Remove variant high from mini')).not.toBe('');
+    // The auto row has no Remove: its body is shown as text, not a field.
+    expect(buttonLabelled(out, 'Remove variant low from mini')).toBe('');
+    expect(inputLabelled(out, 'Variant id in mini')).not.toBe('');
+    expect(out).toMatch(/<pre[^>]*class="settings-variant-body"[^>]*>/);
+  });
+
+  it('each model has an add form: id, label and JSON body fields with an Add variant button', () => {
+    const out = html();
+    expect(inputLabelled(out, 'New variant id for mini')).toContain('type="text"');
+    expect(inputLabelled(out, 'New variant label for mini')).toContain('type="text"');
+    expect(areaLabelled(out, 'New variant body for mini')).not.toBe('');
+    expect(buttonText(out, 'Add variant')).not.toBe('');
+  });
+
+  it('with no variants, the list says where they come from and how to add one', () => {
+    expect(html()).toContain('No variants. Fetched ones appear here; add a manual one below.');
+  });
+
+  it('an auto variant shadowed by a manual one says so', () => {
+    const d = withVariants();
+    d.models = d.models.map((m) =>
+      m.id === 'mini'
+        ? { ...m, variants: [...m.variants, { key: 'v3', id: 'high', label: 'High again', body: '{"a":1}', source: 'auto' as const }] }
+        : m,
+    );
+    expect(html({ draft: d, saved: d })).toContain('Overridden by the manual variant with this id.');
+    const clean = withVariants();
+    expect(html({ draft: clean, saved: clean })).not.toContain('Overridden by the manual variant');
+  });
+
+  it('the default variant cannot be removed from the default model, and the reason is the title', () => {
+    const d = withVariants();
+    d.models = d.models.map((m) =>
+      m.id === 'mini'
+        ? { ...m, variants: [...m.variants, { key: 'v3', id: 'med', label: 'Med', body: '{"a":1}', source: 'manual' as const }] }
+        : m,
+    );
+    const out = html({ draft: d, saved: d, defaultModelId: 'mini', defaultVariantId: 'high' });
+    const remove = buttonLabelled(out, 'Remove variant high from mini');
+    expect(remove).toContain('disabled=""');
+    expect(remove).toContain('Choose another default variant first.');
+    expect(buttonLabelled(out, 'Remove variant med from mini')).not.toContain('disabled');
+  });
+
+  it('the default variant id cannot be edited, but its label and body can', () => {
+    const d = withVariants();
+    const out = html({ draft: d, saved: d, defaultModelId: 'mini', defaultVariantId: 'high' });
+    const id = inputLabelled(out, 'Variant id in mini');
+    expect(id).toContain('disabled=""');
+    expect(id).toContain('This is the default variant. Change the default variant first.');
+    expect(inputLabelled(out, 'Variant label in mini')).not.toContain('disabled');
+    expect(areaLabelled(out, 'Variant body in mini')).not.toContain('disabled');
+  });
+
+  it('with no default variant, every manual variant can be removed', () => {
+    const d = withVariants();
+    const out = html({ draft: d, saved: d, defaultModelId: 'mini', defaultVariantId: null });
+    expect(buttonLabelled(out, 'Remove variant high from mini')).not.toContain('disabled');
+  });
+
+  it('a variant problem is shown under its row, and blocks the save', () => {
+    const d = { ...withVariants(), stream: false };
+    const problems: DraftProblems = { headers: {}, models: {}, variants: { v1: 'Variant body must be a JSON object.' } };
+    const out = html({ draft: d, saved: withVariants(), problems });
+    expect(out).toContain('Variant body must be a JSON object.');
+    expect(buttonText(out, 'Save provider')).toContain('disabled=""');
+  });
+
+  it('a variant over the cap is the model row problem', () => {
+    const out = html({
+      problems: { headers: {}, models: { mini: 'Model "mini" has 17 variants, at most 16 are allowed.' }, variants: {} },
+    });
+    expect(out).toContain('Model &quot;mini&quot; has 17 variants, at most 16 are allowed.');
+  });
+
+  it('a locked editor disables the variant fields and the add form', () => {
+    const d = withVariants();
+    const out = html({ draft: d, saved: d, locked: true });
+    expect(inputLabelled(out, 'Variant id in mini')).toContain('disabled=""');
+    expect(inputLabelled(out, 'Variant label in mini')).toContain('disabled=""');
+    expect(areaLabelled(out, 'Variant body in mini')).toContain('disabled=""');
+    expect(buttonText(out, 'Add variant')).toContain('disabled=""');
+  });
+
+  it('an auto variant label is shown as text, not markup', () => {
+    const d = withVariants();
+    d.models = d.models.map((m) =>
+      m.id === 'mini'
+        ? { ...m, variants: m.variants.map((v) => (v.key === 'v2' ? { ...v, label: '<img src=x>' } : v)) }
+        : m,
+    );
+    const out = html({ draft: d, saved: d });
+    expect(out).not.toContain('<img src=x>');
+    expect(out).toContain('&lt;img src=x&gt;');
   });
 });

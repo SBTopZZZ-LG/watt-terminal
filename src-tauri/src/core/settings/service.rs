@@ -154,6 +154,8 @@ pub struct ActiveLlm {
     /// The provider's display name.
     pub provider: String,
     pub model: String,
+    /// The default model's variant, if one is selected (its overlay is already in `settings.extra`).
+    pub variant: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -587,7 +589,8 @@ impl SettingsService {
     }
 
     /// Folds a fetched model list into provider `id`. A default model that is no longer listed keeps its entry, so the
-    /// default never disappears on a refresh.
+    /// default never disappears on a refresh. A default variant that is no longer on the merged model is cleared, so
+    /// the default falls back to the base model.
     pub fn apply_fetched(&self, id: &str, fetched: Vec<FetchedModel>) -> Result<(SettingsView, FetchSummary), String> {
         // An empty list would remove every fetched model, so it is refused before anything is read or changed.
         if fetched.is_empty() {
@@ -618,6 +621,18 @@ impl SettingsService {
             && let Some(position) = before.iter().position(|m| &m.id == default)
         {
             provider.models.insert(position.min(provider.models.len()), before[position].clone());
+        }
+        // A fetch replaces the auto variants. When the default's variant is gone from the merged model, the default
+        // falls back to the base model; a stale variant would fail validation below.
+        let variant_gone = match &candidate.default_model {
+            Some(default) if default.provider_id == id => match &default.variant {
+                Some(variant) => provider.model(&default.model_id).is_none_or(|m| m.variant(variant).is_none()),
+                None => false,
+            },
+            _ => false,
+        };
+        if variant_gone {
+            candidate.default_model.as_mut().expect("the default was checked just above").variant = None;
         }
         let total = provider.models.len();
 
@@ -652,22 +667,25 @@ impl SettingsService {
         let resolved = resolve::resolve(&settings, &self.secrets, &default)
             .map_err(|e| format!("the default model cannot be used: {e}. Check the AI settings."))?;
         let provider = settings.provider(&default.provider_id).map(|p| p.name.clone()).unwrap_or_default();
-        Ok(Some(ActiveLlm { settings: resolved, provider, model: default.model_id }))
+        Ok(Some(ActiveLlm { settings: resolved, provider, model: default.model_id, variant: default.variant }))
     }
 
-    /// The default model's provider name and model id, for the status line. `Ok(None)` when there is no saved default,
-    /// so the environment settings apply. An error when the saved default cannot be used. Never reads the secret store.
-    pub fn default_label(&self) -> Result<Option<(String, String)>, String> {
+    /// The default model's provider name, model id and variant, for the status line. `Ok(None)` when there is no saved
+    /// default, so the environment settings apply. An error when the saved default cannot be used. Never reads the
+    /// secret store.
+    pub fn default_label(&self) -> Result<Option<(String, String, Option<String>)>, String> {
         let Some((settings, default)) = self.saved_default()? else {
             return Ok(None);
         };
-        Ok(settings.provider(&default.provider_id).map(|p| (p.name.clone(), default.model_id)))
+        Ok(settings
+            .provider(&default.provider_id)
+            .map(|p| (p.name.clone(), default.model_id, default.variant)))
     }
 
     /// The settings for one model, for a connection test. Works before the model is the default.
     pub fn test_plan(&self, provider_id: &str, model_id: &str) -> Result<LlmSettings, String> {
         let settings = self.usable()?;
-        let model = ModelRef { provider_id: provider_id.to_string(), model_id: model_id.to_string() };
+        let model = ModelRef { provider_id: provider_id.to_string(), model_id: model_id.to_string(), variant: None };
         resolve::resolve(&settings, &self.secrets, &model).map_err(|e| e.to_string())
     }
 }
@@ -707,6 +725,8 @@ async fn probe(client: &reqwest::Client, settings: &LlmSettings) -> Result<Strin
         messages: vec![json!({"role": "user", "content": TEST_PROMPT})],
         tools: None,
         max_tokens: Some(TEST_MAX_TOKENS),
+        // The connection test runs the model as configured, variant overlay included.
+        extra: settings.extra.clone(),
     };
     let cancel = TurnCancel::new();
     match timeout(TEST_TIMEOUT, llm::complete(client, &cfg, &req, &cancel)).await {
@@ -768,8 +788,8 @@ mod tests {
     use super::super::secrets::MemoryStore;
     use super::super::test_support::TempDir;
     use super::super::{
-        AgentRequests, ApprovalMode, ApprovalSettings, HeaderEntry, IntegrationSettings, Model, Nested, last_good_path, load,
-        save as save_file,
+        AgentRequests, ApprovalMode, ApprovalSettings, HeaderEntry, IntegrationSettings, Model, ModelVariant, Nested,
+        VariantSource, last_good_path, load, save as save_file,
     };
     use super::*;
 
@@ -795,7 +815,7 @@ mod tests {
     }
 
     fn model(id: &str, source: ModelSource) -> Model {
-        Model { id: id.into(), context_limit: None, provider_context: None, vision: None, source }
+        Model { id: id.into(), context_limit: None, provider_context: None, vision: None, source, variants: Vec::new() }
     }
 
     fn provider(id: &str) -> Provider {
@@ -820,7 +840,7 @@ mod tests {
     }
 
     fn model_ref(provider_id: &str, model_id: &str) -> ModelRef {
-        ModelRef { provider_id: provider_id.into(), model_id: model_id.into() }
+        ModelRef { provider_id: provider_id.into(), model_id: model_id.into(), variant: None }
     }
 
     fn read_file(dir: &TempDir) -> Vec<u8> {
@@ -1117,7 +1137,7 @@ mod tests {
 
         let service = service_on(&f.dir, &f.store);
         let loads_before = f.store.loads();
-        assert_eq!(service.default_label(), Ok(Some(("acme name".to_string(), "big".to_string()))));
+        assert_eq!(service.default_label(), Ok(Some(("acme name".to_string(), "big".to_string(), None))));
         assert_eq!(f.store.loads(), loads_before, "the status line read the store");
     }
 
@@ -1135,6 +1155,7 @@ mod tests {
         let active = f.service.active().unwrap().unwrap();
         assert_eq!(active.provider, "acme name");
         assert_eq!(active.model, "big");
+        assert_eq!(active.variant, None, "no variant is selected");
         assert_eq!(active.settings.api_key, KEY);
         assert_eq!(active.settings.chat_url, "https://api.acme.test/v1/chat/completions");
     }
@@ -1286,7 +1307,7 @@ mod tests {
         assert_eq!(view.settings_state.kind, "last_good");
         assert!(view.load_error.is_some());
         assert_eq!(view.settings.default_model, Some(model_ref("acme", "big")));
-        assert_eq!(service.default_label(), Ok(Some(("acme name".to_string(), "big".to_string()))));
+        assert_eq!(service.default_label(), Ok(Some(("acme name".to_string(), "big".to_string(), None))));
         assert!(service.active().unwrap().is_some(), "the last working copy did not run");
 
         let refused = "settings.json is broken; fix or revert it first";
@@ -1472,8 +1493,8 @@ mod tests {
         f.service.set_default_model(Some(model_ref("acme", "gone"))).unwrap();
 
         let fetched = vec![
-            FetchedModel { id: "kept".into(), context: Some(2_000), vision: None },
-            FetchedModel { id: "fresh".into(), context: None, vision: None },
+            FetchedModel { id: "kept".into(), context: Some(2_000), vision: None, variants: Vec::new() },
+            FetchedModel { id: "fresh".into(), context: None, vision: None, variants: Vec::new() },
         ];
         let (view, summary) = f.service.apply_fetched("acme", fetched.clone()).unwrap();
         assert_eq!(summary, FetchSummary { added: 1, updated: 1, removed: 0, total: 4 });
@@ -1487,6 +1508,118 @@ mod tests {
         let (view, summary) = f.service.apply_fetched("acme", fetched).unwrap();
         assert_eq!(summary, FetchSummary { added: 0, updated: 2, removed: 1, total: 3 });
         assert!(view.settings.providers[0].model("gone").is_none());
+    }
+
+    fn auto_variant(id: &str) -> ModelVariant {
+        ModelVariant {
+            id: id.into(),
+            label: format!("{id} label"),
+            body: serde_json::from_str(r#"{"reasoning":{"effort":"high"}}"#).unwrap(),
+            source: VariantSource::Auto,
+        }
+    }
+
+    fn manual_variant(id: &str) -> ModelVariant {
+        ModelVariant { source: VariantSource::Manual, ..auto_variant(id) }
+    }
+
+    /// A refresh that drops the default's auto variant clears the variant; the default stays on the base model.
+    #[test]
+    fn a_fetch_clears_a_default_variant_that_disappeared() {
+        let f = fixture();
+        let mut p = provider("acme");
+        p.models = vec![Model {
+            id: "big".into(),
+            context_limit: None,
+            provider_context: None,
+            vision: None,
+            source: ModelSource::Fetched,
+            variants: vec![manual_variant("mine"), auto_variant("fast")],
+        }];
+        f.service.save_provider(with_key(p, KEY)).unwrap();
+        f.service
+            .set_default_model(Some(ModelRef {
+                provider_id: "acme".into(),
+                model_id: "big".into(),
+                variant: Some("fast".into()),
+            }))
+            .unwrap();
+        assert_eq!(
+            f.service.default_label(),
+            Ok(Some(("acme name".to_string(), "big".to_string(), Some("fast".to_string()))))
+        );
+
+        let fetched = vec![FetchedModel { id: "big".into(), context: None, vision: None, variants: Vec::new() }];
+        let (view, _) = f.service.apply_fetched("acme", fetched).unwrap();
+        assert_eq!(
+            view.settings.default_model,
+            Some(model_ref("acme", "big")),
+            "the default falls back to the base model"
+        );
+        let kept = view.settings.providers[0].model("big").unwrap();
+        assert_eq!(kept.variants, vec![manual_variant("mine")], "the manual variant is kept");
+        assert_eq!(
+            f.service.default_label(),
+            Ok(Some(("acme name".to_string(), "big".to_string(), None)))
+        );
+        assert!(f.service.active().unwrap().is_some(), "the cleared default still runs");
+    }
+
+    /// A manual default variant survives a fetch whose entry lists no efforts at all.
+    #[test]
+    fn a_manual_default_variant_survives_an_empty_auto_list() {
+        let f = fixture();
+        let mut p = provider("acme");
+        p.models = vec![Model {
+            id: "big".into(),
+            context_limit: None,
+            provider_context: None,
+            vision: None,
+            source: ModelSource::Fetched,
+            variants: vec![manual_variant("mine"), auto_variant("fast")],
+        }];
+        f.service.save_provider(with_key(p, KEY)).unwrap();
+        f.service
+            .set_default_model(Some(ModelRef {
+                provider_id: "acme".into(),
+                model_id: "big".into(),
+                variant: Some("mine".into()),
+            }))
+            .unwrap();
+
+        let fetched = vec![FetchedModel { id: "big".into(), context: None, vision: None, variants: Vec::new() }];
+        let (view, _) = f.service.apply_fetched("acme", fetched).unwrap();
+        assert_eq!(view.settings.providers[0].model("big").unwrap().variants, vec![manual_variant("mine")]);
+        assert_eq!(view.settings.default_model.as_ref().unwrap().variant, Some("mine".to_string()));
+    }
+
+    /// A removed default model is re-inserted whole, variants included, so its variant still checks out.
+    #[test]
+    fn a_removed_default_keeps_its_variants_when_it_is_reinserted() {
+        let f = fixture();
+        let mut p = provider("acme");
+        p.models = vec![Model {
+            id: "big".into(),
+            context_limit: None,
+            provider_context: None,
+            vision: None,
+            source: ModelSource::Fetched,
+            variants: vec![auto_variant("fast")],
+        }];
+        f.service.save_provider(with_key(p, KEY)).unwrap();
+        f.service
+            .set_default_model(Some(ModelRef {
+                provider_id: "acme".into(),
+                model_id: "big".into(),
+                variant: Some("fast".into()),
+            }))
+            .unwrap();
+
+        let fetched = vec![FetchedModel { id: "other".into(), context: None, vision: None, variants: Vec::new() }];
+        let (view, _) = f.service.apply_fetched("acme", fetched).unwrap();
+        let reinserted = view.settings.providers[0].model("big").unwrap();
+        assert_eq!(reinserted.variants, vec![auto_variant("fast")]);
+        assert_eq!(view.settings.default_model.as_ref().unwrap().variant, Some("fast".to_string()));
     }
 
     #[test]
@@ -1563,6 +1696,7 @@ mod tests {
             stream: true,
             max_tokens: None,
             context_limit: None,
+            extra: None,
         }
     }
 
@@ -1584,5 +1718,68 @@ mod tests {
         assert!(!result.ok);
         assert!(result.message.contains("401"), "{result:?}");
         assert!(!result.message.contains(KEY) && !result.message.contains(HEADER), "{result:?}");
+    }
+
+    /// Serves one request like `one_shot_server` and keeps the raw request it received, so a test can read the body.
+    fn one_shot_capture(body: &str) -> (String, Arc<std::sync::Mutex<Vec<u8>>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let seen: Arc<std::sync::Mutex<Vec<u8>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kept = seen.clone();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut data = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = match sock.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                data.extend_from_slice(&buf[..n]);
+                let Some(end) = data.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&data[..end]).to_ascii_lowercase();
+                let length = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if data.len() >= end + 4 + length {
+                    break;
+                }
+            }
+            *kept.lock().unwrap_or_else(|e| e.into_inner()) = data;
+            let _ = sock.write_all(response.as_bytes());
+        });
+        (format!("http://{addr}/v1/chat/completions"), seen)
+    }
+
+    /// The connection test sends the resolved variant overlay with the probe request.
+    #[tokio::test]
+    async fn the_connection_test_sends_the_variant_overlay() {
+        let (url, seen) =
+            one_shot_capture(r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#);
+        let client = llm::http_client().unwrap();
+        let mut settings = llm_settings(url);
+        settings.extra =
+            Some(serde_json::from_str(r#"{"reasoning":{"effort":"high"},"temperature":0.2}"#).unwrap());
+        let result = test_model(&client, &settings).await;
+        assert!(result.ok, "{result:?}");
+
+        let raw = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let text = String::from_utf8_lossy(&raw);
+        let body: serde_json::Value =
+            serde_json::from_str(text.split("\r\n\r\n").nth(1).expect("the request has a body"))
+                .expect("the probe body is JSON");
+        assert_eq!(body["reasoning"], serde_json::json!({"effort": "high"}), "{body}");
+        assert_eq!(body["temperature"], 0.2, "{body}");
+        assert_eq!(body["model"], "big", "{body}");
     }
 }

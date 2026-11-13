@@ -22,6 +22,7 @@ const BASE = {
   onApproveFirst: NOOP,
   onDenyFirst: NOOP,
   onClose: NOOP,
+  loadCommands: async () => ({ commands: [], project_dir: null, global_dir: null }),
 };
 
 type Props = Partial<typeof BASE>;

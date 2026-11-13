@@ -107,7 +107,21 @@ pub struct ChatRequest {
     pub tools: Option<Vec<Value>>,
     /// Sent only when `Some`.
     pub max_tokens: Option<u32>,
+    /// A variant's overlay: extra top-level body keys, merged by `request_body`. `None` sends the base body only.
+    pub extra: Option<serde_json::Map<String, Value>>,
 }
+
+/// Body keys a variant must never override. `request_body` skips them even when one slips through validation.
+pub const PROTECTED_BODY_KEYS: &[&str] = &[
+    "model",
+    "messages",
+    "stream",
+    "tools",
+    "stream_options",
+    "max_tokens",
+    "max_completion_tokens",
+    "models",
+];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AssistantReply {
@@ -414,6 +428,18 @@ fn request_body(req: &ChatRequest, stream: bool) -> Value {
     if let Some(max_tokens) = req.max_tokens {
         body["max_tokens"] = json!(max_tokens);
     }
+    // The variant overlay: each non-protected top-level key replaces the base value whole. No deep merge:
+    // a nested object in `extra` replaces the base object of the same name instead of merging into it.
+    if let Some(extra) = req.extra.as_ref()
+        && let Some(obj) = body.as_object_mut()
+    {
+        for (key, value) in extra {
+            if PROTECTED_BODY_KEYS.contains(&key.as_str()) {
+                continue;
+            }
+            obj.insert(key.clone(), value.clone());
+        }
+    }
     body
 }
 
@@ -538,7 +564,12 @@ mod tests {
             messages: vec![json!({"role": "user", "content": "hi"})],
             tools: None,
             max_tokens: None,
+            extra: None,
         }
+    }
+
+    fn extra_of(pairs: &[(&str, Value)]) -> Option<serde_json::Map<String, Value>> {
+        Some(pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect())
     }
 
     /// Accepts one connection, sends `head` and `body`, then holds the socket open for a few seconds.
@@ -571,6 +602,59 @@ mod tests {
         assert_eq!(body["stream"], true);
         assert_eq!(body["max_tokens"], 64);
         assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn variant_extra_adds_top_level_keys_and_replaces_without_a_deep_merge() {
+        let req = ChatRequest {
+            extra: extra_of(&[
+                ("reasoning", json!({"effort": "high"})),
+                ("temperature", json!(0.2)),
+            ]),
+            ..one_message()
+        };
+        let body = request_body(&req, false);
+        assert_eq!(body["reasoning"], json!({"effort": "high"}));
+        assert_eq!(body["temperature"], 0.2);
+        assert_eq!(body["model"], "m");
+        assert_eq!(body["stream"], false);
+
+        // A nested object lands verbatim: it replaces rather than merging into anything under the same key.
+        let req = ChatRequest {
+            extra: extra_of(&[("reasoning", json!({"effort": "low", "exclude": true}))]),
+            ..one_message()
+        };
+        let merged = request_body(&req, false);
+        assert_eq!(merged["reasoning"], json!({"effort": "low", "exclude": true}), "{merged}");
+    }
+
+    #[test]
+    fn variant_extra_cannot_override_protected_keys() {
+        let req = ChatRequest {
+            extra: extra_of(&[
+                ("model", json!("other-model")),
+                ("messages", json!([])),
+                ("stream", json!(true)),
+                ("tools", json!([])),
+                ("stream_options", json!({"include_usage": true})),
+                ("max_tokens", json!(1)),
+                ("max_completion_tokens", json!(1)),
+                ("models", json!(["m"])),
+                ("reasoning", json!({"effort": "high"})),
+            ]),
+            max_tokens: Some(64),
+            ..one_message()
+        };
+        let body = request_body(&req, false);
+        assert_eq!(body["model"], "m");
+        assert_eq!(body["messages"], json!([{"role": "user", "content": "hi"}]));
+        assert_eq!(body["stream"], false);
+        assert!(body.get("tools").is_none());
+        assert!(body.get("stream_options").is_none());
+        assert_eq!(body["max_tokens"], 64);
+        assert!(body.get("max_completion_tokens").is_none());
+        assert!(body.get("models").is_none());
+        assert_eq!(body["reasoning"], json!({"effort": "high"}), "non-protected keys still merge: {body}");
     }
 
     #[test]

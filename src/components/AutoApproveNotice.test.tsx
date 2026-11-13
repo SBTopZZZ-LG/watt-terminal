@@ -44,6 +44,7 @@ describe('Transcript: the auto-approve notice sits above the banner, in the chat
         view={over.view ?? 'chat'}
         onToggle={NOOP}
         onApprove={NOOP}
+        onAnswerQuestions={NOOP}
         onNewConversation={NOOP}
         warning={warning}
         banner={banner}

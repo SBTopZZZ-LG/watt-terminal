@@ -46,6 +46,10 @@ WATT_HISTFILE=/tmp/watt-terminal-hist npm run tauri dev
 
 Open Settings (Cmd+,), go to **Models**, pick a preset or add a custom OpenAI-compatible endpoint, and paste your API key. With no model saved (and no `WATT_LLM_*` variables set) the app uses a mock agent with a few keyword rules and no network, which is enough to try the UI. A saved default model that cannot be used shows an error rather than falling back.
 
+The default model has an optional variant: a named preset of extra request settings for that model (for example a reasoning effort). Pick it in the **Variant** select next to the model, or with `/model provider/model#variant`. The variants in the list come from the provider's model list when it is fetched; the status strip shows the saved one as `model: id#variant`. With no variant the base model runs with the provider defaults.
+
+To set your own variant, open the provider and expand **Variants (N)** under the model: give it an id, a label and a JSON object body such as `{"reasoning":{"effort":"high"}}`, then save and pick it as the default variant. Manual variants are kept across fetches and win over a fetched variant with the same id; the default variant cannot be removed while it is selected.
+
 For development you can skip the settings dialog and set all three of these (read the key from a password manager rather than typing it into your shell history):
 
 ```sh
@@ -59,7 +63,7 @@ These are only used when no default model is saved. Optional: `WATT_LLM_HEADERS`
 
 ## Using it
 
-The terminal is the main input: keys go to the shell, or to whatever program is running. The bar under the transcript is for the agent: its text is always a message to the agent, never shell input. A `run` request shows an approval card before anything is typed into your shell.
+The terminal is the main input: keys go to the shell, or to whatever program is running. The bar under the transcript is for the agent: its text is a message to the agent, never shell input, unless it is a slash command (see below). A `run` request shows an approval card before anything is typed into your shell.
 
 | Keys | Action |
 | --- | --- |
@@ -75,6 +79,12 @@ The terminal is the main input: keys go to the shell, or to whatever program is 
 | Shift+Enter | Newline (Ctrl+J) in a running program such as `claude`; a plain Enter at the prompt |
 
 The agent panel docks left, right, top or bottom.
+
+### Slash commands
+
+The bar also takes slash commands. Local actions: `/help` (list commands), `/new` (new conversation, `/clear` too), `/stop` (stop the running turn), `/model` (open Settings, or `/model provider/model` to switch), `/export` (copy the conversation as Markdown), `/context` (show the context usage of the last model request), `/history` (open the History view), `/rename <title>` (rename the current conversation), `/btw <question>` (ask a side question about the conversation; the answer is shown once and never stored), `/compact` (summarize the conversation into a new one; the old one stays in history), `/fork` (copy the conversation into a new one and switch to it). Templates sent as a normal message: `/plan [task]`, `/review [focus]` and `/init [focus]` (inspect the project, then create or update `AGENTS.md` at the workspace root). Custom commands are Markdown files in `<workspace root>/.watt/commands` (project) or `<config dir>/commands` (global): the file stem is the name, an optional `---` frontmatter block holds `description:` and `argument-hint:`, and the body is the template with `$ARGUMENTS` and `$1`..`$9`. Built-ins win over customs; any other `/text` is sent to the agent unchanged. Commands never run shell. The workspace root's `AGENTS.md`, when present, is also loaded as project instructions at the start of each agent turn.
+
+Typing `/` opens an autocomplete menu: ArrowUp/Down moves, Enter or Tab accepts, Esc dismisses. Enter on a fully typed command runs it; Enter/Tab on a partial name completes it. `/help` shows the list in a dialog (Esc or the backdrop closes it, focus returns to the bar) instead of the transcript. Bare `/model` opens Settings with the default-model select focused, so Space opens its list. `/history` opens the History view with its search field focused.
 
 ## Approvals
 

@@ -135,6 +135,7 @@ fn request() -> ChatRequest {
             }
         })]),
         max_tokens: Some(300),
+        extra: None,
     }
 }
 

@@ -5,10 +5,14 @@ import { previewJson } from '../lib/format';
 import { isAtBottom, shouldFollowAfterSend } from '../lib/stickScroll';
 import { approvalTitle } from '../lib/transcript';
 import type { TranscriptItem, UserAttachment } from '../lib/transcript';
+import type { QuestionAnswerInput } from '../lib/types';
+import { draftsFromAnswers, enterIntent, firstUnsettled, isComplete, newDrafts, payload, pickOption, setOther, settled, summary, toggleSkip } from '../lib/questions';
+import type { EnterIntent, QuestionDraft } from '../lib/questions';
 import { formatSize } from '../lib/attachments';
 import { safeText } from '../lib/historyView';
 import { askedBecause, decisionLabel, decisionTooltip } from '../lib/approvalReasons';
-import { capDisplay, displayText, sendKeysDisplay } from '../lib/keysDisplay';
+import { displayText } from '../lib/keysDisplay';
+import { toolRowHead } from '../lib/toolDisplay';
 import { interactiveHeader } from '../lib/interactive';
 import { isDeclinedIntegration } from '../lib/integrate';
 import { groupTranscript, toolGroupSummary } from '../lib/toolGroups';
@@ -28,6 +32,8 @@ interface Props {
   open: boolean;
   onToggle: () => void;
   onApprove: (callId: string, approve: boolean) => void;
+  /** Answers the agent's clarification question. Never touches the shell: it only calls `answer_questions`. */
+  onAnswerQuestions: (callId: string, answers: QuestionAnswerInput[]) => void;
   onNewConversation: () => void;
   /** The dock the panel is in. With onDock, the header shows the four dock buttons, with this one marked. */
   dock?: Dock;
@@ -52,6 +58,7 @@ export function Transcript({
   open,
   onToggle,
   onApprove,
+  onAnswerQuestions,
   onNewConversation,
   dock,
   onDock,
@@ -232,7 +239,7 @@ export function Transcript({
       {bodyShown && (
         <div className="transcript-body" ref={bodyRef} tabIndex={-1} onScroll={onScroll} onWheel={onWheel}>
           {items.length === 0 && <div className="empty">Ask the agent something, for example "what was the last command".</div>}
-          {renderEntries(entries, onApprove)}
+          {renderEntries(entries, onApprove, onAnswerQuestions)}
         </div>
       )}
       {bodyShown && showJump && <JumpToLatest busy={busy} onClick={jumpToLatest} />}
@@ -255,13 +262,13 @@ export function JumpToLatest({ busy, onClick }: { busy: boolean; onClick: (e: Mo
 }
 
 /** A run of tool calls, collapsed to one line. Uncontrolled, and keyed by its first item, so it stays open as it grows. */
-function ToolGroup({ items, onApprove }: { items: GroupItem[]; onApprove: Props['onApprove'] }) {
+function ToolGroup({ items, onApprove, onAnswerQuestions }: { items: GroupItem[]; onApprove: Props['onApprove']; onAnswerQuestions: Props['onAnswerQuestions'] }) {
   return (
     <details className="tool tool-group">
       <summary>{toolGroupSummary(items)}</summary>
       <div className="tool-group-items">
         {items.map((item) => (
-          <Entry key={item.id} item={item} onApprove={onApprove} />
+          <Entry key={item.id} item={item} onApprove={onApprove} onAnswerQuestions={onAnswerQuestions} />
         ))}
       </div>
     </details>
@@ -269,15 +276,15 @@ function ToolGroup({ items, onApprove }: { items: GroupItem[]; onApprove: Props[
 }
 
 /** The transcript's entries as elements. Used for the body and, inside an interactive group, for the group's contents. */
-function renderEntries(entries: TranscriptEntry[], onApprove: Props['onApprove']) {
+function renderEntries(entries: TranscriptEntry[], onApprove: Props['onApprove'], onAnswerQuestions: Props['onAnswerQuestions']) {
   return entries.map((entry) => {
     switch (entry.kind) {
       case 'item':
-        return <Entry key={entry.item.id} item={entry.item} onApprove={onApprove} />;
+        return <Entry key={entry.item.id} item={entry.item} onApprove={onApprove} onAnswerQuestions={onAnswerQuestions} />;
       case 'tools':
-        return <ToolGroup key={entry.key} items={entry.items} onApprove={onApprove} />;
+        return <ToolGroup key={entry.key} items={entry.items} onApprove={onApprove} onAnswerQuestions={onAnswerQuestions} />;
       case 'interactive':
-        return <InteractiveGroupView key={entry.key} group={entry.group} onApprove={onApprove} />;
+        return <InteractiveGroupView key={entry.key} group={entry.group} onApprove={onApprove} onAnswerQuestions={onAnswerQuestions} />;
     }
   });
 }
@@ -286,7 +293,7 @@ function renderEntries(entries: TranscriptEntry[], onApprove: Props['onApprove']
  * A command the agent started and left running, and what the agent did for it. The wrapper has an accent rail while the
  * command runs; once it ends the rail goes and the header says how it ended. The header ticks once a second while running.
  */
-function InteractiveGroupView({ group, onApprove }: { group: InteractiveGroup; onApprove: Props['onApprove'] }) {
+function InteractiveGroupView({ group, onApprove, onAnswerQuestions }: { group: InteractiveGroup; onApprove: Props['onApprove']; onAnswerQuestions: Props['onAnswerQuestions'] }) {
   const running = group.ended === null;
   const now = useNow(running);
   const header = interactiveHeader(group, now);
@@ -302,7 +309,7 @@ function InteractiveGroupView({ group, onApprove }: { group: InteractiveGroup; o
           </span>
         )}
       </div>
-      <div className="interactive-items">{renderEntries(group.entries, onApprove)}</div>
+      <div className="interactive-items">{renderEntries(group.entries, onApprove, onAnswerQuestions)}</div>
     </section>
   );
 }
@@ -319,18 +326,6 @@ function useNow(ticking: boolean): number {
     return () => window.clearInterval(timer);
   }, [ticking]);
   return now;
-}
-
-/** The send_keys rows' typed text is cut to this many characters in the summary. The full text is in the row's details. */
-const SEND_KEYS_ROW_CHARS = 40;
-
-/** A tool row's name. A send_keys row shows what it typed (decoded, capped) in place of the bare name. */
-function toolName(item: Extract<TranscriptItem, { kind: 'tool' }>): string {
-  if (item.name !== 'send_keys') {
-    return item.name;
-  }
-  const typed = sendKeysDisplay(item.args);
-  return typed === '' ? item.name : `send_keys "${capDisplay(typed, SEND_KEYS_ROW_CHARS)}"`;
 }
 
 /**
@@ -362,7 +357,7 @@ function MessageAttachments({ items }: { items: UserAttachment[] }) {
   );
 }
 
-function Entry({ item, onApprove }: { item: TranscriptItem; onApprove: Props['onApprove'] }) {
+function Entry({ item, onApprove, onAnswerQuestions }: { item: TranscriptItem; onApprove: Props['onApprove']; onAnswerQuestions: Props['onAnswerQuestions'] }) {
   switch (item.kind) {
     case 'user':
       return (
@@ -388,19 +383,26 @@ function Entry({ item, onApprove }: { item: TranscriptItem; onApprove: Props['on
       // A declined integration request is its own status, not a failure: the user chose it.
       const declined = isDeclinedIntegration(item.name, item.decision);
       const status = declined ? 'declined' : item.status === 'running' ? 'running' : item.status === 'ok' ? 'ok' : 'failed';
+      const head = toolRowHead(item.name, item.args);
       return (
         <details className={`tool tool-${status}`}>
           <summary>
-            {toolName(item)}
-            {item.decision !== null && !declined && (
-              <span
-                className={`decision decision-${item.decision}`}
-                title={decisionTooltip(item.decision, item.reason) ?? undefined}
-              >
-                {` ${decisionLabel(item.decision, item.reason)}`}
+            <span className="tool-summary">
+              <span className="tool-line">
+                {head.label}
+                {head.caption !== null && <span className="tool-caption">{` · ${head.caption}`}</span>}
+                {item.decision !== null && !declined && (
+                  <span
+                    className={`decision decision-${item.decision}`}
+                    title={decisionTooltip(item.decision, item.reason) ?? undefined}
+                  >
+                    {` ${decisionLabel(item.decision, item.reason)}`}
+                  </span>
+                )}
+                {`: ${status}`}
               </span>
-            )}
-            : {status}
+              {head.detail !== null && <span className="tool-detail">{head.detail}</span>}
+            </span>
           </summary>
           <pre>{previewJson({ args: item.args, result: item.result })}</pre>
         </details>
@@ -434,7 +436,289 @@ function Entry({ item, onApprove }: { item: TranscriptItem; onApprove: Props['on
         </div>
       );
     }
+    case 'question': {
+      return <QuestionCard item={item} onAnswer={onAnswerQuestions} />;
+    }
   }
+}
+
+/** The status word of a settled question answer, as the resolved card shows it. */
+function questionStatusWord(status: string): string {
+  switch (status) {
+    case 'answered':
+      return 'Answered';
+    case 'skipped':
+      return 'Skipped';
+    case 'timed_out':
+      return 'Timed out';
+    case 'cancelled':
+      return 'Cancelled';
+    default:
+      return status;
+  }
+}
+
+type QuestionItem = Extract<TranscriptItem, { kind: 'question' }>;
+
+/**
+ * The agent's clarification question. Pending (or failed, after a send error) it is a stepped form: one question at a
+ * time, with a counter, Back and Next (Submit on the last question). Each question is a plain group container (no
+ * fieldset legend, no inner scroll: the transcript body scrolls), with its Other input and Skip beside the options so
+ * nothing hides in a fold. Multi-select questions carry a "Select all that apply" hint. Next is enabled only when the
+ * current question is settled; Enter on a single-select option selects and advances, on a multi-select option only
+ * toggles, and in the Other input keeps the text and advances. Enter never submits partial answers: Submit runs only
+ * on the last step when every question is settled, and a first send locks out further Enter/clicks. A failed card
+ * with every question settled offers Retry on any step. Sending shows the wait; resolved shows the outcome grouped by
+ * question; closed shows the outcome with why it can no longer be answered, and no inputs. Never a tool row, and
+ * never in a collapsible group.
+ */
+function QuestionCard({ item, onAnswer }: { item: QuestionItem; onAnswer: (callId: string, answers: QuestionAnswerInput[]) => void }) {
+  if (item.state === 'closed') {
+    return (
+      <div className="question question-closed">
+        <div className="question-title">The agent asked a question</div>
+        {item.result !== null &&
+          summary(item.result).map((entry) => (
+            <div key={entry.header} className="question-answer">
+              <span className="question-chip">{entry.header}</span>
+              <span className={`question-status question-status-${entry.status}`}>{questionStatusWord(entry.status)}</span>
+              {entry.lines.map((line, i) => (
+                <div key={i} className="question-line">
+                  {line}
+                </div>
+              ))}
+            </div>
+          ))}
+        {item.note !== null && <div className="question-note">{item.note}</div>}
+      </div>
+    );
+  }
+
+  if (item.state === 'resolved' && item.result !== null) {
+    return (
+      <div className="question question-resolved">
+        <div className="question-title">The agent asked a question</div>
+        {summary(item.result).map((entry) => (
+          <div key={entry.header} className="question-answer">
+            <span className="question-chip">{entry.header}</span>
+            <span className={`question-status question-status-${entry.status}`}>{questionStatusWord(entry.status)}</span>
+            {entry.lines.map((line, i) => (
+              <div key={i} className="question-line">
+                {line}
+              </div>
+            ))}
+          </div>
+        ))}
+      </div>
+    );
+  }
+
+  if (item.state === 'answering') {
+    return (
+      <div className="question question-answering">
+        <div className="question-title">The agent asked a question</div>
+        <div className="question-note">Sending the answers...</div>
+      </div>
+    );
+  }
+
+  return <QuestionForm item={item} onAnswer={onAnswer} />;
+}
+
+/**
+ * The stepped form of a pending question, or a failed send retried from its answers. A failed card restores its
+ * drafts from the answers it sent and starts at the first unsettled question. Once an answer is sent, further
+ * Enter/clicks are ignored (the card unmounts to the wait on the re-render; the guard covers the double event
+ * before it). A failed card with every draft settled offers Retry on any step, not just the last one.
+ */
+function QuestionForm({ item, onAnswer }: { item: QuestionItem; onAnswer: (callId: string, answers: QuestionAnswerInput[]) => void }) {
+  const failed = item.state === 'failed';
+  const startDrafts = failed && item.answers !== null ? draftsFromAnswers(item.questions, item.answers) : newDrafts(item.questions.length);
+  const [drafts, setDrafts] = useState<QuestionDraft[]>(startDrafts);
+  const [step, setStep] = useState(() => Math.min(firstUnsettled(startDrafts), Math.max(0, item.questions.length - 1)));
+  // Set when the step changes by Back/Next/Skip/Enter, so focus moves to the new question's first option. Never set on
+  // arrival: the card must not steal the input bar's focus when it appears.
+  const advanced = useRef(false);
+  const stepRef = useRef<HTMLDivElement | null>(null);
+  // Set on the first send (Submit, Retry, Skip all, or Enter on the last step). Double Enter/click before the
+  // re-render must not call onAnswer twice. A retry is a fresh mount (the wait unmounted this one), so no reset.
+  const sent = useRef(false);
+  useEffect(() => {
+    if (!advanced.current) {
+      return;
+    }
+    advanced.current = false;
+    stepRef.current?.querySelector('input')?.focus();
+  }, [step]);
+
+  const question = item.questions[step];
+  if (question === undefined) {
+    return (
+      <div className={`question${failed ? ' question-failed' : ''}`}>
+        <div className="question-title">The agent asked a question</div>
+      </div>
+    );
+  }
+  const draft = drafts[step] ?? { selected: [], other: '', skipped: false };
+  const last = step === item.questions.length - 1;
+  const complete = isComplete(drafts);
+  const group = `question-${item.callId}-q${step}`;
+  const labelId = `question-${item.callId}-q${step}-label`;
+
+  /** Sends the answers once; further Enter/clicks before the re-render are ignored. */
+  const send = (answers: QuestionAnswerInput[]) => {
+    if (sent.current) {
+      return;
+    }
+    sent.current = true;
+    onAnswer(item.callId, answers);
+  };
+
+  /** Settles the step and moves on: Next, or Submit on the last step when every question is settled. */
+  const advance = (next: QuestionDraft[]) => {
+    if (!last) {
+      advanced.current = true;
+      setDrafts(next);
+      setStep(step + 1);
+    } else if (isComplete(next)) {
+      send(payload(item.questions, next));
+    } else {
+      setDrafts(next);
+    }
+  };
+  const submit = () => {
+    if (complete) {
+      send(payload(item.questions, drafts));
+    }
+  };
+  const back = () => {
+    if (step > 0) {
+      advanced.current = true;
+      setStep(step - 1);
+    }
+  };
+  /** Skipping settles the question and moves on (or submits from the last step when complete); unskipping stays. */
+  const skipStep = () => {
+    const next = toggleSkip(drafts, step);
+    if (!draft.skipped) {
+      advance(next);
+    } else {
+      setDrafts(next);
+    }
+  };
+  const skipAll = () => {
+    const skipped = drafts.map(() => ({ selected: [], other: '', skipped: true }));
+    setDrafts(skipped);
+    send(payload(item.questions, skipped));
+  };
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key !== 'Enter') {
+      return;
+    }
+    const target = e.target;
+    if (!(target instanceof HTMLInputElement)) {
+      // Buttons keep their native behaviour.
+      return;
+    }
+    let intent: EnterIntent;
+    if (target.type === 'radio' || target.type === 'checkbox') {
+      intent = enterIntent({ kind: 'option', multiple: question.multiple });
+    } else {
+      intent = enterIntent({ kind: 'other', empty: target.value.trim() === '' });
+    }
+    if (intent === 'native' || intent === 'none') {
+      return;
+    }
+    e.preventDefault();
+    if (intent === 'keep') {
+      advance(drafts);
+      return;
+    }
+    const oi = Number(target.dataset.option ?? -1);
+    if (!Number.isInteger(oi) || oi < 0 || oi >= question.options.length) {
+      return;
+    }
+    const next = pickOption(drafts, step, oi, question.multiple);
+    if (intent === 'toggle') {
+      setDrafts(next);
+    } else {
+      advance(next);
+    }
+  };
+  return (
+    <div className={`question${failed ? ' question-failed' : ''}`} onKeyDown={onKeyDown}>
+      <div className="question-title">
+        The agent asked a question <span className="question-counter">{`${step + 1} / ${item.questions.length}`}</span>
+      </div>
+      <div
+        ref={stepRef}
+        key={question.id}
+        role="group"
+        aria-labelledby={labelId}
+        className={`question-item${draft.skipped ? ' is-skipped' : ''}`}
+      >
+        <div className="question-head" id={labelId}>
+          <span className="question-chip">{question.header}</span>
+          <span className="question-text">{question.question}</span>
+        </div>
+        {question.multiple && <div className="question-hint">Select all that apply</div>}
+        {question.options.map((option, oi) => (
+          <label key={oi} className="question-option">
+            <input
+              type={question.multiple ? 'checkbox' : 'radio'}
+              name={group}
+              data-option={oi}
+              checked={draft.selected.includes(oi)}
+              disabled={draft.skipped}
+              onChange={() => setDrafts((d) => pickOption(d, step, oi, question.multiple))}
+            />
+            <span className="question-label">{option.label}</span>
+            {option.recommended && <span className="question-recommended">Recommended</span>}
+            {option.description !== '' && <span className="question-description">{option.description}</span>}
+          </label>
+        ))}
+        <input
+          type="text"
+          className="question-other"
+          placeholder="Other..."
+          aria-label="Other answer"
+          value={draft.other}
+          disabled={draft.skipped}
+          onChange={(e) => setDrafts((d) => setOther(d, step, e.target.value, question.multiple))}
+        />
+        <button type="button" className="question-skip" aria-pressed={draft.skipped} onClick={skipStep}>
+          {draft.skipped ? 'Unskip' : 'Skip'}
+        </button>
+      </div>
+      {failed && item.error !== null && <div className="question-error">{item.error}</div>}
+      <div className="question-actions">
+        {step > 0 && (
+          <button type="button" className="question-back" onClick={back}>
+            Back
+          </button>
+        )}
+        {last ? (
+          <button type="button" className="question-submit" disabled={!complete} onClick={submit}>
+            {failed ? 'Retry' : 'Submit'}
+          </button>
+        ) : (
+          <>
+            <button type="button" className="question-next" disabled={!settled(draft)} onClick={() => advance(drafts)}>
+              Next
+            </button>
+            {failed && complete && (
+              <button type="button" className="question-submit" onClick={submit}>
+                Retry
+              </button>
+            )}
+          </>
+        )}
+        <button type="button" className="question-skip-all" onClick={skipAll}>
+          Skip all
+        </button>
+      </div>
+    </div>
+  );
 }
 
 /** How long the check mark stays after a copy. */

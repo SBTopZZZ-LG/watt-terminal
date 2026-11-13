@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { approvalTitle, EMPTY_TRANSCRIPT, firstPendingApproval, isBusy, MAX_ITEMS, TRIM_NOTE, transcriptReducer } from './transcript';
+import type { QuestionSpec } from './types';
 import type { Transcript, TranscriptAction } from './transcript';
 
 function run(actions: TranscriptAction[], start: Transcript = EMPTY_TRANSCRIPT): Transcript {
@@ -188,6 +189,14 @@ describe('transcriptReducer: local actions', () => {
     expect(after.items[after.items.length - 1]).toMatchObject({ kind: 'notice', text: 'New shell session started.' });
     expect(firstPendingApproval(after)).toBeNull();
     expect(isBusy(after)).toBe(false);
+  });
+
+  it('a notice keeps its muted flag, and defaults to unmuted', () => {
+    const muted = run([{ type: 'notice', text: 'info', muted: true }]);
+    expect(muted.items[0]).toMatchObject({ kind: 'notice', text: 'info', muted: true });
+    const plain = run([{ type: 'notice', text: 'warn' }]);
+    expect(plain.items[0]).toMatchObject({ kind: 'notice', text: 'warn' });
+    expect(plain.items[0]).not.toHaveProperty('muted');
   });
 
   it('the transcript stays bounded, and ids keep increasing', () => {
@@ -394,6 +403,120 @@ describe('transcriptReducer: conversation_reset', () => {
 
     const next = transcriptReducer(after, { type: 'notice', text: 'fresh' });
     expect(next.items[0].id).toBeGreaterThan(before.nextId - 1);
+  });
+});
+
+describe('transcriptReducer: clarification questions', () => {
+  const questions: QuestionSpec[] = [
+    {
+      id: 'q1',
+      question: 'Which capa?',
+      header: 'Capa',
+      options: [
+        { label: 'a', description: 'first', recommended: true },
+        { label: 'b', description: '', recommended: false },
+      ],
+      multiple: false,
+    },
+  ];
+  const request: TranscriptAction = { type: 'agent_event', event: { type: 'question_request', call_id: 'q-call', questions } };
+  const answers = [{ question_id: 'q1', selected: [0], skipped: false }];
+  const resultValue = { answers: [{ question_id: 'q1', question: 'Which capa?', header: 'Capa', status: 'answered', selected: ['a'] }] };
+  const resultOk: TranscriptAction = {
+    type: 'agent_event',
+    event: { type: 'tool_result', call_id: 'q-call', name: 'ask_user', ok: true, decision: 'read', result: resultValue },
+  };
+
+  it('a question request adds a pending card, and no tool row', () => {
+    const t = run([
+      request,
+      { type: 'agent_event', event: { type: 'tool_call', call_id: 'q-call', name: 'ask_user', args: {} } },
+    ]);
+    expect(t.items.map((i) => i.kind)).toEqual(['question']);
+    expect(t.items[0]).toMatchObject({ kind: 'question', callId: 'q-call', state: 'pending', questions, answers: null, result: null, error: null });
+  });
+
+  it('a question is not a pending approval and does not make the transcript busy', () => {
+    const t = run([request]);
+    expect(firstPendingApproval(t)).toBeNull();
+    expect(isBusy(t)).toBe(false);
+  });
+
+  it('answering marks the card, and its result resolves it with the parsed outcome', () => {
+    const sending = transcriptReducer(run([request]), { type: 'question_answering', callId: 'q-call', answers });
+    expect(sending.items[0]).toMatchObject({ kind: 'question', state: 'answering', answers });
+    const done = transcriptReducer(sending, resultOk);
+    expect(done.items[0]).toMatchObject({ kind: 'question', state: 'resolved', result: resultValue, error: null });
+    expect(done.items.map((i) => i.kind)).toEqual(['question']);
+  });
+
+  it('a result with an unparsable body fails the card instead', () => {
+    const t = run([
+      request,
+      { type: 'agent_event', event: { type: 'tool_result', call_id: 'q-call', name: 'ask_user', ok: true, decision: 'read', result: 'oops' } },
+    ]);
+    expect(t.items[0]).toMatchObject({ kind: 'question', state: 'failed' });
+  });
+
+  it('a failed result (an invalid call) fails the card with the error, and adds no tool row', () => {
+    const t = run([
+      request,
+      { type: 'agent_event', event: { type: 'tool_result', call_id: 'q-call', name: 'ask_user', ok: false, decision: 'read', result: { error: 'no questions' } } },
+    ]);
+    expect(t.items.map((i) => i.kind)).toEqual(['question']);
+    expect(t.items[0]).toMatchObject({ kind: 'question', state: 'failed', error: 'no questions' });
+  });
+
+  it('an ask_user result with no card (an invalid call, which never asked) shows nothing', () => {
+    const t = run([
+      { type: 'agent_event', event: { type: 'tool_call', call_id: 'bad', name: 'ask_user', args: {} } },
+      { type: 'agent_event', event: { type: 'tool_result', call_id: 'bad', name: 'ask_user', ok: false, decision: 'read', result: { error: 'no questions' } } },
+    ]);
+    expect(t.items).toEqual([]);
+  });
+
+  it('a failed send marks the card failed with the reason, and a retry sends again', () => {
+    const sending = transcriptReducer(run([request]), { type: 'question_answering', callId: 'q-call', answers });
+    const failed = transcriptReducer(sending, { type: 'question_failed', callId: 'q-call', message: 'no pending question q-call' });
+    expect(failed.items[0]).toMatchObject({ kind: 'question', state: 'failed', error: 'no pending question q-call' });
+    expect(failed.items).toHaveLength(1);
+    const retry = transcriptReducer(failed, { type: 'question_answering', callId: 'q-call', answers });
+    expect(retry.items[0]).toMatchObject({ kind: 'question', state: 'answering', error: null });
+  });
+
+  it('done closes a still-pending question, and leaves a resolved one alone', () => {
+    const pending = run([request, done]);
+    expect(pending.items[0]).toMatchObject({ kind: 'question', state: 'closed', note: 'The turn ended before this question was answered.' });
+    expect(pending.items[0]).not.toMatchObject({ kind: 'tool' });
+    const resolved = run([request, resultOk, done]);
+    expect(resolved.items[0]).toMatchObject({ kind: 'question', state: 'resolved' });
+    expect(isBusy(resolved)).toBe(false);
+  });
+
+  it('a failed send stays retryable through done', () => {
+    const sending = transcriptReducer(run([request]), { type: 'question_answering', callId: 'q-call', answers });
+    const failed = transcriptReducer(sending, { type: 'question_failed', callId: 'q-call', message: 'no pending question q-call' });
+    const after = transcriptReducer(failed, done);
+    expect(after.items[0]).toMatchObject({ kind: 'question', state: 'failed', error: 'no pending question q-call' });
+  });
+
+  it('a session reset closes a waiting question, and keeps a resolved one and a failed send', () => {
+    const before = run([request, resultOk]);
+    const asked = run([{ type: 'agent_event', event: { type: 'question_request', call_id: 'q2', questions } }], before);
+    const after = transcriptReducer(asked, { type: 'session_reset' });
+    expect(after.items[0]).toMatchObject({ kind: 'question', state: 'resolved' });
+    expect(after.items[1]).toMatchObject({ kind: 'question', state: 'closed', note: 'The shell restarted before this question was answered.' });
+    const sending = transcriptReducer(run([request]), { type: 'question_answering', callId: 'q-call', answers });
+    const failed = transcriptReducer(sending, { type: 'question_failed', callId: 'q-call', message: 'gone' });
+    const reset = transcriptReducer(failed, { type: 'session_reset' });
+    expect(reset.items[0]).toMatchObject({ kind: 'question', state: 'failed', error: 'gone' });
+    const resetWhileSending = transcriptReducer(sending, { type: 'session_reset' });
+    expect(resetWhileSending.items[0]).toMatchObject({ kind: 'question', state: 'closed' });
+  });
+
+  it('a conversation reset clears the cards normally', () => {
+    const after = run([request, resultOk, { type: 'conversation_reset' }]);
+    expect(after.items).toEqual([]);
   });
 });
 

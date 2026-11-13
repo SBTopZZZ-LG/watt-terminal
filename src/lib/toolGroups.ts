@@ -4,6 +4,7 @@
 import { isDeclinedIntegration } from './integrate';
 import { buildFrames } from './interactive';
 import type { FrameNode, GroupEnd } from './interactive';
+import { toolCaption } from './toolDisplay';
 import type { TranscriptItem } from './transcript';
 import { visibleEscapes } from './visibleEscapes';
 
@@ -98,8 +99,8 @@ function collapseRun(run: TranscriptItem[]): TranscriptEntry[] {
 }
 
 /**
- * The one-line summary of a group: the call count, the tool names with repeat counts, then the status. A call still
- * running names the last one; failures and denials are counted or named after it.
+ * The one-line summary of a group: the call count, the tool names with repeat counts, the first caption, then the
+ * status. A call still running names the last one; failures and denials are counted or named after it.
  */
 export function toolGroupSummary(items: GroupItem[]): string {
   const tools = items.filter((i): i is ToolItem => i.kind === 'tool');
@@ -109,6 +110,16 @@ export function toolGroupSummary(items: GroupItem[]): string {
   }
   const names = [...counts].map(([name, n]) => (n > 1 ? `${visibleEscapes(name)} ×${n}` : visibleEscapes(name))).join(', ');
   let text = `${tools.length === 1 ? '1 tool call' : `${tools.length} tool calls`}: ${names}`;
+
+  // A collapsed group says what its first call does; the expanded rows show every caption. More captions hide
+  // behind an ellipsis.
+  const captions = tools.map((t) => toolCaption(t.args)).filter((c): c is string => c !== null);
+  if (captions.length > 0) {
+    text += ` · ${captions[0]}`;
+    if (captions.length > 1) {
+      text += ' …';
+    }
+  }
 
   const running = [...tools].reverse().find((t) => t.status === 'running');
   if (running) {

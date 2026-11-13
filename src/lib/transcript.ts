@@ -1,13 +1,20 @@
 // The agent transcript: what the user said, what the agent said, its tool calls, and approval requests.
 // Pure reducer over AgentEvents (from Rust) and local actions (sent messages, clicks, errors).
 
-import type { AgentEvent, ApprovalReasonCode, ContextUsage, RecordSummary, TodoItem, ToolDecision } from './types';
+import type { AgentEvent, ApprovalReasonCode, ContextUsage, QuestionAnswerInput, QuestionResult, QuestionSpec, RecordSummary, TodoItem, ToolDecision } from './types';
 import { visibleEscapes } from './visibleEscapes';
 import { TODO_TOOL } from './todoView';
+import { ASK_USER_TOOL, closedResult, parseResult } from './questions';
 import { openFramesBelow, openRecordIds, openedBy } from './interactive';
 
 export type ToolStatus = 'running' | 'ok' | 'failed';
 export type ApprovalState = 'pending' | 'answering' | 'resolved';
+/**
+ * A clarification question: `pending` waits for the user, `answering` sent the answers, `resolved` settled, `failed`
+ * did not send (retryable), `closed` can no longer be answered (the shell restarted, the turn ended, or a saved call
+ * had no result).
+ */
+export type QuestionState = 'pending' | 'answering' | 'resolved' | 'failed' | 'closed';
 
 /** An attachment on a message the user sent. `kind` is 'file' for a text document. `thumb` is a data URL, for an image. */
 export interface UserAttachment {
@@ -33,6 +40,12 @@ export type TranscriptItem =
    * `display` is the decoded input of a send_keys card (null for the others, and for a card from an older backend).
    */
   | { id: number; kind: 'approval'; callId: string; name: string; text: string; display: string | null; state: ApprovalState; approve: boolean | null; reason: ApprovalReasonCode | null; location: string | null }
+  /**
+   * The agent's clarification question (`ask_user`). `questions` are the backend's, with its ids. `answers` are the
+   * ones sent (or being sent); `result` is the settled outcome once the tool result arrives. `error` is why a send
+   * failed (retryable). `note` is why a closed question can no longer be answered.
+   */
+  | { id: number; kind: 'question'; callId: string; questions: QuestionSpec[]; state: QuestionState; answers: QuestionAnswerInput[] | null; result: QuestionResult | null; error: string | null; note: string | null }
   /**
    * The command an interactive group opened on has ended (see interactive.ts). Not shown: it closes the group. `integrated` is set
    * when a shell level was pushed above the command (levels_changed), so the group ends while the command may still run.
@@ -103,7 +116,11 @@ export type TranscriptAction =
   | { type: 'user_failed'; clientId: number; message: string }
   | { type: 'approval_answering'; callId: string; approve: boolean }
   | { type: 'approval_failed'; callId: string; message: string }
-  | { type: 'notice'; text: string }
+  /** The user's answers to a question were sent (or are being sent). The card shows the wait until its result arrives. */
+  | { type: 'question_answering'; callId: string; answers: QuestionAnswerInput[] }
+  /** Sending the answers failed: the card is back to pending, with the reason shown. */
+  | { type: 'question_failed'; callId: string; message: string }
+  | { type: 'notice'; text: string; muted?: boolean }
   /** Set from the status snapshot at startup, when a turn may already be running. */
   | { type: 'sync_busy'; busy: boolean }
   /** A new shell replaced the old one. Pending approvals and running tools can never finish, so they are closed. */
@@ -171,14 +188,38 @@ export function transcriptReducer(t: Transcript, action: TranscriptAction): Tran
       );
       return add({ ...t, items }, (id) => ({ id, kind: 'notice', text: action.message }));
     }
+    case 'question_answering':
+      return {
+        ...t,
+        items: t.items.map((i) =>
+          i.kind === 'question' && i.callId === action.callId && (i.state === 'pending' || i.state === 'failed')
+            ? { ...i, state: 'answering', answers: action.answers, error: null }
+            : i,
+        ),
+      };
+    case 'question_failed':
+      // The send failed: the card keeps the error and the answers, so the user can retry them.
+      return {
+        ...t,
+        items: t.items.map((i) =>
+          i.kind === 'question' && i.callId === action.callId && i.state === 'answering'
+            ? { ...i, state: 'failed' as const, error: action.message }
+            : i,
+        ),
+      };
     case 'notice':
-      return add(t, (id) => ({ id, kind: 'notice', text: action.text }));
+      return add(t, (id) => ({ id, kind: 'notice', text: action.text, ...(action.muted ? { muted: true } : {}) }));
     case 'sync_busy':
       return { ...t, inFlight: action.busy ? Math.max(1, t.inFlight) : 0 };
     case 'session_reset': {
       const items = t.items.map((i): TranscriptItem => {
         if (i.kind === 'approval' && i.state !== 'resolved') {
           return { ...i, state: 'resolved' };
+        }
+        // A question still waiting can never be answered now: the turn is gone with the old shell. A failed send
+        // keeps its error and stays retryable.
+        if (i.kind === 'question' && (i.state === 'pending' || i.state === 'answering')) {
+          return { ...i, state: 'closed', result: closedResult(i.questions), note: 'The shell restarted before this question was answered.' };
         }
         if (i.kind === 'tool' && i.status === 'running') {
           return { ...i, status: 'failed' };
@@ -220,6 +261,36 @@ function keyed(item: NewItem, id: number): TranscriptItem {
   return (item.kind === 'agent' ? { ...item, id, streaming: false } : { ...item, id }) as TranscriptItem;
 }
 
+/** Resolves a question card with its tool result. An invalid call has no card (nothing asked), so it is ignored. */
+function resolveQuestion(t: Transcript, callId: string, ok: boolean, result: unknown): Transcript {
+  if (!t.items.some((i) => i.kind === 'question' && i.callId === callId)) {
+    return t;
+  }
+  const parsed = ok ? parseResult(result) : null;
+  const error = ok ? null : resultError(result);
+  return {
+    ...t,
+    items: t.items.map((i) => {
+      if (i.kind !== 'question' || i.callId !== callId) {
+        return i;
+      }
+  if (parsed !== null) {
+      return { ...i, state: 'resolved' as const, result: parsed, error: null, note: null };
+    }
+    return { ...i, state: 'failed' as const, error: error ?? 'The answer could not be read.', note: null };
+    }),
+  };
+}
+
+/** The error text of a failed tool result (`{error: string}`), for the question card. Null when it has none. */
+function resultError(result: unknown): string | null {
+  if (typeof result === 'object' && result !== null && !Array.isArray(result)) {
+    const error = (result as Record<string, unknown>).error;
+    return typeof error === 'string' && error !== '' ? error : null;
+  }
+  return null;
+}
+
 function applyAgentEvent(t: Transcript, ev: AgentEvent, at: number | undefined): Transcript {
   switch (ev.type) {
     case 'text':
@@ -230,7 +301,8 @@ function applyAgentEvent(t: Transcript, ev: AgentEvent, at: number | undefined):
       return { ...t, thinking: ev.active };
     case 'tool_call':
       // The todo tool's rows are not shown: the panel is the view of the list, so the call is not an item (or in flight).
-      if (ev.name === TODO_TOOL) {
+      // The question tool's rows are not shown either: the card is the view of the question.
+      if (ev.name === TODO_TOOL || ev.name === ASK_USER_TOOL) {
         return t;
       }
       return add(t, (id) => ({
@@ -246,6 +318,10 @@ function applyAgentEvent(t: Transcript, ev: AgentEvent, at: number | undefined):
         startedAt: at,
       }));
     case 'tool_result': {
+      // A question's result resolves its card, and never adds a tool row (see tool_call).
+      if (ev.name === ASK_USER_TOOL) {
+        return resolveQuestion(t, ev.call_id, ev.ok, ev.result);
+      }
       if (ev.name === TODO_TOOL) {
         return t;
       }
@@ -295,9 +371,32 @@ function applyAgentEvent(t: Transcript, ev: AgentEvent, at: number | undefined):
         reason: ev.reason ?? null,
         location: ev.location ?? null,
       }));
+    case 'question_request':
+      return add(t, (id) => ({
+        id,
+        kind: 'question',
+        callId: ev.call_id,
+        questions: ev.questions,
+        state: 'pending',
+        answers: null,
+        result: null,
+        error: null,
+        note: null,
+      }));
     case 'done':
-      // The turn is over: the streamed message (if any) is closed, and so is the thinking state.
-      return { ...t, items: closeStream(t.items), inFlight: Math.max(0, t.inFlight - 1), thinking: false };
+      // The turn is over: the streamed message (if any) is closed, and so is the thinking state. A question still
+      // waiting can never be answered now, so it closes (defensive: settled questions already resolved, and a failed
+      // send stays retryable).
+      return {
+        ...t,
+        items: closeStream(t.items).map((i): TranscriptItem =>
+          i.kind === 'question' && i.state === 'pending'
+            ? { ...i, state: 'closed', result: closedResult(i.questions), note: 'The turn ended before this question was answered.' }
+            : i,
+        ),
+        inFlight: Math.max(0, t.inFlight - 1),
+        thinking: false,
+      };
     // Drives the terminal border (see agentControl.ts), not the transcript.
     case 'agent_control':
       return t;

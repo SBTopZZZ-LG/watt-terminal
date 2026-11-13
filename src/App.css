@@ -375,12 +375,16 @@ input {
   text-transform: none;
 }
 
+/* The model chip takes its content width and only shrinks with an ellipsis when the strip is out of room (flex 0 1
+   auto, basis auto; no flex-grow, so it stays snug around its text instead of filling empty space). No max-width cap:
+   long model/variant labels use free strip space. The full text stays in the title attribute. */
 .chip-model {
   font-family: var(--mono);
-  max-width: 260px;
+  flex: 0 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
   letter-spacing: 0;
   text-transform: none;
 }
@@ -1126,6 +1130,8 @@ input {
 
 .notice {
   color: var(--warn);
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 /* A quiet note in the transcript, such as the trim note: the muted colour, not the warning one. */
@@ -1526,6 +1532,62 @@ input {
   font-size: 12px;
 }
 
+/* A tool row's summary is two lines: the name, caption, decision and status, then the command or typed input. Both
+   lines are blocks that shrink to nothing, so the row holds at a 240px side dock; the first line wraps, the detail
+   stays one line and ellipsises. The native marker is hidden and replaced with a custom ▸/▾ in its own grid
+   column, so the marker stays aligned with the first line instead of being forced onto its own line. */
+.tool:not(.tool-group) > summary {
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr);
+  column-gap: 4px;
+  align-items: start;
+  list-style: none;
+}
+
+.tool:not(.tool-group) > summary::-webkit-details-marker {
+  display: none;
+}
+
+.tool:not(.tool-group) > summary::before {
+  content: "▸";
+  grid-column: 1;
+  grid-row: 1;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.7;
+}
+
+.tool:not(.tool-group)[open] > summary::before {
+  content: "▾";
+}
+
+.tool-summary {
+  display: block;
+  grid-column: 2;
+  grid-row: 1;
+  min-width: 0;
+}
+
+.tool-line {
+  display: block;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.tool-caption {
+  color: var(--muted);
+}
+
+.tool-detail {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 11px;
+  color: var(--muted);
+}
+
 .tool-failed summary {
   color: var(--fail);
 }
@@ -1727,6 +1789,251 @@ input {
 .approval-actions .deny {
   border-color: var(--fail);
   color: var(--fail);
+}
+
+/*
+ * A clarification question card (the ask_user tool). The accent frame marks it as the agent asking the user, not
+ * asking for approval (the warn frame). The card has no inner scroll; long content scrolls with the transcript
+ * body. Whole-pixel sizes throughout; wraps at any dock width.
+ */
+.question {
+  margin: 6px 0;
+  padding: 8px 10px;
+  border: 1px solid var(--accent);
+  border-radius: 2px;
+  background: var(--tint);
+  overflow-wrap: anywhere;
+}
+
+.question-resolved,
+.question-closed {
+  border-color: var(--line);
+  background: transparent;
+}
+
+.question-title {
+  margin-bottom: 6px;
+  color: var(--accent);
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.question-resolved .question-title,
+.question-closed .question-title {
+  color: var(--muted);
+}
+
+/* The stepped form's counter ("1 / 3"), after the title. Muted like the resolved title, whole pixels throughout. */
+.question-counter {
+  margin-left: 6px;
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  white-space: nowrap;
+}
+
+.question-item {
+  margin: 0 0 8px;
+  padding: 6px 8px;
+  border: 1px dashed var(--line);
+  border-radius: 2px;
+}
+
+.question-head {
+  margin-bottom: 2px;
+}
+
+.question-chip {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 1px 6px;
+  border: 1px solid var(--accent);
+  border-radius: 2px;
+  color: var(--accent);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.question-text {
+  color: var(--ink-strong);
+  font-size: 12px;
+}
+
+/* Multi-select only: the toggle-only Enter behaviour is not discoverable without it. */
+.question-hint {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.question-option {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+  align-items: baseline;
+  margin-top: 6px;
+  color: var(--ink);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.question-option input {
+  flex: 0 0 auto;
+  width: 12px;
+  height: 12px;
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.question-label {
+  color: var(--ink-strong);
+}
+
+.question-recommended {
+  padding: 0 6px;
+  border-radius: 2px;
+  background: var(--accent);
+  color: var(--bg);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.question-description {
+  flex: 1 1 100%;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.question-other {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  margin-top: 6px;
+  padding: 4px 6px;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  background: var(--bg);
+  font-size: 12px;
+}
+
+.question-other:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.question-skip {
+  margin-top: 6px;
+  padding: 2px 8px;
+  border: 1px dashed var(--rule);
+  border-radius: 2px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.question-skip[aria-pressed="true"] {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+.question-item.is-skipped .question-option,
+.question-item.is-skipped .question-other {
+  opacity: 0.5;
+}
+
+.question-error {
+  margin-top: 6px;
+  color: var(--fail);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.question-note {
+  color: var(--muted);
+  padding: 4px 0;
+}
+
+.question-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.question-actions button {
+  padding: 4px 10px;
+  border: 1px dashed var(--line);
+  border-radius: 2px;
+  background: var(--bg);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.question-actions button:focus-visible,
+.question-skip:focus-visible,
+.question-other:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.question-submit {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.question-submit:disabled,
+.question-next:disabled,
+.question-back:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.question-skip-all {
+  color: var(--muted);
+}
+
+.question-answer {
+  margin-top: 6px;
+  font-size: 12px;
+}
+
+.question-status {
+  margin-left: 6px;
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.question-status-answered {
+  color: var(--ok);
+}
+
+.question-status-skipped,
+.question-status-timed_out,
+.question-status-cancelled {
+  color: var(--warn);
+}
+
+.question-line {
+  margin-top: 2px;
+  color: var(--ink);
+}
+
+/* A side panel: the card's buttons wrap, like the approval card's. */
+.agent-panel.dock-left .question-actions,
+.agent-panel.dock-right .question-actions {
+  flex-wrap: wrap;
 }
 
 /* ---------- input bar ---------- */
@@ -2078,6 +2385,75 @@ input {
 .bar-restart:disabled {
   opacity: 0.5;
   cursor: default;
+}
+
+/*
+ * The slash-command autocomplete menu. It floats above the bar (the bar is its offset parent), full width with
+ * 12px insets, so it fits even in a 240px side dock. Capped in height and scrolled inside: the rows never push
+ * the bar down. No animation.
+ */
+.command-menu {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: calc(100% + 4px);
+  z-index: 10;
+  max-height: 160px;
+  overflow-y: auto;
+  margin: 0;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  background: var(--panel);
+  box-shadow: 0 -4px 12px var(--shadow);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: normal;
+}
+
+.command-menu-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  padding: 4px 8px;
+  border-radius: 2px;
+  cursor: pointer;
+}
+
+.command-menu-item.is-selected {
+  background: var(--tint);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.command-menu-name {
+  flex: 0 0 auto;
+  color: var(--ink-strong);
+  white-space: nowrap;
+}
+
+.command-menu-hint {
+  flex: 0 0 auto;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.command-menu-description {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.command-menu-source {
+  flex: 0 0 auto;
+  padding: 0 4px;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  color: var(--muted);
+  white-space: nowrap;
 }
 
 /* ---------- conversation history (the panel body's History view) ---------- */
@@ -3050,6 +3426,92 @@ input {
   overflow-wrap: anywhere;
 }
 
+/* Variants: the per-model expandable list. Manual rows edit in place; auto rows are read-only. Narrow-safe: the fields
+   wrap, and the body scrolls sideways instead of pushing the dialog wider. */
+.settings-variants {
+  margin-top: 4px;
+}
+
+.settings-variants summary {
+  color: var(--muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.settings-variants-list {
+  margin: 4px 0;
+  padding: 0;
+  list-style: none;
+}
+
+.settings-variant {
+  margin-top: 4px;
+  padding: 6px;
+  border: 1px dashed var(--rule);
+  border-radius: 2px;
+}
+
+.settings-variant-id {
+  color: var(--ink-strong);
+  overflow-wrap: anywhere;
+}
+
+.settings-variant-fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 4px 0;
+}
+
+.settings-variant-body-label {
+  flex: 1 1 100%;
+}
+
+.settings-variant-body-label textarea {
+  width: 100%;
+  min-height: 3.2em;
+  resize: vertical;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.settings-variant-body {
+  max-width: 100%;
+  overflow-x: auto;
+  margin: 4px 0;
+  padding: 4px 6px;
+  border-radius: 2px;
+  background: var(--tint);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.settings-variant-add {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  margin-top: 6px;
+}
+
+.settings-variant-add input[type="text"] {
+  flex: 1 1 120px;
+  min-width: 0;
+}
+
+.settings-variant-add textarea {
+  flex: 1 1 100%;
+  min-height: 2.6em;
+  resize: vertical;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
 .settings-test {
   font-size: 11px;
   overflow-wrap: anywhere;
@@ -3158,6 +3620,48 @@ input {
 .settings-confirm-foot {
   justify-content: flex-end;
   margin: 4px 0 0;
+}
+
+/* ---------- slash-command help dialog ---------- */
+
+/* The card reuses .settings-dialog (head, foot, buttons) with a narrower width: its height is the
+   content's, capped so the body scrolls on a short window. */
+.settings-dialog.help-dialog {
+  width: min(640px, 100vw - 32px);
+  height: auto;
+  max-height: min(560px, calc(100vh - 32px));
+}
+
+/* The help text scrolls inside the card, so the title and Close stay in view. */
+.help-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px 14px;
+}
+
+/* The `/help` list: pre-wrapped lines in mono, like the transcript's muted notices. */
+.help-text {
+  margin: 0;
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.help-state {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.help-state-error {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  color: var(--fail);
 }
 
 /* The chip buttons (auto-approve and the settings gear) take the same focus ring. */

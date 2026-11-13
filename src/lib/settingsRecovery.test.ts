@@ -58,6 +58,14 @@ describe('chipLabel', () => {
     expect(chipLabel(OK, { enabled: true, model: null })).toBe('model: unknown');
     expect(chipLabel(OK, LLM_OFF)).toBe('mock agent');
   });
+
+  it('appends #variant when one is selected, and never on the broken or mock states', () => {
+    expect(chipLabel(OK, { ...LLM_ON, variant: 'high' })).toBe('model: big#high');
+    expect(chipLabel(OK, { ...LLM_ON, variant: null })).toBe('model: big');
+    expect(chipLabel(OK, { ...LLM_OFF, variant: 'high' })).toBe('mock agent');
+    expect(chipLabel(BROKEN, { ...LLM_ON, variant: 'high' })).toBe('settings error');
+    expect(chipLabel(LAST_GOOD, { ...LLM_ON, variant: 'high' })).toBe('last good');
+  });
 });
 
 describe('chipBrokenTitle and recoveryExplanation', () => {

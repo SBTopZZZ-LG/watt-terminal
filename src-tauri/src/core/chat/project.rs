@@ -9,7 +9,7 @@
 use serde_json::{Value, json};
 
 use crate::core::chat::redact::Redactor;
-use crate::core::chat::todo;
+use crate::core::chat::{questions, todo};
 use crate::core::foreground::{Foreground, ForegroundKind};
 use crate::core::observer::SCREEN_HISTORY_CAP;
 use crate::core::tools::foreground_next_step;
@@ -47,6 +47,9 @@ pub fn project(name: &str, ok: bool, result: &Value, redactor: &Redactor) -> Str
             "wait" => wait_text(result, redactor),
             "send_keys" => send_keys_text(result, redactor),
             todo::TOOL_NAME => todo_write_text(result),
+            // The question result is compact JSON the history keeps whole: its own cap, not the small one, so even the
+            // largest valid answers survive. The validation bounds keep it under the cap, so it is never cut mid-JSON.
+            questions::TOOL_NAME => cap(&result.to_string(), questions::ANSWER_LIMIT),
             "request_integration" => result.as_str().unwrap_or_default().to_string(),
             "list_commands" => list_commands_text(result, redactor),
             "get_cwd" => cwd_text(Some(result)),
@@ -779,6 +782,56 @@ mod tests {
     fn todo_write_errors_reach_the_model_as_text() {
         let err = Value::String("item 2: content is empty".to_string());
         assert_eq!(project("todo_write", false, &err, &none()), "error: item 2: content is empty");
+    }
+
+    /// An `ask_user` result keeps its whole JSON under its own cap, not the small one other tools get, and is redacted
+    /// like everything else.
+    #[test]
+    fn ask_user_results_are_compact_json_and_redacted() {
+        let stored = questions::parse(&json!({"questions": [{"question": "Which?", "header": "H",
+            "options": [{"label": "a"}, {"label": "b"}]}]}))
+        .unwrap();
+        let answers = vec![questions::AnswerInput { question_id: "q1".into(), selected: vec![0], other: None, skipped: false }];
+        let value = questions::result(&stored, &answers);
+        assert_eq!(project(questions::TOOL_NAME, true, &value, &none()), value.to_string());
+        let sneaky = vec![questions::AnswerInput {
+            question_id: "q1".into(),
+            selected: Vec::new(),
+            other: Some("token hunter2-secret".into()),
+            skipped: false,
+        }];
+        let r = Redactor::new(vec!["hunter2-secret".to_string()]);
+        let shown = project(questions::TOOL_NAME, true, &questions::result(&stored, &sneaky), &r);
+        assert!(shown.contains("[REDACTED]") && !shown.contains("hunter2-secret"), "{shown}");
+    }
+
+    /// The largest valid answers fit the answer cap, so the projection never cuts them mid-JSON.
+    #[test]
+    fn the_largest_valid_answers_survive_the_projection_whole() {
+        let option = || {
+            json!({"label": "l".repeat(questions::MAX_LABEL), "description": "d".repeat(questions::MAX_DESCRIPTION)})
+        };
+        let items: Vec<Value> = (0..questions::MAX_QUESTIONS)
+            .map(|_| {
+                json!({"question": "q".repeat(questions::MAX_QUESTION), "header": "h".repeat(questions::MAX_HEADER),
+                    "multiple": true, "options": [option(), option(), option(), option()]})
+            })
+            .collect();
+        let stored = questions::parse(&json!({"questions": items})).unwrap();
+        let answers: Vec<questions::AnswerInput> = stored
+            .iter()
+            .map(|q| questions::AnswerInput {
+                question_id: q.id.clone(),
+                selected: (0..questions::MAX_OPTIONS as u32).collect(),
+                other: Some("o".repeat(questions::MAX_OTHER)),
+                skipped: false,
+            })
+            .collect();
+        let value = questions::result(&stored, &answers);
+        let shown = project(questions::TOOL_NAME, true, &value, &none());
+        assert_eq!(shown, value.to_string(), "the maximum valid result is intact, not cut");
+        let parsed: Value = serde_json::from_str(&shown).expect("the projected result parses");
+        assert_eq!(parsed, value);
     }
 
     #[test]

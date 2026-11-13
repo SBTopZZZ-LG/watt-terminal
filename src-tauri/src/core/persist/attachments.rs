@@ -68,6 +68,38 @@ impl AttachmentStore {
         remove_dir_if_exists(&self.root.join(conversation_id))
     }
 
+    /// Copies one conversation's attachment files to another conversation's directory, for a fork: the new directory
+    /// holds the same content-addressed bytes. Only valid `<sha256>.<ext>` files are copied, through `write` (atomic,
+    /// 0600), so stray files are left behind and nothing can point outside the root. A missing source directory is not
+    /// an error: a conversation without attachments forks to one without them.
+    pub fn copy_conversation(&self, from: &str, to: &str) -> io::Result<()> {
+        if !is_valid_id(from) || !is_valid_id(to) {
+            return Err(invalid_name());
+        }
+        if from == to {
+            return Ok(());
+        }
+        let entries = match fs::read_dir(self.root.join(from)) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        for entry in entries {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let (sha, ext) = name.split_once('.').unwrap_or_default();
+            if !is_sha256_hex(sha) || !matches!(ext, "png" | "jpg") {
+                continue;
+            }
+            let bytes = fs::read(entry.path())?;
+            self.write(to, sha, ext, &bytes)?;
+        }
+        Ok(())
+    }
+
     /// Removes every conversation directory whose id is not in `keep`. Entries that are not conversation directories
     /// are left alone.
     pub fn remove_except(&self, keep: &HashSet<String>) -> io::Result<()> {
@@ -277,6 +309,42 @@ mod tests {
         fs::File::open(&dir).unwrap().set_modified(SystemTime::now() + Duration::from_secs(3600)).unwrap();
         s.sweep(&HashSet::new(), SWEEP_GRACE).unwrap();
         assert_eq!(dir_names(s.root()), vec![id(13)]);
+    }
+
+    #[test]
+    fn copy_conversation_copies_only_valid_files_through_an_atomic_write() {
+        let tmp = TempDir::new();
+        let s = store(&tmp);
+        let (png, jpg) = (b"\x89PNG\r\n\x1a\npng-bytes".as_slice(), b"\xff\xd8\xffjpg-bytes".as_slice());
+        let (png_sha, jpg_sha) = (sha256_hex(png), sha256_hex(jpg));
+        s.write(&id(20), &png_sha, "png", png).unwrap();
+        s.write(&id(20), &jpg_sha, "jpg", jpg).unwrap();
+        // Strays ride along in the source directory but must not reach the copy.
+        fs::write(s.root().join(id(20)).join("notes.txt"), b"not ours").unwrap();
+        fs::write(s.root().join(id(20)).join("UPPER.png"), b"nope").unwrap();
+
+        s.copy_conversation(&id(20), &id(21)).unwrap();
+        assert_eq!(s.read(&id(21), &png_sha, "png").unwrap().as_deref(), Some(png));
+        assert_eq!(s.read(&id(21), &jpg_sha, "jpg").unwrap().as_deref(), Some(jpg));
+        let mut expected = vec![format!("{jpg_sha}.jpg"), format!("{png_sha}.png")];
+        expected.sort();
+        assert_eq!(dir_names(&s.root().join(id(21))), expected);
+        // The source is untouched.
+        assert_eq!(s.read(&id(20), &png_sha, "png").unwrap().as_deref(), Some(png));
+
+        // Copying onto itself and from a missing source are not errors and touch nothing.
+        s.copy_conversation(&id(20), &id(20)).unwrap();
+        s.copy_conversation(&id(22), &id(23)).unwrap();
+        assert!(!s.root().join(id(23)).exists(), "no directory is made for a missing source");
+    }
+
+    #[test]
+    fn copy_conversation_refuses_invalid_ids_and_touches_nothing() {
+        let tmp = TempDir::new();
+        let s = store(&tmp);
+        assert!(s.copy_conversation("nope", &id(24)).is_err());
+        assert!(s.copy_conversation(&id(24), "../ses_0").is_err());
+        assert!(!s.root().exists(), "nothing was created");
     }
 
     #[test]
