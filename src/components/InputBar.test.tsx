@@ -13,6 +13,8 @@ const BASE = {
   canApprove: false,
   busy: false,
   locked: false,
+  autoApprove: false,
+  onToggleAutoApprove: NOOP,
   focusToken: 0,
   onFocusChange: NOOP,
   onRestart: NOOP,
@@ -26,7 +28,7 @@ const BASE = {
   loadCommands: async () => ({ commands: [], project_dir: null, global_dir: null }),
 };
 
-type Props = Partial<typeof BASE>;
+type Props = Partial<typeof BASE> & { autoSuspended?: boolean };
 
 const render = (over: Props = {}) => renderToStaticMarkup(<InputBar {...BASE} {...over} />);
 
@@ -166,6 +168,52 @@ describe('InputBar: attaching files', () => {
 
   it('is not highlighted as a drop target at rest', () => {
     expect(render()).not.toContain('is-dragging');
+  });
+});
+
+describe('InputBar: the approval row', () => {
+  it('shows a muted approval label with a manual toggle in chat mode', () => {
+    const html = render();
+    expect(html).toContain('class="bar-approval"');
+    expect(html).toContain('>approval:</span>');
+    const tag = tagHolding(html, 'button', 'bar-approval-toggle');
+    expect(tag).toContain('type="button"');
+    expect(tag).toContain('aria-pressed="false"');
+    expect(tag).toContain('title="manual: each command asks"');
+    expect(tag).not.toContain('is-auto');
+    expect(tag).not.toContain('disabled=""');
+    expect(html).toContain('>manual</button>');
+    // The toggle reads as small text: no border, not even a dashed one.
+    expect(tag).not.toContain('border');
+  });
+
+  it('reads auto, pressed, and in the warn colour when approve-all is on here', () => {
+    const html = render({ autoApprove: true });
+    const tag = tagHolding(html, 'button', 'bar-approval-toggle');
+    expect(tag).toContain('aria-pressed="true"');
+    expect(tag).toContain('is-auto');
+    expect(tag).toContain('title="auto: runs commands without asking, resets when the app restarts"');
+    expect(html).toContain('>auto</button>');
+  });
+
+  it('reads manual when approve-all was switched on in another shell', () => {
+    const html = render({ autoApprove: true, autoSuspended: true });
+    expect(html).toContain('>manual</button>');
+    expect(tagHolding(html, 'button', 'bar-approval-toggle')).not.toContain('is-auto');
+  });
+
+  it('is disabled while locked', () => {
+    expect(tagHolding(render({ locked: true }), 'button', 'bar-approval-toggle')).toContain('disabled=""');
+  });
+
+  it('sits above the input row', () => {
+    const html = render();
+    expect(html.indexOf('bar-approval')).toBeLessThan(html.indexOf('bar-field'));
+  });
+
+  it('is not shown in the exited or collapsed modes', () => {
+    expect(render({ mode: 'exited' })).not.toContain('bar-approval');
+    expect(render({ mode: 'collapsed' })).not.toContain('bar-approval');
   });
 });
 

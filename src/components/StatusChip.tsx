@@ -12,10 +12,6 @@ interface Props {
   /** The foreground hint while a command runs. A program without shell integration replaces the state chip's label. */
   foreground?: Foreground | null;
   cwd: Cwd | null;
-  autoApprove: boolean;
-  /** Approve-all is on in another shell level, so it is off in the shell on top. The chip says so. */
-  autoSuspended?: boolean;
-  onToggleAutoApprove: () => void;
   /** The nested level on top, when there is one. Its label is the location chip. */
   location?: LevelInfo | null;
   /** Offers the Integrate button in the right-hand group, just before the gear, so it stays visible in a narrow strip. */
@@ -56,9 +52,6 @@ export function StatusChip(props: Props) {
     input,
     foreground = null,
     cwd,
-    autoApprove,
-    autoSuspended = false,
-    onToggleAutoApprove,
     location = null,
     canIntegrate = false,
     onIntegrate,
@@ -69,8 +62,6 @@ export function StatusChip(props: Props) {
   } = props;
   const fgChip = foregroundChip(input, foreground);
   const loc = location === null ? null : locationChip(location);
-  // Approve-all is on in this shell only when it was switched on here: a suspended one is off for the shell on top.
-  const autoOn = autoApprove && !autoSuspended;
   const modelLabel = chipLabel(settingsState, llm);
   const broken = recoveryKind(settingsState) !== 'ok';
   const modelTitle = chipBrokenTitle(settingsState) ?? `${llm.provider ? `${llm.provider} · ` : ''}${modelLabel}`;
@@ -97,18 +88,6 @@ export function StatusChip(props: Props) {
       <span className="chip chip-cwd" title={cwd ? `${cwd.host}:${cwd.path}` : undefined}>
         {formatCwd(cwd)}
       </span>
-      <button
-        type="button"
-        className={`chip chip-button${autoOn ? ' chip-warn' : ''}`}
-        onClick={onToggleAutoApprove}
-        title={
-          autoSuspended
-            ? 'Approve-all was turned on in another shell, so it does not apply here. Click to turn it on for this shell.'
-            : 'Lets the agent run commands without asking. Commands still run only at an idle prompt. Off by default.'
-        }
-      >
-        {autoSuspended ? 'auto-approve: off in this shell' : `auto-approve: ${autoOn ? 'ON' : 'off'}`}
-      </button>
       {integrating && (
         <span className="chip chip-integrating" title="The agent is integrating this shell. It was allowed to do so without asking.">
           Integrating…

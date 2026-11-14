@@ -250,6 +250,12 @@ describe('barKeyIntent', () => {
     expect(barKeyIntent('ArrowUp', { ctrl: false, shift: false }, none)).toBe('history_prev');
     expect(barKeyIntent('ArrowDown', { ctrl: false, shift: false }, none)).toBe('history_next');
   });
+
+  it('Shift+Tab toggles approve-all; plain Tab and Ctrl+Shift+Tab leave focus alone', () => {
+    expect(barKeyIntent('Tab', { ctrl: false, shift: true }, none)).toBe('toggle_approval');
+    expect(barKeyIntent('Tab', { ctrl: false, shift: false }, none)).toBe('none');
+    expect(barKeyIntent('Tab', { ctrl: true, shift: true }, none)).toBe('none');
+  });
 });
 
 describe('isFocusBarHotkey', () => {

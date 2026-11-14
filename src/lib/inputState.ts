@@ -164,6 +164,7 @@ export type BarKey =
   | 'close'
   | 'history_prev'
   | 'history_next'
+  | 'toggle_approval'
   | 'none';
 
 export interface BarKeyContext {
@@ -181,7 +182,8 @@ export interface BarKeyContext {
  * whatever the state. Enter approves the first pending approval when the input is empty and approval is armed;
  * otherwise it submits. Escape denies a pending approval, armed or not.
  * Otherwise Escape closes the bar's focus (back to the terminal). Shift-Enter is `none`, so the textarea
- * inserts a newline.
+ * inserts a newline. Shift+Tab is `toggle_approval` (the caller flips approve-all); Ctrl+Shift+Tab stays `none`,
+ * so focus can still move on with a modifier.
  */
 export function barKeyIntent(
   key: string,
@@ -203,6 +205,9 @@ export function barKeyIntent(
       return 'history_prev';
     case 'ArrowDown':
       return 'history_next';
+    case 'Tab':
+      // Plain Tab and Ctrl+Shift+Tab keep their default (focus moves on); Shift+Tab flips approve-all.
+      return mods.shift && !mods.ctrl ? 'toggle_approval' : 'none';
     default:
       return 'none';
   }

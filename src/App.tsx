@@ -1193,9 +1193,6 @@ export default function App() {
         input={effective}
         foreground={input.foreground}
         cwd={cwd}
-        autoApprove={autoApprove}
-        autoSuspended={autoSuspended}
-        onToggleAutoApprove={toggleAutoApprove}
         location={levels.length > 0 ? levels[levels.length - 1] : null}
         canIntegrate={integrate.kind === 'closed' && agentReq === null && canIntegrate(effective, input.foreground)}
         onIntegrate={openIntegrate}
@@ -1306,6 +1303,9 @@ export default function App() {
               onRestart={restartShell}
               restarting={restarting}
               onAgent={onAgent}
+              autoApprove={autoApprove}
+              autoSuspended={autoSuspended}
+              onToggleAutoApprove={toggleAutoApprove}
               modelVision={modelVision}
               onInterrupt={() => {
                 // A side command holds no shell command: cancel it without touching the terminal.

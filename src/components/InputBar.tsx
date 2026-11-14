@@ -44,6 +44,11 @@ interface Props {
   busy: boolean;
   /** An integration is running: the input takes no text and sends nothing until it answers. */
   locked: boolean;
+  /** Approve-all: the agent runs commands without asking. Shown above the input in chat mode; Shift+Tab flips it too. */
+  autoApprove: boolean;
+  /** Approve-all was switched on in another shell level, so it is off in the shell on top. The row says manual until it is switched on here. */
+  autoSuspended?: boolean;
+  onToggleAutoApprove: () => void;
   /** Bumped by the parent to move focus into the input (or the restart button, when the shell exited). */
   focusToken: number;
   /** Reports when the input gains or loses focus. */
@@ -272,6 +277,8 @@ export function InputBar(props: Props) {
   const readyCount = drafts.filter((d) => d.input !== null).length;
   const processing = drafts.some((d) => d.input === null);
   const send = sendButtonFor(busy, text, props.locked, { ready: readyCount, processing });
+  // Approve-all is on in this shell only when it was switched on here: a suspended one reads manual for the shell on top.
+  const autoOn = props.autoApprove && !props.autoSuspended;
 
   /** The send button: Stop while busy, otherwise the same as Enter. Focus stays in the input either way. */
   function onSendClick() {
@@ -341,8 +348,9 @@ export function InputBar(props: Props) {
       return;
     }
     // The menu first: plain keys move, accept or dismiss it. A Ctrl/Meta/Alt chord is not the menu's: it falls
-    // through to the bar's own handling (Ctrl-C still interrupts), as do Shift+Enter (a newline) and Shift+Tab
-    // (focus moves on). Escape dismisses the menu instead of denying or closing.
+    // through to the bar's own handling (Ctrl-C still interrupts), as does Shift+Enter (a newline). Shift+Tab
+    // toggles approve-all (Ctrl+Shift+Tab stays none, so focus moves on). Escape dismisses the menu instead of
+    // denying or closing.
     if (menuOpen && !e.ctrlKey && !e.metaKey && !e.altKey) {
       const intent = menuKeyIntent(e.key, { shift: e.shiftKey, ctrl: false, meta: false, alt: false });
       if (intent === 'next' || intent === 'prev') {
@@ -396,6 +404,13 @@ export function InputBar(props: Props) {
         e.preventDefault();
         props.onClose();
         return;
+      case 'toggle_approval':
+        // Shift+Tab flips approve-all without moving focus. Locked and non-chat modes ignore it.
+        e.preventDefault();
+        if (mode === 'chat' && !props.locked) {
+          props.onToggleAutoApprove();
+        }
+        return;
       case 'submit':
         e.preventDefault();
         if (!sending && !props.locked) {
@@ -444,6 +459,26 @@ export function InputBar(props: Props) {
       onDragLeave={onDragLeave}
       onDrop={onDrop}
     >
+      {mode === 'chat' && (
+        <div className="bar-approval">
+          <span className="bar-approval-label">approval:</span>{' '}
+          <button
+            type="button"
+            className={autoOn ? 'bar-approval-toggle is-auto' : 'bar-approval-toggle'}
+            aria-pressed={autoOn}
+            title={
+              autoOn
+                ? 'auto: runs commands without asking, resets when the app restarts'
+                : 'manual: each command asks'
+            }
+            disabled={props.locked}
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={props.onToggleAutoApprove}
+          >
+            {autoOn ? 'auto' : 'manual'}
+          </button>
+        </div>
+      )}
       {drafts.length > 0 && <AttachmentChips items={chips} onRemove={removeDraft} />}
       {showsVisionWarning(props.modelVision, drafts.filter((d) => d.input?.kind === 'image').length) && (
         <div className="bar-vision">This model may not accept images; they'd be left out.</div>

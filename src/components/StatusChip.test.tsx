@@ -17,8 +17,6 @@ function chip(llm: LlmStatus, settingsState: SettingsStateView | null) {
       observer="ok"
       input="prompt"
       cwd={null}
-      autoApprove={false}
-      onToggleAutoApprove={() => {}}
       llm={llm}
       settingsState={settingsState}
       onOpenSettings={() => {}}
@@ -106,11 +104,10 @@ describe('StatusChip: the AI settings button', () => {
     expect(out).toContain('chip-dot');
   });
 
-  it('is the last control of the strip, after the auto-approve button', () => {
+  it("the gear is the strip's last control", () => {
     const out = chip(LLM_ON, OK);
     const gearAt = out.indexOf('aria-label="AI settings"');
-    expect(out.indexOf('auto-approve')).toBeLessThan(gearAt);
-    // The gear's own <button opens at the last <button in the strip.
+    // The gear's own <button opens before its label, at the last <button in the strip.
     expect(out.lastIndexOf('<button', gearAt)).toBe(out.lastIndexOf('<button'));
   });
 });
@@ -123,8 +120,6 @@ function strip(input: InputState, foreground: Foreground | null | undefined) {
       input={input}
       foreground={foreground}
       cwd={null}
-      autoApprove={false}
-      onToggleAutoApprove={() => {}}
       llm={LLM_ON}
       settingsState={OK}
       onOpenSettings={() => {}}
@@ -176,17 +171,14 @@ describe('StatusChip: the state chip names a program without shell integration',
   });
 });
 
-/** The strip with the nested-shell props: the location, the Integrate offer and approve-all's suspended state. */
-function nestedStrip(over: { location?: LevelInfo | null; canIntegrate?: boolean; autoApprove?: boolean; autoSuspended?: boolean }) {
+/** The strip with the nested-shell props: the location and the Integrate offer. */
+function nestedStrip(over: { location?: LevelInfo | null; canIntegrate?: boolean }) {
   return renderToStaticMarkup(
     <StatusChip
       integration="live"
       observer="ok"
       input="prompt"
       cwd={null}
-      autoApprove={over.autoApprove ?? false}
-      autoSuspended={over.autoSuspended}
-      onToggleAutoApprove={() => {}}
       location={over.location ?? null}
       canIntegrate={over.canIntegrate ?? false}
       onIntegrate={() => {}}
@@ -199,7 +191,7 @@ function nestedStrip(over: { location?: LevelInfo | null; canIntegrate?: boolean
 
 const REMOTE: LevelInfo = { key: 1, kind: 'remote', label: 'ssh ubuntu@lidia', sh: 'zsh', host: 'lidia', user: 'ubuntu', state: 'prompt' };
 
-describe('StatusChip: the location chip, the Integrate button, approve-all in another shell', () => {
+describe('StatusChip: the location chip and the Integrate button', () => {
   it('no nested level: no location chip', () => {
     expect(nestedStrip({})).not.toContain('chip-location');
   });
@@ -215,10 +207,9 @@ describe('StatusChip: the location chip, the Integrate button, approve-all in an
     expect(out).toMatch(/<button[^>]*chip-integrate[^>]*aria-label="Integrate this shell"[^>]*>Integrate<\/button>/);
   });
 
-  it('Integrate is in the right-hand group: after the auto-approve button, just before the gear', () => {
+  it('Integrate is in the right-hand group: just before the gear', () => {
     const out = nestedStrip({ canIntegrate: true });
     const integrateAt = out.indexOf('chip-integrate');
-    expect(out.indexOf('auto-approve')).toBeLessThan(integrateAt);
     expect(integrateAt).toBeLessThan(out.indexOf('aria-label="AI settings"'));
     // Nothing but the gear's own button comes between Integrate and the gear.
     expect(out.slice(integrateAt, out.indexOf('aria-label="AI settings"'))).not.toContain('chip-location');
@@ -229,20 +220,6 @@ describe('StatusChip: the location chip, the Integrate button, approve-all in an
     expect(out).not.toContain('Integrate');
     expect(out).toMatch(/<span class="chip chip-location" title="ssh ubuntu@lidia: zsh as ubuntu@lidia\. [^"]*">ssh ubuntu@lidia<\/span>/);
   });
-
-  it('approve-all on in this shell: ON, in the warning colour', () => {
-    const out = nestedStrip({ autoApprove: true, autoSuspended: false });
-    expect(out).toContain('auto-approve: ON');
-    expect(out).toContain('chip-warn');
-  });
-
-  it('approve-all on in another shell: off in this shell, with a title that says why', () => {
-    const out = nestedStrip({ autoApprove: true, autoSuspended: true });
-    expect(out).toContain('auto-approve: off in this shell');
-    expect(out).not.toContain('auto-approve: ON');
-    expect(out).toContain('Approve-all was turned on in another shell');
-    expect(out).not.toMatch(/chip-button chip-warn/);
-  });
 });
 
 describe('StatusChip: the agent integrates quietly (auto mode)', () => {
@@ -252,10 +229,8 @@ describe('StatusChip: the agent integrates quietly (auto mode)', () => {
         integration="live"
         observer="ok"
         input="running"
-        cwd={null}
-        autoApprove={false}
-        onToggleAutoApprove={() => {}}
-        llm={LLM_ON}
+      cwd={null}
+      llm={LLM_ON}
         settingsState={null}
         onOpenSettings={() => {}}
         integrating={over.integrating}
