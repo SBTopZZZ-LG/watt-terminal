@@ -1006,8 +1006,8 @@ async fn ask_btw(
 
 /// Suggests a title for the live conversation: one model call outside a turn, never touching stored history or
 /// the transcript. Reserves the turn slot, so a second call is refused while one runs, and Ctrl-C/`cancel_agent`
-/// aborts it through the reserved turn's cancel token. Refused when the history has no user message yet, and when
-/// the model's reply cleans to nothing.
+/// aborts it through the reserved turn's cancel token. Refused when the history has no user message yet; an empty
+/// reply or an unusable title falls back to the derived first-message title instead of failing.
 #[tauri::command]
 async fn suggest_name(
     session_id: String,
@@ -1037,12 +1037,12 @@ async fn suggest_name(
     .await?;
     let mut messages = context;
     messages.push(json!({"role": "user", "content": "Name this conversation."}));
-    let reply = SideCall::new(&client, &llm_settings, &old_id, 64, cancel)
+    let reply = SideCall::new(&client, &llm_settings, &old_id, 1024, cancel)
         .ask(side::TITLE_SYSTEM, messages, Duration::from_secs(90))
         .await;
     drop(end);
-    let reply = reply?;
-    side::clean_title(&reply).ok_or_else(|| "the provider returned an unusable title".to_string())
+    let fallback = conversations::derive_title(&snapshot);
+    side::title_or_fallback(reply, fallback)
 }
 
 /// Replaces the live conversation with a summary of itself: one model call outside a turn, saved as a new conversation

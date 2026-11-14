@@ -244,9 +244,22 @@ export function InputBar(props: Props) {
     }
     const sent = new Set(current.filter((d) => d.input !== null).map((d) => d.key));
     setSending(true);
-    const err = await props.onAgent(message ?? '', ready);
-    setSending(false);
+    let err: string | null;
+    try {
+      err = await props.onAgent(message ?? '', ready);
+    } finally {
+      setSending(false);
+    }
     if (err) {
+      // Local slash commands already report their outcome in the transcript, so the bar clears even on
+      // error; plain messages keep their text so the user can retry.
+      if (text.trimStart().startsWith('/')) {
+        history.current.record(text);
+        setText('');
+        commit(draftsRef.current.filter((d) => !sent.has(d.key)));
+        setError(null);
+        return;
+      }
       setError(err);
       return;
     }

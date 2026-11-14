@@ -25,6 +25,9 @@ pub const SUMMARY_SYSTEM: &str =
 /// The system prompt for a title suggestion: a title only, nothing else.
 pub const TITLE_SYSTEM: &str =
     "You name conversations. Reply with a short, descriptive title of at most six words, and nothing else.";
+/// The error text when the provider's reply is empty after trimming and redaction. Kept as a constant so
+/// callers can treat an empty reply as a fallback case rather than a failure.
+pub const EMPTY_REPLY: &str = "the provider returned an empty reply";
 
 /// The context budget when the model's limit is not known, in characters.
 const DEFAULT_BUDGET: usize = 60_000;
@@ -93,7 +96,7 @@ impl SideCall {
         };
         let text = self.redactor.redact(reply.text.trim());
         if text.is_empty() {
-            return Err("the provider returned an empty reply".to_string());
+            return Err(EMPTY_REPLY.to_string());
         }
         Ok(text)
     }
@@ -396,6 +399,16 @@ fn strip_title_label(title: &str) -> &str {
     }
 }
 
+/// The title for a `suggest_name` reply: the cleaned model title, or `fallback` (the derived first-message title)
+/// when the reply is empty or cleans to nothing. Real errors (HTTP/transport/cancel/timeout) stay errors.
+pub fn title_or_fallback(reply: Result<String, String>, fallback: String) -> Result<String, String> {
+    match reply {
+        Ok(text) => Ok(clean_title(&text).unwrap_or(fallback)),
+        Err(e) if e == EMPTY_REPLY => Ok(fallback),
+        Err(e) => Err(e),
+    }
+}
+
 /// The title for a derived conversation: the trimmed old title (or a fallback when it is empty) plus the suffix,
 /// capped at 120 characters while keeping the suffix whole.
 pub fn suffixed_title(old: &str, suffix: &str) -> String {
@@ -601,6 +614,30 @@ mod tests {
         assert_eq!(clean_title(&"t".repeat(61)), None, "over 60 characters is rejected");
         assert_eq!(clean_title("Fix\x07the build"), None, "control characters are rejected");
         assert_eq!(clean_title("ok\x7f"), None, "DEL is a control character");
+    }
+
+    #[test]
+    fn an_empty_or_unusable_title_falls_back_while_real_errors_stay_errors() {
+        let fallback = "Fix the parser".to_string();
+        assert_eq!(
+            title_or_fallback(Ok("Fix the build".to_string()), fallback.clone()),
+            Ok("Fix the build".to_string())
+        );
+        assert_eq!(
+            title_or_fallback(Ok("   \n  ".to_string()), fallback.clone()),
+            Ok(fallback.clone()),
+            "an unusable title falls back"
+        );
+        assert_eq!(
+            title_or_fallback(Err(EMPTY_REPLY.to_string()), fallback.clone()),
+            Ok(fallback.clone()),
+            "an empty reply falls back"
+        );
+        assert_eq!(
+            title_or_fallback(Err("the side request timed out after 90s".to_string()), fallback.clone()),
+            Err("the side request timed out after 90s".to_string()),
+            "a timeout stays an error"
+        );
     }
 
     #[test]
