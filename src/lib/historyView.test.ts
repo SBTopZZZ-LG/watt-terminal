@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  COMPACT_SUMMARY_PREFIX,
   DENIED_PREFIX,
   filterMetas,
   formatWhen,
@@ -34,6 +35,18 @@ describe('itemsFromMessages', () => {
     expect(items).toEqual([
       { kind: 'user', clientId: 0, text: 'what is in /tmp' },
       { kind: 'agent', text: 'Let me look.', streaming: false },
+    ]);
+  });
+
+  it('a compacted summary seed is a muted notice, not a user bubble', () => {
+    const summary = `${COMPACT_SUMMARY_PREFIX}\n\nEarlier the user asked about retries.`;
+    const items = itemsFromMessages([
+      { role: 'user', content: summary },
+      { role: 'assistant', content: 'Got it.' },
+    ]);
+    expect(items).toEqual([
+      { kind: 'notice', text: summary, muted: true },
+      { kind: 'agent', text: 'Got it.', streaming: false },
     ]);
   });
 

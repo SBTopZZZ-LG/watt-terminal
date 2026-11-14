@@ -2,7 +2,7 @@
 //! `<workspace>/.watt/commands` (project). Each command is one Markdown file; the file stem is the
 //! command name and the body is the template. An optional leading `---` block carries `description:`
 //! and `argument-hint:`. Everything is lenient: unreadable, oversize, non-UTF-8 or badly named files
-//! are skipped, never an error.
+//! are skipped, never an error, and listed in the catalog's `skipped` with the reason.
 
 use std::fs;
 use std::path::Path;
@@ -35,75 +35,98 @@ pub struct CommandInfo {
 
 /// The custom commands plus the two directories, so `/help` can show where to create them. The
 /// directories are reported even when they do not exist; each is null only when it cannot apply.
+/// `skipped` names the `*.md` files that were skipped and why, as `<file>: <reason>`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CommandCatalog {
     pub commands: Vec<CommandInfo>,
     pub project_dir: Option<String>,
     pub global_dir: Option<String>,
+    pub skipped: Vec<String>,
 }
 
 /// The catalog from two command directories. Pure filesystem, no Tauri: missing directories read as
 /// empty, and a bad file never fails the whole read. Direct `*.md` children only, sorted by name.
 pub fn catalog(project_dir: Option<&Path>, global_dir: Option<&Path>) -> CommandCatalog {
     let mut commands = Vec::new();
+    let mut skipped = Vec::new();
     if let Some(dir) = global_dir {
-        commands.extend(read_dir(dir, CommandSource::Global));
+        let (infos, bad) = read_dir(dir, CommandSource::Global);
+        commands.extend(infos);
+        skipped.extend(bad);
     }
     if let Some(dir) = project_dir {
+        let (infos, bad) = read_dir(dir, CommandSource::Project);
         // Project names replace global ones; the rest are added. Sorted at the end.
-        for info in read_dir(dir, CommandSource::Project) {
+        for info in infos {
             match commands.iter_mut().find(|c| c.name == info.name) {
                 Some(existing) => *existing = info,
                 None => commands.push(info),
             }
         }
+        skipped.extend(bad);
     }
     commands.sort_by(|a, b| a.name.cmp(&b.name));
     CommandCatalog {
         commands,
         project_dir: project_dir.map(|p| p.to_string_lossy().into_owned()),
         global_dir: global_dir.map(|p| p.to_string_lossy().into_owned()),
+        skipped,
     }
 }
 
-/// The valid commands in one directory: direct `*.md` files with valid stems, in file-name order.
-fn read_dir(dir: &Path, source: CommandSource) -> Vec<CommandInfo> {
+/// The valid commands in one directory plus the skipped files, each as `<file>: <reason>`.
+/// Direct `*.md` children only, in file-name order.
+fn read_dir(dir: &Path, source: CommandSource) -> (Vec<CommandInfo>, Vec<String>) {
     let Ok(entries) = fs::read_dir(dir) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let mut names: Vec<_> = entries
         .filter_map(|entry| entry.ok().map(|e| e.path()))
         .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
         .collect();
     names.sort();
-    names.into_iter().filter_map(|path| read_file(&path, source)).collect()
+    let mut infos = Vec::new();
+    let mut skipped = Vec::new();
+    for path in &names {
+        match read_file(path, source) {
+            Ok(info) => infos.push(info),
+            Err(reason) => skipped.push(format!(
+                "{}: {reason}",
+                path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.to_string_lossy().into_owned())
+            )),
+        }
+    }
+    (infos, skipped)
 }
 
-/// One command file. `None` when the file is unreadable, oversize, non-UTF-8, badly named, or has no
-/// template body.
-fn read_file(path: &Path, source: CommandSource) -> Option<CommandInfo> {
-    let stem = path.file_stem()?.to_str()?;
+/// One command file. `Err` is the concise reason it was skipped: invalid name, not a regular
+/// file, too large, unreadable, not UTF-8, or an empty template.
+fn read_file(path: &Path, source: CommandSource) -> Result<CommandInfo, String> {
+    let stem = path.file_stem().and_then(|s| s.to_str()).ok_or_else(|| "invalid name".to_string())?;
     if !valid_name(stem) {
-        return None;
+        return Err("invalid name".to_string());
     }
-    if fs::metadata(path).is_ok_and(|m| !m.is_file() || m.len() > FILE_CAP) {
-        return None;
+    if fs::metadata(path).is_ok_and(|m| !m.is_file()) {
+        return Err("not a regular file".to_string());
     }
-    let bytes = fs::read(path).ok()?;
+    if fs::metadata(path).is_ok_and(|m| m.len() > FILE_CAP) {
+        return Err("too large".to_string());
+    }
+    let bytes = fs::read(path).map_err(|_| "unreadable".to_string())?;
     if bytes.len() as u64 > FILE_CAP {
-        return None;
+        return Err("too large".to_string());
     }
-    let text = String::from_utf8(bytes).ok()?;
+    let text = String::from_utf8(bytes).map_err(|_| "not UTF-8".to_string())?;
     let (frontmatter, body) = split_frontmatter(&text);
     let template = body.trim().to_string();
     if template.is_empty() {
-        return None;
+        return Err("empty template".to_string());
     }
     let frontmatter = frontmatter.unwrap_or_default();
     let description =
         front_value(frontmatter, "description").unwrap_or_else(|| default_description(&template, stem));
     let hint = front_value(frontmatter, "argument-hint");
-    Some(CommandInfo { name: stem.to_string(), description, hint, source, template })
+    Ok(CommandInfo { name: stem.to_string(), description, hint, source, template })
 }
 
 /// A command name: lowercase ASCII, digits, `_` and `-`, starting with a letter or digit.
@@ -211,6 +234,10 @@ mod tests {
         found.commands.iter().map(|c| c.name.as_str()).collect()
     }
 
+    fn skipped(found: &CommandCatalog) -> Vec<&str> {
+        found.skipped.iter().map(|s| s.as_str()).collect()
+    }
+
     #[test]
     fn missing_dirs_read_as_empty_but_paths_are_reported() {
         let missing = Path::new("/no/such/dir");
@@ -220,6 +247,7 @@ mod tests {
         assert_eq!(found.global_dir, Some("/no/such/dir".to_string()));
         let found = catalog(None, None);
         assert!(found.commands.is_empty());
+        assert!(found.skipped.is_empty());
         assert_eq!(found.project_dir, None);
         assert_eq!(found.global_dir, None);
     }
@@ -236,6 +264,7 @@ mod tests {
         assert_eq!(cmd.hint, None);
         assert_eq!(cmd.source, CommandSource::Global);
         assert_eq!(cmd.template, "# Ship it\n\nInvestigate and write a plan.");
+        assert!(found.skipped.is_empty());
         assert_eq!(found.global_dir, Some(global.to_string_lossy().into_owned()));
         assert_eq!(found.project_dir, None);
     }
@@ -279,6 +308,10 @@ mod tests {
         write(&global, "9lives.md", b"body\n");
         let found = catalog(None, Some(&global));
         assert_eq!(names(&found), ["9lives", "ok-name_1"]);
+        let bad = skipped(&found);
+        assert!(bad.iter().any(|s| s.starts_with("Bad.md:")), "Bad.md is reported, got {bad:?}");
+        assert!(bad.iter().any(|s| s.starts_with("UPPER.md:")), "UPPER.md is reported, got {bad:?}");
+        assert!(bad.iter().all(|s| s.contains(": ")), "every entry names the file and reason, got {bad:?}");
     }
 
     #[test]
@@ -293,6 +326,7 @@ mod tests {
         fs::create_dir_all(global.join("weird.md")).unwrap();
         let found = catalog(None, Some(&global));
         assert_eq!(names(&found), ["top"]);
+        assert_eq!(skipped(&found), ["weird.md: not a regular file"]);
     }
 
     #[test]
@@ -304,6 +338,7 @@ mod tests {
         write(&global, "binary.md", &[0xff, 0xfe, b'x', b'\n']);
         let found = catalog(None, Some(&global));
         assert_eq!(names(&found), ["ok"]);
+        assert_eq!(skipped(&found), ["big.md: too large", "binary.md: not UTF-8"]);
     }
 
     #[test]
@@ -315,6 +350,7 @@ mod tests {
         write(&global, "kept.md", b"kept\n");
         let found = catalog(None, Some(&global));
         assert_eq!(names(&found), ["kept"]);
+        assert_eq!(skipped(&found), ["blank.md: empty template", "empty.md: empty template"]);
     }
 
     #[test]
@@ -334,6 +370,19 @@ mod tests {
         assert_eq!(shared.source, CommandSource::Project);
         let zebra = found.commands.iter().find(|c| c.name == "zebra").unwrap();
         assert_eq!(zebra.source, CommandSource::Global);
+    }
+
+    #[test]
+    fn skipped_merges_global_and_project() {
+        let tmp = TempDir::new();
+        let global = dir(&tmp.path().join("global"));
+        let project = dir(&tmp.path().join("project"));
+        write(&global, "Bad.md", b"body\n");
+        write(&global, "ok.md", b"fine\n");
+        write(&project, "big.md", &vec![b'x'; 65 * 1024]);
+        let found = catalog(Some(&project), Some(&global));
+        assert_eq!(names(&found), ["ok"]);
+        assert_eq!(skipped(&found), ["Bad.md: invalid name", "big.md: too large"]);
     }
 
     #[test]

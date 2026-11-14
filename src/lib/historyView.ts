@@ -24,6 +24,10 @@ export const SKIPPED_PREFIX = 'skipped:';
 /** The result shown for a tool call with no tool message after it. The backend closes such calls, so this is a fallback. */
 export const NO_RESULT_TEXT = 'no result was recorded';
 
+/** The first line of a compacted conversation's first message (src-tauri/src/core/chat/side.rs `compact_seed`). It is the
+ * carried-over summary, not a new request, so it shows as a muted note rather than a user bubble. */
+export const COMPACT_SUMMARY_PREFIX = 'Compacted summary (from the previous conversation; not a new request):';
+
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 const MONTHS_SHORT = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
@@ -171,7 +175,8 @@ function callsOf(toolCalls: unknown): ToolCall[] {
 
 /**
  * The transcript items for a saved conversation's messages, in order. A user message is a user item, with its attachments when
- * its content has any (see attachmentsOf). An assistant message
+ * its content has any (see attachmentsOf), except a compacted summary seed (see COMPACT_SUMMARY_PREFIX), which is a muted
+ * notice item with the text kept. An assistant message
  * gives an agent item (when it has text), then one tool item per tool call. Each tool item takes the content of the tool
  * message with the same tool_call_id: failed when that content starts with `error:`, the DENIED prefix or `skipped:`, ok otherwise.
  * A call with no tool message is failed, with NO_RESULT_TEXT. Tool messages that answer no call are dropped. Empty
@@ -192,6 +197,10 @@ export function itemsFromMessages(messages: ChatMessage[]): NewItem[] {
   for (const m of messages) {
     if (m.role === 'user') {
       const text = textOf(m.content);
+      if (text.startsWith(COMPACT_SUMMARY_PREFIX)) {
+        items.push({ kind: 'notice', text, muted: true });
+        continue;
+      }
       const attachments = Array.isArray(m.content) ? attachmentsOf(m.content) : [];
       if (text !== '' || attachments.length > 0) {
         items.push({ kind: 'user', clientId: 0, text, ...(attachments.length > 0 ? { attachments } : {}) });

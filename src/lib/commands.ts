@@ -244,7 +244,8 @@ export function matchModel(options: ModelChoice[], arg: string): ModelMatch {
 
 /**
  * The `/help` text: the built-ins (with the `/clear` alias), then the custom commands with their source, then the
- * two command directories (reported even when missing), and the note that unknown `/text` goes to the agent.
+ * skipped command files with their reasons, then the two command directories (reported even when missing), and the
+ * note that unknown `/text` goes to the agent.
  */
 export function renderHelp(catalog: CommandCatalog): string {
   const lines = ['Slash commands:'];
@@ -256,6 +257,12 @@ export function renderHelp(catalog: CommandCatalog): string {
     lines.push('', 'Custom commands:');
     for (const cmd of catalog.commands) {
       lines.push(`/${cmd.name}${cmd.hint ? ` ${cmd.hint}` : ''} — ${cmd.description} (${cmd.source})`);
+    }
+  }
+  if ((catalog.skipped ?? []).length > 0) {
+    lines.push('', 'Skipped custom command files:');
+    for (const entry of catalog.skipped ?? []) {
+      lines.push(`- ${entry}`);
     }
   }
   lines.push(

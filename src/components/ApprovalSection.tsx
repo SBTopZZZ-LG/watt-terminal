@@ -123,6 +123,10 @@ export function ApprovalSection(p: ApprovalSectionProps) {
         Only commands made of letters, digits, spaces and the characters _-./:=@+, can run by rule; anything else always asks.
         Approve-all in the status bar overrides the rules for the session.
       </p>
+      <p className="settings-hint">
+        Allow rules match the whole command, but options like `git -c …` or `make -f …` can run other programs under a broad
+        rule, so keep allow rules narrow.
+      </p>
 
       <details className="settings-builtin">
         <summary>

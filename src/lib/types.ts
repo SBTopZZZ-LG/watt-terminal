@@ -558,6 +558,8 @@ export interface CommandCatalog {
   commands: CommandInfo[];
   project_dir: string | null;
   global_dir: string | null;
+  /** Skipped `*.md` files as `<file>: <reason>`. Absent from older backends and fixtures. */
+  skipped?: string[];
 }
 
 /**

@@ -286,6 +286,7 @@ describe('renderHelp', () => {
     expect(text).toContain('- project: /w/.watt/commands');
     expect(text).toContain('- global: /cfg/commands');
     expect(text).toContain('Any other /text is sent to the agent unchanged.');
+    expect(text).not.toContain('Skipped custom command files:');
   });
 
   it('lists custom commands with their hint and source', () => {
@@ -306,6 +307,18 @@ describe('renderHelp', () => {
     const text = renderHelp(catalogWith([], { project_dir: null, global_dir: null }));
     expect(text).toContain('- project: (not available here)');
     expect(text).toContain('- global: (not available here)');
+  });
+
+  it('lists skipped custom command files with their reasons', () => {
+    const text = renderHelp({
+      commands: [],
+      project_dir: '/w/.watt/commands',
+      global_dir: '/cfg/commands',
+      skipped: ['Bad.md: invalid name', 'big.md: too large'],
+    });
+    expect(text).toContain('Skipped custom command files:');
+    expect(text).toContain('- Bad.md: invalid name');
+    expect(text).toContain('- big.md: too large');
   });
 });
 

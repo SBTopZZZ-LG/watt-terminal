@@ -43,6 +43,10 @@ info() {
   echo "==> $*"
 }
 
+if [ -n "${WATT_NONCE:-}" ] || [ -n "${WATT_HISTFILE:-}" ] || [ -n "${WATT_REAL_ZDOTDIR:-}" ]; then
+  die "this is running inside Watt; open a terminal outside Watt and run the install there (installing quits Watt and would kill this script)"
+fi
+
 SRC=""
 DEST=""
 DEBUG=0
