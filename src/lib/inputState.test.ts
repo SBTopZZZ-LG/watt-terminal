@@ -49,13 +49,12 @@ describe('inputReducer and effectiveState', () => {
     expect(inputReducer(m, { type: 'alt', active: false })).toBe(m);
   });
 
-  it('takes the foreground hint with the running state, and a state event without one clears it', () => {
+  it('takes the foreground with the running state, and a state event without one clears it', () => {
     let m = model('prompt');
     m = inputReducer(m, { type: 'rust_state', state: 'running', foreground: SSH });
     expect(m.foreground).toEqual(SSH);
-    expect(routeFor(effectiveState(m), m.foreground).hint).toBe(
-      'ssh ubuntu@lidia is running without shell integration. The agent can read the screen but cannot run commands here.',
-    );
+    // The input bar shows no hint while a command runs: the status strip's chip names the program instead.
+    expect(routeFor(effectiveState(m), m.foreground).hint).toBeNull();
     // The same state and the same hint: nothing changes, so the same object comes back.
     expect(inputReducer(m, { type: 'rust_state', state: 'running', foreground: { ...SSH } })).toBe(m);
     // Back at the prompt the state event carries no hint, and the hint goes with it.
@@ -64,20 +63,20 @@ describe('inputReducer and effectiveState', () => {
     expect(effectiveState(m)).toBe('prompt');
   });
 
-  it('a changed command with the same state is a change of the hint', () => {
+  it('a changed command with the same state is a change of the model', () => {
     const m = inputReducer(model('running'), { type: 'rust_state', state: 'running', foreground: SSH });
     const next = inputReducer(m, { type: 'rust_state', state: 'running', foreground: { kind: 'shell', command: 'zsh -f -i' } });
     expect(next).not.toBe(m);
     expect(next.foreground).toEqual({ kind: 'shell', command: 'zsh -f -i' });
   });
 
-  it('the alt screen keeps the hint in the model, and the alt route does not show it', () => {
+  it('the alt screen keeps the foreground in the model, and the alt route ignores it', () => {
     const alt = inputReducer(inputReducer(model('running'), { type: 'rust_state', state: 'running', foreground: SSH }), {
       type: 'alt',
       active: true,
     });
     expect(effectiveState(alt)).toBe('alt');
-    expect(routeFor(effectiveState(alt), alt.foreground).hint).not.toContain('without shell integration');
+    expect(routeFor(effectiveState(alt), alt.foreground)).toEqual(routeFor('alt'));
   });
 
   it('the alt screen overrides every Rust state, immediately, and leaving it restores the Rust state', () => {
@@ -123,31 +122,29 @@ describe('routeFor: the input routing table', () => {
     }
   });
 
-  it('gives a hint for every state except the prompt, where nothing needs explaining', () => {
+  it('gives a hint for every state except the prompt and the transient command states, which stay quiet', () => {
     for (const s of ALL_STATES) {
-      expect(routeFor(s).hint === null, s).toBe(s === 'prompt');
+      expect(routeFor(s).hint === null, s).toBe(s === 'prompt' || s === 'submitted' || s === 'running');
     }
   });
 
-  it('a program without shell integration changes the running hint, and nothing else', () => {
-    const generic = 'A command is running. The agent cannot run another until it finishes.';
-    expect(routeFor('running').hint).toBe(generic);
-    expect(routeFor('running', null).hint).toBe(generic);
-    expect(routeFor('running', { kind: 'other', command: 'sleep 2' }).hint).toBe(generic);
-    expect(routeFor('running', SSH).hint).toContain('is running without shell integration');
-    // Only the running state has the hint: the others are the same with or without one.
-    for (const s of ALL_STATES.filter((s) => s !== 'running')) {
+  it('a foreground never changes the hint: the chip names the program, the bar stays unchanged', () => {
+    expect(routeFor('running').hint).toBeNull();
+    expect(routeFor('running', null).hint).toBeNull();
+    expect(routeFor('running', { kind: 'other', command: 'sleep 2' }).hint).toBeNull();
+    expect(routeFor('running', SSH).hint).toBeNull();
+    // No state shows the foreground: every route is the same with or without one.
+    for (const s of ALL_STATES) {
       expect(routeFor(s, SSH), s).toEqual(routeFor(s));
     }
-    // Still inline, so the bar keeps its height, and the keys still go to the PTY.
-    expect(routeFor('running', SSH).hintInline).toBe(true);
+    // Not inline either, so the input keeps its placeholder, and the keys still go to the PTY.
+    expect(routeFor('running', SSH).hintInline).toBe(false);
     expect(routeFor('running', SSH).keys).toBe('pty');
   });
 
-  it('shows the hint inline (as the placeholder) only while a command is starting or running', () => {
-    // These two flip on every command, so they must not add a row: the bar would grow and the terminal would resize.
+  it('shows no hint inline: no route uses the placeholder, so the input never changes while a command runs', () => {
     for (const s of ALL_STATES) {
-      expect(routeFor(s).hintInline, s).toBe(s === 'submitted' || s === 'running');
+      expect(routeFor(s).hintInline, s).toBe(false);
     }
   });
 });

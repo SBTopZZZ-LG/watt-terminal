@@ -38,7 +38,3 @@ export function foregroundChip(state: InputState, fg: Foreground | null | undefi
   };
 }
 
-/** The input bar's hint while a running command blocks the agent, when that command is a program without integration. */
-export function foregroundHint(fg: Foreground): string {
-  return `${fg.command} is running without shell integration. The agent can read the screen but cannot run commands here.`;
-}

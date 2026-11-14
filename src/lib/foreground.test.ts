@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { CHIP_COMMAND_CHARS, foregroundChip, foregroundHint, isUnintegrated, truncateCommand } from './foreground';
+import { CHIP_COMMAND_CHARS, foregroundChip, isUnintegrated, truncateCommand } from './foreground';
 import type { Foreground, ForegroundKind, InputState } from './types';
 
 const UNINTEGRATED: Exclude<ForegroundKind, 'other'>[] = ['ssh', 'shell', 'su', 'container_exec', 'multiplexer'];
@@ -96,10 +96,3 @@ describe('foregroundChip', () => {
   });
 });
 
-describe('foregroundHint', () => {
-  it('says the program has no shell integration and the agent can only read the screen', () => {
-    expect(foregroundHint({ kind: 'shell', command: 'zsh -f -i' })).toBe(
-      'zsh -f -i is running without shell integration. The agent can read the screen but cannot run commands here.',
-    );
-  });
-});

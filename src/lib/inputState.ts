@@ -4,7 +4,6 @@
 // Inputs: the InputState that Rust reports, and the alternate-screen flag from xterm's buffer. The alt flag is
 // an immediate local override, so vim and friends take over the keyboard without waiting for a round trip.
 
-import { foregroundHint, isUnintegrated } from './foreground';
 import type { Foreground, InputState } from './types';
 
 export interface InputModel {
@@ -67,18 +66,18 @@ export interface Route {
   /** What the bar says about the state, or null when there is nothing to say. */
   hint: string | null;
   /**
-   * Whether the hint shows as the input's placeholder instead of its own row. The two transient states (a command
-   * starting, a command running) use it, so the bar keeps its height while a command runs and the terminal does not
-   * resize. Every other hint keeps its own row.
+   * Whether the hint shows as the input's placeholder instead of its own row. No current route sets it: every hint
+   * keeps its own row, and the transient states (a command starting, a command running) show no hint at all, so the
+   * input stays unchanged while a command runs. Kept for later use.
    */
   hintInline: boolean;
 }
 
 /**
- * The route for a state. `foreground` only matters while a command runs: a program without shell integration (ssh, a
- * nested shell...) names itself in the hint. An ordinary command keeps the generic hint.
+ * The route for a state. `foreground` is kept for callers but does not change the route: while a command runs the
+ * status strip's foreground chip names the program, and the input bar shows no hint so the field stays unchanged.
  */
-export function routeFor(state: InputState, foreground: Foreground | null = null): Route {
+export function routeFor(state: InputState, _foreground: Foreground | null = null): Route {
   switch (state) {
     case 'booting':
       return {
@@ -90,12 +89,7 @@ export function routeFor(state: InputState, foreground: Foreground | null = null
     case 'prompt':
       return { keys: 'pty', bar: 'chat', hint: null, hintInline: false };
     case 'submitted':
-      return {
-        keys: 'pty',
-        bar: 'chat',
-        hint: 'The command is starting. The agent cannot run commands until it finishes.',
-        hintInline: true,
-      };
+      return { keys: 'pty', bar: 'chat', hint: null, hintInline: false };
     case 'continuation':
       return {
         keys: 'pty',
@@ -112,14 +106,7 @@ export function routeFor(state: InputState, foreground: Foreground | null = null
         hintInline: false,
       };
     case 'running':
-      return {
-        keys: 'pty',
-        bar: 'chat',
-        hint: isUnintegrated(foreground)
-          ? foregroundHint(foreground)
-          : 'A command is running. The agent cannot run another until it finishes.',
-        hintInline: true,
-      };
+      return { keys: 'pty', bar: 'chat', hint: null, hintInline: false };
     case 'alt':
       return {
         keys: 'pty',

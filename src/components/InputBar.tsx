@@ -35,7 +35,7 @@ interface Props {
   mode: BarMode;
   /** Why the bar is limited. Shown under the input, or as the input's placeholder when hintInline is set. */
   hint: string | null;
-  /** Show the hint as the input's placeholder instead of a row under it, so the bar's height does not change. */
+  /** Show the hint as the input's placeholder instead of a row under it. No current route sets it; kept for later use. */
   hintInline: boolean;
   hasPendingApproval: boolean;
   /** Enter may approve the pending card only when armed (500ms visible in the chat body). Escape denies regardless. */
