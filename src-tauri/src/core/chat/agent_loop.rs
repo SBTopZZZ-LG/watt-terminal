@@ -813,11 +813,15 @@ impl LlmAgent {
     }
 
     /// Ends one model call: a reply that was not streamed is said, and an error is shown. None when there is no reply.
+    /// A reply cut by the token limit or the provider's content filter also emits a notice (not stored in history).
     fn finish_call(&self, ctx: &AgentCtx<'_>, result: Result<AssistantReply, LlmError>) -> Option<AssistantReply> {
         match result {
             Ok(reply) => {
                 if !self.stream && !reply.text.is_empty() {
                     ctx.say(self.redactor.redact(&reply.text));
+                }
+                if let Some(notice) = finish_reason_notice(reply.finish_reason.as_deref()) {
+                    ctx.emit(AgentEvent::Notice { text: notice.to_string() });
                 }
                 Some(reply)
             }
@@ -1046,6 +1050,15 @@ fn error_text(e: &LlmError) -> String {
         LlmError::Parse(detail) => format!("I could not read the provider's reply: {detail}"),
         LlmError::TooLarge(detail) => format!("The provider's reply is too large: {detail}"),
         LlmError::Cancelled => "The request was cancelled.".to_string(),
+    }
+}
+
+/// The notice for a reply the provider cut short, by finish reason. None for other reasons. Shown but never stored.
+fn finish_reason_notice(reason: Option<&str>) -> Option<&'static str> {
+    match reason {
+        Some("length") => Some("The reply hit the token limit and was cut off."),
+        Some("content_filter") => Some("The provider's content filter cut the reply."),
+        _ => None,
     }
 }
 
@@ -1645,6 +1658,20 @@ mod tests {
             error_text(&LlmError::Transport("could not connect: refused".into())),
             "I could not reach the provider: could not connect: refused"
         );
+    }
+
+    #[test]
+    fn cut_replies_notice_the_limit_or_the_content_filter() {
+        assert_eq!(
+            finish_reason_notice(Some("length")),
+            Some("The reply hit the token limit and was cut off.")
+        );
+        assert_eq!(
+            finish_reason_notice(Some("content_filter")),
+            Some("The provider's content filter cut the reply.")
+        );
+        assert_eq!(finish_reason_notice(Some("stop")), None);
+        assert_eq!(finish_reason_notice(None), None);
     }
 
     /// A streamed secret fragment is emitted redacted, never as written.

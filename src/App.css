@@ -855,6 +855,20 @@ input {
   font-style: italic;
 }
 
+/* The header's approval badge: a small warning pill next to Agent/working while a card waits. Narrow-safe: it never grows or wraps. */
+.approval-needed {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border: 1px dashed var(--warn);
+  border-radius: 2px;
+  background: var(--warn-tint);
+  color: var(--warn);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
 .decision {
   color: var(--muted);
   font-family: var(--mono);
@@ -3099,6 +3113,12 @@ input {
   overflow-wrap: anywhere;
 }
 
+/* The secret-store warning: same banner, but the warning colour (key presence unknown, settings still usable). */
+.settings-banner-warn {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
 /* The recovery panel: the broken file's reason, its path, and the actions. It sits where the banner was. */
 .settings-recovery {
   margin: 10px 0 0;
@@ -4241,6 +4261,19 @@ input {
   box-shadow: 0 0 6px var(--ok-glow);
   transform: translateX(-50%);
   animation: agent-rail-pulse 2s ease-in-out infinite;
+}
+
+/* The rail's approval dot: a small warning dot below the busy dot while a card waits. */
+.agent-rail-approval {
+  position: absolute;
+  top: 20px;
+  left: 50%;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--warn);
+  box-shadow: 0 0 6px var(--warn);
+  transform: translateX(-50%);
 }
 
 @keyframes agent-rail-pulse {

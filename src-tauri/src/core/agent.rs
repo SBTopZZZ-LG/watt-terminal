@@ -579,10 +579,13 @@ impl<'a> AgentCtx<'a> {
         };
         let writes = self.tools.user_writes();
         let follow = self.rules.follow_local_in_nested;
+        // A latched command whose screen looks like a shell prompt asks per Enter: the command may have exited to
+        // a shell, and typing into a shell by mistake is worse than an extra card. The command-text hint is not a
+        // safety signal; this visible-prompt check is the conservative one.
         let shell_like = matches!(
             foreground::classify(&target.command).kind,
             ForegroundKind::Ssh | ForegroundKind::Shell | ForegroundKind::Su | ForegroundKind::ContainerExec
-        );
+        ) || foreground::looks_like_shell_prompt(&self.tools.get_screen().rows);
         let approve_all = if shell_like {
             follow && self.approvals.auto_approve()
         } else {
@@ -956,6 +959,8 @@ mod tests {
         foreground: Option<Foreground>,
         /// The shell on top. The default is the local shell; a test can change it between calls.
         top: Mutex<TopLevel>,
+        /// What `get_screen` reports as its rows. Empty by default (no prompt).
+        screen_rows: Mutex<Vec<String>>,
         /// When set, every `call` fails with this error after it is recorded.
         call_error: Option<String>,
         /// What `integration_precheck` refuses with. None means it passes (the shell is `ssh h`).
@@ -999,7 +1004,7 @@ mod tests {
         }
         fn get_screen(&self) -> ScreenView {
             ScreenView {
-                rows: Vec::new(),
+                rows: self.screen_rows.lock().unwrap().clone(),
                 cursor: (0, 0),
                 alternate_screen: false,
                 size: (24, 80),
@@ -1493,6 +1498,28 @@ mod tests {
                 ("send_keys".to_string(), "manual", Some("unintegrated_shell")),
                 ("send_keys".to_string(), "manual", Some("unintegrated_shell")),
                 ("send_keys".to_string(), "auto", Some("approve_all")),
+            ]
+        );
+    }
+
+    /// A latched command whose screen looks like a shell prompt asks per Enter: the command may have exited to a
+    /// shell, so the latch no longer means the agent owns the input.
+    #[test]
+    fn a_latched_enter_asks_when_the_screen_looks_like_a_shell_prompt() {
+        let tools = Recorder::default();
+        *tools.keys_target.lock().unwrap() = target(7, "cat");
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let log = Mutex::new(Vec::new());
+        let emit = answering(&gate, &log, true);
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        assert!(ctx.call_tool("send_keys", json!({"text": "first"})).is_ok());
+        *tools.screen_rows.lock().unwrap() = vec!["dev@host:~$".to_string()];
+        assert!(ctx.call_tool("send_keys", json!({"text": "ls", "keys": ["Enter"]})).is_ok());
+        assert_eq!(
+            reasons(&log),
+            [
+                ("send_keys".to_string(), "manual", Some("send_keys")),
+                ("send_keys".to_string(), "manual", Some("unintegrated_shell")),
             ]
         );
     }

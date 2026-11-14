@@ -202,7 +202,8 @@ export function SettingsNotices({ view, recovery, onCheckAgain, onAskRevert, onR
     return null;
   }
   const recovering = recoveryKind(view.settings_state) !== 'ok';
-  if (!recovering && view.load_error === null) {
+  const secretsError = view.secrets_error ?? null;
+  if (!recovering && view.load_error === null && secretsError === null) {
     return null;
   }
   return (
@@ -216,6 +217,11 @@ export function SettingsNotices({ view, recovery, onCheckAgain, onAskRevert, onR
           <button type="button" onClick={onCheckAgain}>
             Check again
           </button>
+        </div>
+      )}
+      {!recovering && secretsError !== null && (
+        <div className="settings-banner settings-banner-warn" role="status">
+          <span>{`API keys could not be checked because the secret store failed (${secretsError}); providers still load, but key presence is unknown.`}</span>
         </div>
       )}
     </div>

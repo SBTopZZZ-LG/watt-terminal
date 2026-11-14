@@ -47,8 +47,9 @@ const MAX_VARIANT_BODY_BYTES: usize = 4096;
 /// Deepest variant body nesting, in levels of objects and arrays.
 const MAX_VARIANT_DEPTH: usize = 8;
 /// Body keys a variant must never carry. They are also skipped by `request_body` if one slips through.
+/// `max_completion_tokens` is not protected: a manual variant may set it for providers that reject `max_tokens`.
 const PROTECTED_BODY_KEYS: &[&str] =
-    &["model", "messages", "stream", "tools", "stream_options", "max_tokens", "max_completion_tokens", "models"];
+    &["model", "messages", "stream", "tools", "stream_options", "max_tokens", "models"];
 
 /// The whole settings document. Written to `settings.json` by `save`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -449,7 +450,8 @@ fn validate_url(label: &str, field: &str, url: &str, problems: &mut Vec<String>)
             let local = matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
             if !local {
                 problems.push(format!(
-                    "{label}: {field} uses plain http; only localhost, 127.0.0.1 and [::1] may"
+                    "{label}: {field} uses plain http; only localhost, 127.0.0.1 and [::1] may use plain http: use an \
+                     https URL or a local proxy"
                 ));
             }
         }
@@ -1586,6 +1588,21 @@ mod tests {
                 "{key}: no problem names the key: {problems:?}"
             );
         }
+    }
+
+    #[test]
+    fn variant_body_may_set_max_completion_tokens_instead_of_max_tokens() {
+        let body: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"max_completion_tokens":128}"#).unwrap();
+        let problems = problems_after(|s| {
+            s.providers[0].models[0].variants.push(ModelVariant {
+                id: "fast".into(),
+                label: "Fast".into(),
+                body: body.clone(),
+                source: VariantSource::Manual,
+            });
+        });
+        assert_eq!(problems, Vec::<String>::new(), "max_completion_tokens is allowed: {problems:?}");
     }
 
     #[test]

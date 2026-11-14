@@ -337,6 +337,24 @@ describe('SettingsBody: providers', () => {
   });
 });
 
+describe('SettingsBody: secret store warning', () => {
+  it('shows a warning banner when the secret store could not be read, even with no recovery or load error', () => {
+    const out = notices({ view: view({ secrets_error: 'Keychain failed' }) });
+    expect(out).toContain('settings-banner settings-banner-warn');
+    expect(out).toContain('role="status"');
+    expect(out).toContain('API keys could not be checked because the secret store failed (Keychain failed)');
+    expect(out).toContain('providers still load, but key presence is unknown');
+    expect(out).not.toContain('settings-recovery');
+  });
+
+  it('shows alongside the load banner, and hides with no error', () => {
+    const out = notices({ view: view({ load_error: 'gone', secrets_error: 'Keychain failed' }) });
+    expect(out).toContain('could not be read');
+    expect(out).toContain('could not be checked');
+    expect(notices()).toBe('');
+  });
+});
+
 describe('SettingsBody: recovery panel (settings.json cannot be used)', () => {
   const REASON = 'settings are invalid: not valid JSON';
   const BROKEN_STATE = { kind: 'broken' as const, reason: REASON, last_good_available: true, path: '/config/settings.json' };

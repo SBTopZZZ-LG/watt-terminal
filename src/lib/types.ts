@@ -494,6 +494,8 @@ export interface SettingsView {
   store_kind: 'keychain' | 'file';
   /** Set while settings.json cannot be used (`settings_state.kind` is not "ok"). Changes are refused until it is fixed. */
   load_error: string | null;
+  /** When the secret store could not be read: key presence is unknown. Absent or null when the check succeeded. */
+  secrets_error?: string | null;
   settings_state: SettingsStateView;
 }
 

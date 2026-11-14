@@ -378,6 +378,57 @@ describe('Transcript: the trim note', () => {
   });
 });
 
+describe('Transcript: approval badge and resolved outcome', () => {
+  const pending = (callId: string): TranscriptAction => ({
+    type: 'agent_event',
+    event: { type: 'approval_request', call_id: callId, name: 'run_command', text: 'ls' },
+  });
+  const answering = (callId: string, approve: boolean): TranscriptAction => ({ type: 'approval_answering', callId, approve });
+  const resolved = (callId: string): TranscriptAction => ({
+    type: 'agent_event',
+    event: { type: 'tool_result', call_id: callId, name: 'run_command', ok: true, decision: 'manual', result: {} },
+  });
+
+  it('shows an approval-needed badge in the header while a card waits', () => {
+    const withPending = renderToStaticMarkup(
+      <Transcript
+        items={[]}
+        busy={false}
+        thinking={false}
+        approvalPending
+        open
+        onToggle={() => {}}
+        onApprove={() => {}}
+        onAnswerQuestions={() => {}}
+        onNewConversation={() => {}}
+      />,
+    );
+    expect(withPending).toContain('approval-needed');
+    expect(withPending).toContain('approval needed');
+
+    const idle = renderToStaticMarkup(
+      <Transcript
+        items={[]}
+        busy={false}
+        thinking={false}
+        open
+        onToggle={() => {}}
+        onApprove={() => {}}
+        onAnswerQuestions={() => {}}
+        onNewConversation={() => {}}
+      />,
+    );
+    expect(idle).not.toContain('approval-needed');
+  });
+
+  it('a resolved card says Approved, Denied, or Closed based on the answer', () => {
+    expect(render([pending('a'), answering('a', true), resolved('a')])).toContain('>Approved</div>');
+    expect(render([pending('d'), answering('d', false), resolved('d')])).toContain('>Denied</div>');
+    expect(render([pending('c'), resolved('c')])).toContain('>Closed</div>');
+    expect(render([pending('c'), resolved('c')])).not.toContain('>Resolved</div>');
+  });
+});
+
 describe('Transcript: a clarification question card', () => {
   const ask = (callId: string): TranscriptAction => ({
     type: 'agent_event',

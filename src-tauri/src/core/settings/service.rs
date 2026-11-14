@@ -69,6 +69,10 @@ pub struct SettingsView {
     pub store_kind: &'static str,
     /// Set while settings.json cannot be used (`settings_state.kind` is "broken" or "last_good"): the reason.
     pub load_error: Option<String>,
+    /// When the secret store could not be read, the error is here and every unchecked presence is false. The
+    /// settings themselves are still returned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secrets_error: Option<String>,
     pub settings_state: SettingsStateView,
 }
 
@@ -337,12 +341,32 @@ impl SettingsService {
     pub fn view(&self) -> Result<SettingsView, String> {
         let state = self.snapshot();
         let mut secrets = BTreeMap::new();
+        let mut secrets_error: Option<String> = None;
         for provider in &state.settings.providers {
-            let api_key = self.has(&api_key_name(&provider.id))?;
+            // A Keychain failure must not block Settings: on the first failure, stop calling the store for the
+            // rest of this view and report the remaining presences as false.
+            let api_key = if secrets_error.is_some() {
+                false
+            } else {
+                match self.has(&api_key_name(&provider.id)) {
+                    Ok(present) => present,
+                    Err(e) => {
+                        secrets_error = Some(e);
+                        false
+                    }
+                }
+            };
             let mut headers = Vec::new();
-            for header in provider.headers.iter().filter(|h| h.secret) {
-                if self.has(&header_secret_name(&provider.id, &header.name))? {
-                    headers.push(header.name.clone());
+            if secrets_error.is_none() {
+                for header in provider.headers.iter().filter(|h| h.secret) {
+                    match self.has(&header_secret_name(&provider.id, &header.name)) {
+                        Ok(true) => headers.push(header.name.clone()),
+                        Ok(false) => {}
+                        Err(e) => {
+                            secrets_error = Some(e);
+                            break;
+                        }
+                    }
                 }
             }
             secrets.insert(provider.id.clone(), SecretsPresent { api_key, headers });
@@ -350,6 +374,7 @@ impl SettingsService {
         let settings_state = self.state_view(&state);
         Ok(SettingsView {
             load_error: settings_state.reason.clone(),
+            secrets_error,
             settings_state,
             settings: state.settings,
             secrets,
@@ -1028,6 +1053,20 @@ mod tests {
         let view = service.view().unwrap();
         assert_eq!(view.load_error, None);
         service.save_provider(with_key(provider("acme"), KEY)).unwrap();
+    }
+
+    #[test]
+    fn a_secret_store_failure_does_not_block_the_settings_view() {
+        let f = fixture();
+        f.service.save_provider(with_key(provider("acme"), KEY)).unwrap();
+        f.store.set_fail_loads(true);
+        let service = service_on(&f.dir, &f.store);
+
+        let view = service.view().expect("the settings are still returned");
+        let problem = view.secrets_error.expect("the secret failure is reported");
+        assert!(problem.contains("simulated failure"), "{problem}");
+        assert_eq!(view.secrets["acme"], SecretsPresent { api_key: false, headers: Vec::new() });
+        assert_eq!(view.settings.providers.len(), 1, "providers are still returned");
     }
 
     #[test]

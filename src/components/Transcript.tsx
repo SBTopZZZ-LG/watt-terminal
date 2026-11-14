@@ -29,6 +29,8 @@ interface Props {
   busy: boolean;
   /** The model is working and has not produced output yet. */
   thinking: boolean;
+  /** An approval card waits for an answer. Shows the header's approval badge. */
+  approvalPending?: boolean;
   open: boolean;
   onToggle: () => void;
   onApprove: (callId: string, approve: boolean) => void;
@@ -55,6 +57,7 @@ export function Transcript({
   items,
   busy,
   thinking,
+  approvalPending = false,
   open,
   onToggle,
   onApprove,
@@ -218,6 +221,7 @@ export function Transcript({
           <span>Agent</span>
           {busy && <span className="busy">working...</span>}
           {thinking && <span className="thinking">thinking...</span>}
+          {approvalPending && <span className="approval-needed">approval needed</span>}
           <span className="toggle">{open ? 'Hide' : 'Show'}</span>
         </button>
         {onDock && dock && <DockButtons dock={dock} onDock={onDock} />}
@@ -432,7 +436,9 @@ function Entry({ item, onApprove, onAnswerQuestions }: { item: TranscriptItem; o
             </div>
           )}
           {item.state === 'answering' && <div className="approval-note">{item.approve ? 'Approving...' : 'Denying...'}</div>}
-          {item.state === 'resolved' && <div className="approval-note">Resolved</div>}
+          {item.state === 'resolved' && (
+            <div className="approval-note">{item.approve === true ? 'Approved' : item.approve === false ? 'Denied' : 'Closed'}</div>
+          )}
         </div>
       );
     }

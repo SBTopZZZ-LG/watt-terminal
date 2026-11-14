@@ -48,7 +48,7 @@ Open Settings (Cmd+,), go to **Models**, pick a preset or add a custom OpenAI-co
 
 The default model has an optional variant: a named preset of extra request settings for that model (for example a reasoning effort). Pick it in the **Variant** select next to the model, or with `/model provider/model#variant`. The variants in the list come from the provider's model list when it is fetched; the status strip shows the saved one as `model: id#variant`. With no variant the base model runs with the provider defaults.
 
-To set your own variant, open the provider and expand **Variants (N)** under the model: give it an id, a label and a JSON object body such as `{"reasoning":{"effort":"high"}}`, then save and pick it as the default variant. Manual variants are kept across fetches and win over a fetched variant with the same id; the default variant cannot be removed while it is selected.
+To set your own variant, open the provider and expand **Variants (N)** under the model: give it an id, a label and a JSON object body such as `{"reasoning":{"effort":"high"}}`, then save and pick it as the default variant. Manual variants are kept across fetches and win over a fetched variant with the same id; the default variant cannot be removed while it is selected. A manual variant can set `max_completion_tokens` for providers that reject `max_tokens`.
 
 For development you can skip the settings dialog and set all three of these (read the key from a password manager rather than typing it into your shell history):
 

@@ -1240,11 +1240,13 @@ export default function App() {
             onExpand={() => dispatchPanel({ type: 'toggle' })}
             busy={busy || sideBusy}
             thinking={transcript.thinking}
+            approvalPending={pendingApproval !== null}
           >
             <Transcript
               items={transcript.items}
               busy={busy}
               thinking={transcript.thinking}
+              approvalPending={pendingApproval !== null}
               open={panel.open}
               onToggle={() => dispatchPanel({ type: 'toggle' })}
               onApprove={answer}

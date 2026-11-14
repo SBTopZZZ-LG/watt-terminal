@@ -100,6 +100,32 @@ describe('AgentPanel', () => {
     );
     expect(idle).not.toContain('agent-rail-busy');
   });
+
+  it('shows an approval dot on the rail button while a card waits, in addition to the busy dot', () => {
+    const both = renderToStaticMarkup(
+      <AgentPanel view={panelView(layoutFor('left', false), BIG)} onExpand={() => {}} busy approvalPending>
+        <span />
+      </AgentPanel>,
+    );
+    expect(both).toContain('agent-rail-approval');
+    expect(both).toContain('aria-label="Approval needed"');
+    expect(both).toContain('agent-rail-busy');
+
+    const only = renderToStaticMarkup(
+      <AgentPanel view={panelView(layoutFor('left', false), BIG)} onExpand={() => {}} approvalPending>
+        <span />
+      </AgentPanel>,
+    );
+    expect(only).toContain('agent-rail-approval');
+    expect(only).not.toContain('agent-rail-busy');
+
+    const neither = renderToStaticMarkup(
+      <AgentPanel view={panelView(layoutFor('left', false), BIG)} onExpand={() => {}}>
+        <span />
+      </AgentPanel>,
+    );
+    expect(neither).not.toContain('agent-rail-approval');
+  });
 });
 
 describe('PanelDivider', () => {

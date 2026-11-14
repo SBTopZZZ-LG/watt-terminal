@@ -112,6 +112,7 @@ pub struct ChatRequest {
 }
 
 /// Body keys a variant must never override. `request_body` skips them even when one slips through validation.
+/// `max_completion_tokens` is not protected: a manual variant may set it for providers that reject `max_tokens`.
 pub const PROTECTED_BODY_KEYS: &[&str] = &[
     "model",
     "messages",
@@ -119,7 +120,6 @@ pub const PROTECTED_BODY_KEYS: &[&str] = &[
     "tools",
     "stream_options",
     "max_tokens",
-    "max_completion_tokens",
     "models",
 ];
 
@@ -429,7 +429,8 @@ fn request_body(req: &ChatRequest, stream: bool) -> Value {
         body["max_tokens"] = json!(max_tokens);
     }
     // The variant overlay: each non-protected top-level key replaces the base value whole. No deep merge:
-    // a nested object in `extra` replaces the base object of the same name instead of merging into it.
+    // a nested object in `extra` replaces the base object of the same name instead of merging into it. A variant
+    // that sets `max_completion_tokens` replaces the base `max_tokens`, so exactly one limit is sent.
     if let Some(extra) = req.extra.as_ref()
         && let Some(obj) = body.as_object_mut()
     {
@@ -438,6 +439,9 @@ fn request_body(req: &ChatRequest, stream: bool) -> Value {
                 continue;
             }
             obj.insert(key.clone(), value.clone());
+        }
+        if extra.contains_key("max_completion_tokens") {
+            obj.remove("max_tokens");
         }
     }
     body
@@ -638,7 +642,6 @@ mod tests {
                 ("tools", json!([])),
                 ("stream_options", json!({"include_usage": true})),
                 ("max_tokens", json!(1)),
-                ("max_completion_tokens", json!(1)),
                 ("models", json!(["m"])),
                 ("reasoning", json!({"effort": "high"})),
             ]),
@@ -652,9 +655,25 @@ mod tests {
         assert!(body.get("tools").is_none());
         assert!(body.get("stream_options").is_none());
         assert_eq!(body["max_tokens"], 64);
-        assert!(body.get("max_completion_tokens").is_none());
         assert!(body.get("models").is_none());
         assert_eq!(body["reasoning"], json!({"effort": "high"}), "non-protected keys still merge: {body}");
+    }
+
+    #[test]
+    fn variant_extra_may_set_max_completion_tokens_instead_of_max_tokens() {
+        let req = ChatRequest {
+            extra: extra_of(&[("max_completion_tokens", json!(128))]),
+            max_tokens: Some(64),
+            ..one_message()
+        };
+        let body = request_body(&req, false);
+        assert_eq!(body["max_completion_tokens"], 128);
+        assert!(body.get("max_tokens").is_none(), "exactly one limit is sent: {body}");
+
+        let req = ChatRequest { extra: extra_of(&[("max_completion_tokens", json!(128))]), ..one_message() };
+        let body = request_body(&req, false);
+        assert_eq!(body["max_completion_tokens"], 128);
+        assert!(body.get("max_tokens").is_none());
     }
 
     #[test]

@@ -5,8 +5,12 @@
 //! multiplexer, or anything else. A remote login or a nested shell has no shell integration, so the agent cannot run
 //! commands in it. The hint lets the app say so.
 //!
-//! It is a HINT, never a safety decision. Nothing that approves or refuses a command reads it. It is guessed from the
-//! words, so an alias or a script can hide what really runs.
+//! The command-text hint is a HINT, never a safety decision. Nothing that approves or refuses a command reads it. It is
+//! guessed from the words, so an alias or a script can hide what really runs.
+//!
+//! Separately, `looks_like_shell_prompt` reads the visible screen rows for a shell prompt. It is a conservative safety
+//! signal, not the hint: when the screen looks like a prompt, `send_keys` asks per Enter, since a latched command may
+//! be sitting at a shell rather than running the agent's own program.
 
 use serde::{Deserialize, Serialize};
 
@@ -116,6 +120,25 @@ pub fn is_login(command: &str) -> bool {
 pub fn integration_offered(fg: &Foreground) -> bool {
     matches!(fg.kind, ForegroundKind::Ssh | ForegroundKind::Shell | ForegroundKind::Su | ForegroundKind::ContainerExec)
         && is_login(&fg.command)
+}
+
+/// True when the visible screen looks like it is sitting at a shell prompt: the last non-empty row (trimmed) ends with
+/// `$`, `#`, `%`, `>`, `❯`, `λ` or `→` and is longer than that one character. False for empty screens and for
+/// password-like rows ending in `:` (such as `Password:`), which ask for input rather than a command.
+///
+/// Conservative on purpose: output that happens to end with one of those characters still asks, since typing into a
+/// shell by mistake is worse than an extra approval card.
+pub fn looks_like_shell_prompt(rows: &[String]) -> bool {
+    let Some(line) = rows.iter().rev().map(|row| row.trim()).find(|row| !row.is_empty()) else {
+        return false;
+    };
+    if line.ends_with(':') {
+        return false;
+    }
+    if line.chars().count() <= 1 {
+        return false;
+    }
+    matches!(line.chars().last(), Some('$' | '#' | '%' | '>' | '❯' | 'λ' | '→'))
 }
 
 /// The words after any assignments and wrappers (see WRAPPERS): the program, then its arguments.
@@ -813,5 +836,26 @@ mod tests {
         assert!(!login("docker exec"));
         assert!(!login("kubectl exec"));
         assert!(!login("su -c"));
+    }
+
+    fn prompt_rows(rows: &[&str]) -> Vec<String> {
+        rows.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn the_screen_prompt_check_names_shell_prompts_and_ignores_passwords_and_empty_screens() {
+        assert!(looks_like_shell_prompt(&prompt_rows(&["dev@host:~$"])));
+        assert!(looks_like_shell_prompt(&prompt_rows(&["root#"])));
+        assert!(looks_like_shell_prompt(&prompt_rows(&["myproject ❯"])));
+        assert!(looks_like_shell_prompt(&prompt_rows(&[">>>"])));
+        assert!(looks_like_shell_prompt(&prompt_rows(&["output line", "ubuntu@lidia:~$ "])));
+        assert!(looks_like_shell_prompt(&prompt_rows(&["total $"])), "output ending in $ still asks: conservative");
+        assert!(!looks_like_shell_prompt(&prompt_rows(&["❯"])), "a lone prompt character is not enough");
+        assert!(!looks_like_shell_prompt(&prompt_rows(&["Password:"])));
+        assert!(!looks_like_shell_prompt(&prompt_rows(&["[sudo] password for ubuntu:"])));
+        assert!(!looks_like_shell_prompt(&prompt_rows(&[])), "empty");
+        assert!(!looks_like_shell_prompt(&prompt_rows(&["", "   "])), "blank rows only");
+        assert!(!looks_like_shell_prompt(&prompt_rows(&["$", ""])), "the last non-empty row is a lone $");
+        assert!(!looks_like_shell_prompt(&prompt_rows(&["make test", "done"])));
     }
 }

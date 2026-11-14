@@ -11,6 +11,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use keyring::Entry;
 #[cfg(test)]
@@ -237,7 +238,13 @@ pub type SecretMap = BTreeMap<String, String>;
 pub struct Secrets {
     store: Box<dyn SecretStore>,
     cache: Mutex<Option<SecretMap>>,
+    /// The last load failure, remembered for a while so reopening Settings does not prompt again. Cleared on a
+    /// successful load or save.
+    load_failure: Mutex<Option<(SecretError, Instant)>>,
 }
+
+/// How long a load failure is remembered before the store is tried again.
+const LOAD_FAILURE_TTL: Duration = Duration::from_secs(30);
 
 impl fmt::Debug for Secrets {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -247,7 +254,7 @@ impl fmt::Debug for Secrets {
 
 impl Secrets {
     pub fn new(store: Box<dyn SecretStore>) -> Self {
-        Self { store, cache: Mutex::new(None) }
+        Self { store, cache: Mutex::new(None), load_failure: Mutex::new(None) }
     }
 
     /// `WATT_SECRETS_FILE` (or the old `AGENT_TERM_SECRETS_FILE`), a non-empty path, selects a `FileStore`. Otherwise
@@ -325,21 +332,66 @@ impl Secrets {
         self.cache.lock().map_err(|_| unavailable("internal lock poisoned"))
     }
 
-    /// Returns the cached map, reading it from the store the first time. A failed read is not cached, so the next call
-    /// tries again.
+    fn failure_lock(&self) -> Result<std::sync::MutexGuard<'_, Option<(SecretError, Instant)>>, SecretError> {
+        self.load_failure.lock().map_err(|_| unavailable("internal lock poisoned"))
+    }
+
+    /// Returns the cached map, reading it from the store the first time. A failed read is remembered for
+    /// `LOAD_FAILURE_TTL`, so a second call within that time returns the same error without touching the store
+    /// (the Keychain would prompt again). A successful load clears the remembered failure.
     fn loaded<'a>(&self, cache: &'a mut Option<SecretMap>) -> Result<&'a mut SecretMap, SecretError> {
         if cache.is_none() {
-            let map = match self.store.load()? {
-                None => SecretMap::new(),
-                Some(blob) => serde_json::from_str::<SecretMap>(&blob).map_err(|_| SecretError::Corrupt)?,
+            if let Some((err, _)) = self.cached_failure()? {
+                return Err(err);
+            }
+            let map = match self.store.load() {
+                Err(e) => {
+                    self.remember_failure(e.clone());
+                    return Err(e);
+                }
+                Ok(None) => SecretMap::new(),
+                Ok(Some(blob)) => match serde_json::from_str::<SecretMap>(&blob) {
+                    Ok(map) => map,
+                    Err(_) => {
+                        self.remember_failure(SecretError::Corrupt);
+                        return Err(SecretError::Corrupt);
+                    }
+                },
             };
+            self.clear_failure();
             *cache = Some(map);
         }
         Ok(cache.get_or_insert_with(SecretMap::new))
     }
 
+    /// The remembered load failure, when it has not expired yet. An expired entry is cleared.
+    fn cached_failure(&self) -> Result<Option<(SecretError, Instant)>, SecretError> {
+        let mut failure = self.failure_lock()?;
+        match failure.clone() {
+            Some((err, at)) if at.elapsed() < LOAD_FAILURE_TTL => Ok(Some((err, at))),
+            Some(_) => {
+                *failure = None;
+                Ok(None)
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn remember_failure(&self, err: SecretError) {
+        if let Ok(mut failure) = self.load_failure.lock() {
+            *failure = Some((err, Instant::now()));
+        }
+    }
+
+    fn clear_failure(&self) {
+        if let Ok(mut failure) = self.load_failure.lock() {
+            *failure = None;
+        }
+    }
+
     /// Applies `change` to the cached map and saves the result. `change` returns false when nothing changed, and then
-    /// nothing is saved. If the save fails, the cache goes back to what it was.
+    /// nothing is saved. If the save fails, the cache goes back to what it was. A successful save clears a
+    /// remembered load failure.
     fn update(&self, change: impl FnOnce(&mut SecretMap) -> bool) -> Result<(), SecretError> {
         let mut cache = self.lock()?;
         let map = self.loaded(&mut cache)?;
@@ -352,6 +404,8 @@ impl Secrets {
             .and_then(|blob| self.store.save(&blob));
         if outcome.is_err() {
             *map = before;
+        } else {
+            self.clear_failure();
         }
         outcome
     }
@@ -460,6 +514,16 @@ mod tests {
         store.set_fail_saves(false);
         secrets.set("new", "2").unwrap();
         assert_eq!(secrets.get("new").unwrap().as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn a_failed_load_is_remembered_so_the_store_is_not_touched_again() {
+        let (secrets, store) = memory(None);
+        store.set_fail_loads(true);
+        assert!(matches!(secrets.has("a"), Err(SecretError::Unavailable(_))));
+        assert_eq!(store.loads(), 1);
+        assert!(matches!(secrets.has("a"), Err(SecretError::Unavailable(_))));
+        assert_eq!(store.loads(), 1, "the second failure comes from the cache, without another load");
     }
 
     #[test]
