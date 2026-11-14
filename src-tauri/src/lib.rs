@@ -33,6 +33,7 @@ use crate::core::chat::questions;
 use crate::core::chat::side::{self, SideCall};
 use crate::core::chat::attachments::{AttachmentInput, ImageFile, prepare};
 use crate::core::chat::context::ContextUsage;
+use crate::core::chat::export;
 use crate::core::chat::history::History;
 use crate::core::chat::redact::Redactor;
 use crate::core::chat::todo::{Todo, TodoList};
@@ -860,18 +861,6 @@ async fn integrate_shell(session_id: String, reg: State<'_, Reg>) -> Result<Inte
     blocking(move || Ok(att.session.integrate_shell())).await
 }
 
-/// Async, so the `pkill`/`kill` calls in `Session::kill` do not run on the UI thread.
-#[tauri::command]
-async fn kill_session(session_id: String, reg: State<'_, Reg>) -> Result<(), String> {
-    match reg.remove(&session_id) {
-        Some(att) => {
-            att.session.kill();
-            Ok(())
-        }
-        None => Err(format!("no session {session_id}")),
-    }
-}
-
 /// The saved conversations, most recently updated first.
 #[tauri::command]
 async fn list_conversations(persist: State<'_, PersistState>) -> Result<Vec<ConversationMeta>, String> {
@@ -1181,6 +1170,14 @@ async fn fork_conversation(
     att.conversation.set_last_usage(out_context.clone());
     drop(end);
     Ok(LoadedConversation { id: new_id, title: saved_title, messages: snapshot, todos: out_todos, context: out_context })
+}
+
+/// The live conversation as Markdown for `/export`: the stored history (never the capped UI
+/// transcript), so nothing is lost.
+#[tauri::command]
+fn export_conversation(session_id: String, reg: State<'_, Reg>) -> Result<String, String> {
+    let att = session(&reg, &session_id)?;
+    Ok(export::markdown(&lock(&att.conversation.history()).snapshot()))
 }
 
 /// What a delete reports: whether a live conversation was among those deleted and was reset to a new one.
@@ -1511,13 +1508,13 @@ pub fn run() {
             suggest_name,
             compact_conversation,
             fork_conversation,
+            export_conversation,
             approve_tool,
             set_auto_approve,
             auto_approve_state,
             get_status,
             list_commands,
             integrate_shell,
-            kill_session,
             list_conversations,
             load_conversation,
             delete_conversation,

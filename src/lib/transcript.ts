@@ -2,6 +2,7 @@
 // Pure reducer over AgentEvents (from Rust) and local actions (sent messages, clicks, errors).
 
 import type { AgentEvent, ApprovalReasonCode, ContextUsage, QuestionAnswerInput, QuestionResult, QuestionSpec, RecordSummary, TodoItem, ToolDecision } from './types';
+import { APPROVAL_WINDOW_MS } from './approvalTime';
 import { visibleEscapes } from './visibleEscapes';
 import { TODO_TOOL } from './todoView';
 import { ASK_USER_TOOL, closedResult, parseResult } from './questions';
@@ -38,8 +39,9 @@ export type TranscriptItem =
   /**
    * `reason` is why the card asks. `location` is the nested shell the command is for (its label), or null on the local shell.
    * `display` is the decoded input of a send_keys card (null for the others, and for a card from an older backend).
+   * `expiresAt` is when the countdown runs out (Unix ms); absent for a card from an older session.
    */
-  | { id: number; kind: 'approval'; callId: string; name: string; text: string; display: string | null; state: ApprovalState; approve: boolean | null; reason: ApprovalReasonCode | null; location: string | null }
+  | { id: number; kind: 'approval'; callId: string; name: string; text: string; display: string | null; state: ApprovalState; approve: boolean | null; reason: ApprovalReasonCode | null; location: string | null; expiresAt?: number }
   /**
    * The agent's clarification question (`ask_user`). `questions` are the backend's, with its ids. `answers` are the
    * ones sent (or being sent); `result` is the settled outcome once the tool result arrives. `error` is why a send
@@ -370,6 +372,7 @@ function applyAgentEvent(t: Transcript, ev: AgentEvent, at: number | undefined):
         approve: null,
         reason: ev.reason ?? null,
         location: ev.location ?? null,
+        expiresAt: (at ?? Date.now()) + APPROVAL_WINDOW_MS,
       }));
     case 'question_request':
       return add(t, (id) => ({

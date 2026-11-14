@@ -69,4 +69,14 @@ describe('ApprovalToast', () => {
     const html = render({ ...RUN, name: 'send_keys', text: 'x', display: 'a‮b⏎' });
     expect(html).toContain('a\\u{202E}b⏎');
   });
+
+  it('shows the countdown line when the approval has an expiry', () => {
+    const html = render({ ...RUN, expiresAt: Date.now() + 120_000 });
+    expect(html).toContain('approval-countdown');
+    expect(html).toMatch(/expires in \d+:\d\d/);
+  });
+
+  it('has no countdown line for a card from an older session', () => {
+    expect(render()).not.toContain('approval-countdown');
+  });
 });

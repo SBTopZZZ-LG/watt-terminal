@@ -86,4 +86,9 @@ describe('api side commands', () => {
     void api.forkConversation();
     expect(invoke).toHaveBeenCalledWith('fork_conversation', { sessionId: 'main' });
   });
+
+  it('exportConversation asks for the live conversation as Markdown', () => {
+    void api.exportConversation();
+    expect(invoke).toHaveBeenCalledWith('export_conversation', { sessionId: 'main' });
+  });
 });

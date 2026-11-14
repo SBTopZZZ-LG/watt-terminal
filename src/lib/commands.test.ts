@@ -6,7 +6,6 @@ import {
   INIT_TEMPLATE,
   PLAN_TEMPLATE,
   REVIEW_TEMPLATE,
-  conversationMarkdown,
   expandTemplate,
   findBuiltin,
   matchModel,
@@ -18,7 +17,6 @@ import {
 } from './commands';
 import type { ModelChoice } from './commands';
 import type { CommandCatalog, ContextUsage } from './types';
-import type { TranscriptItem } from './transcript';
 
 describe('parseCommand', () => {
   it('parses a bare command with no args', () => {
@@ -375,59 +373,3 @@ describe('renderContext', () => {
   });
 });
 
-describe('conversationMarkdown', () => {
-  it('exports user and agent blocks in order, skipping the rest', () => {
-    const items: TranscriptItem[] = [
-      { id: 1, kind: 'notice', text: 'hi' },
-      { id: 2, kind: 'user', clientId: 1, text: 'do it' },
-      { id: 3, kind: 'tool', callId: 'c1', name: 'run_command', args: null, status: 'ok', result: null, decision: 'read', reason: null },
-      { id: 4, kind: 'agent', text: 'done', streaming: false },
-      {
-        id: 5,
-        kind: 'approval',
-        callId: 'c2',
-        name: 'run_command',
-        text: 'ls',
-        display: null,
-        state: 'pending',
-        approve: null,
-        reason: null,
-        location: null,
-      },
-      {
-        id: 6,
-        kind: 'question',
-        callId: 'c3',
-        questions: [],
-        state: 'pending',
-        answers: null,
-        result: null,
-        error: null,
-        note: null,
-      },
-      { id: 7, kind: 'record_end', recordId: 9, exit: 0 },
-    ];
-    expect(conversationMarkdown(items)).toBe('## You\n\ndo it\n\n## Agent\n\ndone');
-  });
-
-  it('lists attachment names under the user block', () => {
-    const items: TranscriptItem[] = [
-      {
-        id: 1,
-        kind: 'user',
-        clientId: 1,
-        text: 'look',
-        attachments: [
-          { kind: 'image', name: 'shot.png', bytes: 10 },
-          { kind: 'file', name: 'notes.txt', bytes: 20 },
-        ],
-      },
-    ];
-    expect(conversationMarkdown(items)).toBe('## You\n\nlook\n\nAttachments: shot.png, notes.txt');
-  });
-
-  it('is empty for a conversation with no messages', () => {
-    expect(conversationMarkdown([])).toBe('');
-    expect(conversationMarkdown([{ id: 1, kind: 'notice', text: 'hi' }])).toBe('');
-  });
-});

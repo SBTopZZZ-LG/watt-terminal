@@ -19,6 +19,7 @@ import { groupTranscript, toolGroupSummary } from '../lib/toolGroups';
 import type { GroupItem, InteractiveGroup, TranscriptEntry } from '../lib/toolGroups';
 import { visibleEscapes } from '../lib/visibleEscapes';
 import { Markdown } from './Markdown';
+import { ApprovalCountdown } from './ApprovalCountdown';
 import { chatBodyShown } from '../lib/panelLayout';
 import { settleTight } from '../lib/panelTight';
 import type { Dock } from '../lib/panelLayout';
@@ -435,6 +436,7 @@ function Entry({ item, onApprove, onAnswerQuestions }: { item: TranscriptItem; o
               </button>
             </div>
           )}
+          {item.state === 'pending' && <ApprovalCountdown expiresAt={item.expiresAt} />}
           {item.state === 'answering' && <div className="approval-note">{item.approve ? 'Approving...' : 'Denying...'}</div>}
           {item.state === 'resolved' && (
             <div className="approval-note">{item.approve === true ? 'Approved' : item.approve === false ? 'Denied' : 'Closed'}</div>

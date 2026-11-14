@@ -7,7 +7,6 @@ import {
   INIT_TEMPLATE,
   PLAN_TEMPLATE,
   REVIEW_TEMPLATE,
-  conversationMarkdown,
   expandTemplate,
   findBuiltin,
   matchModel,
@@ -28,7 +27,7 @@ import { agentDialogPhase, agentIntegratingQuietly, agentRequestAfter, agentRequ
 import type { AgentRequest, IntegratePhase } from './lib/integrate';
 import { agentControlAfter, borderActive, borderLevel, NO_CONTROL, settleControl } from './lib/agentControl';
 import type { AgentControl, BorderLevel } from './lib/agentControl';
-import { EMPTY_TRANSCRIPT, MAX_ITEMS, firstPendingApproval, isBusy, transcriptReducer } from './lib/transcript';
+import { EMPTY_TRANSCRIPT, firstPendingApproval, isBusy, transcriptReducer } from './lib/transcript';
 import type { TranscriptItem } from './lib/transcript';
 import { chatBodyShown, isSideDock, loadPanelLayout, panelReducer, panelView, savePanelLayout } from './lib/panelLayout';
 import type { Container } from './lib/panelLayout';
@@ -797,22 +796,23 @@ export default function App() {
         return { kind: 'handled' };
       }
       case 'export': {
-        const items = transcriptRef.current.items;
-        const md = conversationMarkdown(items);
-        if (md.trim() === '') {
-          dispatchTranscript({ type: 'notice', text: 'There is nothing to export yet.', muted: true });
-          return { kind: 'handled' };
+        try {
+          const md = await api.exportConversation();
+          if (md.trim() === '') {
+            dispatchTranscript({ type: 'notice', text: 'There is nothing to export yet.', muted: true });
+            return { kind: 'handled' };
+          }
+          const ok = await copyText(md, { clipboard: navigator.clipboard ?? undefined, document });
+          dispatchTranscript({
+            type: 'notice',
+            text: ok
+              ? `Copied the conversation to the clipboard (${md.length} characters).`
+              : 'Could not copy the conversation to the clipboard.',
+            ...(ok ? { muted: true } : {}),
+          });
+        } catch (e) {
+          dispatchTranscript({ type: 'notice', text: errorText(e) });
         }
-        const ok = await copyText(md, { clipboard: navigator.clipboard ?? undefined, document });
-        dispatchTranscript({
-          type: 'notice',
-          text: ok
-            ? items.length >= MAX_ITEMS
-              ? `Copied the latest ${MAX_ITEMS} messages to the clipboard (${md.length} characters). Older messages were not included.`
-              : `Copied the conversation to the clipboard (${md.length} characters).`
-            : 'Could not copy the conversation to the clipboard.',
-          ...(ok ? { muted: true } : {}),
-        });
         return { kind: 'handled' };
       }
       case 'plan':

@@ -6,6 +6,7 @@ import { capDisplay } from '../lib/keysDisplay';
 import type { Dock } from '../lib/panelLayout';
 import { MAX_COMMAND_PREVIEW_CHARS, MAX_SEND_KEYS_PREVIEW_CHARS } from '../lib/toolDisplay';
 import type { TranscriptItem } from '../lib/transcript';
+import { ApprovalCountdown } from './ApprovalCountdown';
 
 type ApprovalItem = Extract<TranscriptItem, { kind: 'approval' }>;
 
@@ -36,6 +37,7 @@ export function ApprovalToast({ approval, dock, onApprove, onOpen }: ApprovalToa
           Show
         </button>
       </div>
+      <ApprovalCountdown expiresAt={approval.expiresAt} />
     </div>
   );
 }

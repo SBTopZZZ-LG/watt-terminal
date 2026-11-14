@@ -134,6 +134,10 @@ export const api = {
   forkConversation() {
     return invoke<LoadedConversation>('fork_conversation', { sessionId: SESSION_ID });
   },
+  /** The live conversation as Markdown for `/export`: the stored history, so nothing is lost to the UI cap. */
+  exportConversation() {
+    return invoke<string>('export_conversation', { sessionId: SESSION_ID });
+  },
   /** The saved conversations, most recently updated first. */
   listConversations() {
     return invoke<ConversationMeta[]>('list_conversations');

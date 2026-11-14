@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { approvalTitle, EMPTY_TRANSCRIPT, firstPendingApproval, isBusy, MAX_ITEMS, TRIM_NOTE, transcriptReducer } from './transcript';
+import { APPROVAL_WINDOW_MS } from './approvalTime';
 import type { QuestionSpec } from './types';
 import type { Transcript, TranscriptAction } from './transcript';
 
@@ -52,6 +53,13 @@ describe('transcriptReducer: agent events', () => {
     });
     expect(done.items[0]).toMatchObject({ kind: 'approval', state: 'resolved' });
     expect(firstPendingApproval(done)).toBeNull();
+  });
+
+  it('an approval request stamps its expiry two minutes after it arrives', () => {
+    const stamped = run([
+      { type: 'agent_event', event: { type: 'approval_request', call_id: 'a1', name: 'run_command', text: 'pwd' }, at: 1_000 },
+    ]);
+    expect(stamped.items[0]).toMatchObject({ kind: 'approval', expiresAt: 1_000 + APPROVAL_WINDOW_MS });
   });
 
   it('done ends the in-flight turn', () => {

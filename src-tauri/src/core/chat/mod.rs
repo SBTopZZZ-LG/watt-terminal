@@ -6,6 +6,7 @@ pub mod agent_loop;
 pub mod attachments;
 pub mod commands;
 pub mod context;
+pub mod export;
 pub mod history;
 pub mod instructions;
 pub mod project;

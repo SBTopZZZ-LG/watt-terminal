@@ -85,6 +85,28 @@ describe('Transcript: tool groups', () => {
   });
 });
 
+describe('Transcript: approval countdown', () => {
+  it('a pending card shows the countdown line when it has an expiry', () => {
+    const html = render([
+      { type: 'agent_event', event: { type: 'approval_request', call_id: 'c1', name: 'run_command', text: 'ls' }, at: Date.now() },
+    ]);
+    expect(html).toContain('class="approval approval-pending"');
+    expect(html).toContain('approval-countdown');
+    expect(html).toMatch(/expires in \d+:\d\d/);
+  });
+
+  it('a card from an older session has no countdown line', () => {
+    const html = render([
+      {
+        type: 'conversation_loaded',
+        items: [{ kind: 'approval', callId: 'c1', name: 'run_command', text: 'ls', display: null, state: 'pending', approve: null, reason: null, location: null }],
+      },
+    ]);
+    expect(html).toContain('class="approval approval-pending"');
+    expect(html).not.toContain('approval-countdown');
+  });
+});
+
 describe('Transcript: history button', () => {
   it('has the id App focuses when the History view closes, and is pressed while the view is shown', () => {
     const html = renderToStaticMarkup(

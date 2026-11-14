@@ -1776,6 +1776,17 @@ input {
   overflow-wrap: anywhere;
 }
 
+/* The approval countdown. One muted line under the actions; tabular numerals keep its width steady while it ticks. */
+.approval-countdown {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* The nested shell an approval is for: the label of the level, under the title. */
 .approval-location {
   margin-top: 2px;

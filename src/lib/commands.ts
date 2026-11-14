@@ -4,7 +4,6 @@
 // Unknown `/...` text is not a command: the full text is sent to the agent unchanged. Built-ins win over customs.
 
 import type { CommandCatalog, ContextUsage, ModelRef } from './types';
-import type { TranscriptItem } from './transcript';
 
 /** A `/name args` line. `args` is the rest of the line, trimmed (empty when there is none). */
 export interface ParsedCommand {
@@ -300,24 +299,4 @@ export function renderContext(usage: ContextUsage | null): string {
   }
   lines.push('Stored history is complete; trimming only changes what is sent.');
   return lines.join('\n');
-}
-
-/**
- * The conversation as Markdown for `/export`: `## You` / `## Agent` blocks in transcript order, with the user
- * block's attachment names under its text. Tools, notices, approvals, questions and record markers are skipped.
- */
-export function conversationMarkdown(items: TranscriptItem[]): string {
-  const blocks: string[] = [];
-  for (const item of items) {
-    if (item.kind === 'user') {
-      let block = `## You\n\n${item.text}`;
-      if (item.attachments && item.attachments.length > 0) {
-        block += `\n\nAttachments: ${item.attachments.map((a) => a.name).join(', ')}`;
-      }
-      blocks.push(block);
-    } else if (item.kind === 'agent') {
-      blocks.push(`## Agent\n\n${item.text}`);
-    }
-  }
-  return blocks.join('\n\n');
 }
