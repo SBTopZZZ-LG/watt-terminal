@@ -101,6 +101,8 @@ function global:prompt {
   $ok = $?
   $lec = $global:LASTEXITCODE
   $nonce = $global:WattNonce
+  # PSReadLine can lose the Enter binding after integration (see _WattBindEnter).
+  $null = _WattBindEnter
   if ($global:WattRan) {
     $global:WattRan = $false
     $code = 0
@@ -117,10 +119,43 @@ function global:prompt {
   return ($global:WattEsc + ']133;A;n=' + $nonce + $global:WattTerm) + $text + ($global:WattEsc + ']133;B;n=' + $nonce + $global:WattTerm)
 }
 
+# The prompt function as it was installed above. A Function:\prompt that is not this block was defined by someone else.
+$global:WattPromptBlock = (Get-Item -Path Function:\prompt).ScriptBlock
+
+# A prompt redefined after integration (profile, conda, posh-git, oh-my-posh lazy init) has no A/B/D/cwd. Called from the
+# Enter handler, before the line runs: the new prompt becomes the one to wrap, the wrapper goes back, and Degraded says so.
+# A previous command that never got its D gets one now, exit 0 as a guess, so the observer does not see C over an open record.
+function global:_WattCheckPrompt {
+  $cur = (Get-Item -Path Function:\prompt -ErrorAction SilentlyContinue).ScriptBlock
+  if ([object]::ReferenceEquals($cur, $global:WattPromptBlock)) { return }
+  if ($global:WattRan) {
+    $global:WattRan = $false
+    $global:WattNoOp = $false
+    _WattOsc ("133;D;n=$($global:WattNonce);exit=0;ps=0")
+  }
+  $orig = $cur
+  if ($null -eq $orig) { $orig = { 'PS> ' } }
+  $global:WattOrigPrompt = $orig
+  Set-Item -Path Function:\global:prompt -Value $global:WattPromptBlock
+  _WattOsc ("633;Degraded;n=$($global:WattNonce);reason=prompt")
+}
+
+# Binds Enter to $global:WattEnter. In Vi mode PSReadLine keeps separate Insert and Command maps, so both get it.
+# prompt() calls this each time, because a runtime Set-PSReadLineOption -EditMode Vi or Set-PSReadLineKeyHandler -Key Enter
+# drops the binding. Measured at about 0.4 ms per call (pwsh 7.6.9, PSReadLine 2.4.5).
+function global:_WattBindEnter {
+  Set-PSReadLineKeyHandler -Key Enter -ScriptBlock $global:WattEnter
+  if ([string](Get-PSReadLineOption).EditMode -eq 'Vi') {
+    Set-PSReadLineKeyHandler -Key Enter -ScriptBlock $global:WattEnter -ViMode Insert
+    Set-PSReadLineKeyHandler -Key Enter -ScriptBlock $global:WattEnter -ViMode Command
+  }
+}
+
 # Enter: emit E and C for a complete, non-blank line, then hand off to PSReadLine's normal validate-and-accept.
 # Incomplete input (open block/string/pipe) gets no E/C but a 133;P (continuation, PS2) like zsh; the next Enter that
 # completes the line emits E and C with the whole text. ValidateAndAcceptLine inserts a newline as usual.
-Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
+$global:WattEnter = {
+  _WattCheckPrompt
   $line = $null
   $cursor = $null
   [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor)
@@ -131,9 +166,12 @@ Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
       $global:WattRan = $true
       $global:WattNoOp = _WattNoOp $line
       $global:LASTEXITCODE = 0
+      # The output starts on the row below the cursor at C (observer.rs), so the cursor must be on the last input row.
+      [Microsoft.PowerShell.PSConsoleReadLine]::SetCursorPosition($line.Length)
       _WattOsc ('633;E;n=' + $global:WattNonce + ';' + (_WattEscapeE $line))
       _WattOsc ('133;C;n=' + $global:WattNonce)
     }
   }
   [Microsoft.PowerShell.PSConsoleReadLine]::ValidateAndAcceptLine()
 }
+$null = _WattBindEnter

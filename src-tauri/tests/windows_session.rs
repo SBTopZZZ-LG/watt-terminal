@@ -45,10 +45,14 @@ fn history_path(id: &str) -> PathBuf {
 /// Starts a session the way the app does. A renderer thread takes the output and acks it, and answers each cursor
 /// position query the way xterm.js does: the reply goes back through `write_user`, which writes terminal replies as they are.
 fn start(id: &str) -> Arc<Session> {
+    start_sized(id, 120)
+}
+
+fn start_sized(id: &str, cols: u16) -> Arc<Session> {
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     let histfile = history_path(id);
     let _ = std::fs::remove_file(&histfile);
-    let cfg = SpawnConfig { rows: 30, cols: 120, real_zdotdir: None, histfile: Some(histfile) };
+    let cfg = SpawnConfig { rows: 30, cols, real_zdotdir: None, histfile: Some(histfile) };
     let session = Arc::new(Session::spawn(id, cfg, Box::new(ChanSink(tx))).expect("spawn the PowerShell session"));
     let weak: Weak<Session> = Arc::downgrade(&session);
     thread::spawn(move || {
@@ -91,6 +95,17 @@ fn wait_state(s: &Session, want: InputState) {
 
 fn wait_prompt(s: &Session) {
     wait_state(s, InputState::Prompt);
+}
+
+/// Waits for a continuation prompt and gives PSReadLine time to read input again. The 133;P is sent from the Enter
+/// handler, before ValidateAndAcceptLine returns, so the observer can say Continuation while the handler is still
+/// running. Keys written then can be lost. The row check waits for the continuation prompt on screen, the sleep
+/// lets the handler return.
+fn wait_continuation(s: &Session) {
+    wait_state(s, InputState::Continuation);
+    let ok = wait_until(|| s.screen_snapshot().rows.iter().any(|r| r.trim_end() == ">").then_some(())).is_some();
+    assert!(ok, "no continuation row on screen within {WAIT:?}; screen={:?}", s.screen_snapshot().rows);
+    thread::sleep(Duration::from_millis(200));
 }
 
 /// Submits `cmd` at an idle prompt, waits for its record to finish and for the next prompt. Returns the finished record.
@@ -163,7 +178,7 @@ fn backtick_continuation_is_one_record() {
     wait_prompt(&s);
     let before = s.records().len();
     s.submit(Source::User, "echo a `").expect("submit at an idle prompt");
-    wait_state(&s, InputState::Continuation);
+    wait_continuation(&s);
     assert_eq!(s.records().len(), before, "the incomplete line made a record: {:?}", s.records());
     s.write_user(b"b\r").expect("write the second line");
     let id = wait_until(|| s.records().iter().find(|r| r.command.starts_with("echo a `") && r.exit_code.is_some()).map(|r| r.id))
@@ -175,7 +190,105 @@ fn backtick_continuation_is_one_record() {
     assert_eq!(r.status, RecordStatus::Complete);
     assert!(r.command.ends_with('b'), "command={:?}", r.command);
     // echo gets two arguments and writes one object per argument, so the output is one word per line.
-    assert!(r.output.contains("a\nb"), "output={:?}", r.output);
+    assert_eq!(r.output, "a\nb", "the command's own rows are not output");
+}
+
+#[test]
+fn record_output_is_exactly_the_command_output() {
+    let _g = serial();
+    let s = start("win-output");
+    let echo = run(&s, "echo hi");
+    assert_eq!(echo.output, "hi", "output={:?}", echo.output);
+    let range = run(&s, "1..3");
+    assert_eq!(range.output, "1\n2\n3", "output={:?}", range.output);
+}
+
+/// Waits until a screen row contains `text`, then a short settle so PSReadLine has rendered the keys it read.
+fn wait_screen_contains(s: &Session, text: &str) {
+    let ok = wait_until(|| s.screen_snapshot().rows.iter().any(|r| r.contains(text)).then_some(())).is_some();
+    assert!(ok, "{text:?} never reached the screen; screen={:?}", s.screen_snapshot().rows);
+    thread::sleep(Duration::from_millis(200));
+}
+
+#[test]
+fn enter_with_the_cursor_moved_to_the_start_of_a_wrapped_command_records_only_its_output() {
+    let _g = serial();
+    let s = start_sized("win-wrap", 80);
+    wait_prompt(&s);
+    // The comment pads the command past 80 columns so it wraps. The output is one short word.
+    let cmd = format!("Write-Output 'ok' #{}", "x".repeat(100));
+    s.write_user(cmd.as_bytes()).expect("type the command");
+    s.write_user(b"\x1b[H").expect("Home");
+    s.write_user(b"\r").expect("Enter");
+    let id = wait_until(|| s.records().iter().find(|r| r.command == cmd && r.exit_code.is_some()).map(|r| r.id))
+        .unwrap_or_else(|| panic!("no finished record; records={:?}", s.records()));
+    wait_prompt(&s);
+    let r = s.get_record(id).expect("record by id");
+    assert_eq!(r.exit_code, Some(0));
+    assert_eq!(r.output, "ok", "the command's rows are in the output: {:?}", r.output);
+}
+
+#[test]
+fn enter_with_the_cursor_moved_up_in_a_multi_line_command_records_only_its_output() {
+    let _g = serial();
+    let s = start_sized("win-multi", 120);
+    wait_prompt(&s);
+    s.write_user(b"if ($true) {\r").expect("write the first line");
+    wait_continuation(&s);
+    s.write_user(b"Write-Output 'ok'\r").expect("write the second line");
+    wait_screen_contains(&s, "Write-Output 'ok'");
+    s.write_user(b"}").expect("write the closing brace");
+    wait_screen_contains(&s, "}");
+    s.write_user(b"\x1b[A").expect("Up: the cursor moves off the last row");
+    thread::sleep(Duration::from_millis(200));
+    s.write_user(b"\r").expect("Enter");
+    let id = wait_until(|| s.records().iter().find(|r| r.command.starts_with("if ($true) {") && r.exit_code.is_some()).map(|r| r.id))
+        .unwrap_or_else(|| panic!("no finished record; records={:?}", s.records()));
+    wait_prompt(&s);
+    let r = s.get_record(id).expect("record by id");
+    assert_eq!(r.exit_code, Some(0));
+    assert!(r.command.ends_with('}'), "command={:?}", r.command);
+    assert_eq!(r.output, "ok", "the command's rows are in the output: {:?}", r.output);
+}
+
+#[test]
+fn enter_survives_a_runtime_vi_edit_mode_switch() {
+    let _g = serial();
+    let s = start("win-vi");
+    run(&s, "Set-PSReadLineOption -EditMode Vi");
+    run(&s, "echo throwaway");
+    let r = run(&s, "echo a");
+    assert_eq!(r.exit_code, Some(0), "after the Vi switch");
+    assert_eq!(r.output, "a");
+}
+
+#[test]
+fn enter_rebound_at_runtime_records_later_lines() {
+    let _g = serial();
+    let s = start("win-rebind");
+    run(&s, "Set-PSReadLineKeyHandler -Key Enter -Function AcceptLine");
+    let r = run(&s, "echo after-rebind");
+    assert_eq!(r.exit_code, Some(0), "after the rebind");
+    assert_eq!(r.output, "after-rebind");
+}
+
+#[test]
+fn a_prompt_redefined_after_integration_is_wrapped_again() {
+    let _g = serial();
+    let s = start("win-prompt");
+    wait_prompt(&s);
+    s.submit(Source::User, "function prompt { 'X> ' }").expect("submit at an idle prompt");
+    // The redefined prompt sends no A, so the observer is still Running. The next line goes through the Enter handler,
+    // which wraps the prompt again.
+    wait_state(&s, InputState::Running);
+    s.write_user(b"echo throwaway\r").expect("write the throwaway line");
+    wait_until(|| s.records().iter().find(|r| r.command == "echo throwaway" && r.exit_code.is_some()).map(|_| ()))
+        .unwrap_or_else(|| panic!("the throwaway line did not finish; records={:?}", s.records()));
+    wait_prompt(&s);
+    assert_eq!(s.integration_status(), IntegrationStatus::Live);
+    let r = run(&s, "echo b");
+    assert_eq!(r.exit_code, Some(0), "after the prompt was redefined");
+    assert_eq!(r.output, "b");
 }
 
 #[test]
@@ -199,7 +312,7 @@ fn open_block_is_a_continuation_until_it_is_closed() {
     wait_prompt(&s);
     let before = s.records().len();
     s.submit(Source::User, "if ($true) {").expect("submit at an idle prompt");
-    wait_state(&s, InputState::Continuation);
+    wait_continuation(&s);
     assert_eq!(s.records().len(), before, "the open block made a record: {:?}", s.records());
     s.write_user(b"}\r").expect("write the closing brace");
     let id = wait_until(|| s.records().iter().find(|r| r.command.starts_with("if ($true) {") && r.exit_code.is_some()).map(|r| r.id))
@@ -218,7 +331,7 @@ fn ctrl_c_at_the_continuation_prompt_returns_to_the_prompt() {
     wait_prompt(&s);
     let before = s.records().len();
     s.submit(Source::User, "if ($true) {").expect("submit at an idle prompt");
-    wait_state(&s, InputState::Continuation);
+    wait_continuation(&s);
     s.write_user(b"\x03").expect("send Ctrl-C");
     wait_prompt(&s);
     assert_eq!(s.records().len(), before, "the cancelled block made a record: {:?}", s.records());
