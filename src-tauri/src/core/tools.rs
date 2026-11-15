@@ -1018,7 +1018,7 @@ pub fn integration_result(outcome: &IntegrateOutcome) -> Result<Value, String> {
             Ok(Value::String(format!("Integrated {label} ({sh}{who}). You can now use run_command in this shell.")))
         }
         IntegrateOutcome::UnsupportedShell => Err(
-            "This shell is not supported (needs zsh or bash 4.4+); stay read-only: use get_screen and ask the user.".into(),
+            "This nested or remote shell is not supported: integration needs zsh or bash 4.4+; stay read-only: use get_screen and ask the user.".into(),
         ),
         IntegrateOutcome::Timeout => Err(
             "integration timed out: the shell did not answer the handshake. Ask the user to check that the shell is at its \

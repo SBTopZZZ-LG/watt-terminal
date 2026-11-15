@@ -80,11 +80,13 @@ describe('outcomeView', () => {
   it('unsupported shell, timeout and refusal are failures with their own text', () => {
     expect(outcomeView({ outcome: 'unsupported_shell' })).toEqual({
       tone: 'fail',
-      text: 'This shell is not supported (needs zsh, or bash 4.4+). Nothing was installed.',
+      text: 'This nested or remote shell is not supported: integration needs zsh or bash 4.4+. Nothing was installed.',
     });
     expect(outcomeView({ outcome: 'timeout' })).toEqual({
       tone: 'fail',
-      text: 'The shell did not respond in time. Check that it was at its prompt, then try again.',
+      text:
+        'The shell did not respond in time. Check that it was at its prompt, then try again. ' +
+        'Only zsh and bash can be integrated here, so a PowerShell or cmd shell will not answer.',
     });
     expect(outcomeView({ outcome: 'refused', reason: 'busy' })).toEqual({
       tone: 'fail',

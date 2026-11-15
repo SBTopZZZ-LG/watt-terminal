@@ -148,11 +148,16 @@ export function outcomeView(outcome: IntegrateOutcome): OutcomeView {
       };
     }
     case 'unsupported_shell':
-      return { tone: 'fail', text: 'This shell is not supported (needs zsh, or bash 4.4+). Nothing was installed.' };
+      return {
+        tone: 'fail',
+        text: 'This nested or remote shell is not supported: integration needs zsh or bash 4.4+. Nothing was installed.',
+      };
     case 'timeout':
       return {
         tone: 'fail',
-        text: 'The shell did not respond in time. Check that it was at its prompt, then try again.',
+        text:
+          'The shell did not respond in time. Check that it was at its prompt, then try again. ' +
+          'Only zsh and bash can be integrated here, so a PowerShell or cmd shell will not answer.',
       };
     case 'failed': {
       // The hint is the shell's own last line. A trailing full stop is not doubled.
