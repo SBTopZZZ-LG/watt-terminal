@@ -5,6 +5,7 @@
 // an immediate local override, so vim and friends take over the keyboard without waiting for a round trip.
 
 import type { Foreground, InputState } from './types';
+import { shortcutLabel } from './platform';
 
 export interface InputModel {
   rust: InputState;
@@ -111,7 +112,7 @@ export function routeFor(state: InputState, _foreground: Foreground | null = nul
       return {
         keys: 'pty',
         bar: 'collapsed',
-        hint: 'Full-screen app: keys go to it. Ctrl/Cmd+Shift+A messages the agent.',
+        hint: `Full-screen app: keys go to it. ${shortcutLabel('agent')} messages the agent.`,
         hintInline: false,
       };
     case 'raw':

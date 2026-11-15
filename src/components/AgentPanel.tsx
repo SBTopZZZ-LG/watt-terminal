@@ -1,6 +1,7 @@
 import type { ReactNode, Ref } from 'react';
 import type { Dock, PanelView } from '../lib/panelLayout';
 import wattMark from '../assets/watt-mark.png';
+import { shortcutLabel } from '../lib/platform';
 
 interface WorkspaceProps {
   ref?: Ref<HTMLDivElement>;
@@ -53,7 +54,7 @@ export function AgentPanel({ ref, view, onExpand, busy = false, approvalPending 
           type="button"
           className="agent-rail"
           onClick={onExpand}
-          title="Show the agent (Ctrl/Cmd+Shift+A)"
+          title={`Show the agent (${shortcutLabel('agent')})`}
           aria-label="Show the agent panel"
         >
           <img className="brand-mark" src={wattMark} width={212} height={256} alt="" aria-hidden="true" />

@@ -29,6 +29,7 @@ import { ProviderEditor } from './ProviderEditor';
 import type { TestState } from './ProviderEditor';
 import { SettingsTabs } from './SettingsTabs';
 import type { TabDef } from './SettingsTabs';
+import { secretStoreName } from '../lib/platform';
 
 /** The recovery actions in flight or waiting for their confirm step. `busy` names the action that is running. */
 export interface RecoveryState {
@@ -75,7 +76,7 @@ export const SETTINGS_TABS: readonly TabDef[] = [
 /** The select value for "None" (default model) and "Blank provider" (add provider). Preset keys are never empty. */
 const BLANK_PRESET = '';
 const NO_KEY_TEXT = 'API keys are stored in the file named by WATT_SECRETS_FILE.';
-const KEYCHAIN_TEXT = 'API keys are stored in the macOS Keychain.';
+const KEYCHAIN_TEXT = `API keys are stored in the ${secretStoreName()}.`;
 const LIMIT_ERROR = 'Enter a whole number of at least 1, or clear the field.';
 
 /** Where the secrets live, as a sentence for the top of the dialog. */

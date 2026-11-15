@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { copyText } from './clipboard';
+import { copyText, readClipboardText } from './clipboard';
 import type { CopyDocument, ClipboardEnv } from './clipboard';
 
 /** The fake stands in for the parts of Document the fallback reads and calls. */
@@ -94,5 +94,23 @@ describe('copyText', () => {
   it('returns false when there is neither a clipboard nor a document', async () => {
     await expect(copyText('text', { clipboard: null, document: null })).resolves.toBe(false);
     await expect(copyText('text', {})).resolves.toBe(false);
+  });
+});
+
+describe('readClipboardText', () => {
+  it('returns the clipboard text', async () => {
+    await expect(readClipboardText({ readText: async () => 'hello' })).resolves.toBe('hello');
+  });
+
+  it('returns null when there is no clipboard or the webview refuses to read it', async () => {
+    await expect(readClipboardText(null)).resolves.toBeNull();
+    await expect(readClipboardText(undefined)).resolves.toBeNull();
+    await expect(
+      readClipboardText({
+        readText: async () => {
+          throw new Error('not allowed');
+        },
+      }),
+    ).resolves.toBeNull();
   });
 });

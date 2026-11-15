@@ -524,9 +524,9 @@ export default function App() {
     return () => cancelAnimationFrame(frame);
   }, [panel.dock, panel.open, settle]);
 
-  // Ctrl+Shift+A (Cmd+Shift+A) focuses the agent bar, from anywhere it is offered. Cmd+F, Cmd+K and Cmd+=/-/0 (see
-  // appHotkeys.ts) are handled here too. Capture phase, so xterm does not also get the key, and a handled key is
-  // stopped here so it never reaches the PTY.
+  // Ctrl+Shift+A (Cmd+Shift+A) focuses the agent bar, from anywhere it is offered. The app hotkeys (find, clear, zoom,
+  // settings; see appHotkeys.ts for the Cmd keys on macOS and the Ctrl keys elsewhere) are handled here too. Capture
+  // phase, so xterm does not also get the key, and a handled key is stopped here so it never reaches the PTY.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       // While the AI settings are open they own the keyboard: only their own hotkey is taken here, so no shortcut reaches

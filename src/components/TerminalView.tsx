@@ -1,8 +1,33 @@
 import { useEffect, useRef } from 'react';
 import { fitToContainer, gridScreen, measureGrid, mountTerminal, setCursorHidden, term } from '../lib/terminal';
-import { createKeyFilter } from '../lib/keymap';
+import { clipboardActionFor, createKeyFilter } from '../lib/keymap';
+import { copyText, readClipboardText } from '../lib/clipboard';
 import { createOverflowGuard } from '../lib/gridFit';
+import { reportError } from '../lib/session';
 import type { InputState } from '../lib/types';
+
+/** Copies the selection, then clears it, so a later Ctrl+C interrupts again. Nothing happens without a selection. */
+function copySelection(): void {
+  if (!term.hasSelection()) {
+    return;
+  }
+  const text = term.getSelection();
+  void copyText(text, { clipboard: navigator.clipboard, document }).then((ok) => {
+    if (ok) {
+      term.clearSelection();
+    }
+  });
+}
+
+/** Pastes the clipboard's text as typed text would be: through xterm, so bracketed paste applies. */
+async function pasteFromClipboard(): Promise<void> {
+  const text = await readClipboardText(navigator.clipboard);
+  if (text === null) {
+    reportError('Could not read the clipboard.');
+  } else if (text !== '') {
+    term.paste(text);
+  }
+}
 
 /**
  * Calls `onChange` whenever window.devicePixelRatio changes (the window moved to another display, or was zoomed).
@@ -61,6 +86,17 @@ export function TerminalView({ keysToPty, inputState, onInput, onAltChange }: Pr
     // through term.input, so it takes the same route as typed text. xterm never sees the key.
     const decide = createKeyFilter();
     term.attachCustomKeyEventHandler((ev) => {
+      // Copy and paste off macOS (see keymap.ts). Consumed here, so xterm does not send ETX for Ctrl+C or ^V.
+      const clip = clipboardActionFor(ev, term.hasSelection());
+      if (clip !== null) {
+        ev.preventDefault();
+        if (clip === 'copy') {
+          copySelection();
+        } else {
+          void pasteFromClipboard();
+        }
+        return false;
+      }
       const { data, consume } = decide(ev, latest.current.inputState);
       if (data !== null) {
         term.input(data, true);

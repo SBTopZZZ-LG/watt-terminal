@@ -8,6 +8,20 @@ describe('shortenPath', () => {
     expect(shortenPath('/home/me/src')).toBe('~/src');
   });
 
+  it('replaces a Windows home with ~, keeping the separators of the rest', () => {
+    expect(shortenPath('C:\\Users\\me')).toBe('~');
+    expect(shortenPath('C:\\Users\\me\\proj')).toBe('~\\proj');
+    expect(shortenPath('C:/Users/me/proj')).toBe('~/proj');
+    expect(shortenPath('d:\\users\\me\\src')).toBe('~\\src');
+  });
+
+  it('leaves other Windows paths alone, including ones that only start like a home', () => {
+    expect(shortenPath('C:\\Program Files\\App')).toBe('C:\\Program Files\\App');
+    expect(shortenPath('C:\\Users')).toBe('C:\\Users');
+    expect(shortenPath('C:\\Usersx\\a')).toBe('C:\\Usersx\\a');
+    expect(shortenPath('\\\\server\\share\\Users\\me')).toBe('\\\\server\\share\\Users\\me');
+  });
+
   it('leaves other paths alone, including ones that only start like a home', () => {
     expect(shortenPath('/usr/local/bin')).toBe('/usr/local/bin');
     expect(shortenPath('/Users')).toBe('/Users');

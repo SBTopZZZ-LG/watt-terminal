@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { createKeyFilter, mapTerminalKey } from './keymap';
+import { clipboardActionFor, createKeyFilter, mapTerminalKey } from './keymap';
 import type { KeyLike } from './keymap';
 import type { InputState } from './types';
 
@@ -241,5 +241,66 @@ describe('createKeyFilter: the mapped key and its keypress and keyup', () => {
     decide(press('ArrowLeft', { alt: true }, 'keydown'), 'prompt');
     decide(press('x', {}, 'keydown'), 'prompt');
     expect(decide(press('ArrowLeft', { alt: true }, 'keyup'), 'prompt')).toEqual({ data: null, consume: true });
+  });
+});
+
+describe('mapTerminalKey on Windows and Linux', () => {
+  it('does not map the Windows-key arrows or Backspace, so nothing is rewritten for them', () => {
+    expect(mapTerminalKey(key('ArrowLeft', { meta: true }), 'prompt', false)).toBeNull();
+    expect(mapTerminalKey(key('ArrowRight', { meta: true }), 'prompt', false)).toBeNull();
+    expect(mapTerminalKey(key('Backspace', { meta: true }), 'prompt', false)).toBeNull();
+  });
+
+  it('keeps Option+Left and Option+Right (Alt on Windows) as word jumps', () => {
+    expect(mapTerminalKey(key('ArrowLeft', { alt: true }), 'prompt', false)).toBe('\x1bb');
+    expect(mapTerminalKey(key('ArrowRight', { alt: true }), 'prompt', false)).toBe('\x1bf');
+  });
+
+  it('leaves Home, End, Ctrl+Left, Ctrl+Right and Ctrl+Backspace to xterm, which PSReadLine reads', () => {
+    expect(mapTerminalKey(key('Home'), 'prompt', false)).toBeNull();
+    expect(mapTerminalKey(key('End'), 'prompt', false)).toBeNull();
+    expect(mapTerminalKey(key('ArrowLeft', { ctrl: true }), 'prompt', false)).toBeNull();
+    expect(mapTerminalKey(key('ArrowRight', { ctrl: true }), 'prompt', false)).toBeNull();
+    expect(mapTerminalKey(key('Backspace', { ctrl: true }), 'prompt', false)).toBeNull();
+  });
+
+  it('keeps the Shift+Enter newline rule', () => {
+    expect(mapTerminalKey(key('Enter', { shift: true }), 'running', false)).toBe('\n');
+  });
+});
+
+describe('clipboardActionFor', () => {
+  const win = (k: string, mods: Mods = {}, extra: Partial<KeyLike> = {}) =>
+    key(k, { ctrl: true, ...mods }, extra);
+
+  it('copies with Ctrl+C only when there is a selection, so Ctrl+C without one still interrupts', () => {
+    expect(clipboardActionFor(win('c'), true, false)).toBe('copy');
+    expect(clipboardActionFor(win('c'), false, false)).toBeNull();
+    expect(clipboardActionFor(win('C'), true, false)).toBe('copy');
+  });
+
+  it('copies with Ctrl+Shift+C, with or without a selection (nothing is sent to the shell)', () => {
+    expect(clipboardActionFor(win('C', { shift: true }), true, false)).toBe('copy');
+    expect(clipboardActionFor(win('C', { shift: true }), false, false)).toBe('copy');
+  });
+
+  it('pastes with Ctrl+V and Ctrl+Shift+V', () => {
+    expect(clipboardActionFor(win('v'), false, false)).toBe('paste');
+    expect(clipboardActionFor(win('V', { shift: true }), false, false)).toBe('paste');
+  });
+
+  it('leaves other Ctrl keys, Alt, Cmd and key-up alone', () => {
+    expect(clipboardActionFor(win('k'), true, false)).toBeNull();
+    expect(clipboardActionFor(win('v', { alt: true }), false, false)).toBeNull();
+    expect(clipboardActionFor(win('v', { meta: true }), false, false)).toBeNull();
+    expect(clipboardActionFor(win('v', {}, { type: 'keyup' }), false, false)).toBeNull();
+    expect(clipboardActionFor(key('c', { meta: true }), true, false)).toBeNull();
+    expect(clipboardActionFor(key('v'), false, false)).toBeNull();
+  });
+
+  it('does nothing on macOS, where Cmd+C and Cmd+V already work', () => {
+    expect(clipboardActionFor(key('c', { meta: true }), true, true)).toBeNull();
+    expect(clipboardActionFor(win('c'), true, true)).toBeNull();
+    expect(clipboardActionFor(win('v'), false, true)).toBeNull();
   });
 });

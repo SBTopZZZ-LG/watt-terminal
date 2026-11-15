@@ -1,8 +1,11 @@
 import type { Cwd } from './types';
 
-/** Replaces a leading macOS or Linux home directory with `~`. */
+/**
+ * Replaces a leading home directory with `~`: macOS or Linux (`/Users/x`, `/home/x`), or Windows (`C:\Users\x`, or with
+ * forward slashes). The rest keeps its separators.
+ */
 export function shortenPath(path: string): string {
-  const home = /^\/(?:Users|home)\/[^/]+(?=\/|$)/.exec(path);
+  const home = /^\/(?:Users|home)\/[^/]+(?=\/|$)/.exec(path) ?? /^[A-Za-z]:[\\/]Users[\\/][^\\/]+(?=[\\/]|$)/i.exec(path);
   if (home) {
     return `~${path.slice(home[0].length)}`;
   }

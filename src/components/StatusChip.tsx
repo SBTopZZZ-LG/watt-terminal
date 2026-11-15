@@ -1,5 +1,6 @@
 import { foregroundChip } from '../lib/foreground';
 import { formatCwd } from '../lib/format';
+import { shortcutLabel } from '../lib/platform';
 import { locationChip } from '../lib/integrate';
 import { chipBrokenTitle, chipLabel, recoveryKind } from '../lib/settingsRecovery';
 import { GridChip } from './GridChip';
@@ -108,7 +109,7 @@ export function StatusChip(props: Props) {
         type="button"
         className={`chip chip-button chip-icon${broken ? ' chip-warn' : ''}`}
         aria-label={broken ? 'AI settings (needs attention)' : 'AI settings'}
-        title="AI settings (Ctrl/Cmd+,)"
+        title={`AI settings (${shortcutLabel('settings')})`}
         onClick={onOpenSettings}
       >
         <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.25" aria-hidden="true">

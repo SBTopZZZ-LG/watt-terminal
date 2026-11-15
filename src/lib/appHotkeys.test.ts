@@ -110,3 +110,52 @@ describe('appHotkeyFor: negatives', () => {
     expect(appHotkeyFor(ev('Backspace', { meta: true }))).toBeNull();
   });
 });
+
+describe('appHotkeyFor: Windows and Linux (Ctrl, not Cmd)', () => {
+  const win = (k: string, mods: Mods = {}, code = '') => appHotkeyFor(ev(k, mods, code), false);
+
+  it('maps Ctrl+Shift+F to find and Ctrl+Shift+K to clear, in either letter case', () => {
+    expect(win('f', { ctrl: true, shift: true })).toBe('find');
+    expect(win('F', { ctrl: true, shift: true })).toBe('find');
+    expect(win('k', { ctrl: true, shift: true })).toBe('clear');
+    expect(win('K', { ctrl: true, shift: true })).toBe('clear');
+  });
+
+  it('leaves Ctrl+F and Ctrl+K to the shell', () => {
+    expect(win('f', { ctrl: true })).toBeNull();
+    expect(win('F', { ctrl: true })).toBeNull();
+    expect(win('k', { ctrl: true })).toBeNull();
+    expect(win('K', { ctrl: true })).toBeNull();
+  });
+
+  it('maps Ctrl+= and Ctrl+Shift+= (reported as +) to zoom-in, and the numpad keys too', () => {
+    expect(win('=', { ctrl: true })).toBe('zoom-in');
+    expect(win('+', { ctrl: true, shift: true })).toBe('zoom-in');
+    expect(win('=', { ctrl: true, shift: true })).toBe('zoom-in');
+    expect(win('+', { ctrl: true }, 'NumpadAdd')).toBe('zoom-in');
+  });
+
+  it('maps Ctrl+- to zoom-out and Ctrl+0 to zoom-reset', () => {
+    expect(win('-', { ctrl: true })).toBe('zoom-out');
+    expect(win('-', { ctrl: true }, 'NumpadSubtract')).toBe('zoom-out');
+    expect(win('0', { ctrl: true })).toBe('zoom-reset');
+  });
+
+  it('maps Ctrl+, to settings, and Ctrl+Shift+, to nothing', () => {
+    expect(win(',', { ctrl: true })).toBe('settings');
+    expect(win(',', { ctrl: true, shift: true })).toBeNull();
+  });
+
+  it('does not map the Cmd (Windows) key, Option, or Shift on zoom keys, or Ctrl+Shift+A', () => {
+    expect(win('f', { meta: true, shift: true })).toBeNull();
+    expect(win('k', { meta: true })).toBeNull();
+    expect(win('=', { meta: true, ctrl: true })).toBeNull();
+    expect(win('=', { ctrl: true, alt: true })).toBeNull();
+    expect(win('-', { ctrl: true, shift: true })).toBeNull();
+    expect(win('A', { ctrl: true, shift: true })).toBeNull();
+  });
+
+  it('maps keydown only', () => {
+    expect(win('f', { ctrl: true, shift: true, type: 'keyup' })).toBeNull();
+  });
+});

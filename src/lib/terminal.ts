@@ -2,7 +2,7 @@
 // That keeps the byte path simple. Raw PTY bytes always reach this terminal, and every render is acked.
 //
 // Rule: nothing is written to the terminal except bytes that came from the PTY. One deliberate exception: Cmd+K
-// (clearTerminal) writes ESC[3J locally to drop the scrollback. That only changes xterm's view, the shell is not told and
+// (Ctrl+Shift+K off macOS; clearTerminal) writes ESC[3J locally to drop the scrollback. That only changes xterm's view, the shell is not told and
 // its state is untouched. The Ctrl-L that redraws the prompt does go to the PTY, like any typed key.
 
 import { Terminal } from '@xterm/xterm';
@@ -21,6 +21,7 @@ import type { GridMeasure } from './gridFit';
 import { clearActions } from './clear';
 import { clampFontSize, defaultSizeStorage, FONT_SIZE_DEFAULT, loadFontSize, saveFontSize, stepFontSize } from './zoom';
 import type { InputState } from './types';
+import { terminalFontFamily } from './platform';
 
 /**
  * The terminal background is the CSS token `--term-bg` (App.css), so it is set in one place. This is read once, when the
@@ -76,7 +77,7 @@ export const SEARCH_DECORATIONS = {
 export const term = new Terminal({
   allowProposedApi: true,
   cursorBlink: true,
-  fontFamily: 'Menlo, Monaco, "SF Mono", ui-monospace, monospace',
+  fontFamily: terminalFontFamily(),
   fontSize: loadFontSize(defaultSizeStorage()),
   scrollback: 5000,
   theme: THEME,

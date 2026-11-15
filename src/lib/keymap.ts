@@ -8,6 +8,7 @@
 // newline". At a prompt it is left alone, because Ctrl+J is accept-line in zsh.
 
 import type { InputState } from './types';
+import { IS_MAC } from './platform';
 
 /** The fields of a keyboard event that the mapping reads. A DOM KeyboardEvent satisfies this. */
 export interface KeyLike {
@@ -43,8 +44,10 @@ function onlyShift(ev: KeyLike): boolean {
 /**
  * The data to send in place of this keydown, or null to let xterm handle it.
  * Only keydown is mapped. Key repeat is mapped too, so holding Option+Left keeps moving.
+ * The Cmd rules are macOS only: on Windows the Windows key is not a word or line key, and PSReadLine already handles
+ * Home, End, Ctrl+Left/Right and Ctrl+Backspace.
  */
-export function mapTerminalKey(ev: KeyLike, state: InputState): string | null {
+export function mapTerminalKey(ev: KeyLike, state: InputState, mac: boolean = IS_MAC): string | null {
   if (ev.type !== 'keydown' || ev.isComposing || ev.keyCode === 229) {
     return null;
   }
@@ -64,7 +67,7 @@ export function mapTerminalKey(ev: KeyLike, state: InputState): string | null {
     }
     return null;
   }
-  if (onlyMeta(ev)) {
+  if (mac && onlyMeta(ev)) {
     if (ev.key === 'ArrowLeft') {
       return '\x01';
     }
@@ -75,6 +78,31 @@ export function mapTerminalKey(ev: KeyLike, state: InputState): string | null {
       return '\x15';
     }
     return null;
+  }
+  return null;
+}
+
+/** What a keydown means for the clipboard in the terminal: copy the selection, paste, or nothing (xterm handles it). */
+export type ClipboardAction = 'copy' | 'paste' | null;
+
+/**
+ * Windows and Linux only. Ctrl+Shift+C copies the selection. Ctrl+C copies only when there is a selection; without one it
+ * stays ETX (interrupt). Ctrl+V and Ctrl+Shift+V paste. On macOS the browser's Cmd+C and Cmd+V already work, so nothing
+ * here applies.
+ */
+export function clipboardActionFor(ev: KeyLike, hasSelection: boolean, mac: boolean = IS_MAC): ClipboardAction {
+  if (mac || ev.type !== 'keydown' || ev.isComposing || ev.keyCode === 229) {
+    return null;
+  }
+  if (!ev.ctrlKey || ev.altKey || ev.metaKey) {
+    return null;
+  }
+  const letter = ev.key.toLowerCase();
+  if (letter === 'c') {
+    return ev.shiftKey || hasSelection ? 'copy' : null;
+  }
+  if (letter === 'v') {
+    return 'paste';
   }
   return null;
 }

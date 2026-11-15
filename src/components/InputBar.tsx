@@ -10,6 +10,7 @@ import type { Prepared } from '../lib/attachments';
 import { carriesFiles } from '../lib/dropGuard';
 import { showsVisionWarning } from '../lib/modelVision';
 import { visibleEscapes } from '../lib/visibleEscapes';
+import { shortcutLabel } from '../lib/platform';
 import type { AttachmentInput, CommandCatalog } from '../lib/types';
 import { AttachmentChips } from './AttachmentChips';
 import type { ChipItem } from './AttachmentChips';
@@ -17,7 +18,7 @@ import { CommandMenu, commandMenuItemId, COMMAND_MENU_ID } from './CommandMenu';
 
 const DEFAULT_PLACEHOLDER = 'Ask the agent…';
 /** The shortcut hint, kept as the input's tooltip so the placeholder stays one line at every panel width. */
-const SHORTCUT_HINT = 'Ctrl/Cmd+Shift+A to focus, Esc to return';
+const SHORTCUT_HINT = `${shortcutLabel('agent')} to focus, Esc to return`;
 
 /** No customs: the menu still shows the built-ins while the catalog loads. */
 const EMPTY_CATALOG: CommandCatalog = { commands: [], project_dir: null, global_dir: null };
@@ -161,7 +162,7 @@ export function InputBar(props: Props) {
 
   if (mode === 'collapsed') {
     return (
-      <div className="bar bar-collapsed" title="Ctrl/Cmd+Shift+A to message the agent">
+      <div className="bar bar-collapsed" title={`${shortcutLabel('agent')} to message the agent`}>
         <span className="bar-hint">{hint}</span>
       </div>
     );

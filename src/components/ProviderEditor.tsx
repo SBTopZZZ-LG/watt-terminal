@@ -1,5 +1,6 @@
 import { useId, useState } from 'react';
 import type { TestResult } from '../lib/types';
+import { secretStoreShortName } from '../lib/platform';
 import {
   hasProblems,
   hostChangeNotice,
@@ -371,7 +372,7 @@ export function ProviderEditor(p: ProviderEditorProps) {
                         onChange={(e) => updateHeader(h.key, (x) => renameHeader(x, e.target.value))}
                       />
                       {error && <span className="settings-error">{error}</span>}
-                      {isAutoTicked(h) && <span className="settings-hint">Looks like a credential, so it is stored in the Keychain.</span>}
+                      {isAutoTicked(h) && <span className="settings-hint">Looks like a credential, so it is stored in the {secretStoreShortName()}.</span>}
                     </td>
                     <td>
                       {h.secret ? (

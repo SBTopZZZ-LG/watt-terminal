@@ -1,6 +1,6 @@
-// Copies text to the clipboard. The webview may refuse navigator.clipboard (WKWebView in Tauri does, unless the
-// call is made from a user gesture and the page is secure), so there is a fallback through a hidden textarea.
-// The clipboard and the document are passed in, so the logic runs without a browser.
+// Copies text to the clipboard. The webview may refuse navigator.clipboard (WKWebView on macOS does, unless the
+// call is made from a user gesture and the page is secure; WebView2 on Windows is Chromium), so there is a fallback
+// through a hidden textarea. The clipboard and the document are passed in, so the logic runs without a browser.
 
 export interface ClipboardEnv {
   /** navigator.clipboard, or nothing where the webview does not provide it. */
@@ -26,6 +26,21 @@ export async function copyText(text: string, env: ClipboardEnv): Promise<boolean
     }
   }
   return copyWithTextarea(text, env.document);
+}
+
+/**
+ * The clipboard's plain text, for pasting into the terminal. Null when there is no clipboard, the webview refuses to read
+ * it, or the call throws.
+ */
+export async function readClipboardText(clipboard: { readText(): Promise<string> } | null | undefined): Promise<string | null> {
+  if (!clipboard) {
+    return null;
+  }
+  try {
+    return await clipboard.readText();
+  } catch {
+    return null;
+  }
 }
 
 function copyWithTextarea(text: string, doc: CopyDocument | null | undefined): boolean {
