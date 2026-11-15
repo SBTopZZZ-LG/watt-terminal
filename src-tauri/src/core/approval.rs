@@ -36,24 +36,29 @@ const SAFE_PUNCTUATION: &str = " _-./:=@+,";
 /// First words that are never auto-approved, whatever the rules say: privilege, shell and exec primitives, and
 /// destructive, remote-execution or package-running tools, and the zsh reserved words, precommand modifiers and builtins
 /// that run another word or change the shell's state. Matched exactly against the first word, ASCII-lowercased (macOS
-/// paths are case-insensitive, so `RM` runs `rm`), plus versioned interpreter names (`python3.12`, `node20`: a base name
+/// paths are case-insensitive, so `RM` runs `rm`), with a Windows program extension (`.exe`, `.com`, `.bat`, `.cmd`)
+/// dropped first (`curl.exe` is `curl`), plus versioned interpreter names (`python3.12`, `node20`: a base name
 /// from the list followed by version characters). Kept sorted (byte order), all lowercase and unique: a unit test checks
 /// it, and `binary_search` relies on it.
 pub const BUILTIN_DENY: &[&str] = &[
-    ".", "alias", "arch", "at", "autoload", "awk", "bash", "bindkey", "builtin", "bun", "bye", "caffeinate", "case",
-    "chgrp", "chmod", "chown", "command", "compdef", "coproc", "cp", "crontab", "csh", "curl", "dash", "dd", "declare",
-    "defaults", "deno", "disable", "diskutil", "do", "doas", "docker", "done", "ed", "elif", "else", "emacs", "emulate",
-    "enable", "end", "env", "esac", "eval", "ex", "exec", "exit", "expect", "export", "fc", "fi", "find", "fish",
-    "float", "for", "foreach", "ftp", "function", "functions", "gawk", "gopass", "hash", "if", "install", "integer",
-    "kill", "killall", "ksh", "kubectl", "launchctl", "less", "ln", "local", "logout", "lua", "man", "mkfs", "more",
-    "mount", "mv", "nano", "nc", "ncat", "nice", "nmap", "nocorrect", "node", "noglob", "nohup", "npx", "nvim", "op",
-    "open", "osascript", "parallel", "pass", "perl", "php", "pip", "pipx", "pkill", "pnpm", "podman", "printenv",
-    "python", "python3", "r", "read", "readonly", "reboot", "rehash", "repeat", "rm", "rmdir", "rsync", "ruby",
-    "sandbox-exec", "sched", "scp", "screen", "script", "security", "sed", "select", "set", "setopt", "sftp", "sh",
-    "shred", "shutdown", "source", "sqlite3", "ssh", "stdbuf", "su", "sudo", "tar", "taskpolicy", "tclsh", "tcsh",
-    "tee", "telnet", "then", "time", "timeout", "tmutil", "tmux", "trap", "truncate", "typeset", "umount", "unalias",
-    "unlink", "unset", "unsetopt", "until", "unzip", "uvx", "vi", "view", "vim", "watch", "wget", "while", "xargs",
-    "yarn", "zftp", "zip", "zle", "zmodload", "zpty", "zsh", "ztcp",
+    ".", "alias", "arch", "at", "autoload", "awk", "bash", "bcdedit", "bindkey", "bitsadmin", "builtin", "bun", "bye",
+    "caffeinate", "case", "certutil", "chgrp", "chmod", "chown", "cmd", "command", "compdef", "coproc", "cp", "crontab",
+    "csh", "curl", "dash", "dd", "declare", "defaults", "del", "deno", "disable", "diskpart", "diskutil", "do", "doas",
+    "docker", "done", "ed", "elif", "else", "emacs", "emulate", "enable", "end", "env", "erase", "esac", "eval", "ex",
+    "exec", "exit", "expect", "export", "fc", "fi", "find", "fish", "float", "for", "foreach", "format", "ftp",
+    "function", "functions", "gawk", "gopass", "hash", "icacls", "iex", "if", "install", "integer", "invoke-expression",
+    "invoke-restmethod", "invoke-webrequest", "irm", "iwr", "kill", "killall", "ksh", "kubectl", "launchctl", "less",
+    "ln", "local", "logout", "lua", "man", "mkfs", "more", "mount", "mshta", "msiexec", "mv", "nano", "nc", "ncat", "net",
+    "netsh", "new-service", "nice", "nmap", "nocorrect", "node", "noglob", "nohup", "npx", "nvim", "op", "open",
+    "osascript", "parallel", "pass", "perl", "php", "pip", "pipx", "pkill", "pnpm", "podman", "powershell", "printenv",
+    "pwsh", "python", "python3", "r", "rd", "read", "readonly", "reboot", "reg", "regedit", "rehash", "remove-item",
+    "repeat", "ri", "rm", "rmdir", "rsync", "ruby", "runas", "rundll32", "sandbox-exec", "sc", "sched", "schtasks", "scp",
+    "screen", "script", "security", "sed", "select", "set", "set-executionpolicy", "set-itemproperty", "setopt", "sftp",
+    "sh", "shred", "shutdown", "source", "sqlite3", "ssh", "start", "start-process", "stdbuf", "stop-process", "su",
+    "sudo", "takeown", "tar", "taskkill", "taskpolicy", "tclsh", "tcsh", "tee", "telnet", "then", "time", "timeout",
+    "tmutil", "tmux", "trap", "truncate", "typeset", "umount", "unalias", "unlink", "unset", "unsetopt", "until", "unzip",
+    "uvx", "vi", "view", "vim", "watch", "wget", "while", "wmic", "wsl", "xargs", "yarn", "zftp", "zip", "zle",
+    "zmodload", "zpty", "zsh", "ztcp",
 ];
 
 /// Why a call asks or runs without asking. The code is the wire string in the events and in `test_approval`.
@@ -156,8 +161,8 @@ impl RegexPolicy {
     /// Compiles the saved rules. Fails only when a rule does not compile, which settings validation already refuses.
     pub fn new(approval: &ApprovalSettings) -> Result<Self, String> {
         Ok(RegexPolicy {
-            allow: compile_all(&approval.allow)?,
-            deny: compile_all(&approval.deny)?,
+            allow: compile_all(&approval.allow, false)?,
+            deny: compile_all(&approval.deny, DENY_IGNORES_CASE)?,
             auto_given: AtomicUsize::new(0),
         })
     }
@@ -338,14 +343,22 @@ fn hard_gate(command: &str) -> Option<Reason> {
     }
     // macOS file systems are case-insensitive, so `RM` runs `rm`.
     let lower = first.to_ascii_lowercase();
-    if BUILTIN_DENY.binary_search(&lower.as_str()).is_ok() {
+    let name = strip_program_extension(&lower);
+    if BUILTIN_DENY.binary_search(&name).is_ok() {
         return Some(Reason::GateDenylist);
     }
     // A versioned interpreter name (`python3.12`, `node20`) runs the denied interpreter.
-    if is_versioned_interpreter(&lower) {
+    if is_versioned_interpreter(name) {
         return Some(Reason::GateDenylist);
     }
     None
+}
+
+/// Drops one Windows program extension from a lowercased first word: `curl.exe` is `curl`, `pwsh.cmd` is `pwsh`. A name
+/// without one is returned as it is. Applied on every platform: such a name is not a macOS command, so this only makes the
+/// gate stricter there.
+fn strip_program_extension(name: &str) -> &str {
+    [".exe", ".com", ".bat", ".cmd"].iter().find_map(|ext| name.strip_suffix(ext)).unwrap_or(name)
 }
 
 /// Base names whose versioned forms also run the denied interpreter. Each base is on the deny list, so the exact
@@ -396,12 +409,12 @@ pub fn preview(approval: &ApprovalSettings, command: &str) -> Result<Preview, St
 /// Problems with the saved approval rules, one string each. Names the list and the rule number. Never echoes a rule.
 pub fn validate_settings(approval: &ApprovalSettings) -> Vec<String> {
     let mut problems = Vec::new();
-    validate_list("allow", &approval.allow, &mut problems);
-    validate_list("deny", &approval.deny, &mut problems);
+    validate_list("allow", &approval.allow, false, &mut problems);
+    validate_list("deny", &approval.deny, DENY_IGNORES_CASE, &mut problems);
     problems
 }
 
-fn validate_list(list: &str, rules: &[String], problems: &mut Vec<String>) {
+fn validate_list(list: &str, rules: &[String], case_insensitive: bool, problems: &mut Vec<String>) {
     if rules.len() > MAX_RULES {
         problems.push(format!("approval {list} list must have at most {MAX_RULES} rules"));
     }
@@ -413,27 +426,31 @@ fn validate_list(list: &str, rules: &[String], problems: &mut Vec<String>) {
             problems.push(format!("approval {list} rule {number} must be at most {MAX_RULE_CHARS} characters"));
         } else if rule.chars().any(char::is_control) {
             problems.push(format!("approval {list} rule {number} must not contain a line break or control characters"));
-        } else if compile_rule(rule).is_err() {
+        } else if compile_rule(rule, case_insensitive).is_err() {
             problems.push(format!("approval {list} rule {number} is not a valid pattern"));
         }
     }
 }
 
-fn compile_all(rules: &[String]) -> Result<Vec<Regex>, String> {
+/// Deny rules ignore ASCII case on Windows, where command names are case-insensitive (`REMOVE-ITEM` is `Remove-Item`). On
+/// macOS deny rules stay case-sensitive, as they were. Allow rules are case-sensitive everywhere.
+const DENY_IGNORES_CASE: bool = cfg!(windows);
+
+fn compile_all(rules: &[String], case_insensitive: bool) -> Result<Vec<Regex>, String> {
     rules
         .iter()
         .enumerate()
         .map(|(index, rule)| {
-            compile_rule(rule).map_err(|_| format!("approval rule {} is not a valid pattern", index + 1))
+            compile_rule(rule, case_insensitive).map_err(|_| format!("approval rule {} is not a valid pattern", index + 1))
         })
         .collect()
 }
 
 /// A rule compiles as the whole command: `^(?:rule)$`. The rule must also compile on its own, because an unbalanced
 /// `)` or `(` could otherwise close the wrapper early and turn the match into a partial one.
-fn compile_rule(rule: &str) -> Result<Regex, regex::Error> {
-    RegexBuilder::new(rule).size_limit(REGEX_SIZE_LIMIT).build()?;
-    RegexBuilder::new(&format!("^(?:{rule})$")).size_limit(REGEX_SIZE_LIMIT).build()
+fn compile_rule(rule: &str, case_insensitive: bool) -> Result<Regex, regex::Error> {
+    RegexBuilder::new(rule).case_insensitive(case_insensitive).size_limit(REGEX_SIZE_LIMIT).build()?;
+    RegexBuilder::new(&format!("^(?:{rule})$")).case_insensitive(case_insensitive).size_limit(REGEX_SIZE_LIMIT).build()
 }
 
 /// The built-in deny list, for the settings UI.
@@ -603,6 +620,71 @@ mod tests {
         assert_eq!(gate("unset HOME"), Some(Reason::GateDenylist));
     }
 
+    /// A Windows program name with its extension is the program: `curl.exe` is `curl`, `python.exe` is `python`. The
+    /// versioned forms count too, and a name that only ends like an extension is not stripped.
+    #[test]
+    fn a_windows_program_extension_does_not_hide_the_program() {
+        for command in ["curl.exe http://x", "CURL.EXE x", "ssh.exe host", "python.exe -m pip install x", "pwsh.exe -c x"] {
+            assert_eq!(gate(command), Some(Reason::GateDenylist), "{command:?}");
+        }
+        for command in ["python3.12.exe -V", "python.cmd x", "ssh.bat host", "cmd.com /c x"] {
+            assert_eq!(gate(command), Some(Reason::GateDenylist), "{command:?}");
+        }
+        assert_eq!(gate("git.exe status"), None, "an allowed program keeps its gate result");
+        assert_eq!(gate("myssh.exe host"), None, "only a whole name is refused");
+        assert_eq!(gate("sshexe host"), None);
+        assert_eq!(gate(".exe"), Some(Reason::GatePath), "a bare extension has no name");
+        assert_eq!(strip_program_extension("pwsh.cmd"), "pwsh");
+        assert_eq!(strip_program_extension("a.exe.exe"), "a.exe", "one extension only");
+        assert_eq!(strip_program_extension("notes.txt"), "notes.txt");
+    }
+
+    /// The PowerShell names from the Windows port are refused in their cmdlet spellings, whatever the case.
+    #[test]
+    fn powershell_and_windows_escape_hatches_are_refused() {
+        for command in [
+            "Remove-Item -Recurse x",
+            "REMOVE-ITEM x",
+            "Invoke-Expression x",
+            "iex x",
+            "Start-Process x",
+            "taskkill /f /im x",
+            "reg add x",
+            "wsl ls",
+            "powershell -c x",
+            "net user",
+            "Set-ExecutionPolicy Bypass",
+        ] {
+            assert_eq!(gate(command), Some(Reason::GateDenylist), "{command:?}");
+        }
+        assert_eq!(run(&regex_policy(&[".*"], &[]), "Remove-Item -Recurse x"), Verdict::Ask(Reason::GateDenylist));
+    }
+
+    /// Deny rules compare without ASCII case on Windows and with it elsewhere. Allow rules always compare with it.
+    #[test]
+    fn deny_rules_ignore_case_only_on_windows_and_allow_rules_never_do() {
+        let policy = regex_policy(&[".*"], &["deploy-app .*"]);
+        assert_eq!(run(&policy, "deploy-app x"), Verdict::Ask(Reason::DenyRule));
+        let upper = if cfg!(windows) { Verdict::Ask(Reason::DenyRule) } else { Verdict::Auto(Reason::Rule) };
+        assert_eq!(run(&policy, "DEPLOY-APP x"), upper);
+
+        let allow = regex_policy(&["git status"], &[]);
+        assert_eq!(run(&allow, "GIT status"), Verdict::Ask(Reason::NoRule), "allow rules are case-sensitive");
+    }
+
+    /// The hard gate runs first, so a deny rule cannot change its answer for a denylisted name.
+    #[test]
+    fn a_denylisted_cmdlet_is_refused_by_the_gate_whatever_the_deny_rule_says() {
+        let policy = regex_policy(&[".*"], &["remove-item .*"]);
+        assert_eq!(run(&policy, "REMOVE-ITEM x"), Verdict::Ask(Reason::GateDenylist));
+    }
+
+    #[test]
+    fn a_rule_compiles_case_insensitively_only_when_asked() {
+        assert!(compile_rule("ab", true).unwrap().is_match("AB"));
+        assert!(!compile_rule("ab", false).unwrap().is_match("AB"));
+    }
+
     #[test]
     fn a_deny_list_word_that_is_not_first_is_fine() {
         assert_eq!(gate("ls rm"), None);
@@ -644,7 +726,7 @@ mod tests {
 
     #[test]
     fn a_rule_with_an_unbalanced_paren_is_refused_so_it_cannot_escape_the_wrapper() {
-        assert!(compile_rule("a)|(b").is_err());
+        assert!(compile_rule("a)|(b", false).is_err());
         assert!(RegexPolicy::new(&settings(ApprovalMode::Regex, &["a)|(b"], &[])).is_err());
     }
 

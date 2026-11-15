@@ -44,6 +44,12 @@ static PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
             r#"(?i)\b(?P<name>(?:[A-Za-z0-9]+_)*(?:API_?KEY|ACCESS_?KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|AUTHORIZATION)(?:_[A-Za-z0-9]+)*)=(?:"[^"\[\n][^"\n]*"?|'[^'\[\n][^'\n]*'?|[^\s"'\[][^\s"']*)"#,
             "${name}=[REDACTED:env]",
         ),
+        // PowerShell `$env:NAME = "value"`, with or without spaces around `=` (the unspaced form is also caught above). The
+        // same names and values as above; the spaces stay, the value and its quotes go.
+        (
+            r#"(?i)(\$env:(?:[A-Za-z0-9]+_)*(?:API_?KEY|ACCESS_?KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|AUTHORIZATION)(?:_[A-Za-z0-9]+)*[ \t]*=[ \t]*)(?:"[^"\[\n][^"\n]*"?|'[^'\[\n][^'\n]*'?|[^\s"'\[][^\s"']*)"#,
+            "${1}[REDACTED:env]",
+        ),
         // Credential headers, `x-api-key: value` or `Authorization: Basic value`: the header name and an optional
         // scheme word stay, the value goes. The value is at least 8 characters with no space, quote or comma, and
         // never starts with `[`, so an existing marker is not replaced again.
@@ -266,6 +272,27 @@ mod tests {
         ] {
             assert_eq!(r.redact(text), text, "changed: {text}");
         }
+    }
+
+    #[test]
+    fn powershell_env_assignment_spaced_and_unspaced_redacts_the_value() {
+        let r = none();
+        assert_eq!(r.redact(r#"$env:OPENAI_API_KEY = "abc123xyz""#), "$env:OPENAI_API_KEY = [REDACTED:env]");
+        assert_eq!(r.redact("$env:GITHUB_TOKEN='ghx_1' next"), "$env:GITHUB_TOKEN=[REDACTED:env] next");
+        assert_eq!(r.redact("$env:DB_PASSWORD=hunter2"), "$env:DB_PASSWORD=[REDACTED:env]");
+        assert_eq!(r.redact("$ENV:API_TOKEN   =   abc123xyz"), "$ENV:API_TOKEN   =   [REDACTED:env]");
+        assert_eq!(r.redact(r#"$env:MY_SECRET = "two words here" done"#), "$env:MY_SECRET = [REDACTED:env] done");
+    }
+
+    #[test]
+    fn powershell_env_assignment_keeps_ordinary_variables_and_markers() {
+        let r = none();
+        let kept = [r#"$env:USERPROFILE = "C:\Users\me""#, "$env:PATH = 'C:\\bin;C:\\x'", r#"$env:TOKEN = "[REDACTED:env]""#];
+        for text in kept {
+            assert_eq!(r.redact(text), text, "changed: {text}");
+        }
+        let once = r.redact(r#"$env:SECRET = "abc123xyz""#);
+        assert_eq!(r.redact(&once), once);
     }
 
     #[test]

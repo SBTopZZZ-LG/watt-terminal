@@ -365,9 +365,14 @@ fn is_assignment(word: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// The last part of a path: `/usr/bin/ssh` is `ssh`.
+/// The program name at the end of a path, without a trailing `.exe` (any case): `/usr/bin/ssh` and
+/// `C:\Windows\System32\OpenSSH\ssh.exe` are both `ssh`.
 fn basename(program: &str) -> &str {
-    program.rsplit('/').next().unwrap_or(program)
+    let last = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    match last.len().checked_sub(4).filter(|&at| last.is_char_boundary(at)).map(|at| last.split_at(at)) {
+        Some((stem, ext)) if !stem.is_empty() && ext.eq_ignore_ascii_case(".exe") => stem,
+        _ => last,
+    }
 }
 
 #[cfg(test)]
@@ -509,6 +514,38 @@ mod tests {
         assert_eq!(kind("tmux attach -t work"), ForegroundKind::Multiplexer);
         assert_eq!(kind("screen -S work"), ForegroundKind::Multiplexer);
         assert_eq!(kind("tmuxinator start"), ForegroundKind::Other);
+    }
+
+    #[test]
+    fn a_windows_path_and_exe_suffix_name_the_program() {
+        assert_eq!(kind(r"C:\Windows\System32\OpenSSH\ssh.exe host"), ForegroundKind::Ssh);
+        assert_eq!(kind(r"ssh.exe ubuntu@lidia"), ForegroundKind::Ssh);
+        assert_eq!(kind(r"C:\Windows\System32\OpenSSH\ssh.exe host make"), ForegroundKind::Ssh);
+        assert_eq!(kind(r"docker.exe run -it alpine sh"), ForegroundKind::ContainerExec);
+        assert_eq!(kind(r"kubectl.exe exec -it pod -- bash"), ForegroundKind::ContainerExec);
+        assert!(login(r"C:\Windows\System32\OpenSSH\ssh.exe host"), "a path with .exe is a login as well");
+        assert!(!login(r"C:\Windows\System32\OpenSSH\ssh.exe host make"));
+        assert_eq!(kind(r"C:\Users\me\bin\zsh.exe"), ForegroundKind::Shell);
+    }
+
+    #[test]
+    fn a_name_that_only_looks_like_exe_or_a_program_is_not_read_as_one() {
+        assert_eq!(kind("sshexe host"), ForegroundKind::Other);
+        assert_eq!(kind("myssh.exe host"), ForegroundKind::Other, "the stem must be the program");
+        assert_eq!(kind("ssh.exe.bak host"), ForegroundKind::Other);
+        assert_eq!(kind(".exe"), ForegroundKind::Other, "an extension with no stem");
+        assert_eq!(kind(r"C:\Windows\"), ForegroundKind::Other, "an empty last part");
+        assert_eq!(kind("é.exe"), ForegroundKind::Other, "a multi-byte name does not panic");
+    }
+
+    /// Nested PowerShell and cmd are deliberately not recognised: the POSIX loader cannot integrate them, so they stay
+    /// `other` (no chip, and the agent waits instead of asking for an integration that cannot work).
+    #[test]
+    fn powershell_and_cmd_stay_other() {
+        for line in ["pwsh", "pwsh.exe -NoLogo", "powershell", r"C:\Program Files\PowerShell\7\pwsh.exe", "powershell.exe -c x", "cmd", "cmd /c dir"] {
+            assert_eq!(kind(line), ForegroundKind::Other, "{line}");
+            assert!(!login(line), "{line}");
+        }
     }
 
     #[test]
