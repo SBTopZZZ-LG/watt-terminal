@@ -117,6 +117,20 @@ The app is ad-hoc signed and not notarised, which is fine on the Mac that built 
 
 Before each install replaces the app, the old copy is kept in `~/Library/Caches/watt-terminal/previous/` (the two newest): quit Watt and copy one over the installed app to roll back. Install and uninstall never touch your data or Keychain items. The scripts are tested with fake bundles: `bash scripts/test-app-scripts.sh`.
 
+### Build and install on Windows
+
+Prerequisites: Windows, Node.js, Rust (rustup), and `npm ci` run once. The first build downloads NSIS into `%LOCALAPPDATA%\tauri`, which needs internet.
+
+```powershell
+npm run app:build:win          # NSIS installer: src-tauri\target\release\bundle\nsis\Watt_<version>_x64-setup.exe
+npm run app:install:win        # build if the installer is missing or older than the sources, install silently, verify
+npm run app:uninstall:win      # uninstall silently, verify
+```
+
+The install is per user: no admin prompt, files go to `%LOCALAPPDATA%\Watt`, and Watt is listed under Installed apps. A silent install (what the script runs) creates a Start Menu shortcut and a Desktop shortcut. The install script takes `-Rebuild`, `-CloseRunning` (stops a running Watt; without it the script stops and asks you to close Watt) and `-InstallerPath <exe>`. Uninstall removes the app folder, the shortcuts and the Installed apps entry. Your data in `%APPDATA%\dev.watt.terminal` and `%LOCALAPPDATA%\dev.watt.terminal` is kept.
+
+The installer is not code signed, so SmartScreen shows an "unknown publisher" warning: choose More info, then Run anyway. The WebView2 runtime is needed; the installer downloads it only if it is missing, which needs internet. The scripts run PowerShell with `-ExecutionPolicy Bypass` for that process only.
+
 ## Tests
 
 ```sh
