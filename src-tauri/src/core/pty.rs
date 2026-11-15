@@ -103,14 +103,48 @@ enum ReadMsg {
     Eof,
 }
 
+/// What `start_threads` started. `end` exists on Windows only (see session.rs `watch_exit`).
+pub struct Threads {
+    pub handles: Vec<JoinHandle<()>>,
+    #[cfg(windows)]
+    pub end: StreamEnd,
+}
+
+/// Windows only. ConPTY does not end the reader while the master is open, so the session ends the stream itself once
+/// the shell has exited.
+#[cfg(windows)]
+pub struct StreamEnd {
+    tx: mpsc::SyncSender<ReadMsg>,
+    /// When the reader last returned data (or started).
+    last_read: Arc<Mutex<Instant>>,
+}
+
+#[cfg(windows)]
+impl StreamEnd {
+    pub fn last_read(&self) -> Instant {
+        *self.last_read.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Sends the same EOF the reader sends at a real end of stream. Ignored if the pump has already gone.
+    pub fn end(self) {
+        let _ = self.tx.send(ReadMsg::Eof);
+    }
+}
+
 /// Starts the reader and pump threads. They exit on EOF, or when the gate is closed.
 pub fn start_threads(
     mut reader: Box<dyn Read + Send>,
     gate: Arc<Gate>,
     mut sink: Box<dyn OutputSink>,
     queue: Arc<ObsQueue>,
-) -> io::Result<Vec<JoinHandle<()>>> {
+) -> io::Result<Threads> {
     let (tx, rx) = mpsc::sync_channel::<ReadMsg>(8);
+    #[cfg(windows)]
+    let last_read = Arc::new(Mutex::new(Instant::now()));
+    #[cfg(windows)]
+    let end = StreamEnd { tx: tx.clone(), last_read: last_read.clone() };
+    #[cfg(windows)]
+    let touch = last_read;
     let read_handle = thread::Builder::new().name("pty-read".into()).spawn(move || {
         let mut buf = vec![0u8; READ_BUF];
         loop {
@@ -120,6 +154,10 @@ pub fn start_threads(
                     break;
                 }
                 Ok(n) => {
+                    #[cfg(windows)]
+                    {
+                        *touch.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+                    }
                     if tx.send(ReadMsg::Data(buf[..n].to_vec())).is_err() {
                         break;
                     }
@@ -134,7 +172,11 @@ pub fn start_threads(
         }
     })?;
     let pump_handle = thread::Builder::new().name("pty-pump".into()).spawn(move || pump(rx, gate, &mut *sink, queue))?;
-    Ok(vec![read_handle, pump_handle])
+    Ok(Threads {
+        handles: vec![read_handle, pump_handle],
+        #[cfg(windows)]
+        end,
+    })
 }
 
 fn pump(rx: Receiver<ReadMsg>, gate: Arc<Gate>, sink: &mut dyn OutputSink, queue: Arc<ObsQueue>) {

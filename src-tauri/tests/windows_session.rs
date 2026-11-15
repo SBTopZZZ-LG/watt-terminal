@@ -451,6 +451,74 @@ fn ctrl_c_at_the_continuation_prompt_returns_to_the_prompt() {
     assert_eq!(after.exit_code, Some(0));
 }
 
+/// Waits (`limit`, not WAIT) for the observer to report the shell as Exited.
+fn wait_exited_within(s: &Session, limit: Duration) {
+    let end = Instant::now() + limit;
+    while Instant::now() < end {
+        if s.state() == InputState::Exited {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("state never reached Exited within {limit:?}; state={:?} screen={:?}", s.state(), s.screen_snapshot().rows);
+}
+
+/// Drops the session on another thread and fails if that takes longer than `limit`.
+fn drop_within(s: Arc<Session>, limit: Duration) {
+    let (done_tx, done_rx) = mpsc::channel();
+    thread::spawn(move || {
+        drop(s);
+        let _ = done_tx.send(());
+    });
+    done_rx.recv_timeout(limit).expect("dropping the session hung");
+}
+
+/// The shell exits by itself (`exit` at the prompt). ConPTY never ends the reader while the master is open, so the session
+/// must notice the exit itself: Exited within 3 s, the shell process gone, and the drop returns.
+#[test]
+fn a_shell_that_exits_by_itself_reports_exited() {
+    let _g = serial();
+    let s = start("win-exit");
+    wait_prompt(&s);
+    let pid = s.shell_pid().expect("shell pid");
+    s.submit(Source::User, "exit").expect("submit exit at an idle prompt");
+    wait_exited_within(&s, Duration::from_secs(3));
+    assert!(wait_until(|| (!process_alive(pid)).then_some(())).is_some(), "shell pid {pid} is still running after exit");
+    drop_within(s, Duration::from_secs(5));
+}
+
+/// Output printed before `exit` on the same line is not lost: the exit waits for the shell's last bytes.
+#[test]
+fn output_before_exit_on_the_same_line_is_kept() {
+    let _g = serial();
+    let s = start("win-exit-bye");
+    wait_prompt(&s);
+    s.submit(Source::User, "echo bye; exit").expect("submit at an idle prompt");
+    wait_exited_within(&s, Duration::from_secs(3));
+    let rows = s.screen_snapshot().rows;
+    assert!(rows.iter().any(|r| r.trim() == "bye"), "the output line is not on screen; screen={rows:?}");
+    drop_within(s, Duration::from_secs(5));
+}
+
+/// A command that runs for a while is Running the whole time, never Exited, and its output is recorded.
+#[test]
+fn a_slow_command_does_not_report_exited() {
+    let _g = serial();
+    let s = start("win-slow-live");
+    wait_prompt(&s);
+    let line = "Start-Sleep -Milliseconds 1500; echo slow-done";
+    s.submit(Source::User, line).expect("submit at an idle prompt");
+    thread::sleep(Duration::from_millis(800));
+    assert_eq!(s.state(), InputState::Running, "not Running during the sleep; screen={:?}", s.screen_snapshot().rows);
+    let id = wait_finished(&s, line);
+    wait_prompt(&s);
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(s.state(), InputState::Prompt, "the shell is still at its prompt after the command");
+    let r = s.get_record(id).expect("record by id");
+    assert_eq!(r.exit_code, Some(0));
+    assert_eq!(r.output, "slow-done");
+}
+
 #[test]
 fn watt_histfile_receives_the_session_history() {
     let _g = serial();

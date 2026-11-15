@@ -154,7 +154,11 @@ pub struct Session {
     gate: Arc<Gate>,
     wtx: Sender<WriteCmd>,
     master: Mutex<Box<dyn MasterPty + Send>>,
-    child: Mutex<Box<dyn Child + Send + Sync>>,
+    /// Shared with the Windows exit watcher, which only holds the lock for one `try_wait`.
+    child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
+    /// Windows only: dropping it stops the exit watcher (it sees the disconnect).
+    #[cfg(windows)]
+    _exit_watch: Sender<()>,
     shell_pid: Option<u32>,
     shim_dir: PathBuf,
     /// The integration nonce the shell was given. Never logged; the frontend uses it only to filter OSC payloads.
@@ -184,6 +188,7 @@ impl Session {
         // The parent must drop the slave, or EOF is never seen on the master.
         drop(pair.slave);
         let shell_pid = child.process_id();
+        let child = Arc::new(Mutex::new(child));
         let reader = pair.master.try_clone_reader().map_err(to_io)?;
         let writer = pair.master.take_writer().map_err(to_io)?;
 
@@ -192,7 +197,16 @@ impl Session {
         let gate = Arc::new(Gate::new());
 
         // Reader, pump, observer and writer threads exit on their own once the PTY reaches EOF and their channels close.
-        pty::start_threads(reader, gate.clone(), sink, queue.clone())?;
+        let threads = pty::start_threads(reader, gate.clone(), sink, queue.clone())?;
+        #[cfg(windows)]
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        #[cfg(windows)]
+        {
+            let (child, end) = (child.clone(), threads.end);
+            thread::Builder::new().name("exit-watch".into()).spawn(move || watch_exit(child, end, stop_rx))?;
+        }
+        #[cfg(not(windows))]
+        drop(threads);
         {
             let (q, s) = (queue.clone(), shared.clone());
             thread::Builder::new().name("observer".into()).spawn(move || run_observer(q, s))?;
@@ -209,7 +223,9 @@ impl Session {
             gate,
             wtx,
             master: Mutex::new(pair.master),
-            child: Mutex::new(child),
+            child,
+            #[cfg(windows)]
+            _exit_watch: stop_tx,
             shell_pid,
             shim_dir,
             nonce,
@@ -613,6 +629,50 @@ impl Drop for Session {
         }
         let _ = std::fs::remove_dir_all(&self.shim_dir);
     }
+}
+
+/// How often the exit watcher asks the shell whether it has exited.
+#[cfg(windows)]
+const EXIT_POLL: Duration = Duration::from_millis(100);
+/// Read-quiet needed after the exit is seen (counted from the exit or the last output, whichever is later). The shell's
+/// last bytes arrive within about 15 ms of the exit when measured.
+#[cfg(windows)]
+const EXIT_QUIET: Duration = Duration::from_millis(150);
+/// The longest the watcher waits for quiet after the exit is seen.
+#[cfg(windows)]
+const EXIT_CAP: Duration = Duration::from_secs(1);
+
+/// Windows only. ConPTY does not end the reader while the master is open, so a shell that exits by itself never reaches
+/// the observer as EOF. This polls the shell, lets its last output settle, then ends the stream the way a real EOF does.
+/// The child lock is held only for one `try_wait`. The thread ends when the session drops (`stop` disconnects) and then
+/// sends nothing.
+#[cfg(windows)]
+fn watch_exit(child: Arc<Mutex<Box<dyn Child + Send + Sync>>>, end: pty::StreamEnd, stop: Receiver<()>) {
+    loop {
+        if !pause(&stop, EXIT_POLL) {
+            return;
+        }
+        let exited = matches!(child.lock().unwrap_or_else(|e| e.into_inner()).try_wait(), Ok(Some(_)));
+        if exited {
+            break;
+        }
+    }
+    let seen = Instant::now();
+    loop {
+        if end.last_read().max(seen).elapsed() >= EXIT_QUIET || seen.elapsed() >= EXIT_CAP {
+            break;
+        }
+        if !pause(&stop, Duration::from_millis(20)) {
+            return;
+        }
+    }
+    end.end();
+}
+
+/// Sleeps for `d` unless `stop` fires or disconnects. True when the full time passed.
+#[cfg(windows)]
+fn pause(stop: &Receiver<()>, d: Duration) -> bool {
+    matches!(stop.recv_timeout(d), Err(mpsc::RecvTimeoutError::Timeout))
 }
 
 #[cfg(unix)]
