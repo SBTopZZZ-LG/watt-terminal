@@ -3,7 +3,7 @@
 
 #![cfg(windows)]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
@@ -36,11 +36,19 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
+/// The history file of the session `id`. Every test session gets one (WATT_HISTFILE), so no test writes to the user's
+/// PSReadLine history.
+fn history_path(id: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("watt-windows-session-{id}-{}.history", std::process::id()))
+}
+
 /// Starts a session the way the app does. A renderer thread takes the output and acks it, and answers each cursor
 /// position query the way xterm.js does: the reply goes back through `write_user`, which writes terminal replies as they are.
 fn start(id: &str) -> Arc<Session> {
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
-    let cfg = SpawnConfig { rows: 30, cols: 120, real_zdotdir: None, histfile: None };
+    let histfile = history_path(id);
+    let _ = std::fs::remove_file(&histfile);
+    let cfg = SpawnConfig { rows: 30, cols: 120, real_zdotdir: None, histfile: Some(histfile) };
     let session = Arc::new(Session::spawn(id, cfg, Box::new(ChanSink(tx))).expect("spawn the PowerShell session"));
     let weak: Weak<Session> = Arc::downgrade(&session);
     thread::spawn(move || {
@@ -76,9 +84,13 @@ fn wait_until<T>(mut f: impl FnMut() -> Option<T>) -> Option<T> {
     }
 }
 
+fn wait_state(s: &Session, want: InputState) {
+    let ok = wait_until(|| (s.state() == want).then_some(())).is_some();
+    assert!(ok, "state never reached {want:?} within {WAIT:?}; state={:?} screen={:?}", s.state(), s.screen_snapshot().rows);
+}
+
 fn wait_prompt(s: &Session) {
-    let ok = wait_until(|| (s.state() == InputState::Prompt).then_some(())).is_some();
-    assert!(ok, "no idle prompt within {WAIT:?}; state={:?} screen={:?}", s.state(), s.screen_snapshot().rows);
+    wait_state(s, InputState::Prompt);
 }
 
 /// Submits `cmd` at an idle prompt, waits for its record to finish and for the next prompt. Returns the finished record.
@@ -142,4 +154,86 @@ fn powershell_session_runs_commands_reports_cwd_and_terminates() {
     });
     done_rx.recv_timeout(WAIT).expect("dropping the session hung");
     assert!(wait_until(|| (!process_alive(pid)).then_some(())).is_some(), "shell pid {pid} is still running after drop");
+}
+
+#[test]
+fn backtick_continuation_is_one_record() {
+    let _g = serial();
+    let s = start("win-backtick");
+    wait_prompt(&s);
+    let before = s.records().len();
+    s.submit(Source::User, "echo a `").expect("submit at an idle prompt");
+    wait_state(&s, InputState::Continuation);
+    assert_eq!(s.records().len(), before, "the incomplete line made a record: {:?}", s.records());
+    s.write_user(b"b\r").expect("write the second line");
+    let id = wait_until(|| s.records().iter().find(|r| r.command.starts_with("echo a `") && r.exit_code.is_some()).map(|r| r.id))
+        .unwrap_or_else(|| panic!("no finished record; records={:?}", s.records()));
+    wait_prompt(&s);
+    assert_eq!(s.records().len(), before + 1, "records={:?}", s.records());
+    let r = s.get_record(id).expect("record by id");
+    assert_eq!(r.exit_code, Some(0));
+    assert_eq!(r.status, RecordStatus::Complete);
+    assert!(r.command.ends_with('b'), "command={:?}", r.command);
+    // echo gets two arguments and writes one object per argument, so the output is one word per line.
+    assert!(r.output.contains("a\nb"), "output={:?}", r.output);
+}
+
+#[test]
+fn no_op_lines_after_a_failed_command_exit_zero() {
+    let _g = serial();
+    let s = start("win-noop");
+    let native = run(&s, "cmd /c exit 3");
+    assert_eq!(native.exit_code, Some(3), "native exit code");
+    let comment = run(&s, "# x");
+    assert_eq!(comment.exit_code, Some(0), "comment after a failed command");
+    assert_eq!(comment.status, RecordStatus::Complete);
+    run(&s, "cmd /c exit 3");
+    let func = run(&s, "function WattNoOpProbe { }");
+    assert_eq!(func.exit_code, Some(0), "function definition after a failed command");
+}
+
+#[test]
+fn open_block_is_a_continuation_until_it_is_closed() {
+    let _g = serial();
+    let s = start("win-block");
+    wait_prompt(&s);
+    let before = s.records().len();
+    s.submit(Source::User, "if ($true) {").expect("submit at an idle prompt");
+    wait_state(&s, InputState::Continuation);
+    assert_eq!(s.records().len(), before, "the open block made a record: {:?}", s.records());
+    s.write_user(b"}\r").expect("write the closing brace");
+    let id = wait_until(|| s.records().iter().find(|r| r.command.starts_with("if ($true) {") && r.exit_code.is_some()).map(|r| r.id))
+        .unwrap_or_else(|| panic!("no finished record; records={:?}", s.records()));
+    wait_prompt(&s);
+    assert_eq!(s.records().len(), before + 1, "records={:?}", s.records());
+    let r = s.get_record(id).expect("record by id");
+    assert_eq!(r.exit_code, Some(0));
+    assert!(r.command.ends_with('}'), "command={:?}", r.command);
+}
+
+#[test]
+fn ctrl_c_at_the_continuation_prompt_returns_to_the_prompt() {
+    let _g = serial();
+    let s = start("win-ctrlc");
+    wait_prompt(&s);
+    let before = s.records().len();
+    s.submit(Source::User, "if ($true) {").expect("submit at an idle prompt");
+    wait_state(&s, InputState::Continuation);
+    s.write_user(b"\x03").expect("send Ctrl-C");
+    wait_prompt(&s);
+    assert_eq!(s.records().len(), before, "the cancelled block made a record: {:?}", s.records());
+    let after = run(&s, "echo after-ctrl-c");
+    assert_eq!(after.exit_code, Some(0));
+}
+
+#[test]
+fn watt_histfile_receives_the_session_history() {
+    let _g = serial();
+    let s = start("win-hist");
+    let marker = "echo watt-histfile-probe";
+    run(&s, marker);
+    let path = history_path("win-hist");
+    let found = wait_until(|| std::fs::read_to_string(&path).ok().filter(|t| t.contains(marker)).map(|_| ())).is_some();
+    let _ = std::fs::remove_file(&path);
+    assert!(found, "{} does not contain {marker:?}", path.display());
 }

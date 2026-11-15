@@ -48,8 +48,8 @@ pub struct SpawnConfig {
     /// Directory holding the user's startup files. None: the app's own ZDOTDIR if set, else $HOME.
     /// Tests use this to keep the user's history file out of reach (zsh appends every command to HISTFILE).
     pub real_zdotdir: Option<PathBuf>,
-    /// Dev only: a file to use as HISTFILE instead of the real one (the Tauri layer sets this from
-    /// WATT_HISTFILE). None keeps the user's own history file.
+    /// Dev only: a file to use as the history file instead of the real one (zsh HISTFILE, PSReadLine HistorySavePath; the
+    /// Tauri layer sets this from WATT_HISTFILE). None keeps the user's own history file.
     pub histfile: Option<PathBuf>,
 }
 
@@ -647,9 +647,10 @@ fn shell_command(shim_dir: &Path, nonce: &str, cfg: &SpawnConfig) -> io::Result<
 
 /// PowerShell with the integration script. `-NoProfile` is not passed, so the user's $PROFILE still loads (the dotfiles are
 /// read, never edited). There is no `-ExecutionPolicy`: the script's text goes to ScriptBlock.Create, which a Restricted
-/// policy does not block the way it blocks a dot-sourced file. `cfg` is unused: the shell takes no ZDOTDIR or history.
+/// policy does not block the way it blocks a dot-sourced file. `cfg.histfile` (dev only) becomes WATT_HISTFILE, which the
+/// script reads to point PSReadLine's history at that file. There is no ZDOTDIR on Windows.
 #[cfg(windows)]
-fn shell_command(shim_dir: &Path, nonce: &str, _cfg: &SpawnConfig) -> io::Result<CommandBuilder> {
+fn shell_command(shim_dir: &Path, nonce: &str, cfg: &SpawnConfig) -> io::Result<CommandBuilder> {
     let path_var = std::env::var_os("PATH").unwrap_or_default();
     let system_root = std::env::var_os("SystemRoot");
     let shell = pick_windows_shell(&path_var, system_root.as_deref(), |p| p.is_file()).ok_or_else(|| {
@@ -666,6 +667,9 @@ fn shell_command(shim_dir: &Path, nonce: &str, _cfg: &SpawnConfig) -> io::Result
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     cmd.env("WATT_NONCE", nonce);
+    if let Some(histfile) = &cfg.histfile {
+        cmd.env("WATT_HISTFILE", histfile);
+    }
     Ok(cmd)
 }
 

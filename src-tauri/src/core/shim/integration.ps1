@@ -17,6 +17,12 @@ $global:WattEsc = [string][char]27
 $global:WattBs = [string][char]92
 $global:WattTerm = $global:WattEsc + $global:WattBs
 $global:WattRan = $false
+$global:WattNoOp = $false
+
+# Dev only (WATT_HISTFILE, set by the app or the tests): PSReadLine saves history to that file instead of the user's.
+# Unset, which is the normal case, leaves the history alone. Removed from the environment after reading, like the nonce.
+if ($env:WATT_HISTFILE) { Set-PSReadLineOption -HistorySavePath $env:WATT_HISTFILE }
+Remove-Item Env:WATT_HISTFILE -ErrorAction SilentlyContinue
 
 # OSC emitter: ESC ] body terminator. Written straight to the console so it bypasses the pipeline.
 function global:_WattOsc([string]$body) {
@@ -59,9 +65,25 @@ function global:_WattIncomplete([string]$s) {
   $errs = $null
   [void][System.Management.Automation.Language.Parser]::ParseInput($s, [ref]$null, [ref]$errs)
   $incompleteIds = @('MissingEndCurlyBrace', 'MissingEndParenthesisInExpression', 'MissingEndSquareBracket',
-    'TerminatorExpectedAtEndOfString', 'EmptyPipeElement', 'MissingCommandAfterPipe', 'ExpectedValueExpression')
+    'TerminatorExpectedAtEndOfString', 'EmptyPipeElement', 'MissingCommandAfterPipe', 'ExpectedValueExpression',
+    'IncompleteString')
   foreach ($e in $errs) { if ($incompleteIds -contains $e.ErrorId) { return $true } }
   $false
+}
+
+# True when a complete line runs nothing: blank or comment only, or only function definitions. Such a line has no
+# command status of its own, so the prompt reports exit 0 instead of the stale $?. A line with a parse error is not one.
+function global:_WattNoOp([string]$s) {
+  $errs = $null
+  $ast = [System.Management.Automation.Language.Parser]::ParseInput($s, [ref]$null, [ref]$errs)
+  if ($errs -and $errs.Count) { return $false }
+  $block = $ast.EndBlock
+  if ($block) {
+    foreach ($st in $block.Statements) {
+      if ($st -isnot [System.Management.Automation.Language.FunctionDefinitionAst]) { return $false }
+    }
+  }
+  $true
 }
 
 # Hello: the observer treats a shell that has said Hello as observable. Printed last, after the user's profile.
@@ -82,7 +104,8 @@ function global:prompt {
   if ($global:WattRan) {
     $global:WattRan = $false
     $code = 0
-    if (-not $ok) { if ($lec) { $code = [int]$lec } else { $code = 1 } }
+    if (-not $ok -and -not $global:WattNoOp) { if ($lec) { $code = [int]$lec } else { $code = 1 } }
+    $global:WattNoOp = $false
     _WattOsc ("133;D;n=$nonce;exit=$code;ps=$code")
   }
   if ($PWD.Provider.Name -eq 'FileSystem') {
@@ -94,17 +117,23 @@ function global:prompt {
   return ($global:WattEsc + ']133;A;n=' + $nonce + $global:WattTerm) + $text + ($global:WattEsc + ']133;B;n=' + $nonce + $global:WattTerm)
 }
 
-# Enter: emit E and C only for a complete, non-blank line, then hand off to PSReadLine's normal validate-and-accept.
-# Incomplete input (open block/string/pipe) gets no E/C; ValidateAndAcceptLine inserts a newline as usual.
+# Enter: emit E and C for a complete, non-blank line, then hand off to PSReadLine's normal validate-and-accept.
+# Incomplete input (open block/string/pipe) gets no E/C but a 133;P (continuation, PS2) like zsh; the next Enter that
+# completes the line emits E and C with the whole text. ValidateAndAcceptLine inserts a newline as usual.
 Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
   $line = $null
   $cursor = $null
   [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor)
-  if (-not [string]::IsNullOrWhiteSpace($line) -and -not (_WattIncomplete $line)) {
-    $global:WattRan = $true
-    $global:LASTEXITCODE = 0
-    _WattOsc ('633;E;n=' + $global:WattNonce + ';' + (_WattEscapeE $line))
-    _WattOsc ('133;C;n=' + $global:WattNonce)
+  if (-not [string]::IsNullOrWhiteSpace($line)) {
+    if (_WattIncomplete $line) {
+      _WattOsc ('133;P;n=' + $global:WattNonce + ';k=s')
+    } else {
+      $global:WattRan = $true
+      $global:WattNoOp = _WattNoOp $line
+      $global:LASTEXITCODE = 0
+      _WattOsc ('633;E;n=' + $global:WattNonce + ';' + (_WattEscapeE $line))
+      _WattOsc ('133;C;n=' + $global:WattNonce)
+    }
   }
   [Microsoft.PowerShell.PSConsoleReadLine]::ValidateAndAcceptLine()
 }
