@@ -2,9 +2,11 @@
 //! Nothing here touches a session or a PTY. The real-shell contract is tested in tests/inject_shell.rs.
 //!
 //! Handshake, from the caller's side:
-//! 1. Type `loader_line(token)` into the shell (after Ctrl-C has cleared the line).
-//! 2. Wait for `ESC ] 633;Ready;t=<token>;sh=<zsh|bash> BEL` (scanner Event::Ready). The loader only prints it when the
-//!    shell is zsh, or bash >= 4.4 outside posix mode. Otherwise it prints `Unsupported shell` and nothing else.
+//! 1. Type `loader_for(family, token)` into the shell (after Ctrl-C has cleared the line). The family is the shell
+//!    the foreground program is (`foreground::shell_family`): POSIX (zsh, bash) or PowerShell.
+//! 2. Wait for `ESC ] 633;Ready;t=<token>;sh=<zsh|bash|pwsh> BEL` (scanner Event::Ready). The POSIX loader only prints it when
+//!    the shell is zsh, or bash >= 4.4 outside posix mode. The PowerShell loader prints it on PowerShell 5 or newer. Otherwise
+//!    it prints `Unsupported shell` and nothing else.
 //! 3. Write each line of `blob_lines(nonce, sh)`, then the line `END_MARKER`, each followed by a carriage return.
 //!    `blob_lines` does not include END_MARKER; the writer adds it.
 //! 4. Wait for Hello carrying the nonce. The loader evals the blob, which installs the hooks and prints Hello last.
@@ -12,6 +14,7 @@
 use std::fmt;
 use std::io;
 
+use crate::core::foreground::ShellFamily;
 use crate::core::scanner::READY_FIELD_CAP;
 
 /// The loader reads lines until this one. The writer sends it after the blob. It never appears inside the blob.
@@ -22,11 +25,17 @@ pub const MAX_LINE: usize = 480;
 const NONCE_LEN: usize = 32;
 const ZSH_SCRIPT: &str = include_str!("shim/integration.zsh");
 const BASH_SCRIPT: &str = include_str!("shim/integration.bash");
+const PS_SCRIPT: &str = include_str!("shim/integration.ps1");
 /// The loader line ends with `: <tag>` and the bash history cleanup looks for the tag, so both are filled from this one.
 const LOADER_TAG: &str = "LDRTAG";
 const UNSET_LOADER_VARS: &str = "unset __at_v __at_l __at_ok";
 
-/// The loader: guards the shell, prints Ready, reads the blob up to END_MARKER and evals it. One line, leading space
+/// The PowerShell loader (PowerShell 5.1 and 7). One line, ends with `# @TAG@`. It reads keys with ReadKey, so nothing is
+/// echoed and PSReadLine is not involved, and it ends on the END_MARKER line. In the POC harness Ctrl-C did not stop it, so
+/// an abort after Ready sends the marker instead (session.rs). Its variables live in its own script block.
+const PS_LOADER: &str = r#"& { $t='@TOKEN@'; if ($PSVersionTable.PSVersion.Major -lt 5) { 'Unsupported shell'; return }; [Console]::Out.Write([string][char]27 + ']633;Ready;t=' + $t + ';sh=pwsh' + [string][char]7); $v=''; $l=''; while ($true) { $k=[Console]::ReadKey($true); if ($k.Key -eq 'Enter') { if ($l -eq '__AT_END__') { break }; $v += $l + "`n"; $l='' } else { $l += $k.KeyChar } }; . ([scriptblock]::Create($v)) } # @TAG@"#;
+
+/// The POSIX loader: guards the shell, prints Ready, reads the blob up to END_MARKER and evals it. One line, leading space
 /// (so bash's HISTCONTROL=ignorespace keeps it out of history), ends with `: @TAG@`. `@TOKEN@` and `@TAG@` are replaced.
 const LOADER: &str = r#" __at_ok=; if [ -n "${ZSH_VERSION-}" ]; then __at_ok=zsh; elif [ -n "${BASH_VERSION-}" ]; then if [ "${BASH_VERSINFO[0]:-0}" -gt 4 ] || { [ "${BASH_VERSINFO[0]:-0}" -eq 4 ] && [ "${BASH_VERSINFO[1]:-0}" -ge 4 ]; }; then case ":${SHELLOPTS-}:" in *:posix:*) ;; *) __at_ok=bash;; esac; fi; fi; if [ -z "$__at_ok" ]; then echo 'Unsupported shell'; else stty -echo; printf '\033]633;Ready;t=@TOKEN@;sh=%s\007' "$__at_ok"; __at_v=; while IFS= read -r __at_l && [ "$__at_l" != __AT_END__ ]; do __at_v="$__at_v$__at_l"$'\n'; done; stty echo; eval "$__at_v"; fi; : @TAG@"#;
 
@@ -51,7 +60,7 @@ pub enum InjectError {
 impl fmt::Display for InjectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            InjectError::UnknownShell(sh) => write!(f, "unknown shell {sh:?} (need zsh or bash)"),
+            InjectError::UnknownShell(sh) => write!(f, "unknown shell {sh:?} (need zsh, bash or pwsh)"),
             InjectError::BadNonce => write!(f, "nonce must be {NONCE_LEN} hex digits"),
             InjectError::NotPrintableAscii { line } => write!(f, "blob line {line} has a byte outside printable ASCII"),
             InjectError::LineTooLong { line, len } => write!(f, "blob line {line} is {len} bytes (limit {MAX_LINE})"),
@@ -76,9 +85,21 @@ pub fn loader_line(token: &str) -> String {
     LOADER.replace("@TOKEN@", token).replace("@TAG@", LOADER_TAG)
 }
 
-/// The blob for `sh` (`zsh` or `bash`), one string per line, without END_MARKER (the writer sends that after the lines).
-/// Line 1 is `_watt_inject_nonce=<nonce>`. Then the integration script with comments and blank lines removed, tabs
-/// turned into spaces and trailing spaces dropped. For bash, the history cleanup line. Last, the loader cleanup.
+/// The one-line loader for `family` (see `loader_line` for the POSIX one). Same token rules.
+pub fn loader_for(family: ShellFamily, token: &str) -> String {
+    match family {
+        ShellFamily::Posix => loader_line(token),
+        ShellFamily::PowerShell => {
+            assert!(valid_token(token), "loader token must be 1 to {READY_FIELD_CAP} ASCII letters or digits");
+            PS_LOADER.replace("@TOKEN@", token).replace("@TAG@", LOADER_TAG)
+        }
+    }
+}
+
+/// The blob for `sh` (`zsh`, `bash` or `pwsh`), one string per line, without END_MARKER (the writer sends that after the
+/// lines). Line 1 is `_watt_inject_nonce=<nonce>` (`$env:WATT_NONCE=` for pwsh). Then the integration script with comments
+/// and blank lines removed, tabs turned into spaces and trailing spaces dropped. For bash, the history cleanup line. Last,
+/// the loader cleanup (none for pwsh, whose loader variables die with its script block).
 /// The nonce is only ever on line 1, and nothing in the blob is exported.
 pub fn blob_lines(nonce: &str, sh: &str) -> Result<Vec<String>, InjectError> {
     if !valid_nonce(nonce) {
@@ -87,6 +108,7 @@ pub fn blob_lines(nonce: &str, sh: &str) -> Result<Vec<String>, InjectError> {
     let (script, bash) = match sh {
         "zsh" => (ZSH_SCRIPT, false),
         "bash" => (BASH_SCRIPT, true),
+        "pwsh" => return powershell_blob(nonce),
         other => return Err(InjectError::UnknownShell(other.to_string())),
     };
     let mut lines = vec![format!("_watt_inject_nonce={nonce}")];
@@ -95,6 +117,15 @@ pub fn blob_lines(nonce: &str, sh: &str) -> Result<Vec<String>, InjectError> {
         lines.push(BASH_HISTORY_CLEANUP.replace("@TAG@", LOADER_TAG));
     }
     lines.push(UNSET_LOADER_VARS.to_string());
+    check(&lines)?;
+    Ok(lines)
+}
+
+/// The PowerShell blob: the nonce goes in the environment (integration.ps1 reads it and removes it), then the script as it
+/// is. No cleanup lines: the script's locals and the loader's variables do not outlive the script block.
+fn powershell_blob(nonce: &str) -> Result<Vec<String>, InjectError> {
+    let mut lines = vec![format!("$env:WATT_NONCE='{nonce}'")];
+    lines.extend(script_lines(PS_SCRIPT));
     check(&lines)?;
     Ok(lines)
 }
@@ -212,7 +243,48 @@ mod tests {
     fn bad_nonce_and_unknown_shell_are_refused() {
         assert_eq!(blob_lines("abc", "zsh"), Err(InjectError::BadNonce));
         assert_eq!(blob_lines(&"g".repeat(32), "zsh"), Err(InjectError::BadNonce));
+        assert_eq!(blob_lines("abc", "pwsh"), Err(InjectError::BadNonce));
         assert_eq!(blob_lines(NONCE, "fish"), Err(InjectError::UnknownShell("fish".into())));
+    }
+
+    #[test]
+    fn posix_loader_for_is_the_posix_loader_line() {
+        assert_eq!(loader_for(ShellFamily::Posix, "RDY123"), loader_line("RDY123"));
+    }
+
+    #[test]
+    fn powershell_loader_is_one_ascii_line_with_the_token_and_the_tag() {
+        for token in ["RDY123", NONCE] {
+            let line = loader_for(ShellFamily::PowerShell, token);
+            assert!(!line.contains('\n') && !line.contains('\r'), "single line");
+            assert!(line.is_ascii() && line.len() <= MAX_LINE, "{} bytes", line.len());
+            assert!(line.contains(&format!("$t='{token}';")), "token in the loader: {line:?}");
+            assert!(line.contains("sh=pwsh") && line.contains("Unsupported shell"), "the Ready and refusal branches");
+            assert!(line.contains("'__AT_END__'") && line.contains(END_MARKER), "reads up to the end marker");
+            assert!(line.ends_with("# LDRTAG"), "ends with the loader tag: {line:?}");
+            assert!(!line.contains("@TOKEN@") && !line.contains("@TAG@"), "placeholders replaced");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "loader token must be")]
+    fn powershell_loader_refuses_a_token_that_is_not_alphanumeric() {
+        loader_for(ShellFamily::PowerShell, "a'b");
+    }
+
+    /// The shipped integration.ps1 must pass the blob rules (ASCII, line length, no END marker), and the PowerShell blob is
+    /// the nonce line followed by the script, with no POSIX cleanup lines.
+    #[test]
+    fn powershell_blob_is_the_nonce_then_the_shipped_script() {
+        let lines = blob_lines(NONCE, "pwsh").expect("the shipped integration.ps1 passes the blob rules");
+        assert_eq!(lines[0], format!("$env:WATT_NONCE='{NONCE}'"));
+        assert_eq!(&lines[1..], script_lines(PS_SCRIPT).as_slice());
+        assert!(lines[1..].iter().all(|l| !l.contains(NONCE)), "nonce leaked past line 1");
+        assert!(lines.iter().all(|l| l != END_MARKER), "end marker inside the blob");
+        assert!(lines.iter().all(|l| l.is_ascii() && l.len() <= MAX_LINE && !l.ends_with(' ') && !l.contains('\t')), "line rules");
+        assert!(lines.iter().all(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#')), "no blank or comment lines");
+        assert_ne!(lines.last().map(String::as_str), Some(UNSET_LOADER_VARS), "no POSIX loader cleanup");
+        assert!(lines.iter().all(|l| !l.contains("_watt_inject_nonce")), "no POSIX nonce variable");
     }
 
     #[test]

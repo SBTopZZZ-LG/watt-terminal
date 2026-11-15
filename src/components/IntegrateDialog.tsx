@@ -30,13 +30,15 @@ function consentBody(): ReactNode {
   return (
     <>
       <p>
-        This types one short command into the shell you are connected to, then sends a small script, about 4 KB, that adds
+        This types one short command into the shell you are connected to, then sends a small script, about 4 KB for zsh and bash or 9 KB for PowerShell, that adds
         prompt and command markers so the agent can run and read commands there. Nothing is written to disk on the remote
         machine. The script lives in that shell&apos;s memory only and ends when you exit it.
       </p>
       <p>Make sure the remote shell is at its prompt, not at a password or other prompt: it will receive the typed lines.</p>
-      <p>Works with zsh, and bash 4.4 or newer. Other shells are left untouched.</p>
-      <p className="integrate-note">The one-line loader may remain in zsh history (it is removed from bash history).</p>
+      <p>Works with zsh, bash 4.4 or newer, and PowerShell 5.1 or newer. Other shells are left untouched.</p>
+      <p className="integrate-note">
+        The one-line loader may remain in zsh and PowerShell history (it is removed from bash history).
+      </p>
     </>
   );
 }

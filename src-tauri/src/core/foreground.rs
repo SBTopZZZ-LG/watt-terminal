@@ -23,7 +23,7 @@ pub const MAX_COMMAND_CHARS: usize = 1000;
 pub enum ForegroundKind {
     /// ssh or mosh: a shell on another machine.
     Ssh,
-    /// A shell by name (zsh, bash, ...): a nested shell.
+    /// A shell by name (zsh, bash, pwsh, ...): a nested shell.
     Shell,
     /// su, or sudo with -i or -s and nothing to run: a shell as another user.
     Su,
@@ -73,6 +73,19 @@ pub struct Foreground {
 const WRAPPERS: [&str; 7] = ["command", "exec", "builtin", "nohup", "time", "noglob", "env"];
 /// Shells recognised by name. A path such as `/bin/zsh` counts by its last part.
 const SHELLS: [&str; 9] = ["zsh", "bash", "sh", "fish", "dash", "ksh", "tcsh", "csh", "nu"];
+/// PowerShell by name: PowerShell 7 and Windows PowerShell. They are shells too, but their integration is another family
+/// (see `ShellFamily`). Only the shell rules read this list; ssh and container logins stay POSIX-only, so `ssh host pwsh`
+/// is not a login the POSIX loader would be typed into.
+const POWERSHELLS: [&str; 2] = ["pwsh", "powershell"];
+
+/// Which integration loader and blob a shell takes (see core/inject.rs). PowerShell is its own family; everything else is
+/// the POSIX one (zsh, bash).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellFamily {
+    Posix,
+    PowerShell,
+}
+
 /// sudo short flags that take a value (`-u root`, `-iu root`). The value is skipped, so it is not read as the program.
 const SUDO_VALUE_LETTERS: [char; 9] = ['u', 'g', 'p', 'r', 't', 'U', 'C', 'D', 'T'];
 
@@ -89,6 +102,25 @@ pub fn classify(command: &str) -> Foreground {
         })
         .unwrap_or(ForegroundKind::Other);
     Foreground { kind, command: line.chars().take(MAX_COMMAND_CHARS).collect() }
+}
+
+/// The integration family of the shell that `classify` finds on this line: PowerShell when the program named there is pwsh or
+/// powershell, POSIX otherwise (also when no program is recognised). Same segment rule as `classify`.
+pub fn shell_family(command: &str) -> ShellFamily {
+    let line = one_line(command);
+    line.split([';', '&', '|'])
+        .find_map(|segment| {
+            let words: Vec<&str> = segment.split_whitespace().collect();
+            kind_of_words(&words).map(|_| family_of_words(&words))
+        })
+        .unwrap_or(ShellFamily::Posix)
+}
+
+fn family_of_words(words: &[&str]) -> ShellFamily {
+    match program_words(words).first() {
+        Some(program) if POWERSHELLS.contains(&basename(program)) => ShellFamily::PowerShell,
+        _ => ShellFamily::Posix,
+    }
 }
 
 /// Control characters become spaces (so they cannot glue two words together), and runs of whitespace collapse to one space.
@@ -161,6 +193,7 @@ fn login_of_words(words: &[&str]) -> Option<bool> {
     match basename(program) {
         "ssh" => Some(ssh_login(args)),
         "mosh" => Some(mosh_login(args)),
+        name if POWERSHELLS.contains(&name) => Some(powershell_login(args)),
         name if SHELLS.contains(&name) => Some(shell_login(args)),
         "su" => Some(su_login(args)),
         "sudo" => sudo_login(args),
@@ -241,6 +274,18 @@ fn shell_login(args: &[&str]) -> bool {
     })
 }
 
+/// A PowerShell started with no command and no script: only the flags that keep it interactive (`-NoLogo`, `-NoProfile`,
+/// `-NoExit`, `-Interactive`, `-Login`/`-l`), in any case. Anything else (`-Command`, `-File`, `-EncodedCommand`,
+/// `-Version`, `-NonInteractive`, a value) makes it not a login, so the answer is conservative.
+fn powershell_login(args: &[&str]) -> bool {
+    args.iter().all(|word| {
+        matches!(
+            word.to_ascii_lowercase().as_str(),
+            "-nologo" | "-noprofile" | "-noexit" | "-interactive" | "-login" | "-l"
+        )
+    })
+}
+
 /// `su [-] [-l] [user]`, with nothing else: `-c`, `-s`, and a second word (a command) are not a login.
 fn su_login(args: &[&str]) -> bool {
     let mut user = false;
@@ -286,7 +331,7 @@ fn kind_of_words(words: &[&str]) -> Option<ForegroundKind> {
     let (program, args) = program_words(words).split_first()?;
     match basename(program) {
         "ssh" | "mosh" => Some(ForegroundKind::Ssh),
-        name if SHELLS.contains(&name) => Some(ForegroundKind::Shell),
+        name if SHELLS.contains(&name) || POWERSHELLS.contains(&name) => Some(ForegroundKind::Shell),
         "su" => Some(ForegroundKind::Su),
         "sudo" => sudo_kind(args),
         "docker" | "podman" => docker_kind(args),
@@ -538,14 +583,67 @@ mod tests {
         assert_eq!(kind("é.exe"), ForegroundKind::Other, "a multi-byte name does not panic");
     }
 
-    /// Nested PowerShell and cmd are deliberately not recognised: the POSIX loader cannot integrate them, so they stay
-    /// `other` (no chip, and the agent waits instead of asking for an integration that cannot work).
+    /// Nested PowerShell is a shell (its own integration family, see `shell_family`). cmd is not recognised: it stays `other`
+    /// (no chip, and the agent waits instead of asking for an integration that cannot work).
     #[test]
-    fn powershell_and_cmd_stay_other() {
-        for line in ["pwsh", "pwsh.exe -NoLogo", "powershell", r"C:\Program Files\PowerShell\7\pwsh.exe", "powershell.exe -c x", "cmd", "cmd /c dir"] {
+    fn powershell_is_a_nested_shell_and_cmd_stays_other() {
+        for line in ["pwsh", "pwsh.exe -NoLogo", "powershell", r"C:\tools\pwsh.exe", "powershell.exe -c x", "pwsh -Command x"] {
+            assert_eq!(kind(line), ForegroundKind::Shell, "{line}");
+        }
+        for line in ["cmd", "cmd /c dir"] {
             assert_eq!(kind(line), ForegroundKind::Other, "{line}");
             assert!(!login(line), "{line}");
         }
+        // A space in the path splits the words, as for any shell: the program is `C:\Program`, not pwsh. Known and kept
+        // conservative (no chip, no integration attempt), not a feature.
+        assert_eq!(kind(r"C:\Program Files\PowerShell\7\pwsh.exe"), ForegroundKind::Other);
+    }
+
+    /// The login rule for PowerShell: only the flags that keep it interactive, in any case. A command, a script, a value or
+    /// any other flag is not a login.
+    #[test]
+    fn powershell_logins_are_the_bare_interactive_forms() {
+        for line in [
+            "pwsh",
+            "pwsh.exe -NoLogo",
+            "pwsh -NoLogo -NoProfile -NoExit",
+            "powershell -noprofile",
+            "powershell.exe -NOLOGO",
+            r"C:\tools\pwsh.exe -NoExit -Interactive",
+            "powershell -l",
+            "pwsh -Login",
+        ] {
+            assert!(login(line), "{line}");
+        }
+        for line in [
+            "pwsh -Command x",
+            "pwsh -NoExit -Command Set-PSReadLineOption -HistorySaveStyle SaveNothing",
+            "powershell.exe -c x",
+            "pwsh -File x.ps1",
+            "pwsh -EncodedCommand ZQBjAGgAbwA=",
+            "pwsh -Version",
+            "pwsh -NonInteractive",
+            "pwsh -ExecutionPolicy Bypass",
+            "pwsh -NoLogo x",
+            "pwsh -WorkingDirectory C:\\",
+        ] {
+            assert!(!login(line), "{line}");
+        }
+    }
+
+    /// PowerShell is its own family; every other shell, ssh and container shell stay POSIX. `ssh -t host pwsh` is a remote
+    /// PowerShell this build does not integrate: it is ssh, POSIX, and not a login.
+    #[test]
+    fn shell_family_is_powershell_only_for_the_powershell_programs() {
+        for line in ["pwsh", "pwsh.exe -NoLogo", "powershell", r"C:\tools\pwsh.exe -NoExit", "LANG=C pwsh", "cd x && pwsh"] {
+            assert_eq!(shell_family(line), ShellFamily::PowerShell, "{line}");
+        }
+        for line in ["zsh", "bash -l", "sh -c 'x'", "ssh host", "ssh -t host pwsh", "docker exec -it web pwsh", "cmd", "sleep 3", ""] {
+            assert_eq!(shell_family(line), ShellFamily::Posix, "{line}");
+        }
+        assert_eq!(kind("ssh -t host pwsh"), ForegroundKind::Ssh);
+        assert!(!login("ssh -t host pwsh"), "a remote PowerShell is not a login: the POSIX loader must not be typed into it");
+        assert!(!login("docker exec -it web pwsh"), "a container PowerShell is not a login either");
     }
 
     #[test]

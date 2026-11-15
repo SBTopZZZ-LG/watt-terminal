@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
 
-use crate::core::foreground::Foreground;
+use crate::core::foreground::{self, Foreground, ShellFamily};
 use crate::core::inject::{self, END_MARKER};
 use crate::core::keys::KeyPlan;
 use crate::core::observer::{
@@ -360,7 +360,7 @@ impl Session {
             Ok(token) => token,
             Err(e) => return IntegrateOutcome::Failed { hint: format!("no random bytes for the handshake: {e}") },
         };
-        let label = {
+        let (label, family) = {
             let mut core = self.shared.lock();
             // Checked after the refusals, so a shell that is not there at all still gets its own reason.
             if core.injection_refusal().is_none() && core.integration_starting(Instant::now()) {
@@ -369,20 +369,23 @@ impl Session {
             if let Err(reason) = core.begin_injection(&token) {
                 return IntegrateOutcome::Refused { reason };
             }
-            core.foreground().map(|fg| fg.command).unwrap_or_default()
+            // The loader family is read from the same command text the observer classified (see foreground::shell_family).
+            let fg = core.foreground();
+            let family = fg.as_ref().map_or(ShellFamily::Posix, |fg| foreground::shell_family(&fg.command));
+            (fg.map(|fg| fg.command).unwrap_or_default(), family)
         };
-        let outcome = self.run_injection(&token, &label);
+        let outcome = self.run_injection(&token, &label, family);
         // Only reached once begin_injection succeeded, so the record here is this call's own.
         self.shared.lock().end_injection();
         outcome
     }
 
-    /// The handshake after `begin_injection`. Every early return leaves the shell as it was, or sends Ctrl-C.
-    fn run_injection(&self, token: &str, label: &str) -> IntegrateOutcome {
+    /// The handshake after `begin_injection`. Every early return leaves the shell as it was, or ends it (see `abort`).
+    fn run_injection(&self, token: &str, label: &str, family: ShellFamily) -> IntegrateOutcome {
         // Ctrl-C clears whatever the shell has on its line, then the loader is typed once the output settles.
         self.inject(vec![0x03]);
         self.wait_quiet();
-        self.inject(format!("{}\r", inject::loader_line(token)).into_bytes());
+        self.inject(format!("{}\r", inject::loader_for(family, token)).into_bytes());
 
         let loader = self.poll_until(READY_WAIT, |s| {
             let ready = s.shared.lock().injection_ready();
@@ -403,11 +406,11 @@ impl Session {
 
         let nonce = match inject::new_token() {
             Ok(nonce) => nonce,
-            Err(e) => return self.abort(format!("no random bytes for the nonce: {e}")),
+            Err(e) => return self.abort(format!("no random bytes for the nonce: {e}"), family, true),
         };
         let lines = match inject::blob_lines(&nonce, &sh) {
             Ok(lines) => lines,
-            Err(e) => return self.abort(e.to_string()),
+            Err(e) => return self.abort(e.to_string(), family, true),
         };
         let key = self.shared.lock().expect_level(&nonce, label);
         // The Levels event carries the new nonce. It must reach the listener before any blob byte goes out.
@@ -419,7 +422,7 @@ impl Session {
 
         let pushed = self.poll_until(PUSH_WAIT, |s| (s.shared.lock().top_key() == key).then_some(())).is_some();
         if !pushed {
-            return self.abort(self.last_message());
+            return self.abort(self.last_message(), family, false);
         }
         let level = self.shared.lock().levels().into_iter().find(|l| l.key == key);
         match level {
@@ -430,18 +433,27 @@ impl Session {
                 user: level.user,
                 host: level.host,
             },
-            None => self.abort(self.last_message()),
+            None => self.abort(self.last_message(), family, false),
         }
     }
 
-    /// Drops the pending level and sends Ctrl-C, for a handshake that did not finish. Returns the Failed outcome.
-    fn abort(&self, hint: String) -> IntegrateOutcome {
+    /// Drops the pending level and ends the handshake, for one that did not finish. Returns the Failed outcome.
+    /// `loader_reads`: the loader said Ready and has not yet had END_MARKER, so it is still reading blob lines. The PowerShell
+    /// loader is sent the marker (in the POC harness Ctrl-C did not stop its ReadKey loop; the app's own writer is unmeasured).
+    /// The POSIX loader, and
+    /// a shell whose blob was already sent, get Ctrl-C as before. A marker after the blob would be typed into the shell as a
+    /// command, so it is not sent then.
+    fn abort(&self, hint: String, family: ShellFamily, loader_reads: bool) -> IntegrateOutcome {
         {
             let mut core = self.shared.lock();
             core.cancel_pending_level();
         }
         self.shared.flush();
-        self.inject(vec![0x03]);
+        if loader_reads && family == ShellFamily::PowerShell {
+            self.inject(format!("{END_MARKER}\r").into_bytes());
+        } else {
+            self.inject(vec![0x03]);
+        }
         IntegrateOutcome::Failed { hint }
     }
 

@@ -21,15 +21,15 @@ describe('IntegrateDialog: the consent screen', () => {
 
   it('says what it does, and what it does not do', () => {
     expect(html).toContain('types one short command into the shell you are connected to');
-    expect(html).toContain('about 4 KB');
+    expect(html).toContain('about 4 KB for zsh and bash or 9 KB for PowerShell');
     expect(html).toContain('Nothing is written to disk on the remote machine.');
     expect(html).toContain('ends when you exit it');
   });
 
-  it('warns about prompts, names the shells, and says the loader may stay in zsh history', () => {
+  it('warns about prompts, names the shells, and says the loader may stay in zsh and PowerShell history', () => {
     expect(html).toContain('Make sure the remote shell is at its prompt, not at a password or other prompt: it will receive the typed lines.');
-    expect(html).toContain('Works with zsh, and bash 4.4 or newer. Other shells are left untouched.');
-    expect(html).toContain('The one-line loader may remain in zsh history (it is removed from bash history).');
+    expect(html).toContain('Works with zsh, bash 4.4 or newer, and PowerShell 5.1 or newer. Other shells are left untouched.');
+    expect(html).toContain('The one-line loader may remain in zsh and PowerShell history (it is removed from bash history).');
   });
 
   it('has Integrate (primary) and Cancel', () => {
