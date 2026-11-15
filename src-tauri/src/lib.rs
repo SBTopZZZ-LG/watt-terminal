@@ -24,7 +24,7 @@ use tauri_plugin_window_state::StateFlags;
 pub mod core;
 
 use crate::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate, AutoState, MockAgent, OnDrop, TurnRules, UserMessage};
-use crate::core::env::env_setting;
+use crate::core::env::{env_setting, home_dir};
 use crate::core::approval::{self, ApprovalPolicy, ManualPolicy};
 use crate::core::chat::agent_loop::{self, Conversation, LastUsage, LlmAgent, LlmSettings, USER_AGENT};
 use crate::core::chat::commands::{self, CommandCatalog};
@@ -297,7 +297,7 @@ fn save_conversation(store: &Persist, session: &Session, state: &SavedState, red
         in_turn,
         context: lock(&state.context).clone(),
     };
-    let home = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
+    let home = home_dir();
     let env = TurnEnv { local_host: local_host(), home: home.as_deref() };
     if let Err(e) = save_turn(store, turn, redactor, env, now_secs()) {
         eprintln!("watt: the conversation was not saved ({e})");
@@ -958,7 +958,7 @@ fn save_side(
         in_turn: false,
         context: save.context,
     };
-    let home = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
+    let home = home_dir();
     let env = TurnEnv { local_host: local_host(), home: home.as_deref() };
     save_turn(store, turn, redactor, env, now_secs())
         .map_err(|e| e.to_string())?
