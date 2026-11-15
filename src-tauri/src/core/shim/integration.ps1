@@ -96,6 +96,15 @@ _WattOsc ("633;Hello;n=$($global:WattNonce);v=1;sh=pwsh;ver=$__ver;user=$__user;
 $global:WattOrigPrompt = (Get-Item -Path Function:\prompt -ErrorAction SilentlyContinue).ScriptBlock
 if (-not $global:WattOrigPrompt) { $global:WattOrigPrompt = { 'PS> ' } }
 
+# The cwd pair of the prompt: OSC 7 (the local cwd) then 633;Cwd. Shared by prompt() and _WattIdle.
+function global:_WattCwdOsc {
+  if ($PWD.Provider.Name -eq 'FileSystem') {
+    $p = $PWD.ProviderPath
+    _WattOsc ("7;file://" + [string]$env:COMPUTERNAME + (_WattFileUrlPath $p))
+    _WattOsc ("633;Cwd;n=$($global:WattNonce);" + (_WattEscapeE $p))
+  }
+}
+
 function global:prompt {
   # First statements capture the previous command's status before anything else runs.
   $ok = $?
@@ -110,11 +119,7 @@ function global:prompt {
     $global:WattNoOp = $false
     _WattOsc ("133;D;n=$nonce;exit=$code;ps=$code")
   }
-  if ($PWD.Provider.Name -eq 'FileSystem') {
-    $p = $PWD.ProviderPath
-    _WattOsc ("7;file://" + [string]$env:COMPUTERNAME + (_WattFileUrlPath $p))
-    _WattOsc ("633;Cwd;n=$nonce;" + (_WattEscapeE $p))
-  }
+  _WattCwdOsc
   $text = [string](& $global:WattOrigPrompt)
   return ($global:WattEsc + ']133;A;n=' + $nonce + $global:WattTerm) + $text + ($global:WattEsc + ']133;B;n=' + $nonce + $global:WattTerm)
 }
@@ -138,6 +143,26 @@ function global:_WattCheckPrompt {
   $global:WattOrigPrompt = $orig
   Set-Item -Path Function:\global:prompt -Value $global:WattPromptBlock
   _WattOsc ("633;Degraded;n=$($global:WattNonce);reason=prompt")
+}
+
+# Runs on PowerShell.OnIdle: about every 300 ms while PSReadLine waits at the prompt, not while a command runs. A line that
+# redefines the prompt and then does work (function prompt { ... }; echo x) leaves no prompt() call to repair it, so the
+# record stays open and the observer stays Running until the next Enter. Here the repair happens without input. The
+# guessed D exits 0 even if the line failed. A prompt that is still the wrapper returns at once, so an idle shell prints nothing.
+# Output is OSC only: writing text here would corrupt the prompt line. Errors are swallowed, since an action must not print.
+function global:_WattIdle {
+  try {
+    $cur = (Get-Item -Path Function:\prompt -ErrorAction SilentlyContinue).ScriptBlock
+    if ([object]::ReferenceEquals($cur, $global:WattPromptBlock)) { return }
+    $wasRan = $global:WattRan
+    _WattCheckPrompt
+    if ($wasRan) {
+      # The replaced prompt text is already on screen; A and B go right after it, with the cwd first, as prompt() does.
+      _WattCwdOsc
+      _WattOsc ('133;A;n=' + $global:WattNonce)
+      _WattOsc ('133;B;n=' + $global:WattNonce)
+    }
+  } catch {}
 }
 
 # Binds Enter to $global:WattEnter. In Vi mode PSReadLine keeps separate Insert and Command maps, so both get it.
@@ -175,3 +200,9 @@ $global:WattEnter = {
   [Microsoft.PowerShell.PSConsoleReadLine]::ValidateAndAcceptLine()
 }
 $null = _WattBindEnter
+
+# Idle repair (_WattIdle). Registered once: $global:WattIdleSub guards a second run of this script in the same shell.
+if (-not $global:WattIdleSub) {
+  $global:WattIdleSub = $true
+  $null = Register-EngineEvent -SourceIdentifier PowerShell.OnIdle -Action { _WattIdle }
+}

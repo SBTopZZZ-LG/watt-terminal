@@ -49,17 +49,25 @@ fn start(id: &str) -> Arc<Session> {
 }
 
 fn start_sized(id: &str, cols: u16) -> Arc<Session> {
+    start_capturing(id, cols).0
+}
+
+/// Like `start_sized`, and also keeps every raw output byte the renderer received, for counting OSC events.
+fn start_capturing(id: &str, cols: u16) -> (Arc<Session>, Arc<Mutex<Vec<u8>>>) {
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     let histfile = history_path(id);
     let _ = std::fs::remove_file(&histfile);
     let cfg = SpawnConfig { rows: 30, cols, real_zdotdir: None, histfile: Some(histfile) };
     let session = Arc::new(Session::spawn(id, cfg, Box::new(ChanSink(tx))).expect("spawn the PowerShell session"));
+    let log: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_thread = Arc::clone(&log);
     let weak: Weak<Session> = Arc::downgrade(&session);
     thread::spawn(move || {
         let mut seen: Vec<u8> = Vec::new();
         // Queries before this index are answered already.
         let mut answered = 0;
         for chunk in rx {
+            log_thread.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(&chunk);
             seen.extend_from_slice(&chunk);
             while let Some(i) = find(&seen[answered..], DSR) {
                 answered += i + DSR.len();
@@ -72,7 +80,7 @@ fn start_sized(id: &str, cols: u16) -> Arc<Session> {
             }
         }
     });
-    session
+    (session, log)
 }
 
 fn wait_until<T>(mut f: impl FnMut() -> Option<T>) -> Option<T> {
@@ -95,6 +103,24 @@ fn wait_state(s: &Session, want: InputState) {
 
 fn wait_prompt(s: &Session) {
     wait_state(s, InputState::Prompt);
+}
+
+/// Waits up to `limit` (not WAIT) for the observer to reach the prompt. Used where the repair must come without input.
+fn wait_prompt_within(s: &Session, limit: Duration) {
+    let end = Instant::now() + limit;
+    while Instant::now() < end {
+        if s.state() == InputState::Prompt {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("state never reached Prompt within {limit:?} without input; state={:?}", s.state());
+}
+
+/// Waits for a finished record of `command` and returns its id.
+fn wait_finished(s: &Session, command: &str) -> u64 {
+    wait_until(|| s.records().iter().find(|r| r.command == command && r.exit_code.is_some()).map(|r| r.id))
+        .unwrap_or_else(|| panic!("no finished record for {command:?}; records={:?}", s.records()))
 }
 
 /// Waits for a continuation prompt and gives PSReadLine time to read input again. The 133;P is sent from the Enter
@@ -278,17 +304,103 @@ fn a_prompt_redefined_after_integration_is_wrapped_again() {
     let s = start("win-prompt");
     wait_prompt(&s);
     s.submit(Source::User, "function prompt { 'X> ' }").expect("submit at an idle prompt");
-    // The redefined prompt sends no A, so the observer is still Running. The next line goes through the Enter handler,
-    // which wraps the prompt again.
-    wait_state(&s, InputState::Running);
-    s.write_user(b"echo throwaway\r").expect("write the throwaway line");
-    wait_until(|| s.records().iter().find(|r| r.command == "echo throwaway" && r.exit_code.is_some()).map(|_| ()))
-        .unwrap_or_else(|| panic!("the throwaway line did not finish; records={:?}", s.records()));
-    wait_prompt(&s);
+    // The redefined prompt sends no A. The idle hook (_WattIdle) wraps the prompt again without any input, so the
+    // observer reaches the prompt on its own. Then a typed line still goes through the Enter handler normally.
+    wait_prompt_within(&s, Duration::from_secs(3));
     assert_eq!(s.integration_status(), IntegrationStatus::Live);
+    let throwaway = run(&s, "echo throwaway");
+    assert_eq!(throwaway.exit_code, Some(0), "the throwaway line after the prompt was redefined");
+    assert_eq!(s.stats().forged_events, 0);
     let r = run(&s, "echo b");
     assert_eq!(r.exit_code, Some(0), "after the prompt was redefined");
     assert_eq!(r.output, "b");
+}
+
+/// The one-line case from the QA report: the prompt is redefined and work follows on the same line. Nothing repairs it
+/// except the idle hook, so the record must finish and the observer must reach the prompt without any further input.
+#[test]
+fn a_line_that_redefines_the_prompt_and_runs_work_finishes_without_more_input() {
+    let _g = serial();
+    let s = start("win-prompt-line");
+    wait_prompt(&s);
+    let dir = std::env::temp_dir().to_string_lossy().into_owned();
+    run(&s, &format!("Set-Location -LiteralPath '{}'", dir.replace('\'', "''")));
+    let before = s.records().len();
+    let line = "function prompt { 'X> ' }; echo after-prompt";
+    s.submit(Source::User, line).expect("submit at an idle prompt");
+    let id = wait_finished(&s, line);
+    let r = s.get_record(id).expect("record by id");
+    assert_eq!(r.status, RecordStatus::Complete, "status; output={:?}", r.output);
+    assert_eq!(r.exit_code, Some(0));
+    assert!(r.output.contains("after-prompt"), "output={:?}", r.output);
+    wait_prompt_within(&s, Duration::from_secs(3));
+    assert_eq!(s.stats().forged_events, 0, "events were rejected for the nonce");
+    let cwd = s.cwd().expect("cwd after the redefined prompt");
+    assert_eq!(norm(&cwd.path), norm(&dir), "cwd {:?}", cwd.path);
+
+    let second = run(&s, "echo second");
+    assert_eq!(second.exit_code, Some(0), "the next line after the repair");
+    assert_eq!(second.output, "second");
+    let records = s.records();
+    assert_eq!(records.len(), before + 2, "one record per command, no duplicates: {records:?}");
+    assert_eq!(records.iter().filter(|r| r.command == line).count(), 1);
+}
+
+/// A redefined prompt with slow work after it: the idle hook does not run while a command runs, so the record must not
+/// close before `late` is printed.
+#[test]
+fn a_redefined_prompt_followed_by_slow_work_does_not_finish_early() {
+    let _g = serial();
+    let s = start("win-prompt-slow");
+    wait_prompt(&s);
+    let line = "function prompt { 'X> ' }; Start-Sleep -Seconds 2; echo late";
+    s.submit(Source::User, line).expect("submit at an idle prompt");
+    thread::sleep(Duration::from_millis(800));
+    assert_eq!(s.state(), InputState::Running, "the record closed during the sleep");
+    assert!(
+        !s.records().iter().any(|r| r.command == line && r.exit_code.is_some()),
+        "the record finished during the sleep: {:?}",
+        s.records()
+    );
+    let id = wait_finished(&s, line);
+    let r = s.get_record(id).expect("record by id");
+    assert_eq!(r.exit_code, Some(0));
+    assert_eq!(r.status, RecordStatus::Complete);
+    // The replaced prompt text is printed before the idle hook writes D, so it ends up in the output ("late\nX>").
+    assert!(r.output.starts_with("late"), "output={:?}", r.output);
+    wait_prompt_within(&s, Duration::from_secs(3));
+}
+
+/// A line that redefines the prompt and changes directory: the cwd repair (OSC 7 and 633;Cwd) must come with the idle repair.
+#[test]
+fn a_redefined_prompt_line_that_changes_directory_updates_the_cwd() {
+    let _g = serial();
+    let s = start("win-prompt-cwd");
+    wait_prompt(&s);
+    let dir = std::env::temp_dir().to_string_lossy().into_owned();
+    let line = format!("function prompt {{ 'X> ' }}; Set-Location -LiteralPath '{}'", dir.replace('\'', "''"));
+    s.submit(Source::User, &line).expect("submit at an idle prompt");
+    wait_finished(&s, &line);
+    wait_prompt_within(&s, Duration::from_secs(3));
+    let cwd = s.cwd().expect("cwd after the redefined prompt");
+    assert!(Path::new(&cwd.path).is_absolute(), "cwd is not absolute: {:?}", cwd.path);
+    assert_eq!(norm(&cwd.path), norm(&dir), "cwd {:?}", cwd.path);
+}
+
+/// With the prompt untouched, an idle shell after a finished command writes no OSC at all: the idle hook returns early.
+#[test]
+fn idle_prompt_after_a_command_writes_no_osc() {
+    let _g = serial();
+    let (s, log) = start_capturing("win-idle-quiet", 120);
+    run(&s, "echo quiet");
+    let mark = log.lock().unwrap_or_else(|e| e.into_inner()).len();
+    thread::sleep(Duration::from_secs(3));
+    let log = log.lock().unwrap_or_else(|e| e.into_inner());
+    // Positive control: the capture sees the OSC events of the command, so an empty idle window means something.
+    assert!(log[..mark].windows(2).any(|w| w == b"\x1b]"), "no OSC captured for the command");
+    let idle = &log[mark..];
+    let osc = idle.windows(2).filter(|w| *w == b"\x1b]").count();
+    assert_eq!(osc, 0, "OSC bytes while idle: {:?}", String::from_utf8_lossy(idle));
 }
 
 #[test]
