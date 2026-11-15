@@ -5,7 +5,7 @@
 //! interleave. Output and observation never wait on input.
 
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -72,8 +72,8 @@ pub enum SubmitError {
     ObserverDesynced,
     /// The session has no writer any more (the shell exited or the session was closed).
     Closed,
-    /// The top level is bash, and the text has a newline. bash's multi-line history is joined or split, so the
-    /// observer cannot attribute it safely. Nothing was written.
+    /// The top level is bash or PowerShell, and the text has a newline. bash's multi-line history is joined or split, and
+    /// PowerShell runs each line as its own command, so the observer cannot attribute it safely. Nothing was written.
     MultiLineAtBash,
     /// The shell on top is not the one the command was approved for (it exited, or another shell started). Nothing was
     /// written.
@@ -89,7 +89,7 @@ impl std::fmt::Display for SubmitError {
             SubmitError::Closed => write!(f, "session is closed"),
             SubmitError::MultiLineAtBash => write!(
                 f,
-                "this shell is bash and cannot take multi-line commands safely; send one line, or join with ;"
+                "this shell is bash or PowerShell and cannot take multi-line commands safely; send one line, or join with ;"
             ),
             SubmitError::LocationChanged => write!(
                 f,
@@ -165,28 +165,21 @@ pub struct Session {
 }
 
 impl Session {
-    /// Starts `zsh -l` with the integration shim. `id` names the shim directory; keep it short.
+    /// Starts the shell with the integration shim: `zsh -l` on unix, PowerShell on Windows (see `shell_command`). `id`
+    /// names the shim directory; keep it short.
     pub fn spawn(id: &str, cfg: SpawnConfig, sink: Box<dyn OutputSink>) -> io::Result<Session> {
         let nonce = random_nonce()?;
         let shim_dir = shim::dir_for(id);
         shim::write_to(&shim_dir)?;
 
-        let pair = native_pty_system().openpty(PtySize { rows: cfg.rows, cols: cfg.cols, pixel_width: 0, pixel_height: 0 }).map_err(to_io)?;
-        let mut cmd = CommandBuilder::new("zsh");
-        cmd.arg("-l");
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("COLORTERM", "truecolor");
-        cmd.env("WATT_NONCE", &nonce);
-        cmd.env("ZDOTDIR", &shim_dir);
-        // The user's real ZDOTDIR. Empty means $HOME.
-        let real = match &cfg.real_zdotdir {
-            Some(dir) => dir.clone().into_os_string(),
-            None => std::env::var_os("ZDOTDIR").unwrap_or_default(),
+        let cmd = match shell_command(&shim_dir, &nonce, &cfg) {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&shim_dir);
+                return Err(e);
+            }
         };
-        cmd.env("WATT_REAL_ZDOTDIR", real);
-        if let Some(histfile) = &cfg.histfile {
-            cmd.env("WATT_HISTFILE", histfile);
-        }
+        let pair = native_pty_system().openpty(PtySize { rows: cfg.rows, cols: cfg.cols, pixel_width: 0, pixel_height: 0 }).map_err(to_io)?;
         let child = pair.slave.spawn_command(cmd).map_err(to_io)?;
         // The parent must drop the slave, or EOF is never seen on the master.
         drop(pair.slave);
@@ -601,15 +594,102 @@ impl Drop for Session {
         self.gate.close();
         self.kill();
         if let Ok(mut child) = self.child.lock() {
+            // taskkill has ended the shell's tree. If it failed, TerminateProcess here keeps wait() from blocking forever.
+            #[cfg(windows)]
+            let _ = child.kill();
             let _ = child.wait();
         }
         let _ = std::fs::remove_dir_all(&self.shim_dir);
     }
 }
 
+#[cfg(unix)]
 fn kill_hard(pid: u32) {
     let _ = Command::new("pkill").args(["-KILL", "-P", &pid.to_string()]).status();
     let _ = Command::new("kill").args(["-KILL", &pid.to_string()]).status();
+}
+
+/// Ends the shell and its children (`taskkill /T /F`). No console window is opened for taskkill, and its output is dropped.
+#[cfg(windows)]
+fn kill_hard(pid: u32) {
+    use std::os::windows::process::CommandExt;
+    use std::process::Stdio;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// The command that runs the shell with the integration: `zsh -l` with its dotfiles in the shim directory (unix), or
+/// PowerShell with the integration script (Windows). Both get TERM, COLORTERM and the nonce.
+#[cfg(unix)]
+fn shell_command(shim_dir: &Path, nonce: &str, cfg: &SpawnConfig) -> io::Result<CommandBuilder> {
+    let mut cmd = CommandBuilder::new("zsh");
+    cmd.arg("-l");
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+    cmd.env("WATT_NONCE", nonce);
+    cmd.env("ZDOTDIR", shim_dir);
+    // The user's real ZDOTDIR. Empty means $HOME.
+    let real = match &cfg.real_zdotdir {
+        Some(dir) => dir.clone().into_os_string(),
+        None => std::env::var_os("ZDOTDIR").unwrap_or_default(),
+    };
+    cmd.env("WATT_REAL_ZDOTDIR", real);
+    if let Some(histfile) = &cfg.histfile {
+        cmd.env("WATT_HISTFILE", histfile);
+    }
+    Ok(cmd)
+}
+
+/// PowerShell with the integration script. `-NoProfile` is not passed, so the user's $PROFILE still loads (the dotfiles are
+/// read, never edited). There is no `-ExecutionPolicy`: the script's text goes to ScriptBlock.Create, which a Restricted
+/// policy does not block the way it blocks a dot-sourced file. `cfg` is unused: the shell takes no ZDOTDIR or history.
+#[cfg(windows)]
+fn shell_command(shim_dir: &Path, nonce: &str, _cfg: &SpawnConfig) -> io::Result<CommandBuilder> {
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    let system_root = std::env::var_os("SystemRoot");
+    let shell = pick_windows_shell(&path_var, system_root.as_deref(), |p| p.is_file()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "no PowerShell found: neither pwsh.exe on PATH nor %SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+        )
+    })?;
+    let mut cmd = CommandBuilder::new(shell);
+    cmd.arg("-NoLogo");
+    cmd.arg("-NoExit");
+    cmd.arg("-Command");
+    cmd.arg(pwsh_load_command(&shim_dir.join("integration.ps1")));
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+    cmd.env("WATT_NONCE", nonce);
+    Ok(cmd)
+}
+
+/// The PowerShell to run: `pwsh.exe` from the first absolute PATH entry that has it, else Windows PowerShell under
+/// `system_root`. `is_file` says whether a candidate exists (the caller checks the disk). None when neither does.
+#[cfg(any(windows, test))]
+fn pick_windows_shell(path_var: &std::ffi::OsStr, system_root: Option<&std::ffi::OsStr>, is_file: impl Fn(&Path) -> bool) -> Option<PathBuf> {
+    std::env::split_paths(path_var)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join("pwsh.exe"))
+        .find(|p| is_file(p))
+        .or_else(|| {
+            let root = PathBuf::from(system_root?);
+            let p = root.join("System32").join("WindowsPowerShell").join("v1.0").join("powershell.exe");
+            is_file(&p).then_some(p)
+        })
+}
+
+/// The `-Command` text that loads the integration script. The script's text is read and handed to ScriptBlock.Create, so
+/// no execution policy applies. Single quotes in the path are doubled for the PowerShell string.
+#[cfg(any(windows, test))]
+fn pwsh_load_command(script: &Path) -> String {
+    let quoted = script.to_string_lossy().replace('\'', "''");
+    format!(". ([scriptblock]::Create([IO.File]::ReadAllText('{quoted}')))")
 }
 
 /// Serializes writes to the PTY. Gate check and Submitted transition happen under the core lock, then the bytes go out.
@@ -660,7 +740,7 @@ fn run_writer(rx: Receiver<WriteCmd>, mut writer: Box<dyn Write + Send>, shared:
                         match core.lifecycle_view() {
                             // The user's text is on the line: refuse, and write nothing.
                             InputState::Prompt if core.user_typed_since_prompt() => Err(SubmitError::UserTyped),
-                            InputState::Prompt if text.contains('\n') && core.top_sh() == Some("bash") => {
+                            InputState::Prompt if text.contains('\n') && matches!(core.top_sh(), Some("bash" | "pwsh")) => {
                                 Err(SubmitError::MultiLineAtBash)
                             }
                             InputState::Prompt => {
@@ -730,7 +810,8 @@ fn to_io(e: impl std::fmt::Display) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::random_nonce;
+    use super::{pick_windows_shell, pwsh_load_command, random_nonce};
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn random_nonce_is_32_hex_digits_and_changes() {
@@ -739,5 +820,53 @@ mod tests {
         assert_eq!(a.len(), 32);
         assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b);
+    }
+
+    /// Which PowerShell runs: the first PATH entry with pwsh.exe, else Windows PowerShell under SystemRoot, else none.
+    #[test]
+    fn windows_shell_is_pwsh_on_path_then_windows_powershell() {
+        let base = std::env::temp_dir();
+        let (a, b) = (base.join("a"), base.join("b"));
+        let root = base.join("winroot");
+        let ps51 = root.join("System32").join("WindowsPowerShell").join("v1.0").join("powershell.exe");
+        let path = std::env::join_paths([&a, &b]).unwrap();
+        let root_os = root.clone().into_os_string();
+        let with = |files: Vec<PathBuf>| move |p: &Path| files.iter().any(|f| f == p);
+
+        // pwsh.exe in the second entry wins over Windows PowerShell, which also exists.
+        let got = pick_windows_shell(&path, Some(&root_os), with(vec![b.join("pwsh.exe"), ps51.clone()]));
+        assert_eq!(got, Some(b.join("pwsh.exe")));
+
+        // No pwsh.exe anywhere: Windows PowerShell.
+        assert_eq!(pick_windows_shell(&path, Some(&root_os), with(vec![ps51.clone()])), Some(ps51.clone()));
+
+        // Neither: None, so the caller reports the error.
+        assert_eq!(pick_windows_shell(&path, Some(&root_os), with(vec![])), None);
+        assert_eq!(pick_windows_shell(&path, None, with(vec![])), None);
+        // No SystemRoot: Windows PowerShell cannot be located, even if the file is there.
+        assert_eq!(pick_windows_shell(&path, None, with(vec![ps51.clone()])), None);
+    }
+
+    /// A relative PATH entry is not searched (it would mean the current directory), and empty entries are skipped.
+    #[test]
+    fn windows_shell_ignores_relative_path_entries() {
+        let base = std::env::temp_dir();
+        let path = std::env::join_paths([PathBuf::from("relative"), base.join("a")]).unwrap();
+        let rel = Path::new("relative").join("pwsh.exe");
+        assert_eq!(pick_windows_shell(&path, None, |p| p == rel.as_path()), None);
+        assert_eq!(pick_windows_shell(&path, None, |p| p == base.join("a").join("pwsh.exe").as_path()), Some(base.join("a").join("pwsh.exe")));
+    }
+
+    /// The -Command text reads the script and hands it to ScriptBlock.Create. Single quotes in the path are doubled.
+    #[test]
+    fn pwsh_load_command_doubles_single_quotes() {
+        assert_eq!(
+            pwsh_load_command(Path::new("C:\\Users\\me\\Temp\\watt\\integration.ps1")),
+            ". ([scriptblock]::Create([IO.File]::ReadAllText('C:\\Users\\me\\Temp\\watt\\integration.ps1')))"
+        );
+        assert_eq!(
+            pwsh_load_command(Path::new("C:\\it's here\\integration.ps1")),
+            ". ([scriptblock]::Create([IO.File]::ReadAllText('C:\\it''s here\\integration.ps1')))"
+        );
     }
 }

@@ -11,6 +11,7 @@ const FILES: &[(&str, &str)] = &[
     (".zshrc", include_str!("shim/.zshrc")),
     (".zlogin", include_str!("shim/.zlogin")),
     ("integration.zsh", include_str!("shim/integration.zsh")),
+    ("integration.ps1", include_str!("shim/integration.ps1")),
 ];
 
 /// `<tmp>/watt-terminal-<pid>-<session>`. Any leftover directory with that name is removed first.

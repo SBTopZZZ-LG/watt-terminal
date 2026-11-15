@@ -1,0 +1,110 @@
+# Watt shell integration for PowerShell (pwsh 7 and Windows PowerShell 5.1). Mirrors integration.zsh: the same events,
+# field names and escaping, so the Rust scanner (core/scanner.rs) reads both the same way.
+# Loaded by the -Command of the launch (core/session.rs, Windows only), after the user's $PROFILE. The file's text goes
+# through ScriptBlock.Create, so an execution policy does not block it. Needs WATT_NONCE in the environment; it is removed
+# from the environment after reading.
+# Every OSC 133/633 event carries n=<nonce>. Event order per prompt: E, C (command) / D (exit), OSC 7 and Cwd (cwd),
+# then A, the prompt text and B. The OSC terminator is ST (ESC \) only.
+
+if ($global:WattIntegrated) { [Console]::Write("watt: already integrated`r`n"); return }
+$global:WattIntegrated = $true
+
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+
+$global:WattNonce = [string]$env:WATT_NONCE
+Remove-Item Env:WATT_NONCE -ErrorAction SilentlyContinue
+$global:WattEsc = [string][char]27
+$global:WattBs = [string][char]92
+$global:WattTerm = $global:WattEsc + $global:WattBs
+$global:WattRan = $false
+
+# OSC emitter: ESC ] body terminator. Written straight to the console so it bypasses the pipeline.
+function global:_WattOsc([string]$body) {
+  [Console]::Out.Write($global:WattEsc + ']' + $body + $global:WattTerm)
+  [Console]::Out.Flush()
+}
+
+# E / 633;Cwd payload escaping: backslash -> \\, ';' -> \x3b, C0 and DEL -> \xHH. Same as _watt_escape_e.
+function global:_WattEscapeE([string]$s) {
+  $sb = [System.Text.StringBuilder]::new()
+  foreach ($ch in $s.ToCharArray()) {
+    $n = [int]$ch
+    if ($n -eq 92) { [void]$sb.Append($global:WattBs + $global:WattBs) }
+    elseif ($n -eq 59) { [void]$sb.Append('\x3b') }
+    elseif ($n -lt 32 -or $n -eq 127) { [void]$sb.Append(('\x{0:x2}' -f $n)) }
+    else { [void]$sb.Append($ch) }
+  }
+  $sb.ToString()
+}
+
+# OSC 7 path: Windows drive paths become /C:/..., bytes outside [a-zA-Z0-9/._~:-] are percent-encoded (UTF-8).
+function global:_WattFileUrlPath([string]$p) {
+  $p = $p -replace '\\', '/'
+  if ($p -match '^[A-Za-z]:') { $p = '/' + $p }
+  $sb = [System.Text.StringBuilder]::new()
+  foreach ($b in [System.Text.Encoding]::UTF8.GetBytes($p)) {
+    $c = [char]$b
+    if ($b -lt 128 -and ($c -match '[a-zA-Z0-9/._~:-]')) { [void]$sb.Append($c) }
+    else { [void]$sb.Append(('%{0:X2}' -f $b)) }
+  }
+  $sb.ToString()
+}
+
+# Hello values lose ';' and control bytes, like _watt_hello.
+function global:_WattText([string]$v) { ($v -replace '[\x00-\x1f;]', '') }
+
+# True when PSReadLine would keep the buffer open for more input (unterminated string/block/pipe). This approximates
+# PSReadLine's ValidateAndAcceptLine decision with the parser's error ids (probed in pwsh 7.6.9 and 5.1).
+function global:_WattIncomplete([string]$s) {
+  $errs = $null
+  [void][System.Management.Automation.Language.Parser]::ParseInput($s, [ref]$null, [ref]$errs)
+  $incompleteIds = @('MissingEndCurlyBrace', 'MissingEndParenthesisInExpression', 'MissingEndSquareBracket',
+    'TerminatorExpectedAtEndOfString', 'EmptyPipeElement', 'MissingCommandAfterPipe', 'ExpectedValueExpression')
+  foreach ($e in $errs) { if ($incompleteIds -contains $e.ErrorId) { return $true } }
+  $false
+}
+
+# Hello: the observer treats a shell that has said Hello as observable. Printed last, after the user's profile.
+$__ver = _WattText ([string]$PSVersionTable.PSVersion)
+$__user = _WattText ([string]$env:USERNAME)
+$__host = _WattText ([string]$env:COMPUTERNAME)
+_WattOsc ("633;Hello;n=$($global:WattNonce);v=1;sh=pwsh;ver=$__ver;user=$__user;host=$__host;pid=$PID")
+
+# Wrap the prompt that exists now (the user's, or PowerShell's default).
+$global:WattOrigPrompt = (Get-Item -Path Function:\prompt -ErrorAction SilentlyContinue).ScriptBlock
+if (-not $global:WattOrigPrompt) { $global:WattOrigPrompt = { 'PS> ' } }
+
+function global:prompt {
+  # First statements capture the previous command's status before anything else runs.
+  $ok = $?
+  $lec = $global:LASTEXITCODE
+  $nonce = $global:WattNonce
+  if ($global:WattRan) {
+    $global:WattRan = $false
+    $code = 0
+    if (-not $ok) { if ($lec) { $code = [int]$lec } else { $code = 1 } }
+    _WattOsc ("133;D;n=$nonce;exit=$code;ps=$code")
+  }
+  if ($PWD.Provider.Name -eq 'FileSystem') {
+    $p = $PWD.ProviderPath
+    _WattOsc ("7;file://" + [string]$env:COMPUTERNAME + (_WattFileUrlPath $p))
+    _WattOsc ("633;Cwd;n=$nonce;" + (_WattEscapeE $p))
+  }
+  $text = [string](& $global:WattOrigPrompt)
+  return ($global:WattEsc + ']133;A;n=' + $nonce + $global:WattTerm) + $text + ($global:WattEsc + ']133;B;n=' + $nonce + $global:WattTerm)
+}
+
+# Enter: emit E and C only for a complete, non-blank line, then hand off to PSReadLine's normal validate-and-accept.
+# Incomplete input (open block/string/pipe) gets no E/C; ValidateAndAcceptLine inserts a newline as usual.
+Set-PSReadLineKeyHandler -Key Enter -ScriptBlock {
+  $line = $null
+  $cursor = $null
+  [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor)
+  if (-not [string]::IsNullOrWhiteSpace($line) -and -not (_WattIncomplete $line)) {
+    $global:WattRan = $true
+    $global:LASTEXITCODE = 0
+    _WattOsc ('633;E;n=' + $global:WattNonce + ';' + (_WattEscapeE $line))
+    _WattOsc ('133;C;n=' + $global:WattNonce)
+  }
+  [Microsoft.PowerShell.PSConsoleReadLine]::ValidateAndAcceptLine()
+}

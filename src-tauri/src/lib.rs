@@ -249,17 +249,27 @@ impl SettingsState {
     }
 }
 
-/// This machine's host name, as the shell reports it in OSC 7 (`$HOST`). Read once with `hostname`; "" when that fails.
+/// This machine's host name, as the shell reports it in OSC 7 (`$HOST`). Read once; "" when that fails.
 fn local_host() -> &'static str {
     static HOST: OnceLock<String> = OnceLock::new();
-    HOST.get_or_init(|| {
-        std::process::Command::new("/bin/hostname")
-            .output()
-            .ok()
-            .filter(|out| out.status.success())
-            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
-            .unwrap_or_default()
-    })
+    HOST.get_or_init(read_local_host)
+}
+
+/// Unix: `/bin/hostname`, which is what zsh puts in `$HOST`.
+#[cfg(unix)]
+fn read_local_host() -> String {
+    std::process::Command::new("/bin/hostname")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Windows: `COMPUTERNAME`, the host the PowerShell integration reports (Hello `host=` and the OSC 7 host).
+#[cfg(windows)]
+fn read_local_host() -> String {
+    std::env::var("COMPUTERNAME").unwrap_or_default()
 }
 
 /// What a save of the live conversation needs besides the store and the session: its id, history, todo list and model.

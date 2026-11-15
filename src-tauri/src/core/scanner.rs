@@ -366,13 +366,22 @@ fn text_field(fields: &[&[u8]], key: &[u8]) -> Option<String> {
     Some(String::from_utf8_lossy(kept).into_owned())
 }
 
-/// `7;file://HOST/PATH` (payload after the code), path percent-encoded.
+/// `7;file://HOST/PATH` (payload after the code), path percent-encoded. A Windows drive path comes as `/C:/...`, see `drive_path`.
 fn parse_cwd(rest: &[u8]) -> Option<Event> {
     let url = rest.strip_prefix(b"file://")?;
     let slash = url.iter().position(|&c| c == b'/')?;
     let host = String::from_utf8_lossy(&url[..slash]).into_owned();
-    let path = String::from_utf8_lossy(&percent_decode(&url[slash..])).into_owned();
+    let decoded = percent_decode(&url[slash..]);
+    let path = String::from_utf8_lossy(drive_path(&decoded)).into_owned();
     Some(Event::Cwd { host, path })
+}
+
+/// `/C:/x` becomes `C:/x` (and `/C:` becomes `C:`), so the path is absolute on Windows. Any other path is returned as it is.
+fn drive_path(path: &[u8]) -> &[u8] {
+    match path {
+        [b'/', d, b':', rest @ ..] if d.is_ascii_alphabetic() && (rest.is_empty() || rest[0] == b'/') => &path[1..],
+        _ => path,
+    }
 }
 
 fn hex(b: u8) -> Option<u8> {
@@ -606,6 +615,31 @@ mod tests {
     fn cwd_is_decoded_and_not_nonce_checked() {
         let s = osc("7;file://mac.local/tmp/a%20b");
         assert_eq!(events(&s), vec![Event::Cwd { host: "mac.local".into(), path: "/tmp/a b".into() }]);
+    }
+
+    /// A Windows drive path from OSC 7 (`/C:/...`) loses its leading slash, so it is absolute there. Other paths keep it.
+    #[test]
+    fn windows_drive_cwd_loses_the_url_slash() {
+        let cwd = |path: &str| Event::Cwd { host: "PC".into(), path: path.into() };
+        assert_eq!(events(&osc("7;file://PC/C:/Windows")), vec![cwd("C:/Windows")]);
+        assert_eq!(events(&osc("7;file://PC/d:/Users/a%20b")), vec![cwd("d:/Users/a b")]);
+        assert_eq!(events(&osc("7;file://PC/C:")), vec![cwd("C:")]);
+        assert_eq!(events(&osc("7;file://PC/C:x")), vec![cwd("/C:x")], "not a drive: no colon right after the letter");
+        assert_eq!(events(&osc("7;file://PC/1:/x")), vec![cwd("/1:/x")], "a digit is not a drive letter");
+        assert_eq!(events(&osc("7;file://mac.local/tmp/C:/x")), vec![Event::Cwd { host: "mac.local".into(), path: "/tmp/C:/x".into() }]);
+        let got = events(&osc("7;file://PC/C:/Windows"));
+        if let [Event::Cwd { path, .. }] = got.as_slice() {
+            assert!(std::path::Path::new(path).is_absolute() == cfg!(windows), "{path}");
+        }
+    }
+
+    /// The 633;Cwd of a nested level is E-escaped, so a Windows path keeps its backslashes (doubled on the wire).
+    #[test]
+    fn level_cwd_keeps_windows_backslashes() {
+        let mut sc = Scanner::new(NONCE);
+        let found = sc.feed(&osc(&format!("633;Cwd;n={NONCE};C:\\\\Windows\\\\a\\x3bb")));
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].event, Event::LevelCwd { path: "C:\\Windows\\a;b".into() });
     }
 
     #[test]
