@@ -1147,6 +1147,7 @@ mod tests {
         assert_eq!(loaded.global_context_limit, None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn saved_file_is_mode_0600() {
         use std::os::unix::fs::PermissionsExt;
@@ -1156,6 +1157,7 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600);
     }
 
+    #[cfg(unix)]
     #[test]
     fn missing_config_dir_is_created_0700() {
         use std::os::unix::fs::PermissionsExt;

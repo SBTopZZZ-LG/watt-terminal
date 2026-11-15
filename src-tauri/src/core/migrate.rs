@@ -4,7 +4,7 @@
 //! folder is left as it was. The copy is built in a sibling `<new>.migrating` folder and renamed into place, so an
 //! interrupted copy never leaves a half-filled new folder that would block the next attempt.
 
-use std::fs::{self, DirBuilder, File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 
@@ -131,7 +131,7 @@ fn copy_file(from: &Path, to: &Path) -> io::Result<()> {
 #[cfg(unix)]
 fn create_private_dir(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
-    let mut builder = DirBuilder::new();
+    let mut builder = fs::DirBuilder::new();
     builder.mode(0o700);
     builder.create(path)
 }
@@ -158,19 +158,25 @@ fn create_new_file(path: &Path) -> io::Result<File> {
 mod tests {
     use super::*;
     use crate::core::settings::test_support::TempDir;
-    use std::os::unix::fs::{PermissionsExt, symlink};
 
     fn write_file(path: &Path, content: &str, mode: u32) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, content).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        set_mode(path, mode);
     }
 
+    #[cfg(unix)]
     fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
     }
 
+    #[cfg(not(unix))]
+    fn set_mode(_path: &Path, _mode: u32) {}
+
+    #[cfg(unix)]
     fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
         fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
@@ -203,11 +209,14 @@ mod tests {
         assert_eq!(fs::read_to_string(new.join("ui-state.json")).unwrap(), r#"{"font_size":14}"#);
         let attachment = new.join("conversations").join("attachments").join("a.bin");
         assert_eq!(fs::read_to_string(attachment).unwrap(), "bytes");
-        assert_eq!(mode_of(&new), 0o700);
-        assert_eq!(mode_of(&new.join("settings.json")), 0o600);
-        assert_eq!(mode_of(&new.join("conversations")), 0o700);
-        assert_eq!(mode_of(&new.join("conversations").join("attachments")), 0o750);
-        assert_eq!(mode_of(&new.join("conversations").join("attachments").join("a.bin")), 0o644);
+        #[cfg(unix)]
+        {
+            assert_eq!(mode_of(&new), 0o700);
+            assert_eq!(mode_of(&new.join("settings.json")), 0o600);
+            assert_eq!(mode_of(&new.join("conversations")), 0o700);
+            assert_eq!(mode_of(&new.join("conversations").join("attachments")), 0o750);
+            assert_eq!(mode_of(&new.join("conversations").join("attachments").join("a.bin")), 0o644);
+        }
         assert!(!staging_path(&new).exists(), "the staging folder is renamed away");
     }
 
@@ -220,6 +229,7 @@ mod tests {
         migrate_legacy_dir(&legacy, &new).unwrap();
 
         assert_eq!(fs::read_to_string(legacy.join("settings.json")).unwrap(), r#"{"version":1}"#);
+        #[cfg(unix)]
         assert_eq!(mode_of(&legacy.join("settings.json")), 0o600);
         let attachment = legacy.join("conversations").join("attachments").join("a.bin");
         assert_eq!(fs::read_to_string(attachment).unwrap(), "bytes");
@@ -280,8 +290,10 @@ mod tests {
         assert!(!staging_path(&new).exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlinks_are_skipped_and_their_targets_are_not_touched() {
+        use std::os::unix::fs::symlink;
         let root = TempDir::new();
         let legacy = legacy_folder(root.path());
         let outside = root.path().join("outside.json");
@@ -296,6 +308,8 @@ mod tests {
         assert_eq!(fs::read_to_string(new.join("settings.json")).unwrap(), r#"{"version":1}"#);
     }
 
+    /// The failure is injected with a file mode that cannot be read, which only applies on unix.
+    #[cfg(unix)]
     #[test]
     fn a_failed_copy_leaves_no_new_folder() {
         let root = TempDir::new();

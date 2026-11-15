@@ -181,8 +181,6 @@ fn remove_dir_if_exists(path: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
-
     use super::*;
     use crate::core::settings::test_support::TempDir;
 
@@ -215,8 +213,10 @@ mod tests {
         assert_eq!(dir_names(&s.root().join(id(1))), vec![format!("{sha}.png")], "one content, one file");
     }
 
+    #[cfg(unix)]
     #[test]
     fn files_are_0600_and_the_directories_0700() {
+        use std::os::unix::fs::PermissionsExt;
         let tmp = TempDir::new();
         let s = store(&tmp);
         let sha = sha256_hex(b"x");

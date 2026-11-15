@@ -559,7 +559,6 @@ mod tests {
 
     #[test]
     fn file_store_round_trip_is_private_atomic_and_leaves_no_temp_file() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = TempDir::new();
         let path = dir.path().join("config").join("secrets.json");
         let store = FileStore { path: path.clone() };
@@ -568,10 +567,14 @@ mod tests {
         store.save(r#"{"a":"2"}"#).unwrap();
         assert_eq!(store.load().unwrap().as_deref(), Some(r#"{"a":"2"}"#));
 
-        let mode = fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
-        let dir_mode = fs::metadata(path.parent().unwrap()).unwrap().permissions().mode();
-        assert_eq!(dir_mode & 0o777, 0o700);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+            let dir_mode = fs::metadata(path.parent().unwrap()).unwrap().permissions().mode();
+            assert_eq!(dir_mode & 0o777, 0o700);
+        }
 
         let names: Vec<String> = fs::read_dir(path.parent().unwrap())
             .unwrap()

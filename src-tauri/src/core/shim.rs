@@ -3,7 +3,6 @@
 
 use std::fs;
 use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 const FILES: &[(&str, &str)] = &[
@@ -23,10 +22,32 @@ pub fn dir_for(session_id: &str) -> PathBuf {
 /// Creates the directory with mode 0700 (zsh sources files from it, so other users must not be able to write there) and writes the files.
 pub fn write_to(dir: &Path) -> io::Result<()> {
     let _ = fs::remove_dir_all(dir);
-    fs::DirBuilder::new().mode(0o700).create(dir)?;
+    create_private_dir(dir)?;
     for (name, body) in FILES {
-        let mut f = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(dir.join(name))?;
+        let mut f = create_private_file(&dir.join(name))?;
         f.write_all(body.as_bytes())?;
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn create_private_dir(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new().mode(0o700).create(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(path: &Path) -> io::Result<()> {
+    fs::create_dir(path)
+}
+
+#[cfg(unix)]
+fn create_private_file(path: &Path) -> io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_file(path: &Path) -> io::Result<fs::File> {
+    fs::OpenOptions::new().write(true).create_new(true).open(path)
 }

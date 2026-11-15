@@ -259,7 +259,6 @@ pub fn ui_state_path(config_dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
 
     use serde_json::json;
 
@@ -515,8 +514,10 @@ mod tests {
         assert!(!err.to_string().contains("sk-proj"), "{err}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_state_file_is_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
         let tmp = TempDir::new();
         let s = store(&tmp);
         s.patch(patch_from(json!({"font_size": 11}))).unwrap();

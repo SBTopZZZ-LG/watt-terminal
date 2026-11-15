@@ -657,7 +657,6 @@ fn io_error(path: &Path, e: std::io::Error) -> PersistError {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
 
     use serde_json::json;
 
@@ -962,8 +961,10 @@ mod tests {
         assert!(!fs::read_to_string(s.dir.join(INDEX_FILE)).unwrap().contains(SECRET));
     }
 
+    #[cfg(unix)]
     #[test]
     fn files_are_private_and_the_directory_is_0700() {
+        use std::os::unix::fs::PermissionsExt;
         let tmp = TempDir::new();
         let s = store(&tmp);
         s.save(&request(&id(3), "hi"), &redactor(), 1).unwrap();
@@ -1131,19 +1132,26 @@ mod tests {
 
     #[test]
     fn a_damaged_file_does_not_make_every_call_rewrite_the_index() {
-        use std::os::unix::fs::MetadataExt;
         let tmp = TempDir::new();
         let s = store(&tmp);
         s.save(&request(&id(40), "ok"), &redactor(), 5).unwrap();
         fs::write(s.path_for(&id(41)), b"garbage").unwrap();
         s.list().unwrap();
-        let index_path = s.dir.join(INDEX_FILE);
-        let before = fs::metadata(&index_path).unwrap().ino();
-
         // A rewrite is an atomic rename of a new file, so its inode changes. An unchanged inode means no rewrite.
+        // The inode check is unix-only; elsewhere the listing and the skipped entry are still checked.
+        #[cfg(unix)]
+        let before = {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(s.dir.join(INDEX_FILE)).unwrap().ino()
+        };
+
         assert_eq!(s.list().unwrap().len(), 1);
         assert_eq!(s.list().unwrap().len(), 1);
-        assert_eq!(fs::metadata(&index_path).unwrap().ino(), before);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(fs::metadata(s.dir.join(INDEX_FILE)).unwrap().ino(), before);
+        }
 
         // A save of another conversation still writes the index, and keeps the skipped id.
         s.save(&request(&id(42), "also ok"), &redactor(), 6).unwrap();

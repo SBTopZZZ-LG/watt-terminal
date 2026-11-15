@@ -14,6 +14,7 @@ mod common;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
@@ -166,6 +167,7 @@ impl Remote {
             key_dir,
         };
         fs::create_dir_all(&remote.key_dir).expect("create the key directory");
+        #[cfg(unix)]
         fs::set_permissions(&remote.key_dir, fs::Permissions::from_mode(0o700)).expect("key directory mode");
         let out = Command::new("ssh-keygen")
             .args(["-q", "-t", "ed25519", "-N", "", "-C", "at-b5-test", "-f"])
@@ -173,6 +175,7 @@ impl Remote {
             .output()
             .expect("run ssh-keygen");
         assert!(out.status.success(), "ssh-keygen: {}", String::from_utf8_lossy(&out.stderr));
+        #[cfg(unix)]
         fs::set_permissions(&remote.key, fs::Permissions::from_mode(0o600)).expect("key mode");
         let pubkey = fs::read_to_string(remote.key_dir.join("id_ed25519.pub")).expect("read the public key");
 

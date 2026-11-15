@@ -1000,15 +1000,17 @@ mod tests {
         assert_eq!(f.store.stored(), None);
     }
 
+    /// The write failure is injected with a read-only directory mode, which only applies on unix.
+    #[cfg(unix)]
     #[test]
     fn a_failed_settings_write_puts_the_secrets_back() {
+        use std::os::unix::fs::PermissionsExt;
         let f = fixture();
         f.service.save_provider(with_key(provider("acme"), KEY)).unwrap();
         let blob_before = f.store.stored();
         let file_before = read_file(&f.dir);
 
         // Make the config dir read-only, so settings.json cannot be written but the store still can.
-        use std::os::unix::fs::PermissionsExt;
         let mode = fs::metadata(f.dir.path()).unwrap().permissions().mode();
         fs::set_permissions(f.dir.path(), fs::Permissions::from_mode(0o500)).unwrap();
         if fs::File::create(f.dir.path().join("probe")).is_ok() {
@@ -1224,6 +1226,7 @@ mod tests {
         dir_names(dir).into_iter().filter(|n| n.starts_with("settings.json.broken-")).collect()
     }
 
+    #[cfg(unix)]
     fn mode_of(path: &Path) -> u32 {
         use std::os::unix::fs::PermissionsExt;
         fs::metadata(path).unwrap().permissions().mode() & 0o777
@@ -1252,6 +1255,7 @@ mod tests {
 
         let service = service_on(&f.dir, &f.store);
         assert_eq!(fs::read(last_good_path(f.dir.path())).unwrap(), settings_bytes);
+        #[cfg(unix)]
         assert_eq!(mode_of(&last_good_path(f.dir.path())), 0o600);
         assert!(last_good_path(f.dir.path()).file_name().unwrap().to_string_lossy().starts_with('.'));
         let view = service.view().unwrap();
@@ -1329,6 +1333,7 @@ mod tests {
         assert_eq!(asides.len(), 1, "{asides:?}");
         let aside = f.dir.path().join(&asides[0]);
         assert_eq!(fs::read(&aside).unwrap(), BROKEN, "the broken text was not kept");
+        #[cfg(unix)]
         assert_eq!(mode_of(&aside), 0o600);
         assert_eq!(fs::read(last_good_path(f.dir.path())).unwrap(), good, "the last-good copy changed");
     }
