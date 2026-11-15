@@ -1191,6 +1191,9 @@ impl Core {
     fn start_record(&mut self, command: String, source: Source) {
         let alt = self.parser.screen().alternate_screen();
         let (crow, _) = self.parser.screen().cursor_position();
+        // pwsh sends C from its Enter handler, before PSReadLine echoes the newline, so the cursor is still on the
+        // command's last row and the output starts one row below. zsh and bash send C after the newline.
+        let output_row = if self.top_sh() == Some("pwsh") { crow + 1 } else { crow };
         let id = self.next_id;
         self.next_id += 1;
         // A record made while a nested level is on top belongs to that level: its cwd is the level's, and its location is
@@ -1206,7 +1209,7 @@ impl Core {
         };
         self.events.push(SessionEvent::RecordStarted { id, command: command.clone(), source: source.clone() });
         let cb = self.parser.callbacks_mut();
-        let start_abs = cb.scrolled_total + u64::from(crow);
+        let start_abs = cb.scrolled_total + u64::from(output_row);
         cb.open = Some(OpenRecord {
             record: Record {
                 id,
@@ -2986,6 +2989,65 @@ mod tests {
         assert!(!c.yield_signals("run-t", Instant::now()).output_since_start);
         c.apply(ObsMsg::Bytes(b"tick".to_vec()));
         assert!(c.yield_signals("run-t", Instant::now()).output_since_start);
+    }
+
+    /// One command through the observer as the shell sends it: prompt, command text, E, C, the output and D. `sh` is
+    /// the shell from its Hello. pwsh sends C before the newline is echoed, zsh and bash after it.
+    fn shell_command(c: &mut Core, sh: &str, command: &str, output: &str) {
+        c.feed(&tagged("133;A", LOCAL, ""));
+        c.feed(b"PS> ");
+        c.feed(&tagged("133;B", LOCAL, ""));
+        c.feed(command.as_bytes());
+        c.feed(&tagged("633;E", LOCAL, &format!(";{command}")));
+        if sh == "pwsh" {
+            c.feed(&tagged("133;C", LOCAL, ""));
+            c.feed(b"\r\n");
+        } else {
+            c.feed(b"\r\n");
+            c.feed(&tagged("133;C", LOCAL, ""));
+        }
+        c.feed(output.as_bytes());
+        c.feed(&tagged("133;D", LOCAL, ";exit=0;ps=0"));
+    }
+
+    fn local_shell(sh: &str) -> Core {
+        let mut c = core();
+        c.feed(&tagged("633;Hello", LOCAL, &format!(";v=1;sh={sh};pid=1")));
+        c
+    }
+
+    #[test]
+    fn pwsh_output_starts_on_the_row_after_the_command() {
+        let mut c = local_shell("pwsh");
+        shell_command(&mut c, "pwsh", "echo hi", "hi\r\n");
+        let r = c.get_record(1).expect("record");
+        assert_eq!(r.output, "hi", "the command row is not output");
+    }
+
+    #[test]
+    fn pwsh_output_starts_below_a_wrapped_command() {
+        // 90 columns of input at 80 wrap onto a second row, so the cursor at C is on that row.
+        let mut c = local_shell("pwsh");
+        let command = format!("echo {}", "x".repeat(85));
+        shell_command(&mut c, "pwsh", &command, "xx\r\n");
+        assert_eq!(c.get_record(1).expect("record").output, "xx");
+    }
+
+    #[test]
+    fn pwsh_output_starts_below_the_command_at_the_bottom_of_the_screen() {
+        // The command is on the last row of a 24-row screen, so its newline and the output scroll the screen.
+        let mut c = Core::new(LOCAL, (24, 80));
+        c.feed(&tagged("633;Hello", LOCAL, ";v=1;sh=pwsh;pid=1"));
+        c.feed(&"\r\n".repeat(23).into_bytes());
+        shell_command(&mut c, "pwsh", "echo hi", "hi\r\n");
+        assert_eq!(c.get_record(1).expect("record").output, "hi");
+    }
+
+    #[test]
+    fn zsh_output_still_starts_at_the_cursor_row_after_its_newline() {
+        let mut c = local_shell("zsh");
+        shell_command(&mut c, "zsh", "echo hi", "hi\r\n");
+        assert_eq!(c.get_record(1).expect("record").output, "hi");
     }
 
     /// The login test of the foreground: a login command with nothing open is not one, and a command that is not a login is
