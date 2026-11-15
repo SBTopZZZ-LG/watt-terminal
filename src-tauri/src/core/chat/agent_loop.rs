@@ -19,9 +19,8 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::fs::File;
 use std::future::Future;
-use std::io::{self, Read};
+use std::io;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use reqwest::header::{HeaderName, HeaderValue};
@@ -237,7 +236,7 @@ pub fn shared_client() -> Result<&'static reqwest::Client, String> {
 /// A new conversation id: "ses_" and 32 lowercase hex digits from the OS random source.
 pub fn new_conversation_id() -> io::Result<String> {
     let mut bytes = [0u8; 16];
-    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    getrandom::fill(&mut bytes).map_err(|e| io::Error::other(e.to_string()))?;
     Ok(format!("ses_{}", bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()))
 }
 

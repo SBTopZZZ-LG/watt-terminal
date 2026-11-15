@@ -4,8 +4,7 @@
 //! under the core lock, then the bytes are written by that same thread, so two submits can never
 //! interleave. Output and observation never wait on input.
 
-use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -721,10 +720,24 @@ fn encode_submit(text: &str, bracketed: bool) -> Vec<u8> {
 
 fn random_nonce() -> io::Result<String> {
     let mut bytes = [0u8; 16];
-    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    getrandom::fill(&mut bytes).map_err(to_io)?;
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 fn to_io(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::random_nonce;
+
+    #[test]
+    fn random_nonce_is_32_hex_digits_and_changes() {
+        let a = random_nonce().unwrap();
+        let b = random_nonce().unwrap();
+        assert_eq!(a.len(), 32);
+        assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+    }
 }

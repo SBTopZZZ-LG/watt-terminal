@@ -10,8 +10,7 @@
 //! 4. Wait for Hello carrying the nonce. The loader evals the blob, which installs the hooks and prints Hello last.
 
 use std::fmt;
-use std::fs::File;
-use std::io::{self, Read};
+use std::io;
 
 use crate::core::scanner::READY_FIELD_CAP;
 
@@ -63,10 +62,10 @@ impl fmt::Display for InjectError {
 
 impl std::error::Error for InjectError {}
 
-/// A random 32-hex-digit value, for the loader token and for nonces. Same source as the session nonce (`/dev/urandom`).
+/// A random 32-hex-digit value, for the loader token and for nonces. Same OS random source as the session nonce.
 pub fn new_token() -> io::Result<String> {
     let mut bytes = [0u8; 16];
-    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    getrandom::fill(&mut bytes).map_err(|e| io::Error::other(e.to_string()))?;
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
