@@ -110,6 +110,15 @@ export function canIntegrate(state: InputState, fg: Foreground | null | undefine
   return state === 'running' && fg !== null && fg !== undefined && INTEGRATABLE.includes(fg.kind);
 }
 
+/**
+ * True when the shell to integrate is a bare shell on this machine: a shell in the foreground, and no nested level on top.
+ * `nested` is the nested levels (the local one is not listed). With one, the shell may be inside an integrated program
+ * (a remote login, or a shell on it), so the consent keeps the remote wording.
+ */
+export function integratesLocalShell(fg: Foreground | null | undefined, nested: readonly LevelInfo[]): boolean {
+  return fg?.kind === 'shell' && nested.length === 0;
+}
+
 /** The nested levels, outermost first. The local level is not one of them. */
 export function nestedLevels(levels: readonly LevelInfo[]): LevelInfo[] {
   return levels.filter((level) => level.kind !== 'local');

@@ -6,6 +6,7 @@ import {
   agentRequestClosedBySession,
   agentRunning,
   canIntegrate,
+  integratesLocalShell,
   isDeclinedIntegration,
   locationChip,
   nestedLevels,
@@ -26,6 +27,25 @@ const level = (over: Partial<LevelInfo> = {}): LevelInfo => ({
   user: 'ubuntu',
   state: 'prompt',
   ...over,
+});
+
+describe('integratesLocalShell', () => {
+  it('is a bare shell in the foreground with no nested level on top', () => {
+    expect(integratesLocalShell(fg('shell', 'pwsh'), [])).toBe(true);
+    expect(integratesLocalShell(fg('shell', 'zsh -f -i'), [])).toBe(true);
+  });
+
+  it('is not an ssh login, another program, or no hint', () => {
+    expect(integratesLocalShell(fg('ssh'), [])).toBe(false);
+    expect(integratesLocalShell(fg('su'), [])).toBe(false);
+    expect(integratesLocalShell(fg('container_exec', 'docker exec -it c bash'), [])).toBe(false);
+    expect(integratesLocalShell(null, [])).toBe(false);
+    expect(integratesLocalShell(undefined, [])).toBe(false);
+  });
+
+  it('is not local when a nested level is on top: that shell may be inside an integrated login', () => {
+    expect(integratesLocalShell(fg('shell', 'zsh -f -i'), [level()])).toBe(false);
+  });
 });
 
 describe('canIntegrate', () => {

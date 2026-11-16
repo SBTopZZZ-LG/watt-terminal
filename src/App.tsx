@@ -23,7 +23,7 @@ import { clearTerminal, currentFontSize, fitToContainer, markConnected, marks, o
 import { appHotkeyFor } from './lib/appHotkeys';
 import { effectiveState, focusAfter, inputReducer, INITIAL_INPUT, isFocusBarHotkey, routeFor } from './lib/inputState';
 import type { BarMode, Route } from './lib/inputState';
-import { agentDialogPhase, agentIntegratingQuietly, agentRequestAfter, agentRequestClosedBySession, agentRunning, canIntegrate, nestedLevels } from './lib/integrate';
+import { agentDialogPhase, agentIntegratingQuietly, agentRequestAfter, agentRequestClosedBySession, agentRunning, canIntegrate, integratesLocalShell, nestedLevels } from './lib/integrate';
 import type { AgentRequest, IntegratePhase } from './lib/integrate';
 import { agentControlAfter, borderActive, borderLevel, NO_CONTROL, settleControl } from './lib/agentControl';
 import type { AgentControl, BorderLevel } from './lib/agentControl';
@@ -81,6 +81,8 @@ export default function App() {
   const keyRoute: Route = locked ? { ...route, keys: 'drop' } : route;
   // The nested shell levels, outermost first (the local one is not listed). The last is the shell on top.
   const [levels, setLevels] = useState<LevelInfo[]>([]);
+  // The consent says "this machine" for a bare shell typed here (see integratesLocalShell). Read per render: the foreground is live.
+  const localShell = integratesLocalShell(input.foreground, levels);
   // Approve-all is on, but it was switched on in another shell level, so it is off in the shell on top.
   const [autoSuspended, setAutoSuspended] = useState(false);
 
@@ -1346,9 +1348,9 @@ export default function App() {
       {settingsOpen && <SettingsDialog focusModel={settingsFocusModel} onClose={closeSettings} onChanged={refreshStatus} onViewLoaded={refreshSettingsState} />}
       {helpOpen && <HelpDialog load={helpState} onRetry={loadHelp} onClose={closeHelp} />}
       {agentPhase !== null ? (
-        <IntegrateDialog key="agent" phase={agentPhase} agent={{ onDecline: declineAgent }} onStart={acceptAgent} onClose={closeAgent} />
+        <IntegrateDialog key="agent" phase={agentPhase} agent={{ onDecline: declineAgent }} onStart={acceptAgent} onClose={closeAgent} local={localShell} />
       ) : (
-        integrate.kind !== 'closed' && <IntegrateDialog key="user" phase={integrate} onStart={startIntegrate} onClose={closeIntegrate} />
+        integrate.kind !== 'closed' && <IntegrateDialog key="user" phase={integrate} onStart={startIntegrate} onClose={closeIntegrate} local={localShell} />
       )}
     </div>
   );

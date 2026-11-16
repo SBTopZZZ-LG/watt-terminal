@@ -139,9 +139,9 @@ fn a_declined_question_leaves_the_shell_alone() {
     exit_nested(&s);
 }
 
-/// A question nobody answers is declined when it times out, and that does not stop the turn either.
+/// A question nobody answers says so when it times out (not a decline), and that does not stop the turn either.
 #[test]
-fn an_unanswered_question_is_declined_after_its_timeout() {
+fn an_unanswered_question_says_no_answer_after_its_timeout() {
     let _g = serial();
     let s = nested_zsh_session();
     let tools = SessionTools::new(&s);
@@ -149,7 +149,7 @@ fn an_unanswered_question_is_declined_after_its_timeout() {
     let emit = |_: AgentEvent| {};
     let ctx = AgentCtx::new(&tools, &gate, &emit);
     let err = ctx.call_tool("request_integration", json!({})).expect_err("timed out");
-    assert!(err.starts_with("declined: "), "{err}");
+    assert!(err.starts_with("no answer: "), "{err}");
     assert!(!err.starts_with(DENIED), "{err}");
     assert_eq!(s.levels().len(), 1);
     exit_nested(&s);

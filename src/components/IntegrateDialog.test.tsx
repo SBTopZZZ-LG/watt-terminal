@@ -5,8 +5,8 @@ import type { OpenPhase } from '../lib/integrate';
 
 const NOOP = () => undefined;
 
-function dialog(phase: OpenPhase) {
-  return renderToStaticMarkup(<IntegrateDialog phase={phase} onStart={NOOP} onClose={NOOP} />);
+function dialog(phase: OpenPhase, local = false) {
+  return renderToStaticMarkup(<IntegrateDialog phase={phase} onStart={NOOP} onClose={NOOP} local={local} />);
 }
 
 describe('IntegrateDialog: the consent screen', () => {
@@ -35,6 +35,41 @@ describe('IntegrateDialog: the consent screen', () => {
   it('has Integrate (primary) and Cancel', () => {
     expect(html).toMatch(/<button[^>]*class="integrate-primary"[^>]*>Integrate<\/button>/);
     expect(html).toMatch(/<button[^>]*>Cancel<\/button>/);
+  });
+});
+
+describe('IntegrateDialog: the consent screen for a shell on this machine', () => {
+  const html = dialog({ kind: 'consent' }, true);
+
+  it('says the shell runs on this machine, and what it does not write, without the remote wording', () => {
+    expect(html).toContain('types one short command into the shell running on this machine');
+    expect(html).toContain('about 4 KB for zsh and bash or 9 KB for PowerShell');
+    expect(html).toContain('Apart from the loader line in that shell&#x27;s history (see the note below), nothing is written to disk on this machine.');
+    expect(html).toContain('The script lives in that shell&#x27;s memory only and ends when you exit it.');
+    expect(html).not.toContain('the shell you are connected to');
+    expect(html).not.toContain('remote');
+  });
+
+  it('keeps the prompt caution, worded for a local shell', () => {
+    expect(html).toContain('Make sure the shell is at its prompt, not at a password or other prompt: it will receive the typed lines.');
+    expect(html).not.toContain('Make sure the remote shell');
+  });
+
+  it('keeps the shells list and the history note, and the same title and buttons', () => {
+    expect(html).toContain('Works with zsh, bash 4.4 or newer, and PowerShell 5.1 or newer. Other shells are left untouched.');
+    expect(html).toContain('The one-line loader may remain in zsh and PowerShell history (it is removed from bash history).');
+    expect(html).toContain('Integrate this shell?');
+    expect(html).toMatch(/<button[^>]*>Cancel<\/button>/);
+    expect(html).toMatch(/<button[^>]*class="integrate-primary"[^>]*>Integrate<\/button>/);
+  });
+
+  it('the agent asks with the same local text, and the remote text stays for a remote shell', () => {
+    const asking = renderToStaticMarkup(
+      <IntegrateDialog phase={{ kind: 'consent' }} onStart={NOOP} onClose={NOOP} agent={{ onDecline: NOOP }} local />,
+    );
+    expect(asking).toContain('types one short command into the shell running on this machine');
+    expect(dialog({ kind: 'consent' })).toContain('Nothing is written to disk on the remote machine.');
+    expect(dialog({ kind: 'consent' }, false)).toBe(dialog({ kind: 'consent' }));
   });
 });
 

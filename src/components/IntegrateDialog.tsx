@@ -14,6 +14,8 @@ interface Props {
    * Decline (focused) replaces Cancel, and Escape and the backdrop decline. The other screens are the same.
    */
   agent?: { onDecline(): void };
+  /** The shell to integrate is on this machine (a bare shell, see `integratesLocalShell`). Changes the consent text only. */
+  local?: boolean;
 }
 
 /** Moves focus back to the element that had it when the dialog opened, or to the terminal when that is gone. */
@@ -25,16 +27,32 @@ function restoreFocus(opener: Element | null) {
   document.querySelector<HTMLElement>('.xterm-helper-textarea')?.focus();
 }
 
-/** What the consent screen says. The same text for the user's own integration and for the agent's question. */
-function consentBody(): ReactNode {
+/**
+ * What the consent screen says. The same text for the user's own integration and for the agent's question. `local` is a shell
+ * typed on this machine (see `integratesLocalShell`); otherwise the text is about a shell on the other end of a login.
+ */
+function consentBody(local: boolean): ReactNode {
   return (
     <>
-      <p>
-        This types one short command into the shell you are connected to, then sends a small script, about 4 KB for zsh and bash or 9 KB for PowerShell, that adds
-        prompt and command markers so the agent can run and read commands there. Nothing is written to disk on the remote
-        machine. The script lives in that shell&apos;s memory only and ends when you exit it.
-      </p>
-      <p>Make sure the remote shell is at its prompt, not at a password or other prompt: it will receive the typed lines.</p>
+      {local ? (
+        <p>
+          This types one short command into the shell running on this machine, then sends a small script, about 4 KB for zsh and
+          bash or 9 KB for PowerShell, that adds prompt and command markers so the agent can run and read commands there. Apart from
+          the loader line in that shell&apos;s history (see the note below), nothing is written to disk on this machine. The script
+          lives in that shell&apos;s memory only and ends when you exit it.
+        </p>
+      ) : (
+        <p>
+          This types one short command into the shell you are connected to, then sends a small script, about 4 KB for zsh and bash or
+          9 KB for PowerShell, that adds prompt and command markers so the agent can run and read commands there. Nothing is written
+          to disk on the remote machine. The script lives in that shell&apos;s memory only and ends when you exit it.
+        </p>
+      )}
+      {local ? (
+        <p>Make sure the shell is at its prompt, not at a password or other prompt: it will receive the typed lines.</p>
+      ) : (
+        <p>Make sure the remote shell is at its prompt, not at a password or other prompt: it will receive the typed lines.</p>
+      )}
       <p>Works with zsh, bash 4.4 or newer, and PowerShell 5.1 or newer. Other shells are left untouched.</p>
       <p className="integrate-note">
         The one-line loader may remain in zsh and PowerShell history (it is removed from bash history).
@@ -49,7 +67,7 @@ function consentBody(): ReactNode {
  * it only on a click, never on its own. The agent's question (`agent`) opens it when the agent asks; there Decline is focused
  * and Escape declines. Escape and the backdrop close it, except while it runs.
  */
-export function IntegrateDialog({ phase, onStart, onClose, agent }: Props) {
+export function IntegrateDialog({ phase, onStart, onClose, agent, local = false }: Props) {
   const dialogRef = useRef<HTMLDivElement>(null);
   const cancelRef = useRef<HTMLButtonElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
@@ -105,7 +123,7 @@ export function IntegrateDialog({ phase, onStart, onClose, agent }: Props) {
   let body: ReactNode;
   let foot: ReactNode;
   if (phase.kind === 'consent' && agent !== undefined) {
-    body = consentBody();
+    body = consentBody(local);
     foot = (
       <>
         <button ref={cancelRef} type="button" onClick={agent.onDecline}>
@@ -117,7 +135,7 @@ export function IntegrateDialog({ phase, onStart, onClose, agent }: Props) {
       </>
     );
   } else if (phase.kind === 'consent') {
-    body = consentBody();
+    body = consentBody(local);
     foot = (
       <>
         <button ref={cancelRef} type="button" onClick={onClose}>

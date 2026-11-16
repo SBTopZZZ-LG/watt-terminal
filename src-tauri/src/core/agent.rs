@@ -51,6 +51,14 @@ pub enum AutoState {
     Suspended,
 }
 
+/// How a pending ask ended: the user's yes or no (a cancel counts as no), or no answer before the timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    Yes,
+    No,
+    TimedOut,
+}
+
 /// Calls waiting for an answer, keyed by call id. A call that is not answered in time counts as a denial.
 struct Pending {
     requests: Mutex<HashMap<String, Sender<bool>>>,
@@ -62,13 +70,17 @@ impl Pending {
         Pending { requests: Mutex::new(HashMap::new()), timeout }
     }
 
-    /// Registers `call_id`, runs `announce` so the UI can show the request, then waits. Only an explicit answer of true
-    /// returns true. Denial, cancel and timeout return false.
-    fn ask(&self, call_id: &str, announce: impl FnOnce()) -> bool {
+    /// Registers `call_id`, runs `announce` so the UI can show the request, then waits. Denial and cancel are `No`; no
+    /// answer in time is `TimedOut`.
+    fn ask(&self, call_id: &str, announce: impl FnOnce()) -> Answer {
         let (tx, rx) = mpsc::channel();
         self.lock().insert(call_id.to_string(), tx);
         announce();
-        let answer = rx.recv_timeout(self.timeout).unwrap_or(false);
+        let answer = match rx.recv_timeout(self.timeout) {
+            Ok(true) => Answer::Yes,
+            Ok(false) | Err(mpsc::RecvTimeoutError::Disconnected) => Answer::No,
+            Err(mpsc::RecvTimeoutError::Timeout) => Answer::TimedOut,
+        };
         self.lock().remove(call_id);
         answer
     }
@@ -173,7 +185,7 @@ impl ApprovalGate {
     /// Registers `call_id`, runs `announce` so the UI can show the request, then waits. Only an explicit approval returns
     /// true. Denial, cancel and timeout return false.
     pub fn ask(&self, call_id: &str, announce: impl FnOnce()) -> bool {
-        self.pending.ask(call_id, announce)
+        self.pending.ask(call_id, announce) == Answer::Yes
     }
 
     /// Answers a pending approval. Returns false if `call_id` is not pending (already answered or timed out).
@@ -211,8 +223,9 @@ impl IntegrationGate {
         IntegrationGate { pending: Pending::new(timeout) }
     }
 
-    /// Registers `call_id`, runs `announce` (the dialog), then waits. Only an explicit accept returns true.
-    pub fn ask(&self, call_id: &str, announce: impl FnOnce()) -> bool {
+    /// Registers `call_id`, runs `announce` (the dialog), then waits. Only an explicit accept is `Yes`; a decline or a cancel
+    /// is `No`, and no answer in time is `TimedOut`.
+    pub fn ask(&self, call_id: &str, announce: impl FnOnce()) -> Answer {
         self.pending.ask(call_id, announce)
     }
 
@@ -705,7 +718,7 @@ impl<'a> AgentCtx<'a> {
             let result = self.run_integration(call_id, &label);
             return (if result.is_ok() { "auto" } else { "refused" }, None, result);
         }
-        let accepted = self.approvals.integrations().ask(call_id, || {
+        let answer = self.approvals.integrations().ask(call_id, || {
             self.emit(AgentEvent::Integration {
                 call_id: call_id.to_string(),
                 phase: "asking",
@@ -713,16 +726,24 @@ impl<'a> AgentCtx<'a> {
                 outcome: None,
             })
         });
-        if !accepted {
+        if answer != Answer::Yes {
             self.emit(AgentEvent::Integration {
                 call_id: call_id.to_string(),
                 phase: "done",
                 label: None,
                 outcome: Some(json!({"outcome": "declined"})),
             });
-            let err = "declined: the user did not integrate this shell (declined or no answer within 2 minutes). Do not ask \
-                       again in this turn. You can still read it with get_screen, or ask the user in your reply."
-                .to_string();
+            // A timeout is not a decline: the user may still have been about to answer. The wording says which it was.
+            let err = match answer {
+                Answer::TimedOut => format!(
+                    "no answer: the user did not respond to the integration request within {} minutes. Do not ask again \
+                     in this turn. You can still read it with get_screen, or ask the user in your reply.",
+                    APPROVAL_TIMEOUT.as_secs().div_ceil(60)
+                ),
+                _ => "declined: the user did not integrate this shell (declined or cancelled). Do not ask again in this turn. \
+                      You can still read it with get_screen, or ask the user in your reply."
+                    .to_string(),
+            };
             return ("denied", None, Err(err));
         }
         // The user accepted, so the decision stays "manual" even if the handshake then fails.
@@ -2049,9 +2070,9 @@ mod tests {
         assert_eq!(decisions(&log), [named("request_integration", "denied", false)]);
     }
 
-    /// A cancel while the dialog is open declines it, and so does an ask nobody answers in time. Neither stops the turn.
+    /// A cancel while the dialog is open declines it. It does not stop the turn.
     #[test]
-    fn a_cancelled_or_unanswered_integration_ask_is_declined() {
+    fn a_cancelled_integration_ask_is_declined() {
         let tools = Recorder::default();
         let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
         let log = Mutex::new(Vec::new());
@@ -2066,14 +2087,25 @@ mod tests {
         assert!(err.starts_with("declined: "), "{err}");
         assert!(!err.starts_with(DENIED), "{err}");
         assert_eq!(phases(&log), ["asking", "done"]);
+        assert_eq!(*tools.integrate_calls.lock().unwrap(), 0);
+    }
 
-        let quiet = ApprovalGate::with_timeout(Duration::from_millis(30));
-        let silent = |_: AgentEvent| {};
-        let ctx = AgentCtx::new(&tools, &quiet, &silent);
+    /// An ask nobody answers in time is not a decline: the error says there was no answer, and gives the wait in minutes.
+    /// The decision is still "denied", and it does not stop the turn.
+    #[test]
+    fn an_unanswered_integration_ask_says_no_answer_not_declined() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(30));
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
         let err = ctx.call_tool("request_integration", json!({})).expect_err("timed out");
-        assert!(err.starts_with("declined: "), "{err}");
+        assert!(err.starts_with("no answer: the user did not respond to the integration request within 2 minutes."), "{err}");
+        assert!(!err.contains("declined"), "{err}");
         assert!(!err.starts_with(DENIED), "{err}");
         assert_eq!(*tools.integrate_calls.lock().unwrap(), 0);
+        assert_eq!(phases(&log), ["asking", "done"]);
+        assert_eq!(decisions(&log), [named("request_integration", "denied", false)]);
     }
 
     /// Approve-all is for commands: it does not answer an integration ask.

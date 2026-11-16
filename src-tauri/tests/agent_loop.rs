@@ -609,7 +609,7 @@ fn an_unanswered_integration_does_not_end_the_turn() {
     assert_eq!(provider.requests().len(), 2);
     assert_eq!(texts(&events), ["Nobody answered, so I will work from the screen."]);
     let msgs = stored(&conv.history());
-    assert!(tool_content(&msgs, "call_a").starts_with("error: declined: "), "{msgs:?}");
+    assert!(tool_content(&msgs, "call_a").starts_with("error: no answer: the user did not respond"), "{msgs:?}");
     assert_paired(&msgs);
 }
 
