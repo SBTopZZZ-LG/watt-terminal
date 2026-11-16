@@ -201,6 +201,12 @@ impl KeyPlan {
             && self.keys.iter().all(|key| matches!(key, Key::Ctrl(b'C') | Key::Ctrl(b'D') | Key::Esc))
     }
 
+    /// True when the call is exactly one Ctrl-C and no text. At a continuation (an unclosed quote or block the agent typed)
+    /// this is the only plan the observer lets through: it cancels the line.
+    pub fn is_ctrl_c_only(&self) -> bool {
+        self.text.is_empty() && matches!(self.keys.as_slice(), [Key::Ctrl(b'C')])
+    }
+
     /// True when the call presses Enter, which submits the line in a shell or a REPL.
     pub fn has_enter(&self) -> bool {
         self.keys.contains(&Key::Enter)

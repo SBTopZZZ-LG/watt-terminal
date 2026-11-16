@@ -115,7 +115,8 @@ fn not_run_text(v: &Value) -> String {
     match v.get("reason").and_then(Value::as_str).unwrap_or("") {
         "abandoned" => "not run: the line was abandoned before it ran (cancelled, or finished by the user)".to_string(),
         "waiting_for_input" => {
-            "not run: the shell is waiting for the rest of the line, so the command is incomplete. Nothing was sent to cancel it."
+            "not run: the shell is waiting for the rest of the line, so the command is incomplete. Nothing was sent. To cancel it, \
+             call send_keys with keys [\"Ctrl-C\"] and no id."
                 .to_string()
         }
         "cancelled" => "cancelled while waiting; the command may still be running".to_string(),
@@ -658,6 +659,7 @@ mod tests {
         let waiting =
             project("run_command", true, &json!({"outcome": "not_run", "reason": "waiting_for_input"}), &r);
         assert!(waiting.contains("waiting for the rest of the line"));
+        assert!(waiting.contains("send_keys") && waiting.contains("[\"Ctrl-C\"]") && waiting.contains("no id"), "{waiting}");
         let cancelled = project("run_command", true, &json!({"outcome": "not_run", "reason": "cancelled"}), &r);
         assert!(cancelled.contains("cancelled while waiting; the command may still be running"), "{cancelled}");
         // Before the line was sent nothing runs, so the text must not say the command may still be running.

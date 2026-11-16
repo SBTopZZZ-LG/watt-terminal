@@ -1590,7 +1590,11 @@ impl Core {
     /// calls it under the same lock as the write, so the answer holds for the bytes it sends. Only a command the agent
     /// started and that is running (Running or Alt) takes keys. `record` is the id the call was approved for (or the one
     /// the model named), and `level` the shell key it was approved for. None means no check of that kind.
-    pub fn keys_target(&self, record: Option<u64>, level: Option<u64>) -> Result<u64, KeysRefusal> {
+    ///
+    /// At a Continuation (the shell waits for the rest of a line the agent submitted) the only key that may be sent is
+    /// Ctrl-C alone (`ctrl_c_only`), with no record id. That cancels the line, so the answer is `Ok(None)`: there is no
+    /// command record. A continuation the user typed (not the agent's line) is refused as before.
+    pub fn keys_target(&self, record: Option<u64>, level: Option<u64>, ctrl_c_only: bool) -> Result<Option<u64>, KeysRefusal> {
         if self.desynced {
             return Err(KeysRefusal::Desynced);
         }
@@ -1600,6 +1604,14 @@ impl Core {
         let state = self.lifecycle_view();
         if matches!(state, InputState::Prompt | InputState::Submitted) {
             return Err(KeysRefusal::NothingRunning);
+        }
+        if state == InputState::Continuation {
+            let agents_line = matches!(self.pending, Some((Source::Agent { .. }, _)));
+            return if ctrl_c_only && agents_line && record.is_none() {
+                Ok(None)
+            } else {
+                Err(KeysRefusal::NotRunning(state))
+            };
         }
         if !matches!(state, InputState::Running | InputState::Alt) {
             return Err(KeysRefusal::NotRunning(state));
@@ -1619,7 +1631,13 @@ impl Core {
         if let Some(wanted) = record.filter(|&id| id != open_id) {
             return Err(KeysRefusal::WrongCommand { wanted: Some(wanted), open: open_id });
         }
-        Ok(open_id)
+        Ok(Some(open_id))
+    }
+
+    /// The agent's Ctrl-C at a Continuation discards the unfinished line, so the typed-text flag clears, as `note_user_bytes`
+    /// does for a Ctrl-C at a state that is not Running. Called by the writer after the bytes went out.
+    pub fn note_agent_cancel(&mut self) {
+        self.user_typed = false;
     }
 
     /// Called by the writer under the same lock as the check. Moves to Submitted and records the pending attribution.
@@ -2947,25 +2965,54 @@ mod tests {
     fn keys_target_takes_only_the_agents_running_command_on_top() {
         let mut idle = core();
         idle.lifecycle = Lifecycle::Prompt;
-        assert_eq!(idle.keys_target(None, None), Err(KeysRefusal::NothingRunning), "at a prompt");
+        assert_eq!(idle.keys_target(None, None, false), Err(KeysRefusal::NothingRunning), "at a prompt");
 
         let mut c = core();
         agent_command_open(&mut c, "run-k", "cat");
         let id = c.open_agent_records()[0].id;
-        assert_eq!(c.keys_target(None, None), Ok(id));
-        assert_eq!(c.keys_target(Some(id), Some(LOCAL_KEY)), Ok(id), "the named id and the approved shell match");
-        assert_eq!(c.keys_target(Some(id + 1), None), Err(KeysRefusal::WrongCommand { wanted: Some(id + 1), open: id }));
-        assert_eq!(c.keys_target(None, Some(LOCAL_KEY + 5)), Err(KeysRefusal::Location), "another shell is on top");
+        assert_eq!(c.keys_target(None, None, false), Ok(Some(id)));
+        assert_eq!(c.keys_target(Some(id), Some(LOCAL_KEY), false), Ok(Some(id)), "the named id and the approved shell match");
+        assert_eq!(c.keys_target(Some(id + 1), None, false), Err(KeysRefusal::WrongCommand { wanted: Some(id + 1), open: id }));
+        assert_eq!(c.keys_target(None, Some(LOCAL_KEY + 5), false), Err(KeysRefusal::Location), "another shell is on top");
 
         let mut user = core();
         user.lifecycle = Lifecycle::Prompt;
         user.handle(Event::CommandLine("cat".into()));
         user.handle(Event::CommandStart);
-        assert_eq!(user.keys_target(None, None), Err(KeysRefusal::NotAgents), "the user's own command");
+        assert_eq!(user.keys_target(None, None, false), Err(KeysRefusal::NotAgents), "the user's own command");
 
         c.handle(Event::CommandEnd { exit: 0, pipestatus: vec![0] });
-        assert_eq!(c.keys_target(None, None), Err(KeysRefusal::NoCommand), "after its D there is no open command");
+        assert_eq!(c.keys_target(None, None, false), Err(KeysRefusal::NoCommand), "after its D there is no open command");
         assert!(c.records.iter().any(|r| r.id == id), "the finished record is kept");
+    }
+
+    /// At the continuation of the agent's own line, only Ctrl-C alone with no record id may be sent: it has no record, and
+    /// it cancels the line. Anything else is refused as NotRunning, and so is the continuation of a line the user typed.
+    #[test]
+    fn keys_target_at_the_agents_continuation_takes_only_ctrl_c() {
+        let refused = Err(KeysRefusal::NotRunning(InputState::Continuation));
+        let mut c = core();
+        agent_in_continuation(&mut c, "run-c");
+        assert_eq!(c.keys_target(None, None, true), Ok(None), "Ctrl-C alone cancels the agent's line");
+        assert_eq!(c.keys_target(None, Some(LOCAL_KEY), true), Ok(None), "the approved shell is on top");
+        assert_eq!(c.keys_target(None, None, false), refused, "a plan that is not Ctrl-C alone");
+        assert_eq!(c.keys_target(Some(7), None, true), refused, "Ctrl-C with a record id");
+        assert_eq!(c.keys_target(None, Some(LOCAL_KEY + 5), true), Err(KeysRefusal::Location), "another shell is on top");
+        c.handle(Event::PromptStart);
+        assert_eq!(c.keys_target(None, None, true), Err(KeysRefusal::NothingRunning), "after the cancel: at a prompt");
+
+        let mut user = core();
+        user.lifecycle = Lifecycle::Prompt;
+        user.begin_submit(Some((Source::User, Some("echo `x".into()))));
+        user.handle(Event::Continuation);
+        assert_eq!(user.keys_target(None, None, true), refused, "a continuation the user typed");
+
+        let mut typed = core();
+        agent_in_continuation(&mut typed, "run-d");
+        typed.note_user_bytes(b"x");
+        assert!(typed.user_typed_since_prompt());
+        typed.note_agent_cancel();
+        assert!(!typed.user_typed_since_prompt(), "the agent's Ctrl-C did not clear the typed-text flag");
     }
 
     /// The application cursor mode is read from the screen: DECCKM on turns it on.

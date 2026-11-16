@@ -10,10 +10,12 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use serde_json::json;
 use watt_terminal_lib::core::observer::{InputState, IntegrationStatus, ObserverStatus};
 use watt_terminal_lib::core::pty::OutputSink;
 use watt_terminal_lib::core::record::{Record, RecordStatus, Source};
 use watt_terminal_lib::core::session::{Session, SpawnConfig, SubmitError};
+use watt_terminal_lib::core::tools::{AgentTools, DEFAULT_RUN_WAIT, NotRunReason, RunOutcome, SessionTools};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 const WAIT: Duration = Duration::from_secs(30);
@@ -477,8 +479,8 @@ fn a_prompt_that_chains_the_wrapper_does_not_wedge() {
     assert_eq!(first.output, "after-chain");
     let rows = s.screen_snapshot().rows;
     let last = rows.iter().rev().find(|r| !r.trim().is_empty()).cloned().unwrap_or_default();
-    // The snapshot trims trailing spaces, so the row ends in "Y>".
-    assert!(last.trim_end().ends_with("Y>"), "the chained prompt text is not on the prompt line; last row={last:?} screen={rows:?}");
+    // The chained text is the whole prompt row: no leading space from the inner call. The snapshot trims trailing spaces.
+    assert_eq!(last.trim_end(), "Y>", "the chained prompt row is not exactly the chained text; screen={rows:?}");
 
     let dir = std::env::temp_dir().to_string_lossy().into_owned();
     run_within(&s, &format!("Set-Location -LiteralPath '{}'", dir.replace('\'', "''")));
@@ -559,6 +561,48 @@ fn ctrl_c_at_the_continuation_prompt_returns_to_the_prompt() {
     wait_prompt(&s);
     assert_eq!(s.records().len(), before, "the cancelled block made a record: {:?}", s.records());
     let after = run(&s, "echo after-ctrl-c");
+    assert_eq!(after.exit_code, Some(0));
+}
+
+/// The agent's own unclosed line: run_command returns WaitingForInput, then send_keys with Ctrl-C alone and no id cancels
+/// it. The text the user typed into that continuation is cleared with it, so the next command runs.
+#[test]
+fn agent_send_keys_ctrl_c_cancels_its_unclosed_line() {
+    let _g = serial();
+    let s = start("win-agent-cancel");
+    wait_prompt(&s);
+    let tools = SessionTools::new(&s);
+    let outcome = tools.run_command("echo \"abc", DEFAULT_RUN_WAIT, None).expect("run_command");
+    assert!(matches!(outcome, RunOutcome::NotRun { reason: NotRunReason::WaitingForInput }), "got {outcome:?}");
+    assert_eq!(s.state(), InputState::Continuation, "state={:?} screen={:?}", s.state(), s.screen_snapshot().rows);
+
+    s.write_user(b"zqx").expect("the user types into the agent's continuation");
+    let sent = tools.call("send_keys", &json!({"keys": ["Ctrl-C"]}), None).expect("send_keys Ctrl-C at the agent's continuation");
+    assert_eq!(sent["outcome"], "sent", "{sent}");
+    wait_prompt(&s);
+    assert!(!s.records().iter().any(|r| r.command.contains("\"abc")), "the cancelled line became a record: {:?}", s.records());
+    let ran = tools.run_command("echo ok", DEFAULT_RUN_WAIT, None).expect("run after the cancel");
+    let RunOutcome::Finished { record } = ran else {
+        panic!("expected a finished record");
+    };
+    assert_eq!(record.exit_code, Some(0), "output={:?}", record.output);
+    assert_eq!(record.output, "ok");
+}
+
+/// A continuation the user typed is not the agent's line: send_keys Ctrl-C is refused there, and nothing is sent.
+#[test]
+fn agent_send_keys_ctrl_c_is_refused_at_a_continuation_the_user_typed() {
+    let _g = serial();
+    let s = start("win-agent-cancel-user");
+    wait_prompt(&s);
+    s.submit(Source::User, "echo \"abc").expect("submit at an idle prompt");
+    wait_continuation(&s);
+    let err = SessionTools::new(&s).call("send_keys", &json!({"keys": ["Ctrl-C"]}), None).expect_err("the user's continuation");
+    assert!(err.contains("Continuation"), "{err}");
+    assert_eq!(s.state(), InputState::Continuation, "the refused call changed the state");
+    s.write_user(&[0x03]).expect("the user's ctrl-c");
+    wait_prompt(&s);
+    let after = run(&s, "echo after-user-cancel");
     assert_eq!(after.exit_code, Some(0));
 }
 

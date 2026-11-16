@@ -1019,6 +1019,30 @@ fn unclosed_quote_waits_for_input_then_ctrl_c_recovers() {
     assert_eq!(record.output, "ok");
 }
 
+/// The agent's own unclosed line: after run_command returns WaitingForInput, send_keys with Ctrl-C alone and no id cancels
+/// it. The user's text typed into that continuation is cleared too, so the next run_command is not refused for it.
+#[test]
+fn unclosed_quote_waits_for_input_then_agent_send_keys_ctrl_c_recovers() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let tools = SessionTools::new(&s);
+    let outcome = tools.run_command("echo `x", DEFAULT_RUN_WAIT, None).expect("run_command");
+    assert!(matches!(outcome, RunOutcome::NotRun { reason: NotRunReason::WaitingForInput }), "got {outcome:?}");
+    assert_eq!(s.state(), InputState::Continuation, "the shell is not waiting");
+
+    s.write_user(b"zqx").expect("the user types into the agent's continuation");
+    let sent = tools.call("send_keys", &json!({"keys": ["Ctrl-C"]}), None).expect("send_keys Ctrl-C at the agent's continuation");
+    assert_eq!(sent["outcome"], "sent", "{sent}");
+    wait_prompt(&s);
+    assert!(!s.records().iter().any(|r| r.command.contains("echo `x")), "the unfinished line became a record");
+    let ran = tools.run_command("echo ok", DEFAULT_RUN_WAIT, None).expect("run after the agent's ctrl-c");
+    let RunOutcome::Finished { record } = ran else {
+        panic!("expected a finished record");
+    };
+    assert_eq!(record.output, "ok");
+}
+
 /// Through the agent's approval path (auto-approve on), the WaitingForInput outcome reaches the tool result as JSON.
 #[test]
 fn waiting_for_input_reaches_the_agent_as_a_not_run_result() {

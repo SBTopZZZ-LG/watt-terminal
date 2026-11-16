@@ -141,10 +141,11 @@ enum WriteCmd {
     Keys { plan: KeyPlan, record: Option<u64>, level: Option<u64>, reply: Sender<Result<SentKeys, KeysRefusal>> },
 }
 
-/// What `Session::send_keys` wrote: the command it went to, and how many bytes.
+/// What `Session::send_keys` wrote: the command it went to, and how many bytes. None when the keys cancelled the agent's
+/// unfinished line at a continuation (Ctrl-C alone), which has no command record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SentKeys {
-    pub record_id: u64,
+    pub record_id: Option<u64>,
     pub bytes: usize,
 }
 
@@ -289,8 +290,8 @@ impl Session {
 
     /// The command `send_keys` would type into now, read under one lock. Writes nothing. A pre-check for the approval card:
     /// `send_keys` checks again when it writes.
-    pub fn send_keys_target(&self, record: Option<u64>) -> Result<u64, KeysRefusal> {
-        self.shared.lock().keys_target(record, None)
+    pub fn send_keys_target(&self, record: Option<u64>, ctrl_c_only: bool) -> Result<Option<u64>, KeysRefusal> {
+        self.shared.lock().keys_target(record, None, ctrl_c_only)
     }
 
     /// Resizes the PTY and tells the observer, in order with the bytes already queued.
@@ -844,11 +845,19 @@ fn run_writer(rx: Receiver<WriteCmd>, mut writer: Box<dyn Write + Send>, shared:
             WriteCmd::Keys { plan, record, level, reply } => {
                 let prepared = {
                     let core = shared.lock();
-                    core.keys_target(record, level).map(|record_id| (record_id, plan.encode(core.application_cursor())))
+                    core.keys_target(record, level, plan.is_ctrl_c_only())
+                        .map(|record_id| (record_id, plan.encode(core.application_cursor())))
                 };
                 let result = match prepared {
                     Ok((record_id, bytes)) => write_all(&mut writer, &bytes)
-                        .map(|()| SentKeys { record_id, bytes: bytes.len() })
+                        .map(|()| {
+                            // The agent's Ctrl-C cancelled its line at a continuation: clear the typed-text flag, as a
+                            // user's Ctrl-C does.
+                            if record_id.is_none() {
+                                shared.lock().note_agent_cancel();
+                            }
+                            SentKeys { record_id, bytes: bytes.len() }
+                        })
                         .map_err(|_| KeysRefusal::Closed),
                     Err(refusal) => Err(refusal),
                 };

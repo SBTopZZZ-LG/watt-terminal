@@ -114,8 +114,8 @@ function global:prompt {
   # Marker: _WattCheckPrompt finds copies of this block by its text ('watt-prompt-wrapper'). Keep it in the body.
   $null = 'watt-prompt-wrapper'
   # A replacement that calls this prompt from inside its own text (a chain) re-enters here. The outer call does all the
-  # work, so the inner one writes nothing and returns '' for the chain to compose with.
-  if ($global:WattInPrompt) { return '' }
+  # work, so the inner one writes nothing: a bare return adds no output for the chain to join (a '' would add a space).
+  if ($global:WattInPrompt) { return }
   $global:WattInPrompt = $true
   try {
     $nonce = $global:WattNonce

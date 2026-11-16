@@ -22,7 +22,7 @@ use crate::core::chat::context::ContextUsage;
 use crate::core::chat::questions::{self, QuestionGate};
 use crate::core::chat::todo::Todo;
 use crate::core::foreground::{self, Foreground, ForegroundKind};
-use crate::core::keys::KeyPlan;
+use crate::core::keys::{KeyPlan, TypedLine};
 use crate::core::llm::TurnCancel;
 use crate::core::observer::OpenAgentRecord;
 use crate::core::record::RecordSummary;
@@ -591,28 +591,43 @@ impl<'a> AgentCtx<'a> {
         } else {
             self.approvals.auto_state_across(top.key, follow) == AutoState::On
         };
-        let (call, next_line) = {
-            let mut memory = self.approvals.send_keys_memory();
-            if memory.observe(target.record, writes) {
-                return ("refused", None, Err(KEYS_USER_TOOK_OVER.to_string()));
+        let (call, next_line) = match target.record {
+            Some(record) => {
+                let mut memory = self.approvals.send_keys_memory();
+                if memory.observe(record, writes) {
+                    return ("refused", None, Err(KEYS_USER_TOOK_OVER.to_string()));
+                }
+                let (lines, next_line) = memory.line(record).after(&plan);
+                let call = SendKeysCall {
+                    interrupt_only: plan.is_interrupt_only(),
+                    has_enter: plan.has_enter(),
+                    shell_like,
+                    approve_all,
+                    latched: memory.latched(record),
+                    lines,
+                };
+                (call, next_line)
             }
-            let (lines, next_line) = memory.line(target.record).after(&plan);
-            let call = SendKeysCall {
-                interrupt_only: plan.is_interrupt_only(),
-                has_enter: plan.has_enter(),
-                shell_like,
-                approve_all,
-                latched: memory.latched(target.record),
-                lines,
-            };
-            (call, next_line)
+            // The agent's line at a continuation has no record, so no latch or typed line applies. Only Ctrl-C alone gets here
+            // (see `Core::keys_target`); it is an interrupt, which the verdict approves on its own.
+            None => {
+                let call = SendKeysCall {
+                    interrupt_only: plan.is_interrupt_only(),
+                    has_enter: false,
+                    shell_like: false,
+                    approve_all: false,
+                    latched: false,
+                    lines: Vec::new(),
+                };
+                (call, TypedLine::default())
+            }
         };
         let display = plan.display();
         match approval::send_keys_verdict(self.policy, &call) {
             Verdict::Auto(reason) => {
                 let result = self.execute_send_keys(&plan, target.record, top.key);
-                if result.is_ok() {
-                    self.approvals.send_keys_memory().sent(target.record, next_line);
+                if let (true, Some(record)) = (result.is_ok(), target.record) {
+                    self.approvals.send_keys_memory().sent(record, next_line);
                 }
                 (if result.is_ok() { "auto" } else { "refused" }, Some(reason.code()), result)
             }
@@ -634,14 +649,14 @@ impl<'a> AgentCtx<'a> {
                 }
                 // The user approved, so the decision stays "manual" even if the tool then refuses.
                 let result = self.execute_send_keys(&plan, target.record, top.key);
-                if result.is_ok() {
+                if let (true, Some(record)) = (result.is_ok(), target.record) {
                     let mut memory = self.approvals.send_keys_memory();
-                    memory.sent(target.record, next_line);
+                    memory.sent(record, next_line);
                     // A first write the user approved latches the command: its later writes run without a card, until the
                     // user types. The latch uses the keystroke count from before the card, so a keystroke during the card
                     // revokes it.
                     if reason == Reason::SendKeys {
-                        memory.approve_first_write(target.record, writes);
+                        memory.approve_first_write(record, writes);
                     }
                 }
                 ("manual", Some(reason.code()), result)
@@ -649,13 +664,14 @@ impl<'a> AgentCtx<'a> {
         }
     }
 
-    /// Types the keys into the command `record`, bracketed as control of the shell (see `execute`). The tool checks the
-    /// target again under its lock, and refuses with nothing sent if the command changed.
-    fn execute_send_keys(&self, plan: &KeyPlan, record: u64, level: u64) -> Result<Value, String> {
+    /// Types the keys into the command `record` (None: the agent's line at a continuation, Ctrl-C only), bracketed as control
+    /// of the shell (see `execute`). The tool checks the target again under its lock, and refuses with nothing sent if the
+    /// command changed.
+    fn execute_send_keys(&self, plan: &KeyPlan, record: Option<u64>, level: u64) -> Result<Value, String> {
         self.emit(AgentEvent::AgentControl { active: true });
         let result = self
             .tools
-            .send_keys(plan, Some(record), Some(level))
+            .send_keys(plan, record, Some(level))
             .and_then(|outcome| serde_json::to_value(outcome).map_err(|e| e.to_string()));
         self.emit(AgentEvent::AgentControl { active: false });
         result
@@ -863,7 +879,7 @@ fn outcome_text(cmd: &str, v: &Value) -> String {
             "I stopped waiting for `{cmd}` because you cancelled it. If it had already been sent to the shell, it keeps running there; Ctrl-C in the terminal stops it."
         ),
         Some("not_run") => format!(
-            "`{cmd}` did not run yet: the shell is waiting for the rest of a multi-line command (an unclosed quote or backslash). Press Ctrl-C in the terminal to cancel it, then ask again."
+            "`{cmd}` did not run yet: the shell is waiting for the rest of a multi-line command (an unclosed quote or backslash). Cancel it with send_keys Ctrl-C (no id), or press Ctrl-C in the terminal, then ask again."
         ),
         _ => format!("I got an unexpected result for `{cmd}`."),
     }
@@ -1404,7 +1420,7 @@ mod tests {
     }
 
     fn target(record: u64, command: &str) -> Option<SendTarget> {
-        Some(SendTarget { record, command: command.to_string() })
+        Some(SendTarget { record: Some(record), command: command.to_string() })
     }
 
     /// The first write to a command asks; later writes to it run without a card (the latch).
@@ -1454,6 +1470,24 @@ mod tests {
         assert_eq!(reasons(&log), [("send_keys".to_string(), "auto", Some("interrupt"))]);
         assert!(cards(&log).is_empty());
         assert_eq!(tools.keys_reached.lock().unwrap().len(), 1);
+    }
+
+    /// At the agent's continuation the target has no record. Ctrl-C alone still goes through as an interrupt, and it reaches
+    /// the tools with no record id.
+    #[test]
+    fn ctrl_c_at_a_continuation_has_no_record_and_is_auto() {
+        let tools = Recorder::default();
+        *tools.keys_target.lock().unwrap() = Some(SendTarget { record: None, command: String::new() });
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let log = Mutex::new(Vec::new());
+        let emit = answering(&gate, &log, false);
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        assert!(ctx.call_tool("send_keys", json!({"keys": ["Ctrl-C"]})).is_ok());
+        assert_eq!(reasons(&log), [("send_keys".to_string(), "auto", Some("interrupt"))]);
+        assert!(cards(&log).is_empty());
+        let reached = tools.keys_reached.lock().unwrap().clone();
+        assert_eq!(reached.len(), 1);
+        assert_eq!(reached[0].1, None, "the call reached the tools with no record id");
     }
 
     /// Latches are per command: a new command asks again.
@@ -1675,7 +1709,7 @@ mod tests {
     #[test]
     fn approve_all_skips_the_policy_for_run_command_and_for_send_keys_in_the_shell_it_is_on() {
         let tools = Recorder::default();
-        *tools.keys_target.lock().unwrap() = Some(SendTarget { record: 7, command: "cat".into() });
+        *tools.keys_target.lock().unwrap() = Some(SendTarget { record: Some(7), command: "cat".into() });
         let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
         gate.set_auto_approve(true, 0);
         // No rules: the policy would ask for everything, and the gate would refuse the pipe.
@@ -1738,7 +1772,7 @@ mod tests {
         let abandoned = text(json!({"outcome": "not_run", "reason": "abandoned"}));
         assert!(abandoned.contains("did not run") && abandoned.contains("went back to the prompt"), "{abandoned}");
         let waiting = text(json!({"outcome": "not_run", "reason": "waiting_for_input"}));
-        assert!(waiting.contains("waiting for the rest") && waiting.contains("Press Ctrl-C"), "{waiting}");
+        assert!(waiting.contains("waiting for the rest") && waiting.contains("send_keys Ctrl-C"), "{waiting}");
         assert!(!waiting.contains("still running"), "{waiting}");
         let cancelled = text(json!({"outcome": "not_run", "reason": "cancelled"}));
         assert!(cancelled.contains("you cancelled it") && cancelled.contains("keeps running"), "{cancelled}");

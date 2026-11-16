@@ -136,9 +136,9 @@ impl TopLevel {
 /// The command `send_keys` would type into, as the approval card names it (see `AgentTools::send_keys_precheck`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SendTarget {
-    /// The command's record id.
-    pub record: u64,
-    /// The command text.
+    /// The command's record id. None at the continuation of the agent's own line, which has no record (Ctrl-C only).
+    pub record: Option<u64>,
+    /// The command text. Empty when there is no record.
     pub command: String,
 }
 
@@ -184,7 +184,8 @@ pub struct CommandView {
 pub enum NotRunReason {
     /// The line was cancelled (Ctrl-C back to the prompt) or the user finished it themselves. It will not run.
     Abandoned,
-    /// zsh has been waiting for the rest of the line for `WAITING_FOR_INPUT_AFTER`. Nothing was sent to cancel it.
+    /// zsh has been waiting for the rest of the line for `WAITING_FOR_INPUT_AFTER`. Nothing was sent. `send_keys` with
+    /// Ctrl-C alone and no id cancels that line (see `Core::keys_target`).
     WaitingForInput,
     /// The turn was cancelled while the call waited. Nothing is sent to the shell to stop it: a line that was already
     /// sent keeps running, so the command may still be running; the user can Ctrl-C it in the terminal.
@@ -648,7 +649,7 @@ impl AgentTools for SessionTools<'_> {
 
     fn send_keys_precheck(&self, plan: &KeyPlan) -> Result<SendTarget, String> {
         self.keys_budget()?;
-        self.keys_target_checked(plan.record, plan.is_interrupt_only())
+        self.keys_target_checked(plan.record, plan)
     }
 
     fn user_writes(&self) -> u64 {
@@ -657,18 +658,23 @@ impl AgentTools for SessionTools<'_> {
 
     fn send_keys(&self, plan: &KeyPlan, record: Option<u64>, expected_level: Option<u64>) -> Result<SendKeysOutcome, String> {
         self.keys_budget()?;
-        let target = self.keys_target_checked(record, plan.is_interrupt_only())?;
+        let target = self.keys_target_checked(record, plan)?;
         let before = self.session.activity().screen_gen;
         let started = Instant::now();
         // The writer checks the target again, under the lock, and binds the bytes to it: a command that changed since the
         // check above is refused there, with nothing sent.
-        let sent = self.session.send_keys(plan.clone(), Some(target.record), expected_level).map_err(|e| e.to_string())?;
+        let sent = self.session.send_keys(plan.clone(), target.record, expected_level).map_err(|e| e.to_string())?;
         self.keys_sent.set(self.keys_sent.get() + 1);
-        if self.settle_after_keys(sent.record_id, before, started) {
-            self.settle_at_prompt();
-            if let Some(record) = self.session.get_record(sent.record_id) {
-                return Ok(SendKeysOutcome::Finished { record });
+        match sent.record_id {
+            Some(record_id) if self.settle_after_keys(record_id, before, started) => {
+                self.settle_at_prompt();
+                if let Some(record) = self.session.get_record(record_id) {
+                    return Ok(SendKeysOutcome::Finished { record });
+                }
             }
+            Some(_) => {}
+            // Ctrl-C cancelled the agent's line at a continuation. No command to wait for: only the prompt to return to.
+            None => self.settle_at_prompt(),
         }
         Ok(SendKeysOutcome::Sent {
             bytes: sent.bytes,
@@ -707,13 +713,17 @@ impl SessionTools<'_> {
 
     /// The command `send_keys` may type into now, read under one lock, and the password refusal. An interrupt-only
     /// plan (only Ctrl-C, Ctrl-D or Esc, no text) skips the password refusal but still resolves the target: it can
-    /// only stop or leave the command, never type a secret into it.
-    fn keys_target_checked(&self, record: Option<u64>, interrupt_only: bool) -> Result<SendTarget, String> {
-        let id = self.session.send_keys_target(record).map_err(|refusal| refusal.to_string())?;
-        if !interrupt_only && screen_waits_for_input(&self.session.screen_snapshot().rows) {
+    /// only stop or leave the command, never type a secret into it. At the agent's continuation the target has no record
+    /// (see `Core::keys_target`).
+    fn keys_target_checked(&self, record: Option<u64>, plan: &KeyPlan) -> Result<SendTarget, String> {
+        let id = self.session.send_keys_target(record, plan.is_ctrl_c_only()).map_err(|refusal| refusal.to_string())?;
+        if !plan.is_interrupt_only() && screen_waits_for_input(&self.session.screen_snapshot().rows) {
             return Err(KEYS_PASSWORD_REFUSAL.to_string());
         }
-        let command = self.session.open_agent_records().into_iter().find(|r| r.id == id).map(|r| r.command).unwrap_or_default();
+        let command = match id {
+            Some(id) => self.session.open_agent_records().into_iter().find(|r| r.id == id).map(|r| r.command).unwrap_or_default(),
+            None => String::new(),
+        };
         Ok(SendTarget { record: id, command })
     }
 
@@ -1106,7 +1116,9 @@ pub fn schemas() -> Vec<ToolSchema> {
             name: "send_keys",
             description: "Type into a command you started that is still running, to answer its prompt, drive a pager, an editor \
                  or a REPL, or interrupt it (Ctrl-C). Only for a command run_command gave a record_id for, while it has not \
-                 finished: never to start a command (at an idle prompt, use run_command). Never type a password or other secret: \
+                 finished: never to start a command (at an idle prompt, use run_command). The one exception: when run_command \
+                 returned not_run with reason waiting_for_input, the shell is waiting for the rest of your unclosed line, and \
+                 send_keys with keys [\"Ctrl-C\"] and no id cancels it (nothing else is accepted there). Never type a password or other secret: \
                  when the program asks for one the call is refused, and the user types it. text is typed literally, up to 4096 \
                  bytes, with no control characters (use keys for Enter, Tab or Esc). keys are named keys sent in order: Enter, \
                  Tab, Esc, Backspace, Delete, Space, Up, Down, Left, Right, Home, End, PageUp, PageDown, or Ctrl-A to Ctrl-Z, up \
