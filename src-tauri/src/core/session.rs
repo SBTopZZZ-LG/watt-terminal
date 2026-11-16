@@ -778,28 +778,9 @@ fn run_writer(rx: Receiver<WriteCmd>, mut writer: Box<dyn Write + Send>, shared:
                 // with no typed-text bookkeeping and no CR bookkeeping.
                 if !reply {
                     // The lock is released before the write: a blocked PTY must not hold up the observer.
-                    let submitted = {
-                        let mut core = shared.lock();
-                        core.note_user_bytes(&bytes);
-                        if bytes.contains(&b'\r') && !core.desynced() {
-                            match core.lifecycle_view() {
-                                // The first CR at an idle prompt closes the gate, so the agent cannot inject into the same
-                                // line. C (or the submit timeout, for an empty line) reopens it.
-                                InputState::Prompt => {
-                                    core.begin_submit(Some((Source::User, None)));
-                                    true
-                                }
-                                // A CR completing a multi-line command the user is typing: attribute it to the user.
-                                InputState::Continuation => {
-                                    core.note_user_line();
-                                    false
-                                }
-                                _ => false,
-                            }
-                        } else {
-                            false
-                        }
-                    };
+                    // The first CR at an idle prompt closes the gate, so the agent cannot inject into the same line. C (or
+                    // the submit timeout, for an empty line) reopens it. See `Core::note_user_write`.
+                    let submitted = shared.lock().note_user_write(&bytes);
                     if submitted {
                         shared.flush();
                     }

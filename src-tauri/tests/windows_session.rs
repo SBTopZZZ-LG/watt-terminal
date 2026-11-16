@@ -14,7 +14,7 @@ use serde_json::json;
 use watt_terminal_lib::core::observer::{InputState, IntegrationStatus, ObserverStatus};
 use watt_terminal_lib::core::pty::OutputSink;
 use watt_terminal_lib::core::record::{Record, RecordStatus, Source};
-use watt_terminal_lib::core::session::{Session, SpawnConfig, SubmitError};
+use watt_terminal_lib::core::session::{Session, SpawnConfig, SubmitError, USER_TEXT_CODE};
 use watt_terminal_lib::core::tools::{AgentTools, DEFAULT_RUN_WAIT, NotRunReason, RunOutcome, SessionTools};
 
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -604,6 +604,51 @@ fn agent_send_keys_ctrl_c_is_refused_at_a_continuation_the_user_typed() {
     wait_prompt(&s);
     let after = run(&s, "echo after-user-cancel");
     assert_eq!(after.exit_code, Some(0));
+}
+
+/// The agent's command reads a line from the terminal, and the user answers it with Enter. The Enter ends the typed line
+/// (the command read it), so the agent's next run_command is not refused by it.
+#[test]
+fn enter_answering_the_agents_command_does_not_refuse_the_next_one() {
+    let _g = serial();
+    let s = start("win-read-host");
+    wait_prompt(&s);
+    let tools = SessionTools::new(&s);
+    let outcome = tools.run_command("Read-Host 'name'", DEFAULT_RUN_WAIT, None).expect("run_command");
+    assert!(matches!(outcome, RunOutcome::Running { .. }), "got {outcome:?}");
+    s.write_user(b"bob\r").expect("the user answers the prompt");
+    wait_finished(&s, "Read-Host 'name'");
+    wait_prompt(&s);
+    let RunOutcome::Finished { record } = tools.run_command("echo next-ok", DEFAULT_RUN_WAIT, None).expect("not refused") else {
+        panic!("expected a finished record");
+    };
+    assert_eq!(record.output, "next-ok");
+}
+
+/// Two lines pasted at the prompt: the first runs, and the second is left typed on the next prompt line (type-ahead). The
+/// agent's run_command is refused there and writes nothing. Ctrl-C at the prompt clears the line, and then the agent's
+/// command runs with its own output only.
+#[test]
+fn text_pasted_after_a_submitted_line_refuses_the_agents_command_until_ctrl_c() {
+    let _g = serial();
+    let s = start("win-paste-tail");
+    wait_prompt(&s);
+    s.write_user(b"echo one\recho two").expect("the user pastes two lines");
+    wait_finished(&s, "echo one");
+    wait_prompt(&s);
+    let tools = SessionTools::new(&s);
+    let err = tools.run_command("echo agent-marker", DEFAULT_RUN_WAIT, None).expect_err("refused over the pasted text");
+    assert!(err.starts_with(USER_TEXT_CODE), "error: {err}");
+    assert!(!s.records().iter().any(|r| r.command.contains("agent-marker")), "the refused command ran");
+
+    s.write_user(&[0x03]).expect("ctrl-c at the prompt");
+    wait_until(|| tools.run_command_precheck().is_ok().then_some(())).expect("ctrl-c at the prompt did not clear the refusal");
+    let RunOutcome::Finished { record } = tools.run_command("echo agent-after-ctrl-c", DEFAULT_RUN_WAIT, None).expect("runs after ctrl-c")
+    else {
+        panic!("expected a finished record");
+    };
+    assert_eq!(record.exit_code, Some(0), "output={:?}", record.output);
+    assert_eq!(record.output, "agent-after-ctrl-c");
 }
 
 /// Waits (`limit`, not WAIT) for the observer to report the shell as Exited.

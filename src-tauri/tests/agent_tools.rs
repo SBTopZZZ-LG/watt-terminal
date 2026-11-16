@@ -975,6 +975,51 @@ fn ctrl_c_during_a_command_keeps_the_type_ahead_refusal() {
     assert!(wait_until(Duration::from_secs(5), || tools.run_command_precheck().is_ok().then_some(())).is_some(), "ctrl-c at the prompt did not clear the refusal");
 }
 
+/// The agent's command reads a line (`read line`) and the user answers "y" and Enter. The Enter ends the typed line, so the
+/// agent's next run_command is not refused by it.
+#[test]
+fn enter_answering_the_agents_read_does_not_refuse_the_next_command() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    let tools = SessionTools::new(&s);
+    let cmd = "read line";
+    let outcome = tools.run_command(cmd, DEFAULT_RUN_WAIT, None).expect("run_command");
+    assert!(matches!(outcome, RunOutcome::Running { .. }), "got {outcome:?}");
+    s.write_user(b"y\r").expect("the user answers the read");
+    run_finish(&s, cmd);
+    let RunOutcome::Finished { record } = tools.run_command("echo after-read", DEFAULT_RUN_WAIT, None).expect("not refused") else {
+        panic!("expected a finished record");
+    };
+    assert_eq!(record.output, "after-read");
+}
+
+/// Two lines pasted at the prompt: the first runs, and the second is left typed on the next prompt line. The agent's
+/// run_command is refused there. Ctrl-C at the prompt clears the line, and then the agent's command runs.
+#[test]
+fn text_pasted_after_a_submitted_line_refuses_the_agents_command() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    s.write_user(b"echo one\recho two").expect("the user pastes two lines");
+    run_finish(&s, "echo one");
+    assert!(wait_until(Duration::from_secs(5), || prompt_line(&s).contains("echo two").then_some(())).is_some(), "the pasted tail never reached the prompt line");
+
+    let tools = SessionTools::new(&s);
+    assert!(tools.run_command_precheck().is_err(), "the precheck let the command through");
+    let err = tools.run_command("echo tail-marker", DEFAULT_RUN_WAIT, None).expect_err("refused over the pasted text");
+    assert!(err.starts_with(USER_TEXT_CODE), "error: {err}");
+    assert!(!s.records().iter().any(|r| r.command.contains("tail-marker")), "the refused command ran");
+
+    s.write_user(&[0x03]).expect("ctrl-c at the prompt");
+    assert!(wait_until(Duration::from_secs(5), || (!prompt_line(&s).contains("echo two")).then_some(())).is_some(), "ctrl-c did not clear the prompt line");
+    wait_prompt(&s);
+    let RunOutcome::Finished { record } = tools.run_command("echo after-paste", DEFAULT_RUN_WAIT, None).expect("runs after ctrl-c") else {
+        panic!("expected a finished record");
+    };
+    assert_eq!(record.output, "after-paste");
+}
+
 /// Keys typed in the alt screen go to the full-screen program, not to the prompt, so they do not refuse run_command.
 #[test]
 fn keys_typed_in_the_alt_screen_do_not_refuse_run_command() {

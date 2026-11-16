@@ -577,6 +577,11 @@ fn screen_fingerprint(screen: &vt100::Screen) -> u64 {
     hasher.finish()
 }
 
+/// A byte that puts text on the line: not Ctrl-C, CR or Ctrl-L (see `Core::note_user_bytes`).
+fn is_typed(b: u8) -> bool {
+    !matches!(b, 0x03 | b'\r' | 0x0c)
+}
+
 /// The text and source of an E event at a nested level. bash does not record every command (ignoreboth, ignoredups, or
 /// history off), so its E can be empty, and an E can differ from the line the agent sent. A pending agent line is then the
 /// truth: its text and source win. Otherwise the E stands, as it does at level 0.
@@ -688,10 +693,16 @@ pub struct Core {
     last_e: Option<(String, Source)>,
     /// The user has typed text that may be on the prompt line. Set by `note_user_bytes`, which counts typing at the
     /// prompt and type-ahead typed while a command runs (zsh reads that from the tty at the next prompt). Cleared by
-    /// Ctrl-C at the prompt (not while a command runs), by a CR that submits the line (`begin_submit`), and by C. It
-    /// survives the transition from a command to the prompt. While it is set the agent's run_command is refused, so it
-    /// cannot land on the user's text.
+    /// Ctrl-C at the prompt (not while a command runs), by a CR that submits the line (`begin_submit`), and by C (which
+    /// keeps the text typed after the submitting CR, see `typed_after_submit`). A CR while a command runs leaves only the
+    /// text after it. It survives the transition from a command to the prompt. While it is set the agent's run_command is
+    /// refused, so it cannot land on the user's text.
     user_typed: bool,
+    /// Text typed after the last CR (or Ctrl-C) of the line that was submitted, as the tty holds it. A write whose first
+    /// CR submits the line at the prompt has bytes after that CR: they are type-ahead for the next prompt, and C must not
+    /// clear them. Kept by `note_user_bytes` (Submitted, Unresponsive, Running) and `note_user_write`. C copies it into
+    /// `user_typed`. Cleared with `user_typed` (see `clear_typed`).
+    typed_after_submit: bool,
     /// Agent calls whose line never ran (see `CallStatus::Abandoned`). Bounded by `ABANDONED_CAP`.
     abandoned: VecDeque<String>,
     cwd: Option<Cwd>,
@@ -733,6 +744,7 @@ impl Core {
             pending: None,
             last_e: None,
             user_typed: false,
+            typed_after_submit: false,
             abandoned: VecDeque::new(),
             cwd: None,
             records: VecDeque::new(),
@@ -886,7 +898,7 @@ impl Core {
             parent.parked = Some(parked);
         }
         self.lifecycle = Lifecycle::Booting;
-        self.user_typed = false;
+        self.clear_typed();
         self.stack.push(Level {
             key: pending.key,
             kind: LevelKind::Remote,
@@ -919,7 +931,7 @@ impl Core {
             self.lifecycle = Lifecycle::Running;
             self.pending = parked.pending;
             self.last_e = parked.last_e;
-            self.user_typed = false;
+            self.clear_typed();
             self.parser.callbacks_mut().open = open;
             changed = true;
         }
@@ -1125,8 +1137,9 @@ impl Core {
                 self.settling_history = false;
                 let (command, source) = self.command_for_c();
                 self.pending = None;
-                // The line the user typed has run (or is running): the prompt is no longer holding their text.
-                self.user_typed = false;
+                // The line the user typed has run (or is running): the prompt is no longer holding their text. The
+                // exception is text typed after its submitting CR, which zsh draws on the next prompt.
+                self.user_typed = self.typed_after_submit;
                 self.start_record(command, source);
                 self.lifecycle = Lifecycle::Running;
             }
@@ -1637,7 +1650,7 @@ impl Core {
     /// The agent's Ctrl-C at a Continuation discards the unfinished line, so the typed-text flag clears, as `note_user_bytes`
     /// does for a Ctrl-C at a state that is not Running. Called by the writer after the bytes went out.
     pub fn note_agent_cancel(&mut self) {
-        self.user_typed = false;
+        self.clear_typed();
     }
 
     /// Called by the writer under the same lock as the check. Moves to Submitted and records the pending attribution.
@@ -1645,7 +1658,12 @@ impl Core {
     pub fn begin_submit(&mut self, pending: Option<(Source, Option<String>)>) {
         self.lifecycle = Lifecycle::Submitted { since: Instant::now() };
         self.pending = pending;
+        self.clear_typed();
+    }
+
+    fn clear_typed(&mut self) {
         self.user_typed = false;
+        self.typed_after_submit = false;
     }
 
     /// Records the user's bytes for the typed-text check. Counted in Prompt, Submitted, Continuation and Running. While a
@@ -1665,6 +1683,14 @@ impl Core {
     /// While a program that holds the keys runs in the foreground (ssh, a nested shell, su, a container exec, a
     /// multiplexer: see `foreground_holds_the_keys`), the bytes belong to it and never reach the prompt line, so they do
     /// not count. Nothing clears the flag when that program exits, so the bytes must not set it in the first place.
+    ///
+    /// A CR typed while a command runs ends the line the user typed: the command read it from the tty, or zsh runs it as
+    /// its own line (C clears the flag then). So only text after the last CR of the write counts. Typed text with no CR
+    /// while a command runs counts as before. Known limit: a single key answered without Enter (a `y/n` prompt) still
+    /// sets the flag, and nothing clears it until the next Ctrl-C at the prompt.
+    ///
+    /// In Submitted and Unresponsive the bytes after the last CR or Ctrl-C are what is still on the line: the writer
+    /// notes them after the submitting CR (see `note_user_write`).
     pub fn note_user_bytes(&mut self, bytes: &[u8]) {
         let state = self.lifecycle_view();
         // Unresponsive counts like Submitted: a submitted line is still in the tty and may reach the prompt.
@@ -1677,12 +1703,55 @@ impl Core {
         if state == InputState::Running && self.foreground_holds_the_keys() {
             return;
         }
+        if matches!(state, InputState::Submitted | InputState::Unresponsive) {
+            let residue = match bytes.iter().rposition(|&b| b == b'\r' || b == 0x03) {
+                Some(i) => bytes[i + 1..].iter().any(|&b| is_typed(b)),
+                None => self.typed_after_submit || bytes.iter().any(|&b| is_typed(b)),
+            };
+            self.typed_after_submit = residue;
+            self.user_typed = residue;
+            return;
+        }
         let running = state == InputState::Running;
+        if running && let Some(last_cr) = bytes.iter().rposition(|&b| b == b'\r') {
+            let residue = bytes[last_cr + 1..].iter().any(|&b| is_typed(b));
+            self.typed_after_submit = residue;
+            self.user_typed = residue;
+            return;
+        }
         for &b in bytes {
             match b {
-                0x03 if !running => self.user_typed = false,
+                0x03 if !running => self.clear_typed(),
                 0x03 | b'\r' | 0x0c => {}
                 _ => self.user_typed = true,
+            }
+        }
+    }
+
+    /// The writer's entry point for a user write (not a terminal reply), called under the lock. Notes the bytes for the
+    /// typed-text check. When the first CR of the write submits the line at the prompt, it does `begin_submit` and
+    /// notes the bytes after that CR separately: they are type-ahead for the next prompt, so C keeps them (see
+    /// `typed_after_submit`). Later CRs in that tail are type-ahead too: only the text after the last one counts.
+    /// Returns true when the line was submitted (the caller flushes).
+    pub fn note_user_write(&mut self, bytes: &[u8]) -> bool {
+        let submit_at = bytes
+            .iter()
+            .position(|&b| b == b'\r')
+            .filter(|_| !self.desynced() && self.lifecycle_view() == InputState::Prompt);
+        match submit_at {
+            Some(cr) => {
+                self.note_user_bytes(&bytes[..=cr]);
+                self.begin_submit(Some((Source::User, None)));
+                self.note_user_bytes(&bytes[cr + 1..]);
+                true
+            }
+            None => {
+                self.note_user_bytes(bytes);
+                // A CR completing a multi-line command the user is typing: attribute it to the user.
+                if bytes.contains(&b'\r') && !self.desynced() && self.lifecycle_view() == InputState::Continuation {
+                    self.note_user_line();
+                }
+                false
             }
         }
     }
@@ -1953,6 +2022,79 @@ mod tests {
         started.note_user_bytes(b"x");
         started.handle(Event::CommandStart);
         assert!(!started.user_typed_since_prompt(), "C did not clear");
+    }
+
+    /// `Remove-Item` asks for a Y/N answer, the user types `L` and Enter. The CR ends the line, so the prompt after the
+    /// command is clean (the agent's run_command is not refused by a line that is not there).
+    #[test]
+    fn a_cr_typed_while_a_command_runs_ends_the_typed_line() {
+        let mut c = running("sleep 2");
+        c.note_user_bytes(b"L\r");
+        assert!(!c.user_typed_since_prompt(), "the CR did not end the line");
+        c.handle(Event::CommandEnd { exit: 0, pipestatus: vec![0] });
+        c.handle(Event::PromptStart);
+        assert_eq!(c.lifecycle_view(), InputState::Prompt);
+        assert!(!c.user_typed_since_prompt(), "the prompt after the command holds the typed `L`");
+    }
+
+    /// Text typed after the last CR of a write, while a command runs, is still on the line.
+    #[test]
+    fn text_after_a_cr_typed_while_a_command_runs_stays_on_the_line() {
+        let mut c = running("sleep 2");
+        c.note_user_bytes(b"x\ry");
+        assert!(c.user_typed_since_prompt());
+        c.handle(Event::CommandEnd { exit: 0, pipestatus: vec![0] });
+        c.handle(Event::PromptStart);
+        assert!(c.user_typed_since_prompt());
+    }
+
+    /// The writer's split of a paste at the prompt: "echo Hello\recho World" submits the first line, and the tail is
+    /// type-ahead that zsh draws on the next prompt. C keeps the flag, and the prompt after the command keeps it too.
+    #[test]
+    fn text_after_the_submitting_cr_survives_the_command_and_stays_on_the_prompt() {
+        let mut c = core();
+        c.lifecycle = Lifecycle::Prompt;
+        assert!(c.note_user_write(b"echo Hello\recho World"), "the first CR did not submit");
+        assert_eq!(c.lifecycle_view(), InputState::Submitted);
+        assert!(c.user_typed_since_prompt(), "the tail was not noted");
+        c.handle(Event::CommandStart);
+        assert!(c.user_typed_since_prompt(), "C cleared the text after the submit CR");
+        c.handle(Event::CommandEnd { exit: 0, pipestatus: vec![0] });
+        c.handle(Event::PromptStart);
+        assert_eq!(c.lifecycle_view(), InputState::Prompt);
+        assert!(c.user_typed_since_prompt(), "the prompt does not hold the tail");
+    }
+
+    /// Only the first CR of a paste submits. Later CRs are type-ahead: the flag follows the text after the last one.
+    #[test]
+    fn later_crs_in_a_paste_leave_only_the_text_after_the_last_one() {
+        let mut c = core();
+        c.lifecycle = Lifecycle::Prompt;
+        assert!(c.note_user_write(b"a\rb\rc"));
+        c.handle(Event::CommandStart);
+        assert!(c.user_typed_since_prompt(), "`c` is still on the line after the first command starts");
+        c.handle(Event::CommandEnd { exit: 0, pipestatus: vec![0] });
+        c.handle(Event::CommandStart);
+        assert!(c.user_typed_since_prompt(), "the second command's C cleared `c`");
+        c.handle(Event::CommandEnd { exit: 0, pipestatus: vec![0] });
+        c.handle(Event::PromptStart);
+        assert!(c.user_typed_since_prompt());
+
+        let mut all_run = core();
+        all_run.lifecycle = Lifecycle::Prompt;
+        assert!(all_run.note_user_write(b"a\rb\r"));
+        all_run.handle(Event::CommandStart);
+        assert!(!all_run.user_typed_since_prompt(), "nothing is left after the last CR, but the flag is set");
+    }
+
+    /// A write with no CR at the prompt is noted as before: typed text counts, and the gate stays closed to the writer.
+    #[test]
+    fn a_write_without_a_cr_at_the_prompt_does_not_submit() {
+        let mut c = core();
+        c.lifecycle = Lifecycle::Prompt;
+        assert!(!c.note_user_write(b"echo"));
+        assert_eq!(c.lifecycle_view(), InputState::Prompt);
+        assert!(c.user_typed_since_prompt());
     }
 
     const WAIT: Duration = Duration::from_secs(2);
