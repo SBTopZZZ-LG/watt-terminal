@@ -18,6 +18,8 @@ $global:WattBs = [string][char]92
 $global:WattTerm = $global:WattEsc + $global:WattBs
 $global:WattRan = $false
 $global:WattNoOp = $false
+# True when the last line that set WattRan had a parse error: PowerShell did not run it, so $? stays true.
+$global:WattParseError = $false
 # True while the wrapper prompt runs. A replacement prompt that calls the wrapper (a chain) re-enters it; see prompt().
 $global:WattInPrompt = $false
 
@@ -73,6 +75,13 @@ function global:_WattIncomplete([string]$s) {
   $false
 }
 
+# True when the line has a parse error that is not incomplete input. ValidateAndAcceptLine refuses such a line.
+function global:_WattParseError([string]$s) {
+  $errs = $null
+  [void][System.Management.Automation.Language.Parser]::ParseInput($s, [ref]$null, [ref]$errs)
+  [bool]($errs -and $errs.Count)
+}
+
 # True when a complete line runs nothing: blank or comment only, or only function definitions. Such a line has no
 # command status of its own, so the prompt reports exit 0 instead of the stale $?. A line with a parse error is not one.
 function global:_WattNoOp([string]$s) {
@@ -124,7 +133,7 @@ function global:prompt {
     if ($global:WattRan) {
       $global:WattRan = $false
       $code = 0
-      if (-not $ok -and -not $global:WattNoOp) { if ($lec) { $code = [int]$lec } else { $code = 1 } }
+      if ((-not $ok -or $global:WattParseError) -and -not $global:WattNoOp) { if ($lec) { $code = [int]$lec } else { $code = 1 } }
       $global:WattNoOp = $false
       _WattOsc ("133;D;n=$nonce;exit=$code;ps=$code")
     }
@@ -195,15 +204,21 @@ function global:_WattBindEnter {
 # Enter: emit E and C for a complete, non-blank line, then hand off to PSReadLine's normal validate-and-accept.
 # Incomplete input (open block/string/pipe) gets no E/C but a 133;P (continuation, PS2) like zsh; the next Enter that
 # completes the line emits E and C with the whole text. ValidateAndAcceptLine inserts a newline as usual.
+# A complete line with a parse error is refused by ValidateAndAcceptLine (it stays in the buffer, no prompt follows, and the
+# record never closes). It is accepted with AcceptLine instead: PowerShell prints its ParserError and draws the prompt, so
+# the record closes through the normal D.
 $global:WattEnter = {
   _WattCheckPrompt
   $line = $null
   $cursor = $null
   [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor)
+  $parseError = $false
   if (-not [string]::IsNullOrWhiteSpace($line)) {
     if (_WattIncomplete $line) {
       _WattOsc ('133;P;n=' + $global:WattNonce + ';k=s')
     } else {
+      $parseError = _WattParseError $line
+      $global:WattParseError = $parseError
       $global:WattRan = $true
       $global:WattNoOp = _WattNoOp $line
       $global:LASTEXITCODE = 0
@@ -213,7 +228,7 @@ $global:WattEnter = {
       _WattOsc ('133;C;n=' + $global:WattNonce)
     }
   }
-  [Microsoft.PowerShell.PSConsoleReadLine]::ValidateAndAcceptLine()
+  if ($parseError) { [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine() } else { [Microsoft.PowerShell.PSConsoleReadLine]::ValidateAndAcceptLine() }
 }
 $null = _WattBindEnter
 

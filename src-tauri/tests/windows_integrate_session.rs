@@ -23,6 +23,8 @@ const WAIT: Duration = Duration::from_secs(30);
 const DSR: &[u8] = b"\x1b[6n";
 /// The nested shell's start line. -NoExit keeps it interactive after -Command; SaveNothing keeps its history out of files.
 const NESTED: &str = "pwsh -NoLogo -NoProfile -NoExit -Command Set-PSReadLineOption -HistorySaveStyle SaveNothing";
+/// The same start line for Windows PowerShell 5.1.
+const NESTED_51: &str = "powershell -NoLogo -NoProfile -NoExit -Command Set-PSReadLineOption -HistorySaveStyle SaveNothing";
 
 fn serial() -> MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(|e| e.into_inner())
@@ -176,4 +178,31 @@ fn nested_powershell_is_integrated_and_runs_commands_then_exits_back() {
     assert_eq!(s.stats().forged_events, 0, "events were rejected for the nonce");
     drop(s);
     let _ = std::fs::remove_file(history_path("win-nested"));
+}
+
+/// A nested Windows PowerShell 5.1 gets `&&`, which is a parse error there. The line closes its record with a non-zero exit,
+/// and the next command at that level runs.
+#[test]
+fn ps51_and_operator_line_finishes_and_the_next_command_runs() {
+    let _g = serial();
+    let s = start("win-ps51-and");
+    wait_prompt(&s);
+    s.submit(Source::User, NESTED_51).expect("submit the 5.1 shell");
+    assert!(wait_until(|| at_ps_prompt(&s).then_some(())).is_some(), "5.1 never drew its prompt: {:?}", s.screen_snapshot().rows);
+    assert!(wait_until(|| (!s.integration_starting()).then_some(())).is_some(), "5.1 still starting");
+    assert!(matches!(s.integrate_shell(), IntegrateOutcome::Integrated { key: 1, .. }), "5.1 not integrated");
+    wait_prompt(&s);
+
+    s.submit(Source::Agent { call_id: "ps51-and".into() }, "echo a && echo b").expect("agent submit at depth 2");
+    let and = finished(&s, "echo a && echo b", 1);
+    assert!(and.exit_code.is_some_and(|c| c != 0), "exit={:?} output={:?}", and.exit_code, and.output);
+    assert!(and.output.contains("&&"), "output={:?}", and.output);
+    wait_prompt(&s);
+
+    s.submit(Source::User, "echo ok").expect("user submit at depth 2");
+    let ok = finished(&s, "echo ok", 1);
+    assert_eq!((ok.exit_code, ok.output.as_str()), (Some(0), "ok"));
+    wait_prompt(&s);
+    drop(s);
+    let _ = std::fs::remove_file(history_path("win-ps51-and"));
 }

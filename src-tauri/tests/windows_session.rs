@@ -730,3 +730,27 @@ fn watt_histfile_receives_the_session_history() {
     let _ = std::fs::remove_file(&path);
     assert!(found, "{} does not contain {marker:?}", path.display());
 }
+
+/// A line with a plain syntax error (not incomplete input). PowerShell must run it, print the parser error and draw the
+/// next prompt, so the record closes with a non-zero exit and the next command runs. A line PSReadLine refuses to accept
+/// never closes its record, so run_command would return Running here.
+#[test]
+fn a_line_with_a_parse_error_finishes_and_the_next_command_runs() {
+    let _g = serial();
+    let s = start("win-parse-error");
+    wait_prompt(&s);
+    let tools = SessionTools::new(&s);
+    let outcome = tools.run_command("Write-Output )", DEFAULT_RUN_WAIT, None).expect("run_command");
+    let RunOutcome::Finished { record } = outcome else {
+        panic!("the parse-error line did not finish: {outcome:?}; state={:?} screen={:?}", s.state(), s.screen_snapshot().rows);
+    };
+    assert_ne!(record.exit_code, Some(0), "exit={:?} output={:?}", record.exit_code, record.output);
+    assert!(record.output.contains("Unexpected token"), "output={:?}", record.output);
+    wait_prompt_within(&s, REPAIR_WAIT);
+
+    let RunOutcome::Finished { record: ok } = tools.run_command("echo ok", DEFAULT_RUN_WAIT, None).expect("run after the parse error")
+    else {
+        panic!("the command after the parse error did not finish; state={:?}", s.state());
+    };
+    assert_eq!((ok.exit_code, ok.output.as_str()), (Some(0), "ok"));
+}
