@@ -18,6 +18,8 @@ $global:WattBs = [string][char]92
 $global:WattTerm = $global:WattEsc + $global:WattBs
 $global:WattRan = $false
 $global:WattNoOp = $false
+# True while the wrapper prompt runs. A replacement prompt that calls the wrapper (a chain) re-enters it; see prompt().
+$global:WattInPrompt = $false
 
 # Dev only (WATT_HISTFILE, set by the app or the tests): PSReadLine saves history to that file instead of the user's.
 # Unset, which is the normal case, leaves the history alone. Removed from the environment after reading, like the nonce.
@@ -109,18 +111,28 @@ function global:prompt {
   # First statements capture the previous command's status before anything else runs.
   $ok = $?
   $lec = $global:LASTEXITCODE
-  $nonce = $global:WattNonce
-  # PSReadLine can lose the Enter binding after integration (see _WattBindEnter).
-  $null = _WattBindEnter
-  if ($global:WattRan) {
-    $global:WattRan = $false
-    $code = 0
-    if (-not $ok -and -not $global:WattNoOp) { if ($lec) { $code = [int]$lec } else { $code = 1 } }
-    $global:WattNoOp = $false
-    _WattOsc ("133;D;n=$nonce;exit=$code;ps=$code")
+  # Marker: _WattCheckPrompt finds copies of this block by its text ('watt-prompt-wrapper'). Keep it in the body.
+  $null = 'watt-prompt-wrapper'
+  # A replacement that calls this prompt from inside its own text (a chain) re-enters here. The outer call does all the
+  # work, so the inner one writes nothing and returns '' for the chain to compose with.
+  if ($global:WattInPrompt) { return '' }
+  $global:WattInPrompt = $true
+  try {
+    $nonce = $global:WattNonce
+    # PSReadLine can lose the Enter binding after integration (see _WattBindEnter).
+    $null = _WattBindEnter
+    if ($global:WattRan) {
+      $global:WattRan = $false
+      $code = 0
+      if (-not $ok -and -not $global:WattNoOp) { if ($lec) { $code = [int]$lec } else { $code = 1 } }
+      $global:WattNoOp = $false
+      _WattOsc ("133;D;n=$nonce;exit=$code;ps=$code")
+    }
+    _WattCwdOsc
+    $text = [string](& $global:WattOrigPrompt)
+  } finally {
+    $global:WattInPrompt = $false
   }
-  _WattCwdOsc
-  $text = [string](& $global:WattOrigPrompt)
   return ($global:WattEsc + ']133;A;n=' + $nonce + $global:WattTerm) + $text + ($global:WattEsc + ']133;B;n=' + $nonce + $global:WattTerm)
 }
 
@@ -129,6 +141,7 @@ $global:WattPromptBlock = (Get-Item -Path Function:\prompt).ScriptBlock
 
 # A prompt redefined after integration (profile, conda, posh-git, oh-my-posh lazy init) has no A/B/D/cwd. Called from the
 # Enter handler, before the line runs: the new prompt becomes the one to wrap, the wrapper goes back, and Degraded says so.
+# A copy of the wrapper (its text has the marker) is not adopted, since the wrapper would then call itself. The wrapper just goes back.
 # A previous command that never got its D gets one now, exit 0 as a guess, so the observer does not see C over an open record.
 function global:_WattCheckPrompt {
   $cur = (Get-Item -Path Function:\prompt -ErrorAction SilentlyContinue).ScriptBlock
@@ -138,9 +151,12 @@ function global:_WattCheckPrompt {
     $global:WattNoOp = $false
     _WattOsc ("133;D;n=$($global:WattNonce);exit=0;ps=0")
   }
-  $orig = $cur
-  if ($null -eq $orig) { $orig = { 'PS> ' } }
-  $global:WattOrigPrompt = $orig
+  $isCopy = ($null -ne $cur) -and $cur.ToString().Contains('watt-prompt-wrapper')
+  if (-not $isCopy) {
+    $orig = $cur
+    if ($null -eq $orig) { $orig = { 'PS> ' } }
+    $global:WattOrigPrompt = $orig
+  }
   Set-Item -Path Function:\global:prompt -Value $global:WattPromptBlock
   _WattOsc ("633;Degraded;n=$($global:WattNonce);reason=prompt")
 }

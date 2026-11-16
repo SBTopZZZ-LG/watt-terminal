@@ -114,7 +114,44 @@ fn wait_prompt_within(s: &Session, limit: Duration) {
         }
         thread::sleep(Duration::from_millis(20));
     }
-    panic!("state never reached Prompt within {limit:?} without input; state={:?}", s.state());
+    panic!(
+        "state never reached Prompt within {limit:?} without input; state={:?} records={:?} screen={:?}",
+        s.state(),
+        s.records(),
+        s.screen_snapshot().rows
+    );
+}
+
+/// Limit for the prompt-repair tests. A wedged shell must fail in seconds, not hold the suite for WAIT.
+const REPAIR_WAIT: Duration = Duration::from_secs(6);
+
+/// Waits up to `limit` for a finished record of `command` and returns its id.
+fn finished_within(s: &Session, command: &str, limit: Duration) -> u64 {
+    let end = Instant::now() + limit;
+    loop {
+        if let Some(id) = s.records().iter().find(|r| r.command == command && r.exit_code.is_some()).map(|r| r.id) {
+            return id;
+        }
+        if Instant::now() >= end {
+            panic!("no finished record for {command:?} within {limit:?}; state={:?} records={:?}", s.state(), s.records());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Submits `cmd` at a prompt that is reached within REPAIR_WAIT, then waits for its record and the next prompt.
+fn run_within(s: &Session, cmd: &str) -> Record {
+    wait_prompt_within(s, REPAIR_WAIT);
+    s.submit(Source::User, cmd).expect("submit at an idle prompt");
+    let id = finished_within(s, cmd, REPAIR_WAIT);
+    wait_prompt_within(s, REPAIR_WAIT);
+    s.get_record(id).expect("record by id")
+}
+
+/// How many times `needle` occurs in the captured raw output.
+fn count_bytes(log: &Mutex<Vec<u8>>, needle: &[u8]) -> usize {
+    let log = log.lock().unwrap_or_else(|e| e.into_inner());
+    log.windows(needle.len()).filter(|w| *w == needle).count()
 }
 
 /// Waits for a finished record of `command` and returns its id.
@@ -385,6 +422,80 @@ fn a_redefined_prompt_line_that_changes_directory_updates_the_cwd() {
     let cwd = s.cwd().expect("cwd after the redefined prompt");
     assert!(Path::new(&cwd.path).is_absolute(), "cwd is not absolute: {:?}", cwd.path);
     assert_eq!(norm(&cwd.path), norm(&dir), "cwd {:?}", cwd.path);
+}
+
+/// A replacement prompt that is a copy of the wrapper's own source. The idle repair adopts the copy as the original prompt,
+/// so the wrapper would call itself. The line must finish, the prompt must come back without input, and later lines must
+/// record normally with one D per C.
+#[test]
+fn a_prompt_replaced_by_a_copy_of_the_wrapper_does_not_wedge() {
+    let _g = serial();
+    let (s, log) = start_capturing("win-prompt-copy", 120);
+    wait_prompt(&s);
+    let copy = "$d = (Get-Item function:prompt).ScriptBlock.ToString(); Set-Item function:prompt ([scriptblock]::Create($d))";
+    s.submit(Source::User, copy).expect("submit at an idle prompt");
+    let id = finished_within(&s, copy, REPAIR_WAIT);
+    let r = s.get_record(id).expect("record by id");
+    assert_eq!(r.exit_code, Some(0), "the copy line; output={:?}", r.output);
+    wait_prompt_within(&s, REPAIR_WAIT);
+
+    let after = run_within(&s, "echo after-copy");
+    assert_eq!(after.exit_code, Some(0), "echo after the copy; output={:?}", after.output);
+    assert_eq!(after.output, "after-copy");
+    let later = run_within(&s, "echo later");
+    assert_eq!(later.exit_code, Some(0), "a later command; output={:?}", later.output);
+    assert_eq!(later.output, "later");
+    // The copy must not become the prompt text: the prompt line after the output still shows a prompt (ends in ">").
+    let rows = s.screen_snapshot().rows;
+    let last = rows.iter().rev().find(|r| !r.trim().is_empty()).cloned().unwrap_or_default();
+    assert!(last.trim_end().ends_with('>'), "no prompt text after the copy was repaired; last row={last:?} screen={rows:?}");
+
+    assert_eq!(s.stats().forged_events, 0, "events were rejected for the nonce");
+    assert_eq!(s.records().iter().filter(|r| r.command == "echo after-copy").count(), 1, "records={:?}", s.records());
+    let (c, d) = (count_bytes(&log, b"\x1b]133;C;"), count_bytes(&log, b"\x1b]133;D;"));
+    assert_eq!((c, d), (3, 3), "C and D counts (copy, echo, later)");
+    drop_within(s, Duration::from_secs(5));
+}
+
+/// A replacement prompt that calls the wrapper, the posh-git/oh-my-posh chaining pattern. The chain is adopted, so the
+/// wrapper would call the chain and the chain would call the wrapper. The chained text must stay on the prompt line and
+/// events must keep flowing for each later command.
+#[test]
+fn a_prompt_that_chains_the_wrapper_does_not_wedge() {
+    let _g = serial();
+    let (s, log) = start_capturing("win-prompt-chain", 120);
+    wait_prompt(&s);
+    let chain = "$old = (Get-Item function:prompt).ScriptBlock; function prompt { & $old; 'Y> ' }";
+    s.submit(Source::User, chain).expect("submit at an idle prompt");
+    let id = finished_within(&s, chain, REPAIR_WAIT);
+    let r = s.get_record(id).expect("record by id");
+    assert_eq!(r.exit_code, Some(0), "the chain line; output={:?}", r.output);
+    wait_prompt_within(&s, REPAIR_WAIT);
+
+    let first = run_within(&s, "echo after-chain");
+    assert_eq!(first.exit_code, Some(0), "echo after the chain; output={:?}", first.output);
+    assert_eq!(first.output, "after-chain");
+    let rows = s.screen_snapshot().rows;
+    let last = rows.iter().rev().find(|r| !r.trim().is_empty()).cloned().unwrap_or_default();
+    // The snapshot trims trailing spaces, so the row ends in "Y>".
+    assert!(last.trim_end().ends_with("Y>"), "the chained prompt text is not on the prompt line; last row={last:?} screen={rows:?}");
+
+    let dir = std::env::temp_dir().to_string_lossy().into_owned();
+    run_within(&s, &format!("Set-Location -LiteralPath '{}'", dir.replace('\'', "''")));
+    let cwd = s.cwd().expect("cwd after Set-Location");
+    assert_eq!(norm(&cwd.path), norm(&dir), "cwd {:?}", cwd.path);
+    let second = run_within(&s, "echo chain-2");
+    assert_eq!(second.exit_code, Some(0), "output={:?}", second.output);
+    assert_eq!(second.output, "chain-2");
+    let third = run_within(&s, "echo chain-3");
+    assert_eq!(third.exit_code, Some(0), "output={:?}", third.output);
+    assert_eq!(third.output, "chain-3");
+
+    assert_eq!(s.stats().forged_events, 0, "events were rejected for the nonce");
+    assert_eq!(s.records().iter().filter(|r| r.command == "echo after-chain").count(), 1, "records={:?}", s.records());
+    let (c, d) = (count_bytes(&log, b"\x1b]133;C;"), count_bytes(&log, b"\x1b]133;D;"));
+    assert_eq!(c, d, "C and D counts differ");
+    drop_within(s, Duration::from_secs(5));
 }
 
 /// With the prompt untouched, an idle shell after a finished command writes no OSC at all: the idle hook returns early.
