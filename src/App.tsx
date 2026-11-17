@@ -1079,8 +1079,8 @@ export default function App() {
   }, [pendingApproval]);
   const canApprove = approvalArmed && chatBodyShown(panel.open, panelBody);
   const busy = isBusy(transcript);
-  // The border is 'working' for the whole agent turn, but an exited shell takes it off even if a turn is still open.
-  const border: BorderLevel = borderLevel(agentControl, busy && effective !== 'exited');
+  // Same busy as the input bar's loader (busy || sideBusy). An exited shell takes the border off even if a turn is still open.
+  const border: BorderLevel = borderLevel(agentControl, (busy || sideBusy) && effective !== 'exited');
   const borderClass: Record<BorderLevel, string> = {
     off: 'agent-control',
     working: 'agent-control is-working',

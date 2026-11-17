@@ -199,7 +199,7 @@ describe('borderLevel', () => {
     expect(borderLevel(NO_CONTROL, true)).toBe('working');
   });
 
-  it('is control while a call or an agent command holds the shell, busy or not', () => {
+  it('is control while a call or an agent command holds the shell during a turn', () => {
     const holds: AgentControl[] = [
       { call: true, commands: new Set() },
       { call: false, commands: new Set([1]) },
@@ -207,8 +207,24 @@ describe('borderLevel', () => {
     ];
     for (const c of holds) {
       expect(borderLevel(c, true)).toBe('control');
-      expect(borderLevel(c, false)).toBe('control');
     }
+  });
+
+  it('is off outside a turn, even while a call or an agent command still holds the shell', () => {
+    const holds: AgentControl[] = [
+      { call: true, commands: new Set() },
+      { call: false, commands: new Set([1]) },
+      { call: true, commands: new Set([1, 2]) },
+    ];
+    for (const c of holds) {
+      expect(borderLevel(c, false)).toBe('off');
+    }
+  });
+
+  it('is off once the shell exited, even if a hold was open', () => {
+    const held: AgentControl = { call: true, commands: new Set([7]) };
+    const exited = agentControlAfter(held, { type: 'state', state: 'exited' });
+    expect(borderLevel(exited, false)).toBe('off');
   });
 
   it('follows the transcript turn: working from the send until done, then off', () => {

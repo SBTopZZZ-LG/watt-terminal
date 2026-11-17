@@ -80,15 +80,16 @@ export function borderActive(c: AgentControl): boolean {
 }
 
 /**
- * How strong the border is. 'control': the agent holds the shell (see borderActive). 'working': a turn is in flight
- * (`busy`, the transcript's isBusy, from the send until `done`) but the agent is not holding the shell yet, so it is
- * thinking, streaming, or waiting for an approval. 'off': neither.
+ * How strong the border is. `busy` is the input bar's loader flag (the transcript's isBusy or a busy side shell, and not
+ * exited). Not busy: 'off', even if a hold is still open (a parked or running command that outlived the turn). Busy:
+ * 'control' while the agent holds the shell (see borderActive), else 'working' (thinking, streaming, or waiting for an
+ * approval).
  */
 export type BorderLevel = 'off' | 'working' | 'control';
 
 export function borderLevel(c: AgentControl, busy: boolean): BorderLevel {
-  if (borderActive(c)) {
-    return 'control';
+  if (!busy) {
+    return 'off';
   }
-  return busy ? 'working' : 'off';
+  return borderActive(c) ? 'control' : 'working';
 }
