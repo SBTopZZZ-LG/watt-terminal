@@ -625,30 +625,63 @@ fn enter_answering_the_agents_command_does_not_refuse_the_next_one() {
     assert_eq!(record.output, "next-ok");
 }
 
-/// Two lines pasted at the prompt: the first runs, and the second is left typed on the next prompt line (type-ahead). The
-/// agent's run_command is refused there and writes nothing. Ctrl-C at the prompt clears the line, and then the agent's
-/// command runs with its own output only.
-#[test]
-fn text_pasted_after_a_submitted_line_refuses_the_agents_command_until_ctrl_c() {
-    let _g = serial();
-    let s = start("win-paste-tail");
-    wait_prompt(&s);
-    s.write_user(b"echo one\recho two").expect("the user pastes two lines");
-    wait_finished(&s, "echo one");
-    wait_prompt(&s);
-    let tools = SessionTools::new(&s);
-    let err = tools.run_command("echo agent-marker", DEFAULT_RUN_WAIT, None).expect_err("refused over the pasted text");
-    assert!(err.starts_with(USER_TEXT_CODE), "error: {err}");
-    assert!(!s.records().iter().any(|r| r.command.contains("agent-marker")), "the refused command ran");
+/// The text on the cursor row. At a prompt, that is the prompt line.
+fn prompt_line(s: &Session) -> String {
+    let snap = s.screen_snapshot();
+    snap.rows.get(snap.cursor.0 as usize).cloned().unwrap_or_default()
+}
 
-    s.write_user(&[0x03]).expect("ctrl-c at the prompt");
-    wait_until(|| tools.run_command_precheck().is_ok().then_some(())).expect("ctrl-c at the prompt did not clear the refusal");
-    let RunOutcome::Finished { record } = tools.run_command("echo agent-after-ctrl-c", DEFAULT_RUN_WAIT, None).expect("runs after ctrl-c")
+/// Text the user typed at the prompt (no Enter) is cleared by the agent's run_command: the command is submitted to a clean
+/// line, its record holds only its own output, and the user's text is gone from the prompt line and was never run.
+#[test]
+fn text_typed_at_the_prompt_is_cleared_before_the_agents_command() {
+    let _g = serial();
+    let s = start("win-typed-cleared");
+    wait_prompt(&s);
+    s.write_user(b"echo user-typed").expect("the user types");
+    wait_until(|| prompt_line(&s).contains("echo user-typed").then_some(())).expect("the typed text never reached the prompt line");
+    assert!(s.user_typed_since_prompt(), "the typed text is not counted");
+
+    let tools = SessionTools::new(&s);
+    assert!(tools.run_command_precheck().is_ok(), "the precheck refused over the user's text");
+    let RunOutcome::Finished { record } = tools.run_command("echo agent-after-clear", DEFAULT_RUN_WAIT, None).expect("runs after the clear")
     else {
         panic!("expected a finished record");
     };
+    assert_eq!(record.command, "echo agent-after-clear", "the record holds more than the agent's line");
+    assert!(matches!(record.status, RecordStatus::Complete), "status={:?}", record.status);
     assert_eq!(record.exit_code, Some(0), "output={:?}", record.output);
-    assert_eq!(record.output, "agent-after-ctrl-c");
+    assert_eq!(record.output, "agent-after-clear");
+    wait_prompt(&s);
+    assert!(!prompt_line(&s).contains("user-typed"), "the user's text is still on the prompt line: {:?}", prompt_line(&s));
+    assert!(!s.user_typed_since_prompt(), "the typed-text flag is still set after the clear");
+    assert!(!s.records().iter().any(|r| r.command.contains("user-typed")), "the user's text ran: {:?}", s.records());
+}
+
+/// The writer still refuses a submit over text typed after the clear: that is the backstop for text that arrives between
+/// the clear and the submit. Nothing is written, and the text stays on the line.
+#[test]
+fn a_submit_over_text_typed_after_the_clear_is_refused_by_the_writer() {
+    let _g = serial();
+    let s = start("win-typed-backstop");
+    wait_prompt(&s);
+    let tools = SessionTools::new(&s);
+    let RunOutcome::Finished { .. } = tools.run_command("echo first", DEFAULT_RUN_WAIT, None).expect("first run") else {
+        panic!("expected a finished record");
+    };
+    wait_prompt(&s);
+    s.write_user(b"typed-again").expect("the user types again");
+    wait_until(|| prompt_line(&s).contains("typed-again").then_some(())).expect("the text never reached the prompt line");
+
+    let err = s.submit(Source::User, "echo backstop-marker").expect_err("the writer submitted over the user's text");
+    assert_eq!(err, SubmitError::UserTyped);
+    assert!(err.to_string().starts_with(USER_TEXT_CODE), "error: {err}");
+    assert!(!s.records().iter().any(|r| r.command.contains("backstop-marker")), "the refused command ran");
+    assert!(prompt_line(&s).contains("typed-again"), "the refused submit changed the line: {:?}", prompt_line(&s));
+
+    s.write_user(&[0x03]).expect("ctrl-c at the prompt");
+    wait_until(|| (!prompt_line(&s).contains("typed-again")).then_some(())).expect("ctrl-c did not clear the line");
+    wait_prompt(&s);
 }
 
 /// Waits (`limit`, not WAIT) for the observer to report the shell as Exited.

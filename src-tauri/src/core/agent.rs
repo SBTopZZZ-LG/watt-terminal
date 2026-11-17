@@ -528,8 +528,8 @@ impl<'a> AgentCtx<'a> {
         if name == "request_integration" {
             return self.gate_integration(call_id);
         }
-        // A run_command the user's typed text would block is refused before the approval card: the user is not asked to
-        // approve it. The tool checks again when it injects, in case the user types while the card waits.
+        // A run_command the shell cannot take now (not at an idle prompt) is refused before the approval card: the user is not
+        // asked to approve it. The tool checks again when it runs, after the approval.
         if name == "run_command"
             && let Err(e) = self.tools.run_command_precheck()
         {
@@ -786,6 +786,10 @@ impl<'a> AgentCtx<'a> {
         if controls_shell {
             self.emit(AgentEvent::AgentControl { active: false });
         }
+        // The user sees that their typed text was cleared, so the command's clean line is not a surprise.
+        if name == "run_command" && result.as_ref().is_ok_and(|v| v["typed_text_cleared"] == json!(true)) {
+            self.emit(AgentEvent::Notice { text: "Cleared text you had typed at the prompt.".into() });
+        }
         result
     }
 }
@@ -992,6 +996,8 @@ mod tests {
         bound_levels: Mutex<Vec<Option<u64>>>,
         /// What `run_command_precheck` returns as an error. None means the precheck passes.
         precheck: Option<String>,
+        /// When set, a `run_command` result says the user's typed text was cleared (`typed_text_cleared`).
+        typed_cleared: bool,
         /// What `foreground` reports. None means nothing runs in the foreground.
         foreground: Option<Foreground>,
         /// The shell on top. The default is the local shell; a test can change it between calls.
@@ -1105,6 +1111,7 @@ mod tests {
             }
             match &self.call_error {
                 Some(e) => Err(e.clone()),
+                None if name == "run_command" && self.typed_cleared => Ok(json!({"ok": true, "typed_text_cleared": true})),
                 None => Ok(json!({"ok": true})),
             }
         }
@@ -1244,6 +1251,28 @@ mod tests {
         assert!(ctx.call_tool("run_command", json!({"command": "pwd"})).is_ok());
         assert_eq!(decisions(&log), [named("run_command", "manual", true)]);
         assert_eq!(tools.reached(), ["run_command"]);
+    }
+
+    /// A run_command that cleared the user's typed text says so in the chat, once.
+    #[test]
+    fn a_run_that_cleared_typed_text_emits_one_notice() {
+        let tools = Recorder { typed_cleared: true, ..Default::default() };
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        gate.set_auto_approve(true, 0);
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        assert!(ctx.call_tool("run_command", json!({"command": "pwd"})).is_ok());
+        let notices: Vec<String> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Notice { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notices, ["Cleared text you had typed at the prompt."]);
     }
 
     #[test]

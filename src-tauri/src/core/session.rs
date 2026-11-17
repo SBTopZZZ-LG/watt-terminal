@@ -139,6 +139,10 @@ enum WriteCmd {
     /// Keys the agent types into the command it started (`send_keys`). The target is checked under the lock, then the bytes
     /// are encoded for the application cursor mode of that moment, and written.
     Keys { plan: KeyPlan, record: Option<u64>, level: Option<u64>, reply: Sender<Result<SentKeys, KeysRefusal>> },
+    /// The agent clears the user's text on the prompt line with Ctrl-C (see `Session::clear_typed_at_prompt`). Written only
+    /// at an idle prompt, on the level the call was approved for. `reply` carries the prompt count before the Ctrl-C when
+    /// it was written, None when there was no text to clear.
+    ClearTyped { expected_level: Option<u64>, reply: Sender<Result<Option<u64>, SubmitError>> },
 }
 
 /// What `Session::send_keys` wrote: the command it went to, and how many bytes. None when the keys cancelled the agent's
@@ -286,6 +290,21 @@ impl Session {
         let (reply, got) = mpsc::channel();
         self.wtx.send(WriteCmd::Keys { plan, record, level, reply }).map_err(|_| KeysRefusal::Closed)?;
         got.recv().map_err(|_| KeysRefusal::Closed)?
+    }
+
+    /// Clears the text the user typed on the prompt line, with Ctrl-C, so the agent's command can be submitted to a clean
+    /// line. Only at an idle prompt, and only on the shell `expected_level` names. Ok(None): there was no text, nothing was
+    /// written. Ok(Some(n)): Ctrl-C was written; `n` is the prompt count before it, and the caller waits for the count to
+    /// rise (a fresh prompt) before it submits.
+    pub fn clear_typed_at_prompt(&self, expected_level: Option<u64>) -> Result<Option<u64>, SubmitError> {
+        let (reply, got) = mpsc::channel();
+        self.wtx.send(WriteCmd::ClearTyped { expected_level, reply }).map_err(|_| SubmitError::Closed)?;
+        got.recv().map_err(|_| SubmitError::Closed)?
+    }
+
+    /// Top-level prompts seen so far (see `Core::prompt_count`).
+    pub fn prompt_count(&self) -> u64 {
+        self.shared.lock().prompt_count()
     }
 
     /// The command `send_keys` would type into now, read under one lock. Writes nothing. A pre-check for the approval card:
@@ -841,6 +860,36 @@ fn run_writer(rx: Receiver<WriteCmd>, mut writer: Box<dyn Write + Send>, shared:
                         })
                         .map_err(|_| KeysRefusal::Closed),
                     Err(refusal) => Err(refusal),
+                };
+                let _ = reply.send(result);
+            }
+            WriteCmd::ClearTyped { expected_level, reply } => {
+                // The check and the count are read under one lock. Only the writer writes, so the user's bytes cannot come in
+                // between this check and the Ctrl-C.
+                let prepared = {
+                    let core = shared.lock();
+                    if core.desynced() {
+                        Err(SubmitError::ObserverDesynced)
+                    } else if expected_level.is_some_and(|key| key != core.top_key()) {
+                        Err(SubmitError::LocationChanged)
+                    } else {
+                        match core.lifecycle_view() {
+                            InputState::Prompt if core.user_typed_since_prompt() => Ok(Some(core.prompt_count())),
+                            InputState::Prompt => Ok(None),
+                            other => Err(SubmitError::NotAtPrompt(other)),
+                        }
+                    }
+                };
+                let result = match prepared {
+                    Ok(Some(before)) => write_all(&mut writer, &[0x03])
+                        .map(|()| {
+                            // Ctrl-C at the prompt discards the line, as a user's Ctrl-C does (see `note_user_bytes`).
+                            shared.lock().note_agent_cancel();
+                            Some(before)
+                        })
+                        .map_err(|_| SubmitError::Closed),
+                    Ok(None) => Ok(None),
+                    Err(e) => Err(e),
                 };
                 let _ = reply.send(result);
             }

@@ -21,7 +21,7 @@ use crate::core::observer::{
     CallStatus, InjectRefusal, InputState, IntegrationStatus, LevelKind, ObserverStatus, OpenAgentRecord, YieldSignals,
 };
 use crate::core::record::{Cwd, Record, RecordSummary, Source};
-use crate::core::session::{user_text_refusal, IntegrateOutcome, Session};
+use crate::core::session::{IntegrateOutcome, Session};
 use crate::core::settings::LimitsSettings;
 
 /// The wait `run_command` gives a command when the model gives no `wait_seconds`. A command still running at its end is
@@ -61,6 +61,11 @@ const RUN_POLL: Duration = Duration::from_millis(25);
 /// After a command's D, the shell's prompt (A) can take a while: the user's precmd hooks run first. `run_command` waits up
 /// to this long for the prompt before it returns, so a back-to-back call is not refused in that gap.
 const PROMPT_SETTLE: Duration = Duration::from_secs(3);
+/// Added to a `run_command` result when the text the user had typed on the prompt was cleared (Ctrl-C) before the command ran.
+/// The model reads it, so it is not surprised by the command's clean line.
+pub const TYPED_CLEARED_NOTE: &str = "Text the user had typed at the prompt was cleared (Ctrl-C) before this command ran.";
+/// The refusal when the prompt does not return after the clear. Nothing was submitted, so the command did not run.
+const CLEAR_NO_PROMPT: &str = "the text the user had typed at the prompt was cleared (Ctrl-C), but the shell did not return to a prompt in time, so the command was not run. Use get_screen to check the shell, then try again";
 /// The refusal for a `run_command` while the nested shell has not answered a submitted line (see `InputState::Unresponsive`).
 pub const UNRESPONSIVE_REFUSAL: &str = "cannot run a command now: the shell is not answering (it may be busy, or the connection dropped); use get_screen, or ask the user";
 /// Added to a nested `run_command` result that may be waiting for a password or other input. The agent must not type it.
@@ -309,10 +314,16 @@ pub trait AgentTools {
     /// `WaitReason`. With `record`, the wait is keyed to that command: it ends when that command finishes. Counts against
     /// the turn's wait budget, not the command limit.
     fn wait(&self, seconds: u64, ignore_updates: bool, record: Option<u64>) -> Result<WaitView, String>;
-    /// Whether `run_command` would already be refused for text the user typed on the prompt. Checked before the approval
-    /// card, so the user is not asked to approve a command that will be refused. Writes nothing.
+    /// Whether `run_command` would be refused now (not at an idle prompt, and the other refusals it makes before it writes).
+    /// Checked before the approval card, so the user is not asked to approve a command that will be refused. Text the user
+    /// typed on the prompt does not refuse it: `run_command` clears that text first. Writes nothing.
     fn run_command_precheck(&self) -> Result<(), String> {
         Ok(())
+    }
+    /// Whether the last `run_command` cleared the user's typed text before it ran, and resets that mark. `call` reads it right
+    /// after `run_command` to add `TYPED_CLEARED_NOTE`. Defaults to false (a fake clears nothing).
+    fn take_typed_cleared(&self) -> bool {
+        false
     }
     /// Checks that `request_integration` may start now, and returns the label of the shell it would integrate (the command
     /// that holds the foreground). The error is the text the model reads. Writes nothing. A fake without a shell refuses.
@@ -376,12 +387,17 @@ pub trait AgentTools {
                 let command = str_arg(args, "command")?;
                 let (seconds, clamp_note) = seconds_arg(args, "wait_seconds", DEFAULT_RUN_WAIT_SECONDS);
                 let outcome = self.run_command(command, Duration::from_secs(seconds), expected_level)?;
+                let cleared = self.take_typed_cleared();
                 let reason = match &outcome {
                     RunOutcome::Running { reason, .. } => Some(*reason),
                     _ => None,
                 };
                 let mut value = to_json(outcome)?;
                 let mut notes: Vec<String> = clamp_note.into_iter().collect();
+                if cleared {
+                    value["typed_text_cleared"] = json!(true);
+                    notes.push(TYPED_CLEARED_NOTE.to_string());
+                }
                 // The do-not-type note. A password-like prompt always gets it. A remote shell never does: its hint says what to
                 // do, and that shell is ready for a request, not waiting for input. Otherwise, in a nested shell, a call that
                 // is still running or sits at a password prompt gets it, as before.
@@ -423,6 +439,8 @@ pub struct SessionTools<'a> {
     wait_used: Cell<Duration>,
     /// `send_keys` calls that wrote keys, this turn (see `SEND_KEYS_PER_TURN`).
     keys_sent: Cell<u32>,
+    /// Set by `run_command` when it cleared the user's typed text, and read (and reset) by `take_typed_cleared`.
+    typed_cleared: Cell<bool>,
 }
 
 impl<'a> SessionTools<'a> {
@@ -439,6 +457,7 @@ impl<'a> SessionTools<'a> {
             wait_budget: LimitsSettings::default().max_wait(),
             wait_used: Cell::new(Duration::ZERO),
             keys_sent: Cell::new(0),
+            typed_cleared: Cell::new(false),
         }
     }
 
@@ -553,11 +572,18 @@ impl AgentTools for SessionTools<'_> {
         if let Some(c) = command.chars().find(|c| c.is_control() && *c != '\n' && *c != '\t') {
             return Err(format!("command contains the control character {c:?}, which cannot be sent"));
         }
+        self.typed_cleared.set(false);
         if let Some(refusal) = self.not_at_prompt() {
             return Err(refusal);
         }
         if self.cancelled() {
             return Ok(RunOutcome::NotRun { reason: NotRunReason::CancelledBeforeSend });
+        }
+        // Text the user typed on the prompt is cleared with Ctrl-C, so the command is submitted to a clean line. This runs
+        // here, after the approval, so text typed while the card waited is cleared too. Nothing is cleared for a command
+        // that is refused above or cancelled.
+        if self.clear_user_text(expected_level)? {
+            self.typed_cleared.set(true);
         }
         let call_id = format!("run-{}", NEXT_RUN.fetch_add(1, Ordering::Relaxed));
         // submit() re-checks the prompt, and the user's text, atomically, so a racing user submit or keystroke wins or
@@ -614,15 +640,16 @@ impl AgentTools for SessionTools<'_> {
     }
 
     fn run_command_precheck(&self) -> Result<(), String> {
-        // The same refusals run_command makes before it writes, first: a call that is doomed gets no approval card.
-        if let Some(refusal) = self.not_at_prompt() {
-            return Err(refusal);
+        // The same refusal run_command makes before it writes, first: a call that is doomed gets no approval card. Text the
+        // user typed does not refuse: run_command clears it.
+        match self.not_at_prompt() {
+            Some(refusal) => Err(refusal),
+            None => Ok(()),
         }
-        if self.session.user_typed_since_prompt() {
-            Err(user_text_refusal())
-        } else {
-            Ok(())
-        }
+    }
+
+    fn take_typed_cleared(&self) -> bool {
+        self.typed_cleared.replace(false)
     }
 
     fn integration_precheck(&self) -> Result<String, String> {
@@ -698,6 +725,26 @@ impl SessionTools<'_> {
                 _ if Instant::now() >= end => return,
                 _ => thread::sleep(RUN_POLL),
             }
+        }
+    }
+
+    /// Clears the text the user typed on the prompt line with Ctrl-C, then waits for the shell's fresh prompt, so the command
+    /// is submitted to a clean line. Ok(true): text was cleared. Ok(false): there was none, and nothing was written. Err: the
+    /// prompt did not come back within `PROMPT_SETTLE`, or the shell exited. The caller must not run the command then.
+    fn clear_user_text(&self, expected_level: Option<u64>) -> Result<bool, String> {
+        let Some(before) = self.session.clear_typed_at_prompt(expected_level).map_err(|e| e.to_string())? else {
+            return Ok(false);
+        };
+        let end = Instant::now() + PROMPT_SETTLE;
+        loop {
+            let state = self.session.state();
+            if state == InputState::Prompt && self.session.prompt_count() > before {
+                return Ok(true);
+            }
+            if state == InputState::Exited || Instant::now() >= end {
+                return Err(CLEAR_NO_PROMPT.into());
+            }
+            thread::sleep(RUN_POLL);
         }
     }
 

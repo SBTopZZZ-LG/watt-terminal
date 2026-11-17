@@ -695,14 +695,17 @@ pub struct Core {
     /// prompt and type-ahead typed while a command runs (zsh reads that from the tty at the next prompt). Cleared by
     /// Ctrl-C at the prompt (not while a command runs), by a CR that submits the line (`begin_submit`), and by C (which
     /// keeps the text typed after the submitting CR, see `typed_after_submit`). A CR while a command runs leaves only the
-    /// text after it. It survives the transition from a command to the prompt. While it is set the agent's run_command is
-    /// refused, so it cannot land on the user's text.
+    /// text after it. It survives the transition from a command to the prompt. While it is set, run_command clears the
+    /// line with Ctrl-C before it submits (see `SessionTools::run_command`), and the writer refuses a submit meanwhile.
     user_typed: bool,
     /// Text typed after the last CR (or Ctrl-C) of the line that was submitted, as the tty holds it. A write whose first
     /// CR submits the line at the prompt has bytes after that CR: they are type-ahead for the next prompt, and C must not
     /// clear them. Kept by `note_user_bytes` (Submitted, Unresponsive, Running) and `note_user_write`. C copies it into
     /// `user_typed`. Cleared with `user_typed` (see `clear_typed`).
     typed_after_submit: bool,
+    /// Prompts (A) seen at the top level, ever. `run_command` reads it before it clears the user's text with Ctrl-C, and
+    /// waits for it to rise: that A is the prompt the command is then submitted to.
+    prompts: u64,
     /// Agent calls whose line never ran (see `CallStatus::Abandoned`). Bounded by `ABANDONED_CAP`.
     abandoned: VecDeque<String>,
     cwd: Option<Cwd>,
@@ -745,6 +748,7 @@ impl Core {
             last_e: None,
             user_typed: false,
             typed_after_submit: false,
+            prompts: 0,
             abandoned: VecDeque::new(),
             cwd: None,
             records: VecDeque::new(),
@@ -1088,6 +1092,9 @@ impl Core {
             Event::Ready { .. } => {}
             Event::PromptStart => {
                 self.desynced = false;
+                if self.top_is_local() {
+                    self.prompts += 1;
+                }
                 self.close_open(RecordStatus::Incomplete);
                 self.last_e = None;
                 // At a nested level a submit that timed out is Unresponsive: its own A is what ends that.
@@ -1662,10 +1669,16 @@ impl Core {
         Ok(Some(open_id))
     }
 
-    /// The agent's Ctrl-C at a Continuation discards the unfinished line, so the typed-text flag clears, as `note_user_bytes`
-    /// does for a Ctrl-C at a state that is not Running. Called by the writer after the bytes went out.
+    /// The agent's Ctrl-C at a Continuation, or at the prompt to clear the user's typed text, discards the line, so the
+    /// typed-text flag clears, as `note_user_bytes` does for a Ctrl-C at a state that is not Running. Called by the writer
+    /// after the bytes went out.
     pub fn note_agent_cancel(&mut self) {
         self.clear_typed();
+    }
+
+    /// Top-level prompts seen so far (see the field `prompts`).
+    pub fn prompt_count(&self) -> u64 {
+        self.prompts
     }
 
     /// Called by the writer under the same lock as the check. Moves to Submitted and records the pending attribution.
@@ -3281,6 +3294,24 @@ mod tests {
         assert!(typed.user_typed_since_prompt());
         typed.note_agent_cancel();
         assert!(!typed.user_typed_since_prompt(), "the agent's Ctrl-C did not clear the typed-text flag");
+    }
+
+    /// The prompt count rises with each top-level prompt, and not with a prompt of a nested shell: run_command waits for
+    /// the count to rise after its Ctrl-C, and a nested shell's prompt is not the one the command goes to.
+    #[test]
+    fn prompt_count_rises_for_top_level_prompts_only() {
+        let mut c = core();
+        assert_eq!(c.prompt_count(), 0);
+        c.handle(Event::PromptStart);
+        assert_eq!(c.prompt_count(), 1);
+        c.handle(Event::PromptStart);
+        assert_eq!(c.prompt_count(), 2, "a redraw of the prompt counts too");
+
+        let mut nested = nested_at_prompt();
+        let before = nested.prompt_count();
+        nested.handle(Event::PromptStart);
+        assert!(!nested.top_is_local());
+        assert_eq!(nested.prompt_count(), before, "a nested shell's prompt counted");
     }
 
     /// The application cursor mode is read from the screen: DECCKM on turns it on.

@@ -14,7 +14,7 @@ use watt_terminal_lib::core::chat::redact::Redactor;
 use watt_terminal_lib::core::llm::TurnCancel;
 use watt_terminal_lib::core::foreground::ForegroundKind;
 use watt_terminal_lib::core::observer::{EventSink, InputState, IntegrationStatus, ObserverStatus, SessionEvent};
-use watt_terminal_lib::core::record::Source;
+use watt_terminal_lib::core::record::{RecordStatus, Source};
 use watt_terminal_lib::core::session::{Session, USER_TEXT_CODE};
 use watt_terminal_lib::core::settings::{ApprovalMode, ApprovalSettings};
 use watt_terminal_lib::core::tools::{schemas, AgentTools, NotRunReason, RunOutcome, SessionTools, WaitReason, DEFAULT_RUN_WAIT};
@@ -716,8 +716,9 @@ fn tool_result_decisions_on_the_real_path() {
     h.join().expect("turn");
     assert_eq!(decision(&log.lock().unwrap()), [("run_command".to_string(), "denied", false)]);
 
-    s.write_user(b"echo typed-for-refusal").expect("typed");
-    assert!(wait_until(Duration::from_secs(5), || screen_has(&s, "typed-for-refusal").then_some(())).is_some());
+    // A command still running refuses run_command before the card, so the turn does not wait for an approval.
+    s.submit(Source::User, "sleep 30").expect("submit");
+    assert!(wait_state(&s, InputState::Running, Duration::from_secs(3)), "state={:?}", s.state());
     let refused = turn(&s, &ApprovalGate::new(), "please run `echo dec-refused`");
     assert_eq!(decision(&refused), [("run_command".to_string(), "refused", false)]);
     s.write_user(&[0x03]).expect("ctrl-c");
@@ -787,10 +788,10 @@ fn run_command_error(log: &Log) -> Option<String> {
     })
 }
 
-/// Text the user typed on the prompt (no CR) refuses run_command, and nothing reaches the PTY: the typed line stays as
-/// it was and the agent's command never ran. Ctrl-C clears the line, and then the agent can run again.
+/// Text the user typed on the prompt (no CR) does not refuse run_command: it is cleared with Ctrl-C, and then the agent's
+/// command is submitted to the clean line. The command's record holds only its own output, and the user's text never runs.
 #[test]
-fn user_text_at_the_prompt_refuses_run_command_and_writes_nothing() {
+fn user_text_at_the_prompt_is_cleared_before_run_command() {
     let _g = serial();
     let s = start();
     wait_prompt(&s);
@@ -798,49 +799,68 @@ fn user_text_at_the_prompt_refuses_run_command_and_writes_nothing() {
     assert!(wait_until(Duration::from_secs(5), || screen_has(&s, "echo typed-by-user").then_some(())).is_some());
 
     let tools = SessionTools::new(&s);
-    assert!(tools.run_command_precheck().is_err(), "the precheck let the command through");
-    let err = tools.run_command("echo agent-marker", DEFAULT_RUN_WAIT, None).expect_err("refused while text is typed");
-    assert!(err.starts_with(USER_TEXT_CODE), "error: {err}");
-    assert!(!s.records().iter().any(|r| r.command.contains("agent-marker")), "the refused command ran");
-    assert!(!screen_has(&s, "agent-marker"), "the refused command reached the screen");
-    assert!(screen_has(&s, "echo typed-by-user"), "the user's line changed");
-
-    s.write_user(&[0x03]).expect("ctrl-c");
-    assert!(wait_until(Duration::from_secs(5), || (!prompt_line(&s).contains("typed-by-user")).then_some(())).is_some(), "ctrl-c did not clear the prompt line");
-    wait_prompt(&s);
-    let outcome = tools.run_command("echo after-ctrl-c", DEFAULT_RUN_WAIT, None).expect("runs after ctrl-c");
+    assert!(tools.run_command_precheck().is_ok(), "the precheck refused over the user's text");
+    let outcome = tools.run_command("echo agent-marker", DEFAULT_RUN_WAIT, None).expect("runs after the clear");
     let RunOutcome::Finished { record } = outcome else { panic!("expected a finished record, got {outcome:?}") };
-    assert_eq!(record.output, "after-ctrl-c");
+    assert_eq!(record.command, "echo agent-marker", "the record holds more than the agent's line");
+    assert!(matches!(record.status, RecordStatus::Complete), "status={:?}", record.status);
+    assert_eq!(record.output, "agent-marker");
+    assert!(!s.records().iter().any(|r| r.command.contains("typed-by-user")), "the user's text ran");
+    wait_prompt(&s);
+    assert!(!prompt_line(&s).contains("typed-by-user"), "the user's text is still on the prompt line: {:?}", prompt_line(&s));
+    assert!(!s.user_typed_since_prompt(), "the typed-text flag is still set after the clear");
 }
 
-/// The MockAgent refuses before the approval card: nobody is asked to approve a command that would be refused.
+/// The result of a run_command that cleared the user's text says so (`typed_text_cleared`, and a note the model reads). A
+/// later run with nothing typed says nothing of it.
 #[test]
-fn user_text_at_the_prompt_refuses_before_the_approval_card() {
+fn run_command_result_says_the_typed_text_was_cleared() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    s.write_user(b"echo noted").expect("typed");
+    assert!(wait_until(Duration::from_secs(5), || screen_has(&s, "echo noted").then_some(())).is_some());
+
+    let tools = SessionTools::new(&s);
+    let v = tools.call("run_command", &json!({"command": "echo cleared-note"}), None).expect("runs after the clear");
+    assert_eq!(v["typed_text_cleared"], json!(true), "{v}");
+    assert!(v["note"].as_str().unwrap_or_default().contains("cleared"), "{v}");
+    assert_eq!(v["record"]["output"], json!("cleared-note"), "{v}");
+    let v = tools.call("run_command", &json!({"command": "echo plain"}), None).expect("runs");
+    assert!(v.get("typed_text_cleared").is_none(), "{v}");
+    assert!(!v["note"].as_str().unwrap_or_default().contains("cleared"), "{v}");
+}
+
+/// The approval card is still raised for a command over the user's text, and the approved command runs after the clear.
+#[test]
+fn user_text_at_the_prompt_does_not_refuse_before_the_approval_card() {
     let _g = serial();
     let s = start();
     wait_prompt(&s);
     s.write_user(b"echo typed-first").expect("typed");
     assert!(wait_until(Duration::from_secs(5), || screen_has(&s, "typed-first").then_some(())).is_some());
 
-    // A card would wait for 300 ms and then count as a denial. Either way the refusal must come first.
-    let approvals = ApprovalGate::with_timeout(Duration::from_millis(300));
-    let events = turn(&s, &approvals, "please run `echo card-check`");
-    assert!(!has_approval(&events), "an approval card was raised for a refused command");
-    assert!(!events.iter().any(|e| matches!(e, AgentEvent::AgentControl { .. })), "the agent took control for a refused command");
-    assert_eq!(run_ok(&events), Some(false));
-    assert_eq!(
-        text_of(&events),
-        "I can't run that: you have text typed at the prompt. Clear it (Ctrl-C) and ask again."
+    let approvals = Arc::new(ApprovalGate::new());
+    let (h, log) = turn_in_thread(s.arc(), approvals.clone(), "please run `echo card-check`");
+    let (id, _) = wait_approval(&s, &log);
+    assert!(approvals.decide(&id, true));
+    h.join().expect("turn");
+    let events = log.lock().unwrap().clone();
+    assert!(has_approval(&events), "no approval card was raised");
+    assert_eq!(run_ok(&events), Some(true), "{}", dump_turn(&s, &log));
+    assert!(text_of(&events).contains("Ran `echo card-check`: exit code 0"), "text: {}", text_of(&events));
+    assert!(
+        events.iter().any(|e| matches!(e, AgentEvent::Notice { text } if text == "Cleared text you had typed at the prompt.")),
+        "no notice for the clear"
     );
-    assert!(!s.records().iter().any(|r| r.command == "echo card-check"), "the refused command ran");
-
-    s.write_user(&[0x03]).expect("ctrl-c");
+    assert!(s.records().iter().any(|r| r.command == "echo card-check" && r.exit_code == Some(0)), "the approved command did not run");
     wait_prompt(&s);
+    assert!(!prompt_line(&s).contains("typed-first"), "the user's text is still on the prompt line");
 }
 
-/// Text typed while the approval card waits is caught at injection: the approved command is refused, and nothing runs.
+/// Text typed while the approval card waits is cleared when the approved command runs: the command runs on a clean line.
 #[test]
-fn user_text_typed_while_an_approval_waits_refuses_the_injection() {
+fn user_text_typed_while_an_approval_waits_is_cleared_at_execution() {
     let _g = serial();
     let s = start();
     wait_prompt(&s);
@@ -851,14 +871,28 @@ fn user_text_typed_while_an_approval_waits_refuses_the_injection() {
     assert!(wait_until(Duration::from_secs(5), || screen_has(&s, "typed-late").then_some(())).is_some());
     assert!(approvals.decide(&id, true));
     h.join().expect("turn");
-    assert_eq!(run_command_ok(&log), Some(false));
-    let err = run_command_error(&log).expect("the injection was refused with an error");
-    assert!(err.starts_with(USER_TEXT_CODE), "error: {err}");
-    assert!(!s.records().iter().any(|r| r.command == "echo late-cmd"), "the approved command ran over the user's text");
-    assert!(!screen_has(&s, "late-cmd"), "the approved command reached the screen");
+    assert_eq!(run_command_ok(&log), Some(true), "{}", dump_turn(&s, &log));
+    assert!(s.records().iter().any(|r| r.command == "echo late-cmd" && r.exit_code == Some(0)), "the approved command did not run");
+    assert!(!s.records().iter().any(|r| r.command.contains("typed-late")), "the user's text ran");
+    wait_prompt(&s);
+    assert!(!prompt_line(&s).contains("typed-late"), "the user's text is still on the prompt line");
+}
 
+/// The writer still refuses a submit over text typed after the clear: the backstop for text that arrives between the clear
+/// and the submit. Nothing is written, and the text stays on the line.
+#[test]
+fn a_submit_over_text_typed_after_the_clear_is_refused_by_the_writer() {
+    let _g = serial();
+    let s = start();
+    wait_prompt(&s);
+    s.write_user(b"typed-again").expect("typed");
+    assert!(wait_until(Duration::from_secs(5), || screen_has(&s, "typed-again").then_some(())).is_some());
+    let err = s.submit(Source::User, "echo backstop-marker").expect_err("the writer submitted over the user's text");
+    assert!(err.to_string().starts_with(USER_TEXT_CODE), "error: {err}");
+    assert!(!s.records().iter().any(|r| r.command.contains("backstop-marker")), "the refused command ran");
+    assert!(prompt_line(&s).contains("typed-again"), "the refused submit changed the line: {:?}", prompt_line(&s));
     s.write_user(&[0x03]).expect("ctrl-c");
-    assert!(wait_until(Duration::from_secs(5), || (!prompt_line(&s).contains("typed-late")).then_some(())).is_some(), "ctrl-c did not clear the prompt line");
+    assert!(wait_until(Duration::from_secs(5), || (!prompt_line(&s).contains("typed-again")).then_some(())).is_some(), "ctrl-c did not clear the prompt line");
     wait_prompt(&s);
 }
 
@@ -913,9 +947,9 @@ fn keys_typed_while_a_command_runs_do_not_block_the_next_agent_command() {
 }
 
 
-/// Ctrl-L redraws the line and keeps the user's text, so the refusal stays after it.
+/// Ctrl-L redraws the line and keeps the user's text. run_command does not refuse over it: it clears the line first.
 #[test]
-fn ctrl_l_keeps_user_text_refusing_the_agent() {
+fn ctrl_l_keeps_user_text_and_run_command_clears_it() {
     let _g = serial();
     let s = start();
     wait_prompt(&s);
@@ -924,15 +958,21 @@ fn ctrl_l_keeps_user_text_refusing_the_agent() {
     s.write_user(b"\x0c").expect("ctrl-l");
     thread::sleep(Duration::from_millis(500));
     assert!(screen_has(&s, "echo kept"), "ctrl-l removed the user's text from the screen");
-    assert!(SessionTools::new(&s).run_command_precheck().is_err(), "ctrl-l cleared the refusal");
-    s.write_user(&[0x03]).expect("ctrl-c");
+    let tools = SessionTools::new(&s);
+    assert!(tools.run_command_precheck().is_ok(), "ctrl-l made the precheck refuse");
+    let RunOutcome::Finished { record } = tools.run_command("echo after-ctrl-l", DEFAULT_RUN_WAIT, None).expect("runs over the kept text") else {
+        panic!("expected a finished record");
+    };
+    assert_eq!(record.command, "echo after-ctrl-l");
+    assert_eq!(record.output, "after-ctrl-l");
     wait_prompt(&s);
+    assert!(!prompt_line(&s).contains("echo kept"), "the user's text is still on the prompt line");
 }
 
-/// Text typed while a command runs is type-ahead: zsh draws it on the next prompt line. The agent's run_command is refused
-/// there and writes nothing. Ctrl-C at the prompt clears the line, and then the agent's command runs.
+/// Text typed while a command runs is type-ahead: zsh draws it on the next prompt line. run_command clears it with Ctrl-C
+/// and then submits the agent's command to the clean line, so the record is the agent's command alone.
 #[test]
-fn type_ahead_during_a_command_refuses_the_next_agent_command() {
+fn type_ahead_during_a_command_is_cleared_before_the_next_agent_command() {
     let _g = serial();
     let s = start();
     wait_prompt(&s);
@@ -943,24 +983,20 @@ fn type_ahead_during_a_command_refuses_the_next_agent_command() {
     assert!(wait_until(Duration::from_secs(5), || prompt_line(&s).contains("zqx").then_some(())).is_some(), "the type-ahead never reached the prompt line");
 
     let tools = SessionTools::new(&s);
-    assert!(tools.run_command_precheck().is_err(), "the precheck let the command through");
-    let err = tools.run_command("echo type-ahead-marker", DEFAULT_RUN_WAIT, None).expect_err("refused over type-ahead");
-    assert!(err.starts_with(USER_TEXT_CODE), "error: {err}");
-    assert!(!s.records().iter().any(|r| r.command.contains("type-ahead-marker")), "the refused command ran");
-    assert!(!screen_has(&s, "type-ahead-marker"), "the refused command reached the screen");
-
-    s.write_user(&[0x03]).expect("ctrl-c at the prompt");
-    assert!(wait_until(Duration::from_secs(5), || (!prompt_line(&s).contains("zqx")).then_some(())).is_some(), "ctrl-c did not clear the prompt line");
-    wait_prompt(&s);
-    let RunOutcome::Finished { record } = tools.run_command("echo after-type-ahead", DEFAULT_RUN_WAIT, None).expect("runs after ctrl-c") else {
+    assert!(tools.run_command_precheck().is_ok(), "the precheck refused over type-ahead");
+    let RunOutcome::Finished { record } = tools.run_command("echo type-ahead-marker", DEFAULT_RUN_WAIT, None).expect("runs after the clear") else {
         panic!("expected a finished record");
     };
-    assert_eq!(record.output, "after-type-ahead");
+    assert_eq!(record.command, "echo type-ahead-marker", "the type-ahead ran with the agent's command");
+    assert_eq!(record.output, "type-ahead-marker");
+    wait_prompt(&s);
+    assert!(!prompt_line(&s).contains("zqx"), "the type-ahead is still on the prompt line");
 }
 
-/// Ctrl-C while a command runs does not clear type-ahead, so the refusal holds until a Ctrl-C at the prompt.
+/// Ctrl-C while a command runs does not clear type-ahead from the flag, so run_command clears it at the next prompt: the
+/// agent's record is its own command alone.
 #[test]
-fn ctrl_c_during_a_command_keeps_the_type_ahead_refusal() {
+fn ctrl_c_during_a_command_keeps_the_type_ahead_for_the_clear() {
     let _g = serial();
     let s = start();
     wait_prompt(&s);
@@ -970,9 +1006,12 @@ fn ctrl_c_during_a_command_keeps_the_type_ahead_refusal() {
     s.write_user(&[0x03]).expect("ctrl-c while the command runs");
     wait_prompt(&s);
     let tools = SessionTools::new(&s);
-    assert!(tools.run_command_precheck().is_err(), "ctrl-c during the command cleared the type-ahead");
-    s.write_user(&[0x03]).expect("ctrl-c at the prompt");
-    assert!(wait_until(Duration::from_secs(5), || tools.run_command_precheck().is_ok().then_some(())).is_some(), "ctrl-c at the prompt did not clear the refusal");
+    assert!(tools.run_command_precheck().is_ok(), "the precheck refused at the prompt");
+    let RunOutcome::Finished { record } = tools.run_command("echo kept-flag", DEFAULT_RUN_WAIT, None).expect("runs after the clear") else {
+        panic!("expected a finished record");
+    };
+    assert_eq!(record.command, "echo kept-flag", "the type-ahead was not cleared");
+    assert_eq!(record.output, "kept-flag");
 }
 
 /// The agent's command reads a line (`read line`) and the user answers "y" and Enter. The Enter ends the typed line, so the
@@ -994,10 +1033,10 @@ fn enter_answering_the_agents_read_does_not_refuse_the_next_command() {
     assert_eq!(record.output, "after-read");
 }
 
-/// Two lines pasted at the prompt: the first runs, and the second is left typed on the next prompt line. The agent's
-/// run_command is refused there. Ctrl-C at the prompt clears the line, and then the agent's command runs.
+/// Two lines pasted at the prompt: the first runs, and the second is left typed on the next prompt line. run_command clears
+/// that tail with Ctrl-C and submits the agent's command to the clean line: the record is the agent's command alone.
 #[test]
-fn text_pasted_after_a_submitted_line_refuses_the_agents_command() {
+fn text_pasted_after_a_submitted_line_is_cleared_before_the_agents_command() {
     let _g = serial();
     let s = start();
     wait_prompt(&s);
@@ -1006,18 +1045,15 @@ fn text_pasted_after_a_submitted_line_refuses_the_agents_command() {
     assert!(wait_until(Duration::from_secs(5), || prompt_line(&s).contains("echo two").then_some(())).is_some(), "the pasted tail never reached the prompt line");
 
     let tools = SessionTools::new(&s);
-    assert!(tools.run_command_precheck().is_err(), "the precheck let the command through");
-    let err = tools.run_command("echo tail-marker", DEFAULT_RUN_WAIT, None).expect_err("refused over the pasted text");
-    assert!(err.starts_with(USER_TEXT_CODE), "error: {err}");
-    assert!(!s.records().iter().any(|r| r.command.contains("tail-marker")), "the refused command ran");
-
-    s.write_user(&[0x03]).expect("ctrl-c at the prompt");
-    assert!(wait_until(Duration::from_secs(5), || (!prompt_line(&s).contains("echo two")).then_some(())).is_some(), "ctrl-c did not clear the prompt line");
-    wait_prompt(&s);
-    let RunOutcome::Finished { record } = tools.run_command("echo after-paste", DEFAULT_RUN_WAIT, None).expect("runs after ctrl-c") else {
+    assert!(tools.run_command_precheck().is_ok(), "the precheck refused over the pasted text");
+    let RunOutcome::Finished { record } = tools.run_command("echo tail-marker", DEFAULT_RUN_WAIT, None).expect("runs after the clear") else {
         panic!("expected a finished record");
     };
-    assert_eq!(record.output, "after-paste");
+    assert_eq!(record.command, "echo tail-marker", "the pasted tail ran with the agent's command");
+    assert_eq!(record.output, "tail-marker");
+    assert!(!s.records().iter().any(|r| r.command == "echo two"), "the pasted tail ran");
+    wait_prompt(&s);
+    assert!(!prompt_line(&s).contains("echo two"), "the pasted tail is still on the prompt line");
 }
 
 /// Keys typed in the alt screen go to the full-screen program, not to the prompt, so they do not refuse run_command.
