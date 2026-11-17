@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use reqwest::header::{HeaderName, HeaderValue};
 use serde_json::{Value, json};
 
-use crate::core::agent::{Agent, AgentCtx, AgentEvent, DENIED, UserMessage};
+use crate::core::agent::{Agent, AgentCtx, AgentEvent, RunApproval, DENIED, UserMessage};
 use crate::core::env::env_setting;
 use crate::core::foreground::{Foreground, ForegroundKind};
 use crate::core::chat::attachments::{Resolver, user_content};
@@ -40,10 +40,10 @@ use crate::core::chat::redact::Redactor;
 use crate::core::chat::todo::{self, Todo, TodoList};
 use crate::core::chat::trim::{self, TrimPlan};
 use crate::core::llm::{self, AssistantReply, ChatRequest, Delta, LlmError, ProviderConfig, ToolCall, TurnCancel};
-use crate::core::observer::OpenAgentRecord;
+use crate::core::observer::{InputState, IntegrationStatus, ObserverStatus, OpenAgentRecord};
 use crate::core::persist::attachments::AttachmentStore;
 use crate::core::settings::LimitsSettings;
-use crate::core::tools::{age_text, foreground_next_step, TopLevel};
+use crate::core::tools::{age_text, foreground_next_step, SessionFacts, TopLevel};
 
 const SESSION_PLACEHOLDER: &str = "{session_id}";
 pub const USER_AGENT: &str = concat!("watt-terminal/", env!("CARGO_PKG_VERSION"));
@@ -240,17 +240,45 @@ pub fn new_conversation_id() -> io::Result<String> {
     Ok(format!("ses_{}", bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()))
 }
 
-/// What the model is told about a conversation that was resumed from storage: the shell is a new session.
-const RESUME_NOTE: &str = "This conversation was resumed from storage. The shell is the current session: its \
-directory, environment and running jobs may differ from earlier in this conversation, so re-check before relying on \
-earlier output.";
+/// The shell is a new process after either restart. Said once, in the note of the first turn that follows the restart.
+const NEW_SHELL_NOTE: &str = "The shell is a brand-new session (a new process): its directory, environment variables, background \
+jobs, and any nested shell or ssh session from earlier in this conversation are gone. Re-check with get_cwd or get_screen \
+before relying on earlier output.";
+/// The app was restarted and this conversation was reopened from storage. (The first sentence is kept as it was.)
+const RELAUNCH_NOTE: &str = "This conversation was resumed from storage. The app was restarted.";
+/// The user clicked "Start new session" after the previous shell exited or crashed.
+const RESTART_NOTE: &str = "The user started a new shell session after the previous one ended.";
+/// Both: the app was restarted, then the user started a new shell session.
+const RELAUNCH_AND_RESTART_NOTE: &str = "This conversation was resumed from storage. The app was restarted, and the user then \
+started a new shell session after the previous one ended.";
 /// Added when the saved copy was made in the middle of a turn: the app ended before that turn finished.
 const RESUME_NOTE_INTERRUPTED: &str = "The previous session ended abruptly (crash, quit or kill) in the middle \
 of a turn, so the last request may be unfinished or half done: verify what actually happened before continuing.";
+/// Added to the system text of every call while the shell has exited: nothing can run in it, and the user starts a new one.
+const SHELL_EXITED_NOTE: &str = "The shell exited or crashed, so nothing more can run in it. Tell the user to click the \"Start \
+new session\" button in the input bar, and do not retry.";
 
-/// The resume note for a restored conversation. `in_turn` is the stored flag (see `StoredConversation::in_turn`).
-fn resume_note_for(in_turn: bool) -> String {
-    if in_turn { format!("{RESUME_NOTE} {RESUME_NOTE_INTERRUPTED}") } else { RESUME_NOTE.to_string() }
+/// What the next turn is told about the shell, once: the app was restarted and this conversation reopened (`relaunched`,
+/// with `interrupted` when the saved copy was made mid-turn), and/or the user started a new shell session (`restarted`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PendingNote {
+    relaunched: bool,
+    interrupted: bool,
+    restarted: bool,
+}
+
+/// The note text for a pending note. One note even when both restarts apply: no sentence is said twice.
+fn shell_note_text(note: PendingNote) -> String {
+    let lead = match (note.relaunched, note.restarted) {
+        (true, true) => RELAUNCH_AND_RESTART_NOTE,
+        (true, false) => RELAUNCH_NOTE,
+        _ => RESTART_NOTE,
+    };
+    let mut text = format!("{lead} {NEW_SHELL_NOTE}");
+    if note.relaunched && note.interrupted {
+        text = format!("{text} {RESUME_NOTE_INTERRUPTED}");
+    }
+    text
 }
 
 /// One session's conversation: the id sent to the provider, the history, the todo list, and the note the next turn
@@ -259,7 +287,7 @@ pub struct Conversation {
     id: Mutex<String>,
     history: Arc<Mutex<History>>,
     todos: TodoList,
-    resume_note: Mutex<Option<String>>,
+    resume_note: Mutex<Option<PendingNote>>,
     /// The models that refused images here. Kept by `reset` and `restore`: it is a fact about the model, not the chat.
     no_vision: NoVisionModels,
     /// How far this conversation's estimates were from the provider's counts. In memory only; reset by `reset` and
@@ -345,7 +373,7 @@ impl Conversation {
         *lock_string(&self.id) = id;
         *lock(&self.history) = history;
         *lock_todos(&self.todos) = todos;
-        *lock_note(&self.resume_note) = Some(resume_note_for(in_turn));
+        *lock_note(&self.resume_note) = Some(PendingNote { relaunched: true, interrupted: in_turn, restarted: false });
         // The restored conversation is a different content: the calibration learned from the live one does not carry over.
         *lock_calibration(&self.calibration) = Calibrator::default();
         // The last usage belongs to the content it was measured on. The caller sets the saved one (see `set_last_usage`).
@@ -373,7 +401,7 @@ impl Conversation {
             id: Mutex::new(lock_string(&self.id).clone()),
             history: self.history.clone(),
             todos: self.todos.clone(),
-            resume_note: Mutex::new(lock_note(&self.resume_note).clone()),
+            resume_note: Mutex::new(*lock_note(&self.resume_note)),
             no_vision: self.no_vision.clone(),
             calibration: self.calibration.clone(),
             learned_limits: self.learned_limits.clone(),
@@ -381,10 +409,16 @@ impl Conversation {
         }
     }
 
-    /// The resume note, once: a turn that calls the model takes it, and the next turn gets none. `None` for a
-    /// conversation that was not resumed, or after a turn has taken it.
+    /// The user started a new shell session after the previous one ended ("Start new session", lib.rs `restart_session`).
+    /// The next turn is told so, once. A pending relaunch note stays and is combined with it (see `shell_note_text`).
+    pub fn note_new_shell_session(&self) {
+        lock_note(&self.resume_note).get_or_insert_with(PendingNote::default).restarted = true;
+    }
+
+    /// The shell note, once: a turn that calls the model takes it, and the next turn gets none. `None` for a conversation
+    /// that was not resumed and did not start a new shell session, or after a turn has taken it.
     pub fn take_resume_note(&self) -> Option<String> {
-        lock_note(&self.resume_note).take()
+        lock_note(&self.resume_note).take().map(shell_note_text)
     }
 }
 
@@ -579,10 +613,17 @@ impl LlmAgent {
         if let Some(rules) = &self.project_rules {
             system = format!("{system}\n\n{}", instructions::note(rules));
         }
+        let top = ctx.top_level();
+        let facts = ctx.session_facts();
+        if let Some(facts) = &facts
+            && let Some(note) = environment_note(std::env::consts::OS, facts, &top, ctx.approval_mode(), &self.redactor)
+        {
+            system = format!("{system}\n\n{note}");
+        }
         if let Some(note) = &self.resume_note {
             system = format!("{system}\n\n{note}");
         }
-        if let Some(note) = location_note(&ctx.top_level(), &self.redactor) {
+        if let Some(note) = location_note(&top, &self.redactor) {
             system = format!("{system}\n\n{note}");
         }
         // The agent's own command, when it is open, is described by its note. The foreground note is for any other program.
@@ -597,6 +638,9 @@ impl LlmAgent {
         }
         if let Some(note) = finished {
             system = format!("{system}\n\n{note}");
+        }
+        if facts.as_ref().is_some_and(|f| f.state == InputState::Exited) {
+            system = format!("{system}\n\n{SHELL_EXITED_NOTE}");
         }
         if let Some(block) = todo::prompt_block(&lock_todos(&self.todos)) {
             system = format!("{system}\n\n{block}");
@@ -1078,6 +1122,52 @@ pub fn location_note(top: &TopLevel, r: &Redactor) -> Option<String> {
     )))
 }
 
+/// The environment note for one model call, from the live state: the operating system, the local shell and the terminal
+/// size, the local directory, shell integration, and how run_command is approved. None once the shell has exited (the exit
+/// note says what to do). On a nested shell the shell and the directory are left out: the location note already names that
+/// shell, so nothing is described twice.
+pub fn environment_note(os: &str, facts: &SessionFacts, top: &TopLevel, mode: RunApproval, r: &Redactor) -> Option<String> {
+    if facts.state == InputState::Exited {
+        return None;
+    }
+    let os = match os {
+        "windows" => "Windows",
+        "macos" => "macOS",
+        "linux" => "Linux",
+        other => other,
+    };
+    let (rows, cols) = facts.size;
+    let mut lines = Vec::with_capacity(4);
+    let shell = top.sh.as_deref().filter(|_| !top.is_nested()).map(|sh| format!(", shell {sh}")).unwrap_or_default();
+    lines.push(format!("Environment: {os}{shell}, terminal {rows} rows x {cols} columns."));
+    if let Some(cwd) = facts.cwd.as_ref().filter(|_| !top.is_nested()) {
+        lines.push(format!("Directory: {}:{}.", cwd.host, cwd.path));
+    }
+    let integration = match facts.integration {
+        IntegrationStatus::Live => "live",
+        IntegrationStatus::Booting => "starting, so run_command is not available yet",
+        IntegrationStatus::Raw => "not integrated, so run_command is not available here",
+    };
+    let lost = if matches!(facts.observer, ObserverStatus::Desynced) {
+        "; output was lost, so the screen may be stale until the next prompt"
+    } else {
+        ""
+    };
+    lines.push(format!("Shell integration: {integration}{lost}."));
+    lines.push(
+        match mode {
+            RunApproval::Manual => "Approval: manual. Every run_command asks the user first.",
+            RunApproval::Rules => "Approval: the saved rules decide. A command they allow runs without a card; any other asks the user first.",
+            RunApproval::ApproveAll => "Approval: approve-all is on, so run_command runs here without a card.",
+            RunApproval::ApproveAllSuspended => {
+                "Approval: approve-all is on in another shell, so it is off here: run_command asks the user first."
+            }
+        }
+        .to_string(),
+    );
+    Some(r.redact(&lines.join("\n")))
+}
+
 /// The command text in the terminal note is cut to this many characters, the ellipsis included.
 const NOTE_COMMAND_CHARS: usize = 300;
 
@@ -1259,7 +1349,7 @@ fn lock_todos(m: &TodoList) -> MutexGuard<'_, Vec<Todo>> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn lock_note(m: &Mutex<Option<String>>) -> MutexGuard<'_, Option<String>> {
+fn lock_note(m: &Mutex<Option<PendingNote>>) -> MutexGuard<'_, Option<PendingNote>> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -1282,6 +1372,7 @@ fn lock_usage(m: &Mutex<Option<ContextUsage>>) -> MutexGuard<'_, Option<ContextU
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::record::Cwd;
     use std::collections::HashMap;
 
     /// The nested-shell note is present only on a nested level, and names its label, user, host and shell.
@@ -1471,17 +1562,118 @@ mod tests {
         assert!(conversation.take_resume_note().is_none(), "a new conversation has no note");
 
         conversation.restore(conversation.id(), History::new(), Vec::new(), false);
-        assert_eq!(conversation.take_resume_note().as_deref(), Some(RESUME_NOTE));
+        let note = conversation.take_resume_note().expect("a note");
+        assert!(note.starts_with("This conversation was resumed from storage. The app was restarted."), "{note}");
+        assert!(note.contains(NEW_SHELL_NOTE) && !note.contains("ended abruptly"), "{note}");
         assert!(conversation.take_resume_note().is_none(), "taking the note clears it");
 
         conversation.restore(conversation.id(), History::new(), Vec::new(), true);
         let note = conversation.take_resume_note().expect("a note");
-        assert!(note.starts_with(RESUME_NOTE) && note.ends_with(RESUME_NOTE_INTERRUPTED), "{note}");
+        assert!(note.starts_with(RELAUNCH_NOTE) && note.ends_with(RESUME_NOTE_INTERRUPTED), "{note}");
 
         // A new conversation drops a note that no turn has taken yet.
         conversation.restore(conversation.id(), History::new(), Vec::new(), false);
         conversation.reset().unwrap();
         assert!(conversation.take_resume_note().is_none());
+    }
+
+    /// "Start new session" gives the followed conversation its note, once. The conversation it came from has none.
+    #[test]
+    fn a_new_shell_session_gives_its_note_to_one_turn_only() {
+        let old = Conversation::new().unwrap();
+        let carried = old.follow();
+        carried.note_new_shell_session();
+        assert!(old.take_resume_note().is_none(), "the old conversation is not changed");
+        let note = carried.take_resume_note().expect("a note");
+        assert!(note.starts_with(RESTART_NOTE) && note.contains(NEW_SHELL_NOTE), "{note}");
+        assert!(!note.contains(RELAUNCH_NOTE) && !note.contains("resumed from storage"), "no relaunch: {note}");
+        assert!(carried.take_resume_note().is_none(), "consumed once");
+    }
+
+    /// The app was restarted and the conversation reopened, then the user started a new session: one note, one new-shell
+    /// sentence, and the interrupted sentence once when it applies.
+    #[test]
+    fn a_relaunch_and_a_new_shell_session_give_one_combined_note() {
+        let conversation = Conversation::new().unwrap();
+        conversation.restore(conversation.id(), History::new(), Vec::new(), true);
+        conversation.note_new_shell_session();
+        let note = conversation.take_resume_note().expect("a note");
+        assert!(note.starts_with(RELAUNCH_AND_RESTART_NOTE), "{note}");
+        assert_eq!(note.matches(NEW_SHELL_NOTE).count(), 1, "{note}");
+        assert!(note.ends_with(RESUME_NOTE_INTERRUPTED), "{note}");
+        assert!(!note.contains(RESTART_NOTE), "the restart sentence is not said twice: {note}");
+        assert!(conversation.take_resume_note().is_none(), "consumed once");
+    }
+
+    /// The text for each combination: the relaunch sentence only with a relaunch, the restart sentence only with a restart,
+    /// and the interrupted sentence only with a relaunch that was interrupted.
+    #[test]
+    fn the_shell_note_says_only_the_restarts_that_happened() {
+        let note = |relaunched, interrupted, restarted| shell_note_text(PendingNote { relaunched, interrupted, restarted });
+        let relaunch = note(true, false, false);
+        assert!(relaunch.starts_with(RELAUNCH_NOTE) && !relaunch.contains("started a new shell session"), "{relaunch}");
+        let restart = note(false, false, true);
+        assert!(restart.starts_with(RESTART_NOTE) && !restart.contains("resumed from storage"), "{restart}");
+        assert!(!note(false, true, true).contains("ended abruptly"), "an interrupted sentence needs a relaunch");
+        assert!(note(true, true, false).ends_with(RESUME_NOTE_INTERRUPTED));
+        assert_eq!(note(true, false, true).matches("brand-new session").count(), 1);
+    }
+
+    /// The environment note: the local shell, the terminal size, the directory, integration and approval, for a Windows
+    /// PowerShell fixture and a zsh fixture. Nothing for an exited shell, and a nested shell is not named twice.
+    #[test]
+    fn the_environment_note_describes_the_live_state_for_each_shell() {
+        let r = Redactor::new(Vec::new());
+        let facts = |state, integration, observer| SessionFacts {
+            state,
+            integration,
+            observer,
+            size: (40, 150),
+            cwd: Some(Cwd { host: "DESKTOP".into(), path: r"C:\Users\me".into() }),
+        };
+        let local = |sh: &str| TopLevel { sh: Some(sh.into()), ..TopLevel::default() };
+        let ok = ObserverStatus::Ok;
+
+        let windows = environment_note("windows", &facts(InputState::Prompt, IntegrationStatus::Live, ok), &local("pwsh"), RunApproval::Manual, &r)
+            .expect("a note");
+        assert_eq!(
+            windows,
+            "Environment: Windows, shell pwsh, terminal 40 rows x 150 columns.\n\
+             Directory: DESKTOP:C:\\Users\\me.\n\
+             Shell integration: live.\n\
+             Approval: manual. Every run_command asks the user first."
+        );
+        assert!(windows.lines().count() <= 5, "{windows}");
+
+        let zsh = environment_note("macos", &facts(InputState::Prompt, IntegrationStatus::Live, ok), &local("zsh"), RunApproval::Rules, &r)
+            .expect("a note");
+        assert!(zsh.starts_with("Environment: macOS, shell zsh, terminal 40 rows x 150 columns."), "{zsh}");
+        assert!(zsh.contains("Approval: the saved rules decide."), "{zsh}");
+
+        let exited = facts(InputState::Exited, IntegrationStatus::Live, ok);
+        assert_eq!(environment_note("windows", &exited, &local("pwsh"), RunApproval::Manual, &r), None, "the exit note says it instead");
+
+        let booting = facts(InputState::Booting, IntegrationStatus::Booting, ObserverStatus::Desynced);
+        let text = environment_note("linux", &booting, &local("zsh"), RunApproval::ApproveAll, &r).expect("a note");
+        assert!(text.contains("Shell integration: starting, so run_command is not available yet; output was lost"), "{text}");
+        assert!(text.contains("Approval: approve-all is on, so run_command runs here without a card."), "{text}");
+        let raw = facts(InputState::Prompt, IntegrationStatus::Raw, ok);
+        assert!(environment_note("linux", &raw, &local("zsh"), RunApproval::ApproveAllSuspended, &r)
+            .expect("a note")
+            .contains("Shell integration: not integrated, so run_command is not available here."));
+
+        let nested = TopLevel { key: 1, location: Some("ssh box".into()), sh: Some("bash".into()), ..TopLevel::default() };
+        let text = environment_note("windows", &facts(InputState::Running, IntegrationStatus::Live, ok), &nested, RunApproval::Manual, &r)
+            .expect("a note");
+        assert!(text.starts_with("Environment: Windows, terminal 40 rows x 150 columns.\n"), "{text}");
+        assert!(!text.contains("bash") && !text.contains("Directory:"), "the location note names the nested shell: {text}");
+    }
+
+    #[test]
+    fn the_shell_notes_are_not_in_the_base_prompt() {
+        for note in [RELAUNCH_NOTE, RESTART_NOTE, SHELL_EXITED_NOTE, NEW_SHELL_NOTE] {
+            assert!(!prompt::system_prompt_for("pwsh").contains(note), "{note}");
+        }
     }
 
     #[test]
@@ -1531,7 +1723,7 @@ mod tests {
 
         let carried = conversation.follow();
         assert_eq!(carried.id(), conversation.id(), "a restart keeps the conversation id");
-        assert_eq!(carried.take_resume_note().as_deref(), Some(RESUME_NOTE), "the resume note is cloned");
+        assert!(carried.take_resume_note().is_some_and(|n| n.starts_with(RELAUNCH_NOTE)), "the resume note is cloned");
         assert!(carried.take_resume_note().is_none(), "taking the note clears it");
 
         lock(&carried.history()).push_user("after restart");

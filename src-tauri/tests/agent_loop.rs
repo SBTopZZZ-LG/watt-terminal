@@ -25,10 +25,10 @@ use watt_terminal_lib::core::chat::todo;
 use watt_terminal_lib::core::foreground::{Foreground, ForegroundKind};
 use watt_terminal_lib::core::llm::{TurnCancel, http_client};
 use watt_terminal_lib::core::keys::KeyPlan;
-use watt_terminal_lib::core::observer::OpenAgentRecord;
+use watt_terminal_lib::core::observer::{InputState, IntegrationStatus, ObserverStatus, OpenAgentRecord};
 use watt_terminal_lib::core::record::{Cwd, RecordStatus, RecordSummary, Source};
 use watt_terminal_lib::core::session::IntegrateOutcome;
-use watt_terminal_lib::core::tools::{AgentTools, CommandView, RunOutcome, ScreenView, SendKeysOutcome, WaitView};
+use watt_terminal_lib::core::tools::{AgentTools, CommandView, RunOutcome, ScreenView, SendKeysOutcome, SessionFacts, TopLevel, WaitView};
 use serde_json::{Value, json};
 
 const KEY: &str = "sk-or-test-SECRETVALUE-0123456789";
@@ -208,6 +208,10 @@ struct FakeTools {
     finished: Mutex<Option<RecordSummary>>,
     /// When set, `run_command` answers "still running" with this record id instead of a finished record.
     running_record: Option<u64>,
+    /// The session facts the environment note and the exit note read (`session_facts`). None: a fake without a shell.
+    facts: Option<SessionFacts>,
+    /// The shell on top (`top_level`): its kind, and whether it is a nested level.
+    top: TopLevel,
 }
 
 impl FakeTools {
@@ -266,6 +270,12 @@ impl AgentTools for FakeTools {
     }
     fn finished_summary(&self, id: u64) -> Option<RecordSummary> {
         self.finished.lock().unwrap().clone().filter(|r| r.id == id)
+    }
+    fn session_facts(&self) -> Option<SessionFacts> {
+        self.facts.clone()
+    }
+    fn top_level(&self) -> TopLevel {
+        self.top.clone()
     }
     fn integration_precheck(&self) -> Result<String, String> {
         Ok("ssh h".to_string())
@@ -2358,4 +2368,72 @@ fn the_conversations_last_usage_is_the_last_usage_event_and_a_turn_without_a_req
     let emitted_again = usages(&events);
     assert_eq!(emitted_again.len(), 1, "no reply, so only the usage before the request");
     assert_eq!(conv.last_usage().lock().unwrap().clone(), emitted_again.last().cloned());
+}
+
+fn live_facts(state: InputState) -> SessionFacts {
+    SessionFacts {
+        state,
+        integration: IntegrationStatus::Live,
+        observer: ObserverStatus::Ok,
+        size: (30, 120),
+        cwd: Some(Cwd { host: "box".into(), path: "/home/u".into() }),
+    }
+}
+
+/// The environment note is read per call from the shell, and the exit note is added once the shell has exited. Without a
+/// shell (a fake with no facts) neither is said.
+#[test]
+fn the_environment_and_exit_notes_are_read_per_call_from_the_shell() {
+    let provider = serve(vec![
+        Script::json(text_reply("one")),
+        Script::json(text_reply("two")),
+        Script::json(text_reply("three")),
+    ]);
+    let conv = Conversation::new().unwrap();
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
+    let pwsh = TopLevel { sh: Some("pwsh".into()), ..TopLevel::default() };
+    let live = FakeTools { facts: Some(live_facts(InputState::Prompt)), top: pwsh, ..FakeTools::default() };
+    turn(&mut agent, &live, &no_gate(), "first");
+    let exited = FakeTools { facts: Some(live_facts(InputState::Exited)), ..FakeTools::default() };
+    turn(&mut agent, &exited, &no_gate(), "second");
+    turn(&mut agent, &FakeTools::default(), &no_gate(), "third");
+
+    let requests = provider.requests();
+    let system = |n: usize| system_of(&requests[n]);
+    let first = system(0);
+    assert!(first.contains("\nEnvironment: "), "{first}");
+    assert!(first.contains(", shell pwsh, terminal 30 rows x 120 columns."), "{first}");
+    assert!(first.contains("Directory: box:/home/u."), "{first}");
+    assert!(first.contains("Shell integration: live."), "{first}");
+    assert!(first.contains("Approval: manual. Every run_command asks the user first."), "{first}");
+    assert!(!first.contains("The shell exited or crashed"), "{first}");
+
+    let second = system(1);
+    assert!(second.contains("The shell exited or crashed, so nothing more can run in it."), "{second}");
+    assert!(second.contains("\"Start new session\" button in the input bar, and do not retry."), "{second}");
+    assert!(!second.contains("\nEnvironment: "), "an exited shell has no environment note: {second}");
+
+    let third = system(2);
+    assert!(!third.contains("\nEnvironment: ") && !third.contains("shell exited or crashed"), "{third}");
+}
+
+/// A nested shell is named once: the location note covers it, so the environment note leaves out its shell and directory.
+#[test]
+fn a_nested_shell_is_not_described_twice() {
+    let provider = serve(vec![Script::json(text_reply("ok"))]);
+    let conv = Conversation::new().unwrap();
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
+    let nested = TopLevel {
+        key: 1,
+        location: Some("ssh box".into()),
+        user: Some("u".into()),
+        host: Some("box".into()),
+        sh: Some("bash".into()),
+    };
+    let tools = FakeTools { facts: Some(live_facts(InputState::Running)), top: nested, ..FakeTools::default() };
+    turn(&mut agent, &tools, &no_gate(), "where am I");
+    let system = system_of(&provider.requests()[0]);
+    assert!(system.contains("You are in a nested/remote shell: ssh box, as u@box, shell bash."), "{system}");
+    assert!(system.contains("\nEnvironment: ") && system.contains("terminal 30 rows x 120 columns."), "{system}");
+    assert!(!system.contains(", shell bash, terminal") && !system.contains("Directory: box:/home/u."), "{system}");
 }

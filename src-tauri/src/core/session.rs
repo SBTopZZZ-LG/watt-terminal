@@ -21,7 +21,7 @@ use crate::core::inject::{self, END_MARKER};
 use crate::core::keys::KeyPlan;
 use crate::core::observer::{
     run_observer, Activity, CallStatus, Core, EventSink, InjectRefusal, InputState, IntegrationStatus, KeysRefusal, LevelInfo,
-    ObsMsg, ObsQueue, ObserverStatus, OpenAgentRecord, ScreenLines, ScreenSnapshot, Shared, YieldSignals,
+    ObsMsg, ObsQueue, ObserverStatus, OpenAgentRecord, ScreenLines, ScreenSnapshot, Shared, YieldSignals, SHELL_EXITED_TEXT,
 };
 use crate::core::pty::{self, Gate, OutputSink};
 use crate::core::record::{Cwd, Record, RecordSummary, Source};
@@ -86,14 +86,14 @@ impl std::fmt::Display for SubmitError {
             SubmitError::NotAtPrompt(s) => write!(f, "session is not at a prompt (state: {s:?})"),
             SubmitError::UserTyped => write!(f, "{}", user_text_refusal()),
             SubmitError::ObserverDesynced => write!(f, "observer is desynced; wait for the next prompt"),
-            SubmitError::Closed => write!(f, "session is closed"),
+            SubmitError::Closed => write!(f, "{SHELL_EXITED_TEXT}"),
             SubmitError::MultiLineAtBash => write!(
                 f,
                 "this shell is bash or PowerShell and cannot take multi-line commands safely; send one line, or join with ;"
             ),
             SubmitError::LocationChanged => write!(
                 f,
-                "the shell you were working in has changed (it exited or another shell started); the command was not run, check the screen and decide again"
+                "the shell you were working in has changed (it exited or another shell started); the command was not run. If the shell exited, nothing more can run in it: tell the user to click the \"Start new session\" button in the input bar, and do not retry. Otherwise check the screen and decide again"
             ),
         }
     }

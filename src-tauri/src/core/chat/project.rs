@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use crate::core::chat::redact::Redactor;
 use crate::core::chat::{questions, todo};
 use crate::core::foreground::{Foreground, ForegroundKind};
-use crate::core::observer::SCREEN_HISTORY_CAP;
+use crate::core::observer::{SCREEN_HISTORY_CAP, SHELL_EXITED_TEXT};
 use crate::core::tools::foreground_next_step;
 
 /// `run_command` output longer than this is cut to a head and tail. Output at or under it is sent whole.
@@ -33,6 +33,8 @@ const COMMAND_TEXT_LIMIT: usize = 200;
 /// A run of this many identical lines or more is collapsed.
 const REPEAT_MIN: usize = 3;
 const TRUNCATED_MARK: &str = "...[truncated]";
+/// Said of a finished record whose status is approximate: its rendered output may be missing rows (see `RecordStatus`).
+const APPROXIMATE_NOTE: &str = "Its output may be incomplete or misaligned: the terminal was resized, cleared, or scrolled in a region while it ran. If it matters, use get_screen or run the command again.";
 
 /// Shapes one tool result for the model. `ok` is whether the tool call succeeded; on failure `result` carries the
 /// error text (a string, or an object with `message` or `error`). Everything passes through `redactor`.
@@ -93,6 +95,9 @@ fn finished_text(record: Option<&Value>, r: &Redactor) -> String {
     if record.get("output_truncated").and_then(Value::as_bool) == Some(true) {
         fields.insert("output_truncated".into(), json!(true));
     }
+    if is_approximate(record) {
+        fields.insert("note".into(), json!(APPROXIMATE_NOTE));
+    }
     fields.insert("output".into(), json!(window_output(output, RUN_OUTPUT_LIMIT, &id, r)));
     Value::Object(fields).to_string()
 }
@@ -137,7 +142,13 @@ fn get_command_text(v: &Value, r: &Redactor) -> String {
         scalar(v.get("truncated")),
     );
     let output = v.get("output").and_then(Value::as_str).unwrap_or("");
-    format!("{header}\n{}", window_output(output, GET_OUTPUT_LIMIT, &id, r))
+    let note = if is_approximate(v) { format!("\n{APPROXIMATE_NOTE}") } else { String::new() };
+    format!("{header}{note}\n{}", window_output(output, GET_OUTPUT_LIMIT, &id, r))
+}
+
+/// Whether a finished record (JSON as the tools give it) has the approximate status.
+fn is_approximate(record: &Value) -> bool {
+    record.get("status").and_then(Value::as_str) == Some("approximate")
 }
 
 fn get_screen_text(v: &Value, r: &Redactor) -> String {
@@ -184,6 +195,9 @@ fn wait_text(v: &Value, r: &Redactor) -> String {
     lines.push(format!("{}\n{body}", screen_header(screen, r)));
     if let (Some(rec), Some(output)) = (record, output) {
         lines.push(command_header(rec, r));
+        if is_approximate(rec) {
+            lines.push(APPROXIMATE_NOTE.to_string());
+        }
         let screen_rows: Vec<&str> = body.lines().map(str::trim_end).collect();
         let shown = output.lines().all(|line| screen_rows.contains(&line.trim_end()));
         lines.push(if output.trim().is_empty() {
@@ -204,7 +218,7 @@ fn waited_text(v: &Value) -> String {
 fn wait_reason_text(v: &Value) -> String {
     match v.get("reason").and_then(Value::as_str).unwrap_or("") {
         "idle" => "the shell is idle at the prompt, so there was nothing to wait for".to_string(),
-        "session_exited" => "the shell session has exited".to_string(),
+        "session_exited" => SHELL_EXITED_TEXT.to_string(),
         "command_finished" => match v.get("record").and_then(|rec| rec.get("exit_code")).and_then(Value::as_i64) {
             Some(code) => format!("the command finished with exit status {code}"),
             None => "the command finished, exit status unknown".to_string(),
@@ -313,7 +327,12 @@ fn list_commands_text(v: &Value, r: &Redactor) -> String {
     if list.is_empty() {
         return "no finished commands".to_string();
     }
-    let lines: Vec<String> = list.iter().map(|c| command_line(c, r)).collect();
+    let mut lines: Vec<String> = list.iter().map(|c| command_line(c, r)).collect();
+    // The list has no output to caveat: one line says the approximate ones may be incomplete, with their ids.
+    let approximate: Vec<String> = list.iter().filter(|c| is_approximate(c)).map(|c| scalar(c.get("id"))).collect();
+    if !approximate.is_empty() {
+        lines.push(format!("approximate ids {}: {APPROXIMATE_NOTE}", approximate.join(", ")));
+    }
     keep_tail(&lines.join("\n"), LIST_LIMIT)
 }
 
@@ -1140,5 +1159,43 @@ mod tests {
 
         let plain = project("get_screen", true, &screen(&["$ ls"]), &none());
         assert!(!plain.contains("lines="), "{plain}");
+    }
+
+    #[test]
+    fn a_wait_that_saw_the_shell_exit_says_to_start_a_new_session_and_not_to_retry() {
+        let v = json!({"reason": "session_exited", "waited_ms": 0, "state": "exited", "screen": screen(&["$ exit"])});
+        let out = project("wait", true, &v, &none());
+        assert!(out.starts_with("waited 0.0s: the shell exited or crashed, so nothing more can run in it"), "{out}");
+        assert!(out.contains("\"Start new session\" button in the input bar") && out.contains("Do not retry"), "{out}");
+        assert!(!out.contains("session has exited"), "the old wording is gone: {out}");
+    }
+
+    #[test]
+    fn an_approximate_record_says_its_output_may_be_incomplete_in_every_view() {
+        let mut approx = finished("hello");
+        approx["record"]["status"] = json!("approximate");
+        let out = run(&approx);
+        assert_eq!(out["note"], APPROXIMATE_NOTE, "{out}");
+        assert_eq!(out["status"], "approximate");
+        assert!(run(&finished("hello")).get("note").is_none(), "a complete record has no caveat");
+
+        let view = json!({"id": 3, "exit_code": 0, "status": "approximate", "cwd": null, "offset": 0, "total_bytes": 2,
+            "truncated": false, "output": "ok"});
+        let text = project("get_command", true, &view, &none());
+        assert!(text.lines().nth(1) == Some(APPROXIMATE_NOTE), "{text}");
+
+        let waited = json!({"reason": "command_finished", "waited_ms": 9, "state": "prompt", "screen": screen(&["$ x"]),
+            "record": approx["record"].clone()});
+        let text = project("wait", true, &waited, &none());
+        assert!(text.contains(APPROXIMATE_NOTE), "{text}");
+
+        let list = json!([
+            {"id": 4, "command": "a", "exit_code": 0, "output_bytes": 1, "status": "complete", "source": {"kind": "agent"}},
+            {"id": 5, "command": "b", "exit_code": 0, "output_bytes": 1, "status": "approximate", "source": {"kind": "agent"}},
+        ]);
+        let text = project("list_commands", true, &list, &none());
+        assert!(text.ends_with(&format!("approximate ids 5: {APPROXIMATE_NOTE}")), "{text}");
+        let plain = json!([{"id": 4, "command": "a", "exit_code": 0, "output_bytes": 1, "status": "complete", "source": {"kind": "agent"}}]);
+        assert!(!project("list_commands", true, &plain, &none()).contains("approximate"));
     }
 }

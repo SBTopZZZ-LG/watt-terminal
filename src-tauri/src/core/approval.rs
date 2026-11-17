@@ -138,6 +138,12 @@ pub trait ApprovalPolicy: Send + Sync {
     fn check_line(&self, line: &str) -> Option<Reason> {
         hard_gate(line)
     }
+
+    /// Whether saved rules can approve a call here: false for the manual policy, where every call asks. Read for the
+    /// environment note (see `AgentCtx::approval_mode`).
+    fn uses_rules(&self) -> bool {
+        true
+    }
 }
 
 /// Every call asks. The default, and the fallback when the settings cannot be used.
@@ -146,6 +152,10 @@ pub struct ManualPolicy;
 impl ApprovalPolicy for ManualPolicy {
     fn decide(&self, tool: &str, _args: &Value, _nested: bool) -> Verdict {
         if tool == "run_command" { Verdict::Ask(Reason::ManualMode) } else { Verdict::Ask(Reason::SendKeys) }
+    }
+
+    fn uses_rules(&self) -> bool {
+        false
     }
 }
 
@@ -1003,5 +1013,11 @@ mod tests {
         let regex = policy_for(&settings(ApprovalMode::Regex, &["echo .*"], &[])).unwrap();
         assert_eq!(run(regex.as_ref(), "echo hi"), Verdict::Auto(Reason::Rule));
         assert!(policy_for(&settings(ApprovalMode::Regex, &["a("], &[])).is_err());
+    }
+
+    #[test]
+    fn only_the_manual_policy_says_its_rules_do_not_apply() {
+        assert!(!ManualPolicy.uses_rules());
+        assert!(regex_policy(&["echo .*"], &[]).uses_rules());
     }
 }

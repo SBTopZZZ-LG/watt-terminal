@@ -376,7 +376,10 @@ async fn restart_session(
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            Some(old.conversation.follow())
+            // The new shell is a new session: the next turn is told so, once (see `Conversation::note_new_shell_session`).
+            let conversation = old.conversation.follow();
+            conversation.note_new_shell_session();
+            Some(conversation)
         }
         None => None,
     };

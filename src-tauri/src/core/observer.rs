@@ -274,6 +274,12 @@ impl std::fmt::Display for InjectRefusal {
     }
 }
 
+/// The text the model reads once the shell has exited (the observer saw its end): nothing can run in it, the user starts a
+/// new one with the "Start new session" button in the input bar, and the model does not retry. Used by the refusals of
+/// `run_command`, `send_keys` and `wait`, and by the writer's refusal.
+pub const SHELL_EXITED_TEXT: &str = "the shell exited or crashed, so nothing more can run in it: tell the user to click the \"Start new session\" \
+button in the input bar, since the terminal cannot be used until then. Do not retry.";
+
 /// Why `send_keys` may not type now (see `Core::keys_target`). The texts are for the model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeysRefusal {
@@ -300,17 +306,19 @@ pub enum KeysRefusal {
 impl std::fmt::Display for KeysRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            KeysRefusal::Closed => write!(f, "the session is closed"),
+            KeysRefusal::Closed => write!(f, "{SHELL_EXITED_TEXT}"),
             KeysRefusal::Desynced => write!(f, "the shell output was lost; nothing was sent: use get_screen, then decide again"),
             KeysRefusal::Location => write!(
                 f,
-                "the shell you were working in has changed (it exited or another shell started); nothing was sent: check the \
-                 screen and decide again"
+                "the shell you were working in has changed (it exited or another shell started); nothing was sent. If the shell \
+                 exited, nothing more can run in it: tell the user to click the \"Start new session\" button in the input bar, and do \
+                 not retry. Otherwise check the screen and decide again"
             ),
             KeysRefusal::NothingRunning => write!(
                 f,
                 "nothing is running; use run_command to start a command at an idle prompt"
             ),
+            KeysRefusal::NotRunning(InputState::Exited) => write!(f, "keys cannot be sent: {SHELL_EXITED_TEXT}"),
             KeysRefusal::NotRunning(state) => write!(
                 f,
                 "the session is {state:?}, so keys cannot be sent to a command now: use get_screen and wait, or ask the user"
@@ -1928,6 +1936,23 @@ mod tests {
         fn on_scroll(&mut self, contents: RowContents<'_>, _alternate_screen: bool) {
             self.0.push(row_text(&contents));
         }
+    }
+
+    /// The keys refusals for an exited shell name the exit and the button, and say not to retry. The closed writer says the same.
+    #[test]
+    fn the_refusals_for_an_exited_shell_say_to_start_a_new_session() {
+        let exited = KeysRefusal::NotRunning(InputState::Exited).to_string();
+        assert_eq!(exited, format!("keys cannot be sent: {SHELL_EXITED_TEXT}"));
+        assert_eq!(KeysRefusal::Closed.to_string(), SHELL_EXITED_TEXT);
+        assert!(KeysRefusal::Location.to_string().contains("\"Start new session\" button in the input bar"));
+        assert!(KeysRefusal::Location.to_string().contains("Otherwise check the screen"));
+        for text in [exited, KeysRefusal::Closed.to_string()] {
+            assert!(text.contains("exited or crashed") && text.contains("Do not retry"), "{text}");
+        }
+        assert!(
+            KeysRefusal::NotRunning(InputState::Running).to_string().starts_with("the session is Running"),
+            "other states keep their wording"
+        );
     }
 
     /// Guards the Debug-based wrap readout in `row_text`: a soft-wrapped row must read as wrapped, a hard line end must not.

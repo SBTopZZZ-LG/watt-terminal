@@ -776,3 +776,60 @@ fn the_resume_note_reaches_the_first_turn_only_and_is_never_stored() {
     let history_text = serde_json::to_string(&live.history().lock().unwrap().snapshot()).unwrap();
     assert!(!history_text.contains("resumed from storage"), "the note is not in the history");
 }
+
+#[test]
+fn the_shell_notes_reach_the_next_turn_once_and_are_never_stored() {
+    let provider = serve(vec![
+        text_reply("first answer"),
+        text_reply("second answer"),
+        text_reply("third answer"),
+        text_reply("fourth answer"),
+    ]);
+    let tmp = TempDir::new();
+    let persist = persist_in(&tmp);
+    let s = settings(&provider.url);
+
+    // The user clicked "Start new session": the carried conversation is told once, and the old one is not changed.
+    let old = Conversation::new().unwrap();
+    let mut first = agent_for(&s, &old);
+    run(&mut first, "first question");
+    let saved = finish(&persist, &old, &first, None, 100).expect("saved");
+
+    let carried = old.follow();
+    carried.note_new_shell_session();
+    assert!(old.take_resume_note().is_none(), "the old conversation has no note of its own");
+    let mut restarted_turn = agent_for(&s, &carried);
+    run(&mut restarted_turn, "second question");
+    let mut later = agent_for(&s, &carried);
+    run(&mut later, "third question");
+    finish(&persist, &carried, &later, None, 100).expect("saved");
+
+    // The app was restarted and this conversation reopened, then the user started a new session: one combined note.
+    let loaded = resume(&persist, &saved.id).unwrap();
+    let relaunched = Conversation::new().unwrap();
+    relaunched.restore(loaded.id, loaded.history, loaded.todos, loaded.in_turn);
+    relaunched.note_new_shell_session();
+    let mut combined = agent_for(&s, &relaunched);
+    run(&mut combined, "fourth question");
+
+    let requests = provider.requests();
+    let system = |n: usize| sent_messages(&requests[n])[0]["content"].as_str().unwrap().to_string();
+    assert!(!system(0).contains("brand-new session"), "a conversation with no restart has no note");
+    let restart = system(1);
+    assert!(restart.contains("The user started a new shell session after the previous one ended."), "{restart}");
+    assert!(restart.contains("The shell is a brand-new session (a new process)"), "{restart}");
+    assert!(!restart.contains("resumed from storage"), "no relaunch happened: {restart}");
+    assert!(!system(2).contains("started a new shell session"), "the note is for the first turn only");
+    let combined_text = system(3);
+    assert!(
+        combined_text.contains("This conversation was resumed from storage. The app was restarted, and the user then started a new shell session after the previous one ended."),
+        "{combined_text}"
+    );
+    assert_eq!(combined_text.matches("brand-new session").count(), 1, "the new-shell sentence is said once: {combined_text}");
+
+    let stored = all_text(tmp.path());
+    assert!(!stored.contains("started a new shell session") && !stored.contains("brand-new session"), "the note is not on disk");
+    assert!(!stored.contains("resumed from storage"), "the note is not on disk");
+    let history_text = serde_json::to_string(&carried.history().lock().unwrap().snapshot()).unwrap();
+    assert!(!history_text.contains("started a new shell session"), "the note is not in the history");
+}

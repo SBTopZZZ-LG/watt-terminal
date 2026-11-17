@@ -18,9 +18,10 @@ use crate::core::foreground::{self, Foreground, ForegroundKind};
 use crate::core::keys::KeyPlan;
 use crate::core::llm::TurnCancel;
 use crate::core::observer::{
-    CallStatus, InjectRefusal, InputState, IntegrationStatus, LevelKind, ObserverStatus, OpenAgentRecord, YieldSignals,
+    CallStatus, InjectRefusal, InputState, IntegrationStatus, LevelKind, ObserverStatus, OpenAgentRecord, SHELL_EXITED_TEXT,
+    YieldSignals,
 };
-use crate::core::record::{Cwd, Record, RecordSummary, Source};
+use crate::core::record::{Cwd, Record, RecordSummary, RecordStatus, Source};
 use crate::core::session::{IntegrateOutcome, Session};
 use crate::core::settings::LimitsSettings;
 
@@ -70,6 +71,8 @@ const CLEAR_NO_PROMPT: &str = "the text the user had typed at the prompt was cle
 pub const UNRESPONSIVE_REFUSAL: &str = "cannot run a command now: the shell is not answering (it may be busy, or the connection dropped); use get_screen, or ask the user";
 /// Added to a nested `run_command` result that may be waiting for a password or other input. The agent must not type it.
 pub const INPUT_WAIT_NOTE: &str = "The shell appears to be waiting for a password or other input. Do not type it. Ask the user to handle it, then use get_screen.";
+/// Added to a `run_command` result whose record ended without its end marker because the shell exited while it ran.
+pub const SHELL_EXIT_DURING_RUN_NOTE: &str = "The shell exited while this command ran, so its record is incomplete: its output may be cut short and its exit status is unknown. Nothing more can run in the shell: tell the user to click the \"Start new session\" button in the input bar, and do not retry.";
 /// The next step, when the foreground is a shell or program without integration. Used by the refusal, the screen and the note.
 pub const INTEGRATE_HINT: &str = "Call request_integration to ask for it.";
 /// The refusal for `request_integration` while the shell waits for a password or passphrase: the loader must not be typed there.
@@ -270,6 +273,18 @@ pub struct WaitView {
     pub record: Option<Record>,
 }
 
+/// The session's state as the agent loop reads it for each model call (see `AgentTools::session_facts`).
+#[derive(Debug, Clone)]
+pub struct SessionFacts {
+    pub state: InputState,
+    pub integration: IntegrationStatus,
+    pub observer: ObserverStatus,
+    /// (rows, cols)
+    pub size: (u16, u16),
+    /// The local shell's directory and host (OSC 7), when known.
+    pub cwd: Option<Cwd>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolSchema {
     pub name: &'static str,
@@ -324,6 +339,11 @@ pub trait AgentTools {
     /// after `run_command` to add `TYPED_CLEARED_NOTE`. Defaults to false (a fake clears nothing).
     fn take_typed_cleared(&self) -> bool {
         false
+    }
+    /// The session's live facts, read per model call for the environment note and the exit notes (see `SessionFacts`).
+    /// None for a fake without a shell, so it gets no such note.
+    fn session_facts(&self) -> Option<SessionFacts> {
+        None
     }
     /// Checks that `request_integration` may start now, and returns the label of the shell it would integrate (the command
     /// that holds the foreground). The error is the text the model reads. Writes nothing. A fake without a shell refuses.
@@ -392,11 +412,15 @@ pub trait AgentTools {
                     RunOutcome::Running { reason, .. } => Some(*reason),
                     _ => None,
                 };
+                let exited_during = exited_during_run(&outcome, self.session_facts().map(|f| f.state));
                 let mut value = to_json(outcome)?;
                 let mut notes: Vec<String> = clamp_note.into_iter().collect();
                 if cleared {
                     value["typed_text_cleared"] = json!(true);
                     notes.push(TYPED_CLEARED_NOTE.to_string());
+                }
+                if exited_during {
+                    notes.push(SHELL_EXIT_DURING_RUN_NOTE.to_string());
                 }
                 // The do-not-type note. A password-like prompt always gets it. A remote shell never does: its hint says what to
                 // do, and that shell is ready for a request, not waiting for input. Otherwise, in a nested shell, a call that
@@ -652,7 +676,20 @@ impl AgentTools for SessionTools<'_> {
         self.typed_cleared.replace(false)
     }
 
+    fn session_facts(&self) -> Option<SessionFacts> {
+        Some(SessionFacts {
+            state: self.session.state(),
+            integration: self.session.integration_status(),
+            observer: self.session.observer_status(),
+            size: self.session.screen_snapshot().size,
+            cwd: self.session.cwd(),
+        })
+    }
+
     fn integration_precheck(&self) -> Result<String, String> {
+        if self.session.state() == InputState::Exited {
+            return Err(format!("cannot integrate the shell now: {SHELL_EXITED_TEXT}"));
+        }
         if let Some(reason) = self.session.integration_refusal() {
             return Err(integration_refusal_text(&reason));
         }
@@ -809,10 +846,14 @@ impl SessionTools<'_> {
     /// Why `run_command` cannot run now, when the shell is not live or not at an idle prompt. None when it may run.
     /// `run_command` and `run_command_precheck` both use it, so the refusals match.
     fn not_at_prompt(&self) -> Option<String> {
+        // An exited shell is named first: it is not live either, and the user must start a new session, not wait.
+        let state = self.session.state();
+        if state == InputState::Exited {
+            return Some(not_at_prompt_text(state, None, None));
+        }
         if self.session.integration_status() != IntegrationStatus::Live {
             return Some("shell integration is not live, so commands cannot be run".into());
         }
-        let state = self.session.state();
         (state != InputState::Prompt).then(|| {
             // The agent's own command, when it is open: the one on top, else the innermost parked one.
             let agent = self.session.open_agent_records();
@@ -1003,11 +1044,21 @@ pub fn age_text(age: Duration) -> String {
     }
 }
 
+/// Whether a `run_command` outcome is a record that ended without its end marker because the shell exited (`state` is the
+/// shell's state after the call). Only a finished record can be incomplete this way.
+pub fn exited_during_run(outcome: &RunOutcome, state: Option<InputState>) -> bool {
+    matches!(outcome, RunOutcome::Finished { record } if record.status == RecordStatus::Incomplete)
+        && state == Some(InputState::Exited)
+}
+
 /// The refusal for a `run_command` when the shell is not at an idle prompt. The text starts with the plain refusal
 /// either way. When the agent's own command is open, the text names its id and says to wait for it. While a command runs
 /// and the hint names a program, it says what runs and what the agent can do: read the screen, wait, and ask the user to
 /// leave a program without shell integration.
 pub fn not_at_prompt_text(state: InputState, foreground: Option<&Foreground>, agent: Option<&OpenAgentRecord>) -> String {
+    if state == InputState::Exited {
+        return format!("cannot run a command now: {SHELL_EXITED_TEXT}");
+    }
     if state == InputState::Unresponsive {
         return UNRESPONSIVE_REFUSAL.to_string();
     }
@@ -1676,5 +1727,53 @@ mod tests {
         let keys = by_name("send_keys").parameters;
         assert!(keys["properties"]["text"].is_object() && keys["properties"]["keys"].is_object(), "{keys}");
         assert!(keys["properties"].get("bytes").is_none(), "{keys}");
+    }
+
+    /// The refusal for an exited shell names the exit, the "Start new session" button and not retrying, and never the
+    /// "not at an idle prompt" wording of a busy shell.
+    #[test]
+    fn an_exited_shell_refusal_says_to_start_a_new_session_and_not_to_retry() {
+        let text = not_at_prompt_text(InputState::Exited, None, None);
+        assert_eq!(text, format!("cannot run a command now: {SHELL_EXITED_TEXT}"));
+        for phrase in ["exited or crashed", "\"Start new session\" button in the input bar", "Do not retry"] {
+            assert!(text.contains(phrase), "{text}");
+        }
+        assert!(!text.contains("idle prompt") && !text.contains("Exited,"), "{text}");
+    }
+
+    fn finished_run(status: RecordStatus) -> RunOutcome {
+        RunOutcome::Finished {
+            record: Record {
+                id: 4,
+                command: "sleep 9".into(),
+                source: Source::Agent { call_id: "run-4".into() },
+                shell_pid: None,
+                cwd: None,
+                level: 0,
+                location: None,
+                exit_code: None,
+                pipestatus: Vec::new(),
+                status,
+                used_alt_screen: false,
+                output: String::new(),
+                output_truncated: false,
+                raw_head: Vec::new(),
+                raw_tail: Vec::new(),
+                raw_truncated: false,
+            },
+        }
+    }
+
+    /// The exit note goes with an incomplete record only when the shell has exited: a record that ended some other way
+    /// (a new prompt arrived first) is incomplete too, but the shell is alive.
+    #[test]
+    fn the_exit_note_is_for_an_incomplete_record_when_the_shell_exited() {
+        let incomplete = finished_run(RecordStatus::Incomplete);
+        assert!(exited_during_run(&incomplete, Some(InputState::Exited)));
+        assert!(!exited_during_run(&incomplete, Some(InputState::Prompt)), "the shell is alive");
+        assert!(!exited_during_run(&incomplete, None), "no shell facts, no note");
+        assert!(!exited_during_run(&finished_run(RecordStatus::Complete), Some(InputState::Exited)), "a complete record");
+        assert!(!exited_during_run(&RunOutcome::NotRun { reason: NotRunReason::Abandoned }, Some(InputState::Exited)));
+        assert!(SHELL_EXIT_DURING_RUN_NOTE.contains("\"Start new session\" button in the input bar"));
     }
 }

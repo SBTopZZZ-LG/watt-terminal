@@ -27,7 +27,7 @@ use crate::core::llm::TurnCancel;
 use crate::core::observer::OpenAgentRecord;
 use crate::core::record::RecordSummary;
 use crate::core::session::{Session, USER_TEXT_CODE};
-use crate::core::tools::{AgentTools, TopLevel, integration_result};
+use crate::core::tools::{AgentTools, SessionFacts, TopLevel, integration_result};
 
 pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -49,6 +49,19 @@ pub enum AutoState {
     On,
     /// On, but switched on in another shell level. The calls here ask.
     Suspended,
+}
+
+/// How `run_command` is approved at this moment, for the agent's environment note (see `AgentCtx::approval_mode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunApproval {
+    /// Every `run_command` asks the user.
+    Manual,
+    /// The saved allow and deny rules decide; a command the rules do not allow asks.
+    Rules,
+    /// Approve-all is on for the shell on top: its calls run without a card.
+    ApproveAll,
+    /// Approve-all is on in another shell level, so it is suspended here: calls ask.
+    ApproveAllSuspended,
 }
 
 /// How a pending ask ended: the user's yes or no (a cancel counts as no), or no answer before the timeout.
@@ -418,6 +431,23 @@ impl<'a> AgentCtx<'a> {
     /// The agent's own open commands at this moment (see `AgentTools::open_agent_records`). Read per model call.
     pub fn open_agent_records(&self) -> Vec<OpenAgentRecord> {
         self.tools.open_agent_records()
+    }
+
+    /// The session's live facts at this moment (see `AgentTools::session_facts`). Read per model call. None without a shell.
+    pub fn session_facts(&self) -> Option<SessionFacts> {
+        self.tools.session_facts()
+    }
+
+    /// How `run_command` is approved at this moment, as the agent loop describes it: approve-all when it covers the shell on
+    /// top (or is switched on in another shell and suspended here), else the saved rules, else manual.
+    pub fn approval_mode(&self) -> RunApproval {
+        let top = self.tools.top_level();
+        match self.approvals.auto_state_across(top.key, self.rules.follow_local_in_nested) {
+            AutoState::On => RunApproval::ApproveAll,
+            AutoState::Suspended => RunApproval::ApproveAllSuspended,
+            AutoState::Off if self.policy.uses_rules() => RunApproval::Rules,
+            AutoState::Off => RunApproval::Manual,
+        }
     }
 
     /// A finished command's summary, by id (see `AgentTools::finished_summary`).
@@ -2135,6 +2165,30 @@ mod tests {
         assert_eq!(*tools.integrate_calls.lock().unwrap(), 0);
         assert_eq!(phases(&log), ["asking", "done"]);
         assert_eq!(decisions(&log), [named("request_integration", "denied", false)]);
+    }
+
+    /// The approval mode the environment note reads: manual by default (the default policy asks every call), approve-all on
+    /// the shell it was switched on in, and suspended in another shell level.
+    #[test]
+    fn the_approval_mode_is_manual_then_approve_all_here_or_suspended_elsewhere() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let emit = |_: AgentEvent| {};
+        assert_eq!(AgentCtx::new(&tools, &gate, &emit).approval_mode(), RunApproval::Manual);
+        gate.set_auto_approve(true, 0);
+        assert_eq!(AgentCtx::new(&tools, &gate, &emit).approval_mode(), RunApproval::ApproveAll);
+        gate.set_auto_approve(true, 1);
+        assert_eq!(AgentCtx::new(&tools, &gate, &emit).approval_mode(), RunApproval::ApproveAllSuspended);
+        // A policy that uses the saved rules (any policy but the manual one) reads as rules.
+        struct Rules;
+        impl ApprovalPolicy for Rules {
+            fn decide(&self, _tool: &str, _args: &Value, _nested: bool) -> Verdict {
+                Verdict::Ask(Reason::ManualMode)
+            }
+        }
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let ctx = AgentCtx::new(&tools, &gate, &emit).with_policy(&Rules);
+        assert_eq!(ctx.approval_mode(), RunApproval::Rules);
     }
 
     /// Approve-all is for commands: it does not answer an integration ask.

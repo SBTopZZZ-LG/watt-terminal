@@ -15,7 +15,7 @@ use watt_terminal_lib::core::observer::{InputState, IntegrationStatus, ObserverS
 use watt_terminal_lib::core::pty::OutputSink;
 use watt_terminal_lib::core::record::{Record, RecordStatus, Source};
 use watt_terminal_lib::core::session::{Session, SpawnConfig, SubmitError, USER_TEXT_CODE};
-use watt_terminal_lib::core::tools::{AgentTools, DEFAULT_RUN_WAIT, NotRunReason, RunOutcome, SessionTools};
+use watt_terminal_lib::core::tools::{AgentTools, DEFAULT_RUN_WAIT, NotRunReason, RunOutcome, SessionTools, WaitReason};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 const WAIT: Duration = Duration::from_secs(30);
@@ -717,6 +717,44 @@ fn a_shell_that_exits_by_itself_reports_exited() {
     s.submit(Source::User, "exit").expect("submit exit at an idle prompt");
     wait_exited_within(&s, Duration::from_secs(3));
     assert!(wait_until(|| (!process_alive(pid)).then_some(())).is_some(), "shell pid {pid} is still running after exit");
+    drop_within(s, Duration::from_secs(5));
+}
+
+/// After the shell exits, the agent's run_command is refused with the exit text (nothing is sent), and a wait returns at once
+/// with the session_exited reason. Real PowerShell.
+#[test]
+fn an_exited_shell_refuses_run_command_and_wait_with_the_start_new_session_text() {
+    let _g = serial();
+    let s = start("win-exit-agent");
+    wait_prompt(&s);
+    s.submit(Source::User, "exit").expect("submit exit at an idle prompt");
+    wait_exited_within(&s, Duration::from_secs(3));
+    let tools = SessionTools::new(&s);
+    let err = tools.run_command("echo after-exit", DEFAULT_RUN_WAIT, None).expect_err("an exited shell runs nothing");
+    assert!(err.starts_with("cannot run a command now: the shell exited or crashed"), "{err}");
+    assert!(err.contains("\"Start new session\" button in the input bar") && err.contains("Do not retry"), "{err}");
+    assert!(tools.run_command_precheck().is_err(), "the precheck refuses the same way, before any approval card");
+    let integrate = tools.integration_precheck().expect_err("an exited shell cannot be integrated");
+    assert!(integrate.starts_with("cannot integrate the shell now: the shell exited or crashed"), "{integrate}");
+    let view = tools.wait(1, false, None).expect("a wait on an exited shell returns at once");
+    assert_eq!(view.reason, WaitReason::SessionExited);
+    assert!(s.records().iter().all(|r| !r.command.contains("after-exit")), "nothing ran: {:?}", s.records());
+    drop_within(s, Duration::from_secs(5));
+}
+
+/// A run_command whose command exits the shell says so in its result (the record is incomplete, and nothing more can run).
+#[test]
+fn a_command_that_exits_the_shell_says_so_in_its_result() {
+    let _g = serial();
+    let s = start("win-exit-during-run");
+    wait_prompt(&s);
+    let tools = SessionTools::new(&s);
+    let value = tools.call("run_command", &json!({"command": "exit", "wait_seconds": 5}), None).expect("the call returns");
+    assert_eq!(value["outcome"], "finished", "{value}");
+    assert_eq!(value["record"]["status"], "incomplete", "{value}");
+    let note = value["note"].as_str().expect("a note");
+    assert!(note.contains("The shell exited while this command ran"), "{note}");
+    assert!(note.contains("\"Start new session\" button in the input bar") && note.contains("do not retry"), "{note}");
     drop_within(s, Duration::from_secs(5));
 }
 
