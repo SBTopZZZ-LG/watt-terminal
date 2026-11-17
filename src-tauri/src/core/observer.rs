@@ -1149,9 +1149,24 @@ impl Core {
                     self.finish_record(open, Some(exit), pipestatus, RecordStatus::Complete);
                 }
             }
-            Event::ScrollRegion | Event::ScreenClear => {
+            Event::ScrollRegion => {
                 if let Some(open) = self.parser.callbacks_mut().open.as_mut() {
                     open.approximate = true;
+                }
+            }
+            Event::ScreenClear => {
+                // A clear that blanks the whole screen and leaves the cursor on row N (ConPTY's Clear-Host, zsh's clear) moves
+                // the output after it to row N. Re-anchor the record there when its start is below that row, or every row the
+                // record would read is already past the cursor. A clear over content (a progress bar's home) does not move it.
+                let (screen, cb) = self.parser.screen_and_callbacks_mut();
+                let (crow, _) = screen.cursor_position();
+                let home = cb.scrolled_total + u64::from(crow);
+                let cols = screen.size().1.get();
+                if let Some(open) = cb.open.as_mut() {
+                    open.approximate = true;
+                    if open.start_abs > home && !screen.alternate_screen() && screen.rows(0, cols).all(|row| row.trim().is_empty()) {
+                        open.start_abs = home;
+                    }
                 }
             }
             Event::Cwd { host, path } => {
@@ -2175,6 +2190,117 @@ mod tests {
         let mut idle = core();
         idle.handle(Event::ScreenClear);
         assert!(idle.records().is_empty());
+    }
+
+    /// A pwsh or zsh command record opened below 40 lines of output, with the cursor on row 14 (mid-screen, rows below
+    /// erased). pwsh sends C before its newline and zsh after it, as in `shell_command`.
+    fn record_mid_screen(sh: &str, command: &str) -> Core {
+        let mut c = Core::new(LOCAL, (30, 120));
+        c.feed(&tagged("633;Hello", LOCAL, &format!(";v=1;sh={sh};pid=1")));
+        c.feed(&numbered_lines("before", 1, 40));
+        c.feed(b"\x1b[15;1H\x1b[J");
+        c.feed(&tagged("133;A", LOCAL, ""));
+        c.feed(b"PS> ");
+        c.feed(&tagged("133;B", LOCAL, ""));
+        c.feed(command.as_bytes());
+        c.feed(&tagged("633;E", LOCAL, &format!(";{command}")));
+        if sh == "pwsh" {
+            c.feed(&tagged("133;C", LOCAL, ""));
+            c.feed(b"\r\n");
+        } else {
+            c.feed(b"\r\n");
+            c.feed(&tagged("133;C", LOCAL, ""));
+        }
+        c
+    }
+
+    /// The start row of the open record (its absolute index).
+    fn anchor(c: &mut Core) -> u64 {
+        c.parser.callbacks_mut().open.as_ref().expect("an open record").start_abs
+    }
+
+    /// The bytes ConPTY sends for pwsh's Clear-Host (captured from pwsh 7.6.9): home, erase each row, then ED3 and the same
+    /// again. No ED2, and the old content is not sent again.
+    fn conpty_clear_host() -> Vec<u8> {
+        let mut v = b"\x1b[?25l\x1b[m\r\n\x1b[H".to_vec();
+        for _ in 0..29 {
+            v.extend_from_slice(b"\x1b[K\r\n");
+        }
+        v.extend_from_slice(b"\x1b[K\x1b[H\x1b[?25h\x1b[?25l\x1b[3J");
+        for _ in 0..29 {
+            v.extend_from_slice(b"\x1b[K\r\n");
+        }
+        v.extend_from_slice(b"\x1b[K\x1b[H\x1b[?25h");
+        v
+    }
+
+    /// A clear that homes the cursor and blanks the screen (ConPTY's Clear-Host): the record keeps what is printed after it.
+    #[test]
+    fn a_conpty_clear_host_keeps_the_output_after_it() {
+        let mut c = record_mid_screen("pwsh", "Clear-Host");
+        c.feed(&conpty_clear_host());
+        c.feed(b"after-clear\r\n");
+        c.feed(&tagged("133;D", LOCAL, ";exit=0;ps=0"));
+        let rec = c.get_record(1).expect("record");
+        assert!(rec.output.contains("after-clear"), "output={:?}", rec.output);
+        assert_eq!(rec.status, RecordStatus::Approximate);
+    }
+
+    /// macOS `clear` (zsh) sends home, ED2 and ED3: the same record keeps the output printed after it.
+    #[test]
+    fn a_zsh_clear_keeps_the_output_after_it() {
+        let mut c = record_mid_screen("zsh", "clear");
+        c.feed(b"\x1b[H\x1b[2J\x1b[3J");
+        c.feed(b"after-clear\r\n");
+        c.feed(&tagged("133;D", LOCAL, ";exit=0;ps=0"));
+        let rec = c.get_record(1).expect("record");
+        assert!(rec.output.contains("after-clear"), "output={:?}", rec.output);
+        assert_eq!(rec.status, RecordStatus::Approximate);
+    }
+
+    /// A bare ED3 with content on screen is not a clear of the screen: the anchor stays and the output is kept.
+    #[test]
+    fn a_bare_ed3_mid_output_keeps_the_anchor() {
+        let mut c = record_mid_screen("pwsh", "Get-Stuff");
+        c.feed(b"out-1\r\nout-2\r\n");
+        let before = anchor(&mut c);
+        c.feed(b"\x1b[3J");
+        assert_eq!(anchor(&mut c), before);
+        c.feed(b"out-3\r\n");
+        c.feed(&tagged("133;D", LOCAL, ";exit=0;ps=0"));
+        assert_eq!(c.get_record(1).expect("record").output, "out-1\nout-2\nout-3");
+    }
+
+    /// A temporary home (a progress bar) over content, then a cursor move back: the anchor stays and the output is kept.
+    #[test]
+    fn a_temporary_home_over_content_keeps_the_anchor() {
+        let mut c = record_mid_screen("pwsh", "Get-Stuff");
+        c.feed(b"out-1\r\nout-2\r\n");
+        let before = anchor(&mut c);
+        let (row, _) = c.parser.screen().cursor_position();
+        c.feed(b"\x1b[H");
+        assert_eq!(anchor(&mut c), before);
+        c.feed(format!("\x1b[{};1H", row + 1).as_bytes());
+        c.feed(b"out-3\r\n");
+        c.feed(&tagged("133;D", LOCAL, ";exit=0;ps=0"));
+        assert_eq!(c.get_record(1).expect("record").output, "out-1\nout-2\nout-3");
+    }
+
+    /// A ConPTY resize repaint over content (home, reprint the rows, cursor back) leaves the anchor where it was.
+    #[test]
+    fn a_resize_repaint_frame_over_content_keeps_the_anchor() {
+        let mut c = record_mid_screen("pwsh", "Get-Stuff");
+        c.feed(b"out-1\r\nout-2\r\n");
+        let before = anchor(&mut c);
+        let (row, _) = c.parser.screen().cursor_position();
+        c.feed(b"\x1b[?25l\x1b[8;50;100t\x1b[H");
+        assert_eq!(anchor(&mut c), before);
+        c.feed(b"\x1b[Kout-1\r\n\x1b[Kout-2\r\n");
+        for _ in 0..27 {
+            c.feed(b"\x1b[K\r\n");
+        }
+        c.feed(format!("\x1b[K\x1b[{};1H\x1b[?25h", row + 1).as_bytes());
+        assert_eq!(anchor(&mut c), before);
     }
 
     #[test]

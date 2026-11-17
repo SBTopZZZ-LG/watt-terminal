@@ -754,3 +754,21 @@ fn a_line_with_a_parse_error_finishes_and_the_next_command_runs() {
     };
     assert_eq!((ok.exit_code, ok.output.as_str()), (Some(0), "ok"));
 }
+
+/// Clear-Host through the agent's run_command, after output on screen: the record keeps the output printed after the clear.
+#[test]
+fn agent_clear_host_keeps_the_output_after_it() {
+    let _g = serial();
+    let s = start("win-clear-host");
+    wait_prompt(&s);
+    let tools = SessionTools::new(&s);
+    let RunOutcome::Finished { .. } = tools.run_command("1..40 | ForEach-Object { \"line-$_\" }", DEFAULT_RUN_WAIT, None).expect("run_command")
+    else {
+        panic!("the output lines did not finish");
+    };
+    let RunOutcome::Finished { record } = tools.run_command("Clear-Host; echo after-clear", DEFAULT_RUN_WAIT, None).expect("run_command")
+    else {
+        panic!("the Clear-Host command did not finish; state={:?}", s.state());
+    };
+    assert!(record.output.contains("after-clear"), "output={:?} status={:?}", record.output, record.status);
+}
