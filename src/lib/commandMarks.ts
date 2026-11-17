@@ -84,6 +84,13 @@ export class CommandMarks {
       }
       return false;
     });
+    // Windows ConPTY clears with EL rows and a home, never ESC[2J. Runs before the cursor moves, as above.
+    term.parser.registerCsiHandler({ final: 'H' }, (params) => {
+      if (isHome(params)) {
+        this.clearBlankViewport();
+      }
+      return false;
+    });
   }
 
   /** Shell event C: a command is starting. */
@@ -300,6 +307,35 @@ export class CommandMarks {
   }
 
   /**
+   * A home over a blank viewport is a clear: ConPTY erases the rows with EL, which leaves xterm's markers alive, so
+   * this runs the ESC[2J erase and disposes the separator lines on those rows. A home over text is a cursor move (a
+   * progress bar, a resize repaint), so nothing happens. Runs before the cursor moves, while the rows are in place.
+   */
+  private clearBlankViewport(): void {
+    const buf = this.term.buffer.active;
+    if (buf.type === 'alternate' || !this.viewportBlank()) {
+      return;
+    }
+    this.eraseViewport();
+    for (const sep of this.separatorMarkers) {
+      if (sep.line >= buf.baseY) {
+        sep.dispose();
+      }
+    }
+  }
+
+  /** True when every viewport row is empty. Stops at the first row with text, so it is cheap while output is shown. */
+  private viewportBlank(): boolean {
+    const buf = this.term.buffer.active;
+    for (let y = buf.baseY; y < buf.length; y++) {
+      if (buf.getLine(y)?.translateToString(true) !== '') {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
    * The rows a mark covers, inclusive, or null when it has no stripe. A finished mark with no end marker has none.
    */
   private range(mark: Mark): { start: number; end: number } | null {
@@ -349,6 +385,15 @@ export class CommandMarks {
     const cursorRow = buf.baseY + buf.cursorY;
     return buf.cursorX > 0 ? cursorRow : cursorRow - 1;
   }
+}
+
+/** CSI H with no parameters, 0, or 1;1: the cursor goes to the top left. Other positions are not a clear. */
+function isHome(params: (number | number[])[]): boolean {
+  return (
+    params.length === 0 ||
+    (params.length === 1 && params[0] === 0) ||
+    (params.length === 2 && params[0] === 1 && params[1] === 1)
+  );
 }
 
 export function exitClass(exit: Exit | null): StripeExit {

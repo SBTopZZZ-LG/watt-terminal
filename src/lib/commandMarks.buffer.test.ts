@@ -10,8 +10,8 @@ import { badgeOnSeparator, separatorSegments, stripeSegments } from './stripes';
 
 const { Terminal } = pkg;
 
-function makeTerminal(scrollback: number) {
-  return new Terminal({ cols: 80, rows: 10, scrollback, allowProposedApi: true });
+function makeTerminal(scrollback: number, rows = 10) {
+  return new Terminal({ cols: 80, rows, scrollback, allowProposedApi: true });
 }
 
 /** Resolves once xterm has parsed the bytes. */
@@ -421,5 +421,143 @@ describe('the agent badge on the separator, on a real buffer', () => {
     const [, cmd2] = marks.stripes();
     expect(cmd2.separatorRow).toBe(1);
     expect(badgeOnSeparator(cmd2.separatorRow, (row) => isBlank(term, row))).toBe(false);
+  });
+});
+
+/**
+ * The bytes Windows ConPTY sends for Clear-Host on a terminal of `rows` rows (captured on Windows 11, pwsh 7.6). There
+ * is no ESC[2J: each pass homes the cursor and erases every row with EL, then the second pass adds ESC[3J.
+ */
+function conptyClear(rows: number): string {
+  const eraseRows = '\x1b[K\r\n'.repeat(rows - 1);
+  const pass1 = `\x1b[?25l\x1b[m\r\n\x1b[H${eraseRows}\x1b[K\x1b[H\x1b[?25h`;
+  const pass2 = `\x1b[?25l\x1b[3J${eraseRows}\x1b[K\x1b[H\x1b[?25h`;
+  return pass1 + pass2;
+}
+
+/** A ConPTY resize repaint: home, the viewport's rows sent again over the same content, cursor back on the bottom row. */
+function resizeRepaint(term: InstanceType<typeof Terminal>, rows: number): string {
+  const buf = term.buffer.active;
+  let out = '\x1b[?25l\x1b[8;50;100t\x1b[H';
+  for (let y = 0; y < rows; y++) {
+    const text = buf.getLine(buf.viewportY + y)?.translateToString(true) ?? '';
+    out += y < rows - 1 ? `${text}\x1b[K\r\n` : `${text}\x1b[K`;
+  }
+  return `${out}\x1b[${rows};1H\x1b[?25h`;
+}
+
+/**
+ * On a 30-row terminal: a finished command that reaches into the scrollback, its prompt, then a command that starts
+ * and finishes in the viewport, and its prompt. The cursor ends on the bottom row.
+ */
+async function markedSession(term: InstanceType<typeof Terminal>, marks: CommandMarks): Promise<void> {
+  marks.commandStart();
+  await write(term, lines('out', 40));
+  marks.commandEnd(0);
+  marks.promptStart();
+  await write(term, '$ ');
+  marks.commandStart();
+  await write(term, 'Get-Date\r\n');
+  marks.commandEnd(0);
+  marks.promptStart();
+  await write(term, '$ ');
+}
+
+describe('a clear without ESC[2J (Windows ConPTY), on a real buffer', () => {
+  it('Clear-Host clears the stripes and separators on the cleared rows, and the next command gets its own marks', async () => {
+    const term = makeTerminal(100, 30);
+    const marks = new CommandMarks(term as unknown as MarksTerminal);
+    await markedSession(term, marks);
+    expect(marks.stripes()).toEqual([
+      { start: 0, end: 39, exit: 'ok', agent: false, separatorRow: null },
+      { start: 40, end: 40, exit: 'ok', agent: false, separatorRow: 40 },
+    ]);
+    expect(separatorRows(marks)).toEqual([40, 41]);
+
+    marks.commandStart();
+    await write(term, 'Clear-Host; echo after-clear');
+    await write(term, conptyClear(30));
+    await write(term, 'after-clear\r\n');
+    marks.commandEnd(0);
+    marks.promptStart();
+    await write(term, '$ ');
+    expect(marks.stripes()).toEqual([]);
+    expect(marks.separators()).toEqual([]);
+
+    marks.commandStart();
+    await write(term, 'Get-Date\r\n');
+    marks.commandEnd(0);
+    marks.promptStart();
+    await write(term, '$ ');
+    const buf = term.buffer.active;
+    expect(marks.stripes()).toEqual([{ start: 1, end: 1, exit: 'ok', agent: false, separatorRow: null }]);
+    expect(marks.separators()).toEqual([{ row: 2, agent: false }]);
+    expect(stripeSegments(marks.stripes(), buf.viewportY, 30)).toEqual([expect.objectContaining({ firstRow: 1 })]);
+  });
+
+  it('a home over text in the viewport leaves the marks alone', async () => {
+    const term = makeTerminal(100, 30);
+    const marks = new CommandMarks(term as unknown as MarksTerminal);
+    await markedSession(term, marks);
+    const stripes = marks.stripes();
+    const separators = marks.separators();
+    await write(term, '\x1b[H');
+    expect(marks.stripes()).toEqual(stripes);
+    expect(marks.separators()).toEqual(separators);
+  });
+
+  it('a resize repaint frame over text leaves the marks alone', async () => {
+    const term = makeTerminal(100, 30);
+    const marks = new CommandMarks(term as unknown as MarksTerminal);
+    await markedSession(term, marks);
+    const stripes = marks.stripes();
+    const separators = marks.separators();
+    await write(term, resizeRepaint(term, 30));
+    expect(term.buffer.active.type).toBe('normal');
+    expect(marks.stripes()).toEqual(stripes);
+    expect(marks.separators()).toEqual(separators);
+  });
+
+  it('a bare ESC[3J over text leaves the viewport marks alone', async () => {
+    const term = makeTerminal(100, 30);
+    const marks = new CommandMarks(term as unknown as MarksTerminal);
+    marks.commandStart();
+    await write(term, 'out 0\r\nout 1\r\n');
+    marks.commandEnd(0);
+    marks.promptStart();
+    await write(term, '$ ');
+    const stripes = marks.stripes();
+    const separators = marks.separators();
+    expect(stripes).toHaveLength(1);
+    await write(term, '\x1b[3J');
+    expect(marks.stripes()).toEqual(stripes);
+    expect(marks.separators()).toEqual(separators);
+  });
+
+  it('a home on the blank viewport after ESC[2J leaves the same marks as ESC[2J alone', async () => {
+    const alone = makeTerminal(100, 30);
+    const aloneMarks = new CommandMarks(alone as unknown as MarksTerminal);
+    await markedSession(alone, aloneMarks);
+    await write(alone, '\x1b[2J');
+
+    const withHome = makeTerminal(100, 30);
+    const homeMarks = new CommandMarks(withHome as unknown as MarksTerminal);
+    await markedSession(withHome, homeMarks);
+    await write(withHome, '\x1b[2J');
+    await write(withHome, '\x1b[H');
+
+    expect(aloneMarks.stripes()).toEqual([{ start: 0, end: 11, exit: 'ok', agent: false, separatorRow: null }]);
+    expect(homeMarks.stripes()).toEqual(aloneMarks.stripes());
+    expect(homeMarks.separators()).toEqual(aloneMarks.separators());
+    expect(homeMarks.separators()).toEqual([]);
+  });
+
+  it('the macOS clear ESC[H ESC[2J ESC[3J still erases the viewport marks', async () => {
+    const term = makeTerminal(100, 30);
+    const marks = new CommandMarks(term as unknown as MarksTerminal);
+    await markedSession(term, marks);
+    await write(term, '\x1b[H\x1b[2J\x1b[3J');
+    expect(marks.separators()).toEqual([]);
+    expect(marks.stripes()).toEqual([]);
   });
 });
