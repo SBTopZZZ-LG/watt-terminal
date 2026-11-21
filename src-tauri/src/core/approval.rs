@@ -346,9 +346,10 @@ fn hard_gate(command: &str) -> Option<Reason> {
         return Some(Reason::GateChars);
     }
     // The charset allows only spaces, so this is the first word. It must be a plain command name: an assignment prefix
-    // (`FOO=1 rm`), an equals expansion (`=ls`), a path (`./x`) or a leading `-` would hide the program from the list.
+    // (`FOO=1 rm`), an equals expansion (`=ls`), a path (`./x`), a drive-relative Windows path (`c:cmd.exe`, which
+    // runs `cmd.exe` on drive C) or a leading `-` would hide the program from the list. No macOS command name has a `:`.
     let first = command.split_whitespace().next().unwrap_or_default();
-    if !first.starts_with(|c: char| c.is_ascii_alphanumeric()) || first.contains(['=', '/']) {
+    if !first.starts_with(|c: char| c.is_ascii_alphanumeric()) || first.contains(['=', '/', ':']) {
         return Some(Reason::GatePath);
     }
     // macOS file systems are case-insensitive, so `RM` runs `rm`.
@@ -569,6 +570,18 @@ mod tests {
         for command in ["./x", "../x", "/bin/ls", "bin/ls -l", "./x --flag"] {
             assert_eq!(gate(command), Some(Reason::GatePath), "{command:?}");
         }
+    }
+
+    /// A drive-relative path (`c:cmd.exe` runs cmd.exe on drive C) hides the program: the first word may not hold a `:`.
+    /// A `:` in a later word is an argument, and the first word of a plain command is unchanged.
+    #[test]
+    fn a_drive_relative_first_word_is_refused() {
+        for command in ["c:cmd.exe /c del x", "c:foo", "C:cmd /c x", "c:.exe"] {
+            assert_eq!(gate(command), Some(Reason::GatePath), "{command:?}");
+        }
+        assert_eq!(gate("c:\\windows\\system32\\cmd.exe"), Some(Reason::GateChars), "a backslash path is refused by the charset");
+        assert_eq!(gate("git status"), None);
+        assert_eq!(gate("echo a:b"), None, "a colon in an argument is fine");
     }
 
     #[test]

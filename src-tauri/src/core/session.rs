@@ -302,7 +302,7 @@ impl Session {
         got.recv().map_err(|_| SubmitError::Closed)?
     }
 
-    /// Top-level prompts seen so far (see `Core::prompt_count`).
+    /// Prompts seen so far, at any level (see `Core::prompt_count`).
     pub fn prompt_count(&self) -> u64 {
         self.shared.lock().prompt_count()
     }
@@ -781,10 +781,17 @@ fn pick_windows_shell(path_var: &std::ffi::OsStr, system_root: Option<&std::ffi:
 }
 
 /// The `-Command` text that loads the integration script. The script's text is read and handed to ScriptBlock.Create, so
-/// no execution policy applies. Single quotes in the path are doubled for the PowerShell string.
+/// no execution policy applies. Every PowerShell single-quote character is doubled for the string: ' and the curly quotes
+/// U+2018, U+2019, U+201A and U+201B, which PowerShell also reads as single quotes.
 #[cfg(any(windows, test))]
 fn pwsh_load_command(script: &Path) -> String {
-    let quoted = script.to_string_lossy().replace('\'', "''");
+    let mut quoted = String::new();
+    for c in script.to_string_lossy().chars() {
+        quoted.push(c);
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}') {
+            quoted.push(c);
+        }
+    }
     format!(". ([scriptblock]::Create([IO.File]::ReadAllText('{quoted}')))")
 }
 
@@ -982,6 +989,11 @@ mod tests {
         assert_eq!(
             pwsh_load_command(Path::new("C:\\it's here\\integration.ps1")),
             ". ([scriptblock]::Create([IO.File]::ReadAllText('C:\\it''s here\\integration.ps1')))"
+        );
+        // Each curly single quote that PowerShell reads as a quote is doubled by repeating it.
+        assert_eq!(
+            pwsh_load_command(Path::new("C:\\a\u{2018}b\u{2019}c\u{201a}d\u{201b}e\\x.ps1")),
+            ". ([scriptblock]::Create([IO.File]::ReadAllText('C:\\a\u{2018}\u{2018}b\u{2019}\u{2019}c\u{201a}\u{201a}d\u{201b}\u{201b}e\\x.ps1')))"
         );
     }
 }

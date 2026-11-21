@@ -119,6 +119,8 @@ function global:_WattCwdOsc {
 function global:prompt {
   # First statements capture the previous command's status before anything else runs.
   $ok = $?
+  # The user's own $LASTEXITCODE, not reset by the Enter handler: a failed native command's code is still there for the user.
+  # It is only used when $ok is false (see the D line below).
   $lec = $global:LASTEXITCODE
   # Marker: _WattCheckPrompt finds copies of this block by its text ('watt-prompt-wrapper'). Keep it in the body.
   $null = 'watt-prompt-wrapper'
@@ -221,7 +223,6 @@ $global:WattEnter = {
       $global:WattParseError = $parseError
       $global:WattRan = $true
       $global:WattNoOp = _WattNoOp $line
-      $global:LASTEXITCODE = 0
       # The output starts on the row below the cursor at C (observer.rs), so the cursor must be on the last input row.
       [Microsoft.PowerShell.PSConsoleReadLine]::SetCursorPosition($line.Length)
       _WattOsc ('633;E;n=' + $global:WattNonce + ';' + (_WattEscapeE $line))

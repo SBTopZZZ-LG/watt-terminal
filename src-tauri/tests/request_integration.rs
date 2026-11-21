@@ -13,7 +13,7 @@ use watt_terminal_lib::core::foreground::ForegroundKind;
 use watt_terminal_lib::core::observer::InputState;
 use watt_terminal_lib::core::record::Source;
 use watt_terminal_lib::core::session::Session;
-use watt_terminal_lib::core::tools::{INTEGRATE_PASSWORD_REFUSAL, SessionTools};
+use watt_terminal_lib::core::tools::{AgentTools, DEFAULT_RUN_WAIT, INTEGRATE_PASSWORD_REFUSAL, RunOutcome, SessionTools};
 use common::*;
 use serde_json::{Value, json};
 
@@ -258,6 +258,34 @@ fn the_granted_result_is_text() {
     let ctx = AgentCtx::new(&tools, &gate, &emit);
     let result: Value = ctx.call_tool("request_integration", json!({})).expect("integrated");
     assert!(result.is_string(), "{result}");
+    assert!(wait_state(&s, InputState::Prompt, WAIT));
+    exit_nested(&s);
+}
+
+/// Text the user typed at the integrated nested prompt (no Enter) is cleared by run_command: its Ctrl-C makes a fresh prompt
+/// at the nested level, which run_command waits for. The command then runs in the nested shell, and the text never runs.
+#[test]
+fn typed_text_at_a_nested_prompt_is_cleared_before_run_command() {
+    let _g = serial();
+    let s = nested_zsh_session();
+    let tools = SessionTools::new(&s);
+    let gate = ApprovalGate::with_timeout(Duration::from_secs(5));
+    let emit = |_: AgentEvent| {};
+    let rules = TurnRules { integrate_without_asking: true, ..TurnRules::default() };
+    let ctx = AgentCtx::new(&tools, &gate, &emit).with_rules(rules);
+    ctx.call_tool("request_integration", json!({})).expect("integrated");
+    assert!(wait_state(&s, InputState::Prompt, WAIT), "state {:?}", s.state());
+
+    s.write_user(b"echo user-typed").expect("the user types at the nested prompt");
+    assert!(wait_until(WAIT, || s.user_typed_since_prompt().then_some(())).is_some(), "the typed text is not counted");
+
+    let RunOutcome::Finished { record } = tools.run_command("echo nested-after-clear", DEFAULT_RUN_WAIT, None).expect("run_command")
+    else {
+        panic!("the command did not finish: state {:?}", s.state());
+    };
+    assert_eq!(record.exit_code, Some(0), "output={:?}", record.output);
+    assert_eq!(record.output, "nested-after-clear", "the record holds more than the agent's line");
+    assert!(!s.records().iter().any(|r| r.command.contains("user-typed")), "the user's text ran: {:?}", s.records());
     assert!(wait_state(&s, InputState::Prompt, WAIT));
     exit_nested(&s);
 }

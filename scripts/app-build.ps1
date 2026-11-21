@@ -1,6 +1,7 @@
 # Build Watt as a per-user NSIS installer for this Windows PC.
 # Run with: npm run app:build:win
-# The last line of stdout is INSTALLER=<path to the .exe>. scripts/app-install.ps1 uses that path.
+# The last line of stdout is INSTALLER=<path to the .exe>. scripts/app-install.ps1 does not read that line: it finds the
+# installer itself (Find-Installer: the newest Watt_<version>_*-setup.exe in the nsis folder).
 $ErrorActionPreference = 'Stop'
 
 function Info([string]$msg) { Write-Output "==> $msg" }

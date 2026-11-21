@@ -711,8 +711,8 @@ pub struct Core {
     /// clear them. Kept by `note_user_bytes` (Submitted, Unresponsive, Running) and `note_user_write`. C copies it into
     /// `user_typed`. Cleared with `user_typed` (see `clear_typed`).
     typed_after_submit: bool,
-    /// Prompts (A) seen at the top level, ever. `run_command` reads it before it clears the user's text with Ctrl-C, and
-    /// waits for it to rise: that A is the prompt the command is then submitted to.
+    /// Prompts (A) seen at any level, ever. `run_command` reads it before it clears the user's text with Ctrl-C, and
+    /// waits for it to rise: the A that follows that Ctrl-C is the fresh prompt the command is then submitted to.
     prompts: u64,
     /// Agent calls whose line never ran (see `CallStatus::Abandoned`). Bounded by `ABANDONED_CAP`.
     abandoned: VecDeque<String>,
@@ -1100,9 +1100,9 @@ impl Core {
             Event::Ready { .. } => {}
             Event::PromptStart => {
                 self.desynced = false;
-                if self.top_is_local() {
-                    self.prompts += 1;
-                }
+                // Every prompt counts, at any level. A nested shell's prompt is what a Ctrl-C at that prompt produces, and
+                // the submit path's expected_level check already refuses a command sent after the level changed.
+                self.prompts += 1;
                 self.close_open(RecordStatus::Incomplete);
                 self.last_e = None;
                 // At a nested level a submit that timed out is Unresponsive: its own A is what ends that.
@@ -1684,7 +1684,7 @@ impl Core {
         self.clear_typed();
     }
 
-    /// Top-level prompts seen so far (see the field `prompts`).
+    /// Prompts seen so far, at any level (see the field `prompts`).
     pub fn prompt_count(&self) -> u64 {
         self.prompts
     }
@@ -3321,10 +3321,10 @@ mod tests {
         assert!(!typed.user_typed_since_prompt(), "the agent's Ctrl-C did not clear the typed-text flag");
     }
 
-    /// The prompt count rises with each top-level prompt, and not with a prompt of a nested shell: run_command waits for
-    /// the count to rise after its Ctrl-C, and a nested shell's prompt is not the one the command goes to.
+    /// The prompt count rises with each prompt, at the top level and at a nested shell alike: run_command waits for it to
+    /// rise after its Ctrl-C, and a nested integrated shell's Ctrl-C produces a fresh prompt that the count must see.
     #[test]
-    fn prompt_count_rises_for_top_level_prompts_only() {
+    fn prompt_count_rises_for_every_prompt_at_any_level() {
         let mut c = core();
         assert_eq!(c.prompt_count(), 0);
         c.handle(Event::PromptStart);
@@ -3336,7 +3336,7 @@ mod tests {
         let before = nested.prompt_count();
         nested.handle(Event::PromptStart);
         assert!(!nested.top_is_local());
-        assert_eq!(nested.prompt_count(), before, "a nested shell's prompt counted");
+        assert_eq!(nested.prompt_count(), before + 1, "a nested shell's prompt did not count");
     }
 
     /// The application cursor mode is read from the screen: DECCKM on turns it on.

@@ -18,8 +18,17 @@ $installedExe = Join-Path $installDir 'watt-terminal.exe'
 $desktopLnk = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Watt.lnk'
 $startLnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'Watt.lnk'
 
-$uninstKeys = @(Get-ChildItem -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall' -ErrorAction SilentlyContinue |
-  Where-Object { (Get-ItemProperty -LiteralPath $_.PSPath).DisplayName -eq 'Watt' })
+# The Installed apps entry of this install: DisplayName Watt and InstallLocation is $installDir. Another product can be named
+# Watt, so the name alone is not enough.
+function Get-WattEntries {
+  @(Get-ChildItem -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall' -ErrorAction SilentlyContinue | Where-Object {
+    $p = Get-ItemProperty -LiteralPath $_.PSPath
+    $loc = ([string]$p.InstallLocation).Trim().Trim('"').TrimEnd('\')
+    $p.DisplayName -eq 'Watt' -and $loc -ieq $installDir
+  })
+}
+
+$uninstKeys = Get-WattEntries
 if ($uninstKeys.Count -gt 1) { Fail "found $($uninstKeys.Count) HKCU Uninstall entries named Watt. Remove the extra ones by hand first." }
 
 $running = @(Get-Process -Name 'watt-terminal' -ErrorAction SilentlyContinue |
@@ -50,8 +59,7 @@ for ($i = 0; $i -lt 20; $i++) {
   if (Test-Path -LiteralPath $installDir) { $leftovers += "install dir: $installDir" }
   if (Test-Path -LiteralPath $desktopLnk) { $leftovers += "Desktop shortcut: $desktopLnk" }
   if (Test-Path -LiteralPath $startLnk) { $leftovers += "Start Menu shortcut: $startLnk" }
-  $left = @(Get-ChildItem -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall' -ErrorAction SilentlyContinue |
-    Where-Object { (Get-ItemProperty -LiteralPath $_.PSPath).DisplayName -eq 'Watt' })
+  $left = Get-WattEntries
   if ($left.Count -gt 0) { $leftovers += "Installed apps entry: $($left[0].Name)" }
   if ($leftovers.Count -eq 0) { break }
   [System.Threading.Thread]::Sleep(500)

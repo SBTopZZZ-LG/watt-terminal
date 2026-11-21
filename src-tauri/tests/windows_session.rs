@@ -530,6 +530,25 @@ fn no_op_lines_after_a_failed_command_exit_zero() {
     assert_eq!(func.exit_code, Some(0), "function definition after a failed command");
 }
 
+/// The Enter handler must not reset the user's $LASTEXITCODE: after a native failure, the next line still sees its code.
+/// The recorded codes stay right: the echo is a success (0), and a cmdlet failure with no earlier native failure is 1.
+#[test]
+fn last_exit_code_is_still_set_on_the_next_line() {
+    let _g = serial();
+    let s = start("win-lastexit");
+    let native = run(&s, "cmd /c exit 3");
+    assert_eq!(native.exit_code, Some(3), "native exit code; pipestatus={:?}", native.pipestatus);
+    let echo = run(&s, "echo $LASTEXITCODE");
+    assert_eq!(echo.exit_code, Some(0), "the echo is a success; output={:?}", echo.output);
+    assert_eq!(echo.output, "3", "the user's $LASTEXITCODE after the native failure");
+    drop_within(s, Duration::from_secs(5));
+
+    let s = start("win-cmdlet-fail");
+    let fail = run(&s, "Get-Item -LiteralPath 'C:\\watt-no-such-path-probe'");
+    assert_eq!(fail.exit_code, Some(1), "a cmdlet failure with no native failure before it; output={:?}", fail.output);
+    drop_within(s, Duration::from_secs(5));
+}
+
 #[test]
 fn open_block_is_a_continuation_until_it_is_closed() {
     let _g = serial();
