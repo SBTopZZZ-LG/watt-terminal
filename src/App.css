@@ -113,6 +113,52 @@ input {
   color: inherit;
 }
 
+/*
+ * Selection and native drags. The app is not a web page, so chrome text is not selectable: html and body are none, and
+ * only the text a user copies is allow-listed in the next block. To make more text selectable, add its selector there.
+ * Form fields are listed explicitly, because WebKit needs it when body is none. .xterm (its own rule in xterm.css) draws
+ * its own selection. .md-code-copy (the copy button in a code block) stays none (see its rule below the markdown styles).
+ */
+html,
+body {
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: default;
+}
+
+.msg,
+.msg .md,
+.tool pre,
+.tool-detail,
+.notice,
+.question-error,
+.chip-model,
+.chip-provider,
+.chip-cwd,
+.settings-path,
+.about,
+input,
+textarea,
+[contenteditable] {
+  -webkit-user-select: text;
+  user-select: text;
+  cursor: text;
+}
+
+/* Checkboxes and radios are inputs too; they keep the arrow. */
+input[type="checkbox"],
+input[type="radio"] {
+  cursor: default;
+}
+
+/* Images and links are not dragged out of the page (the drag itself is also cancelled in webviewGuards.ts). */
+img,
+svg,
+a {
+  -webkit-user-drag: none;
+  user-drag: none;
+}
+
 .app {
   display: flex;
   flex-direction: column;

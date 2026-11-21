@@ -17,7 +17,9 @@
         "height": 600,
         "minWidth": 800,
         "minHeight": 600,
-        "dragDropEnabled": false
+        "dragDropEnabled": false,
+        "generalAutofillEnabled": false,
+        "allowLinkPreview": false
       }
     ],
     "security": {

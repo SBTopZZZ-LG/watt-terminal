@@ -21,6 +21,7 @@ import { connect, reportError, restart, setSessionNonces, subscribe } from './li
 import type { Incoming } from './lib/session';
 import { clearTerminal, currentFontSize, fitToContainer, markConnected, marks, onFontSizeChange, receiveBytes, resetForNewSession, setFontSize, term, terminalSize, zoomFont } from './lib/terminal';
 import { appHotkeyFor } from './lib/appHotkeys';
+import { isEditableElement, isSelectAllKey, selectAllTarget, selectContentsOf } from './lib/selectAll';
 import { effectiveState, focusAfter, inputReducer, INITIAL_INPUT, isFocusBarHotkey, routeFor } from './lib/inputState';
 import type { BarMode, Route } from './lib/inputState';
 import { agentDialogPhase, agentIntegratingQuietly, agentRequestAfter, agentRequestClosedBySession, agentRunning, canIntegrate, integratesLocalShell, nestedLevels } from './lib/integrate';
@@ -621,6 +622,24 @@ export default function App() {
           setFocusToken((t) => t + 1);
         }
         return;
+      }
+      // Ctrl+A (Cmd+A) outside a field selects the focus zone's text, never the whole page. The terminal keeps its key.
+      if (isSelectAllKey(e)) {
+        const el = e.target instanceof Element ? e.target : null;
+        const zone = selectAllTarget({
+          editable: isEditableElement(el),
+          inTerminal: el?.closest('.xterm') != null,
+          inAgentPanel: el?.closest('.agent-panel') != null,
+        });
+        if (zone !== null) {
+          e.preventDefault();
+          if (zone === 'terminal') {
+            term.selectAll();
+          } else {
+            selectContentsOf(document.querySelector('.transcript-body'));
+          }
+          return;
+        }
       }
       const app = appHotkeyFor(e);
       if (app === null) {

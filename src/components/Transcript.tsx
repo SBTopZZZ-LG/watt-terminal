@@ -219,7 +219,7 @@ export function Transcript({
     <section ref={sectionRef} className={`transcript${open ? ' open' : ''}`}>
       <div className="transcript-header">
         <button type="button" className="transcript-head" onClick={onToggle}>
-          <img className="brand-mark" src={wattMark} width={212} height={256} alt="" aria-hidden="true" />
+          <img className="brand-mark" src={wattMark} width={212} height={256} alt="" aria-hidden="true" draggable={false} />
           <span>Agent</span>
           {busy && <span className="busy">working...</span>}
           {thinking && <span className="thinking">thinking...</span>}
@@ -356,7 +356,7 @@ function MessageAttachments({ items }: { items: UserAttachment[] }) {
         if (a.kind === 'image' && a.thumb !== undefined) {
           return (
             <div key={i} className="msg-attach is-image">
-              <img className="msg-attach-thumb" src={a.thumb} alt={name} title={name} />
+              <img className="msg-attach-thumb" src={a.thumb} alt={name} title={name} draggable={false} />
             </div>
           );
         }

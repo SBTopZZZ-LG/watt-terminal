@@ -39,7 +39,7 @@ export function AttachmentChips({ items, onRemove }: Props) {
         if (item.kind === 'image' && item.thumb !== undefined) {
           return (
             <div key={item.key} className="bar-attach is-image">
-              <img className="bar-attach-thumb" src={item.thumb} alt={item.name} title={item.name} />
+              <img className="bar-attach-thumb" src={item.thumb} alt={item.name} title={item.name} draggable={false} />
               {remove}
             </div>
           );
