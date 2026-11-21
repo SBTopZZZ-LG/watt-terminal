@@ -8,13 +8,13 @@
 
 [![CI](https://github.com/SBTopZZZ-LG/watt-terminal/actions/workflows/ci.yml/badge.svg)](https://github.com/SBTopZZZ-LG/watt-terminal/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A terminal for macOS and Windows 11 where you and an AI agent share one persistent shell session. You type commands as you always do. The agent sees the same session (commands, output, screen, working directory) and can run commands in it, with your approval. Built with Tauri v2, Rust, React and TypeScript, with xterm.js for rendering.
+An experimental terminal for macOS and Windows 11 where you and an AI agent share one persistent shell session. You type commands as you always do. The agent sees the same session (commands, output, screen, working directory) and can run commands in it, with your approval. Built with Tauri v2, Rust, React and TypeScript, with xterm.js for rendering.
 
 <p align="center">
   <img src="assets/screenshot.png" alt="Watt Terminal: a shell on the left and the agent panel on the right, with a todo list and context meter above the input bar">
 </p>
 
-> Early-stage personal project. It works day to day for its author, but expect rough edges. Supported on macOS and Windows 11.
+> Experimental and still changing. Behaviour and settings may change between versions. It has not been fully tested yet, notably on Windows, so expect rough edges. Targets macOS and Windows 11.
 
 ## What it does
 
