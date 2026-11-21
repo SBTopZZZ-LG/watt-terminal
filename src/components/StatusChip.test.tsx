@@ -152,22 +152,28 @@ describe('StatusChip: the state chip names a program without shell integration',
 
   it('an ordinary running command keeps the plain running chip, with no title', () => {
     const tag = stateChip(strip('running', { kind: 'other', command: 'sleep 2' }));
-    expect(tag).toBe('<span class="chip">running</span>');
+    expect(tag).toBe('<span class="chip chip-state">running</span>');
   });
 
   it('no hint keeps the plain running chip too', () => {
-    expect(stateChip(strip('running', null))).toBe('<span class="chip">running</span>');
-    expect(stateChip(strip('running', undefined))).toBe('<span class="chip">running</span>');
+    expect(stateChip(strip('running', null))).toBe('<span class="chip chip-state">running</span>');
+    expect(stateChip(strip('running', undefined))).toBe('<span class="chip chip-state">running</span>');
   });
 
   it('at the prompt, the chip reads prompt even if a stale hint is passed', () => {
-    expect(stateChip(strip('prompt', SSH))).toBe('<span class="chip">prompt</span>');
+    expect(stateChip(strip('prompt', SSH))).toBe('<span class="chip chip-state">prompt</span>');
   });
 
   it('the hint does not change the strip around the state chip', () => {
     const plain = strip('running', null);
     const named = strip('running', SSH);
-    expect(named.replace(/<span class="chip chip-foreground"[^>]*>[^<]*<\/span>/, '<span class="chip">running</span>')).toBe(plain);
+    expect(named.replace(/<span class="chip chip-foreground"[^>]*>[^<]*<\/span>/, '<span class="chip chip-state">running</span>')).toBe(plain);
+  });
+
+  it('the state chip has the fixed-width class, whatever the word', () => {
+    for (const state of ['prompt', 'submitted', 'running', 'continuation', 'raw'] as const) {
+      expect(strip(state, null)).toMatch(new RegExp(`<span class="chip chip-state">[^<]+<\\/span>`));
+    }
   });
 });
 
@@ -219,6 +225,60 @@ describe('StatusChip: the location chip and the Integrate button', () => {
     const out = nestedStrip({ location: REMOTE, canIntegrate: false });
     expect(out).not.toContain('Integrate');
     expect(out).toMatch(/<span class="chip chip-location" title="ssh ubuntu@lidia: zsh as ubuntu@lidia\. [^"]*">ssh ubuntu@lidia<\/span>/);
+  });
+});
+
+/** The strip with the given integration and observer status, at the prompt. */
+function statusStrip(integration: 'booting' | 'live' | 'raw', observer: 'ok' | 'desynced') {
+  return renderToStaticMarkup(
+    <StatusChip
+      integration={integration}
+      observer={observer}
+      input="prompt"
+      cwd={null}
+      llm={LLM_ON}
+      settingsState={OK}
+      onOpenSettings={() => {}}
+    />,
+  );
+}
+
+describe('StatusChip: the integration and observer chips show only when there is an issue', () => {
+  it('a live integration with an ok observer: neither chip is shown', () => {
+    const out = statusStrip('live', 'ok');
+    expect(out).not.toContain('integration:');
+    expect(out).not.toContain('observer');
+    expect(out).not.toContain('chip-live');
+    expect(out).not.toContain('chip-ok');
+  });
+
+  it('the other remaining state chips stay in place: state, model, cwd and the gear', () => {
+    const out = statusStrip('live', 'ok');
+    expect(out).toContain('chip-state');
+    expect(out).toContain('chip-model');
+    expect(out).toContain('chip-cwd');
+    expect(out).toContain('aria-label="AI settings"');
+  });
+
+  it('booting shows the integration chip', () => {
+    expect(statusStrip('booting', 'ok')).toContain('integration: booting');
+    expect(statusStrip('booting', 'ok')).not.toContain('observer');
+  });
+
+  it('raw shows the integration chip as "integration: none"', () => {
+    expect(statusStrip('raw', 'ok')).toMatch(/<span class="chip chip-raw">integration: none<\/span>/);
+  });
+
+  it('desynced shows the observer chip', () => {
+    expect(statusStrip('live', 'desynced')).toMatch(/<span class="chip chip-desynced">observer desynced<\/span>/);
+    expect(statusStrip('live', 'desynced')).not.toContain('integration:');
+  });
+
+  it('both issues: both chips, integration first', () => {
+    const out = statusStrip('raw', 'desynced');
+    expect(out).toContain('integration: none');
+    expect(out).toContain('observer desynced');
+    expect(out.indexOf('integration: none')).toBeLessThan(out.indexOf('observer desynced'));
   });
 });
 

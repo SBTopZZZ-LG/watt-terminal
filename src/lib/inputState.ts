@@ -20,7 +20,7 @@ export type InputAction =
   | { type: 'rust_state'; state: InputState; foreground?: Foreground | null }
   | { type: 'alt'; active: boolean };
 
-function sameForeground(a: Foreground | null, b: Foreground | null): boolean {
+export function sameForeground(a: Foreground | null, b: Foreground | null): boolean {
   return a === b || (a !== null && b !== null && a.kind === b.kind && a.command === b.command);
 }
 

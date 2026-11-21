@@ -25,6 +25,7 @@ import { effectiveState, focusAfter, inputReducer, INITIAL_INPUT, isFocusBarHotk
 import type { BarMode, Route } from './lib/inputState';
 import { agentDialogPhase, agentIntegratingQuietly, agentRequestAfter, agentRequestClosedBySession, agentRunning, canIntegrate, integratesLocalShell, nestedLevels } from './lib/integrate';
 import type { AgentRequest, IntegratePhase } from './lib/integrate';
+import { useSettledStrip } from './lib/stripSettle';
 import { agentControlAfter, borderActive, borderLevel, NO_CONTROL, settleControl } from './lib/agentControl';
 import type { AgentControl, BorderLevel } from './lib/agentControl';
 import { EMPTY_TRANSCRIPT, firstPendingApproval, isBusy, transcriptReducer } from './lib/transcript';
@@ -69,6 +70,8 @@ export default function App() {
   const [input, dispatchInput] = useReducer(inputReducer, INITIAL_INPUT);
   const effective = effectiveState(input);
   const route = routeFor(effective, input.foreground);
+  // What the status strip shows of the state and the foreground hint: the prompt is held while a quick command runs (see stripSettle.ts).
+  const strip = useSettledStrip(effective, input.foreground);
   // The Integrate dialog's phase. While the handshake runs (`running`) no key goes to the shell and the bar takes none: the
   // backend is typing the loader and the blob, and a key typed then would land in the middle of them.
   const [integrate, setIntegrate] = useState<IntegratePhase>({ kind: 'closed' });
@@ -1194,11 +1197,11 @@ export default function App() {
       <StatusChip
         integration={integration}
         observer={observer}
-        input={effective}
-        foreground={input.foreground}
+        input={strip.state}
+        foreground={strip.foreground}
         cwd={cwd}
         location={levels.length > 0 ? levels[levels.length - 1] : null}
-        canIntegrate={integrate.kind === 'closed' && agentReq === null && canIntegrate(effective, input.foreground)}
+        canIntegrate={integrate.kind === 'closed' && agentReq === null && canIntegrate(strip.state, strip.foreground)}
         onIntegrate={openIntegrate}
         integrating={agentIntegratingQuietly(agentReq)}
         llm={llm}

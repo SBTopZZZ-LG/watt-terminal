@@ -68,14 +68,15 @@ export function StatusChip(props: Props) {
   const modelTitle = chipBrokenTitle(settingsState) ?? `${llm.provider ? `${llm.provider} · ` : ''}${modelLabel}`;
   return (
     <div className="status-chip" role="status">
-      <span className={`chip chip-${integration}`}>{INTEGRATION_LABEL[integration]}</span>
-      <span className={`chip chip-${observer}`}>{observer === 'ok' ? 'observer ok' : 'observer desynced'}</span>
+      {/* Shown only when there is something to fix: a live integration and an ok observer are the normal case. */}
+      {integration !== 'live' && <span className={`chip chip-${integration}`}>{INTEGRATION_LABEL[integration]}</span>}
+      {observer !== 'ok' && <span className={`chip chip-${observer}`}>observer desynced</span>}
       {fgChip ? (
         <span className="chip chip-foreground" title={fgChip.title}>
           {fgChip.label}
         </span>
       ) : (
-        <span className="chip">{INPUT_LABEL[input]}</span>
+        <span className="chip chip-state">{INPUT_LABEL[input]}</span>
       )}
       {loc !== null && (
         <span className="chip chip-location" title={loc.title}>

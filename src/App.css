@@ -365,6 +365,13 @@ input {
   color: var(--fail);
 }
 
+/* The state word keeps a fixed width (about the longest common word, "submitted"), so the chips to its left do not move
+   as the state changes. A longer word (e.g. "full-screen app") still widens it. */
+.chip-state {
+  min-width: 10ch;
+  text-align: center;
+}
+
 .chip-grid {
   font-family: var(--mono);
 }
