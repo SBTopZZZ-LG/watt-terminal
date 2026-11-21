@@ -1,7 +1,7 @@
 //! Where secret values live: API keys and secret header values, kept out of `settings.json`.
 //!
-//! All secrets sit in one blob, a JSON object `{key: value}`, behind a `SecretStore`. The production store is one
-//! Keychain item, so the OS asks at most once. `FileStore` is an explicit opt-in (`WATT_SECRETS_FILE`) for
+//! All secrets sit in one blob, a JSON object `{key: value}`, behind a `SecretStore`. The production store keeps it in one
+//! Keychain item, or in several chunk items when it is too large for one (see `save_blob`). The OS asks at most once. `FileStore` is an explicit opt-in (`WATT_SECRETS_FILE`) for
 //! development. `Secrets` reads the blob lazily on first use and keeps it cached. Nothing here prints or formats a
 //! value: errors and `Debug` output carry names and kinds only.
 
@@ -63,23 +63,37 @@ pub trait SecretStore: Send + Sync {
     fn kind(&self) -> &'static str;
 }
 
-/// One macOS Keychain item (generic password) holding the blob.
+/// The macOS Keychain item (generic password) holding the blob, or the Windows Credential Manager entry. A blob too large
+/// for one item is split across chunk items (see `save_blob`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeychainStore {
     pub service: String,
     pub account: String,
 }
 
-impl KeychainStore {
-    fn entry(&self) -> Result<Entry, SecretError> {
-        Entry::new(&self.service, &self.account).map_err(unavailable)
+impl SecretStore for KeychainStore {
+    fn load(&self) -> Result<Option<String>, SecretError> {
+        load_blob(&OsItems { service: &self.service }, &self.account)
+    }
+
+    fn save(&self, blob: &str) -> Result<(), SecretError> {
+        save_blob(&OsItems { service: &self.service }, &self.account, blob)
+    }
+
+    fn kind(&self) -> &'static str {
+        "keychain"
     }
 }
 
-impl SecretStore for KeychainStore {
-    fn load(&self) -> Result<Option<String>, SecretError> {
-        match self.entry()?.get_password() {
-            Ok(blob) => Ok(Some(blob)),
+/// Items of the OS credential store: one generic-password item per account, under `service`.
+struct OsItems<'a> {
+    service: &'a str,
+}
+
+impl ItemStore for OsItems<'_> {
+    fn get(&self, account: &str) -> Result<Option<String>, SecretError> {
+        match Entry::new(self.service, account).map_err(unavailable)?.get_password() {
+            Ok(value) => Ok(Some(value)),
             Err(keyring::Error::NoEntry) => Ok(None),
             // The variant carries the raw bytes, so it is mapped here and never formatted.
             Err(keyring::Error::BadEncoding(_)) => Err(SecretError::Corrupt),
@@ -87,13 +101,127 @@ impl SecretStore for KeychainStore {
         }
     }
 
-    fn save(&self, blob: &str) -> Result<(), SecretError> {
-        self.entry()?.set_password(blob).map_err(unavailable)
+    fn set(&self, account: &str, value: &str) -> Result<(), SecretError> {
+        Entry::new(self.service, account).map_err(unavailable)?.set_password(value).map_err(unavailable)
     }
 
-    fn kind(&self) -> &'static str {
-        "keychain"
+    fn delete(&self, account: &str) -> Result<(), SecretError> {
+        match Entry::new(self.service, account).map_err(unavailable)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(unavailable(e)),
+        }
     }
+}
+
+/// The items a blob is kept in, by account name. `OsItems` is the real one; the tests use an in-memory map.
+trait ItemStore {
+    fn get(&self, account: &str) -> Result<Option<String>, SecretError>;
+    fn set(&self, account: &str, value: &str) -> Result<(), SecretError>;
+    /// Removes the item. A missing item is not an error.
+    fn delete(&self, account: &str) -> Result<(), SecretError>;
+}
+
+/// Windows Credential Manager refuses a value over 2560 UTF-16 bytes (keyring 4.2). A blob of at most this many UTF-16
+/// bytes is stored in the main item exactly as before; a larger one is split into chunks of at most this many bytes.
+const MAX_ITEM_BYTES: usize = 2000;
+/// A chunked blob's main item is `watt-chunked:v1:<chunks>:<checksum>`, the checksum as 16 hex digits. A JSON blob never
+/// starts with this.
+const CHUNKED_PREFIX: &str = "watt-chunked:v1:";
+/// The most chunks a header may name. Far above what a real secrets blob needs; it bounds the reads a bad header causes.
+const MAX_CHUNKS: usize = 1000;
+
+fn utf16_bytes(text: &str) -> usize {
+    text.encode_utf16().count() * 2
+}
+
+/// Splits `blob` into pieces of at most `max_bytes` UTF-16 bytes each, at char boundaries: a character is never split.
+fn split_chunks(blob: &str, max_bytes: usize) -> Vec<&str> {
+    let mut chunks = Vec::new();
+    let (mut start, mut used) = (0, 0);
+    for (index, c) in blob.char_indices() {
+        let size = c.len_utf16() * 2;
+        if used + size > max_bytes {
+            chunks.push(&blob[start..index]);
+            start = index;
+            used = 0;
+        }
+        used += size;
+    }
+    if start < blob.len() {
+        chunks.push(&blob[start..]);
+    }
+    chunks
+}
+
+/// FNV-1a over the UTF-8 bytes. Lets a load detect chunks that do not belong to one save (a save that failed part way).
+fn checksum(text: &str) -> u64 {
+    text.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3))
+}
+
+fn chunk_account(account: &str, number: usize) -> String {
+    format!("{account}.{number}")
+}
+
+/// The chunk count and checksum a main item names. `Ok(None)` for a plain blob; `Err(Corrupt)` for a malformed header.
+fn parse_header(value: &str) -> Result<Option<(usize, u64)>, SecretError> {
+    let Some(rest) = value.strip_prefix(CHUNKED_PREFIX) else {
+        return Ok(None);
+    };
+    let parsed = rest.split_once(':').and_then(|(count, sum)| {
+        let count = count.parse::<usize>().ok().filter(|n| (1..=MAX_CHUNKS).contains(n))?;
+        let sum = (sum.len() == 16).then(|| u64::from_str_radix(sum, 16).ok()).flatten()?;
+        Some((count, sum))
+    });
+    parsed.map(Some).ok_or(SecretError::Corrupt)
+}
+
+/// Reads the blob: the main item itself, or the chunks its header names, joined and checked against the header's checksum.
+/// A missing or wrong chunk is `Corrupt`, never a shorter blob.
+fn load_blob(items: &dyn ItemStore, account: &str) -> Result<Option<String>, SecretError> {
+    let Some(value) = items.get(account)? else {
+        return Ok(None);
+    };
+    let Some((count, sum)) = parse_header(&value)? else {
+        return Ok(Some(value));
+    };
+    let mut blob = String::new();
+    for number in 1..=count {
+        let chunk = items.get(&chunk_account(account, number))?.ok_or(SecretError::Corrupt)?;
+        blob.push_str(&chunk);
+    }
+    if checksum(&blob) != sum {
+        return Err(SecretError::Corrupt);
+    }
+    Ok(Some(blob))
+}
+
+/// Writes the blob. A small one replaces the main item. A large one writes all its chunks first and the header last, so
+/// the header never names chunks that are not there yet. Chunks above the new count are then removed, best-effort: they are
+/// never read, and a later save removes what this one missed. If a save fails after its chunks are written, the header
+/// still names the old count, and the mixed chunks fail the checksum on load until the next successful save.
+fn save_blob(items: &dyn ItemStore, account: &str, blob: &str) -> Result<(), SecretError> {
+    let previous = items
+        .get(account)?
+        .and_then(|value| parse_header(&value).ok().flatten())
+        .map_or(0, |(count, _)| count);
+    let now = if utf16_bytes(blob) <= MAX_ITEM_BYTES {
+        items.set(account, blob)?;
+        0
+    } else {
+        let pieces = split_chunks(blob, MAX_ITEM_BYTES);
+        if pieces.len() > MAX_CHUNKS {
+            return Err(unavailable("the secrets are too large to store"));
+        }
+        for (index, piece) in pieces.iter().enumerate() {
+            items.set(&chunk_account(account, index + 1), piece)?;
+        }
+        items.set(account, &format!("{CHUNKED_PREFIX}{}:{:016x}", pieces.len(), checksum(blob)))?;
+        pieces.len()
+    };
+    for number in now + 1..=previous {
+        let _ = items.delete(&chunk_account(account, number));
+    }
+    Ok(())
 }
 
 /// A file holding the blob, mode 0600. Used only when `WATT_SECRETS_FILE` is set.
@@ -430,6 +558,7 @@ pub fn provider_prefix(provider_id: &str) -> String {
 mod tests {
     use super::super::test_support::TempDir;
     use super::*;
+    use std::cell::RefCell;
 
     fn memory(blob: Option<&str>) -> (Secrets, MemoryStore) {
         let store = match blob {
@@ -705,18 +834,176 @@ mod tests {
         assert!(legacy.stored().unwrap().contains("DUMMY-key"), "the old item is never changed");
     }
 
-    /// Real macOS Keychain round trip. Ignored by default because it touches the login Keychain. Run with
-    /// `cargo test -- --ignored keychain`. Uses a throwaway service name and dummy values, and deletes the item on
-    /// drop, including when an assertion fails.
+    /// In-memory `ItemStore` for the chunk tests. `fail_set` and `fail_get` name an account whose operation fails, to
+    /// simulate a failure part way through a save or a load. `set` applies the Windows item limit, as the real store does.
+    #[derive(Default)]
+    struct FakeItems {
+        items: RefCell<BTreeMap<String, String>>,
+        fail_set: RefCell<Option<String>>,
+        fail_get: RefCell<Option<String>>,
+    }
+
+    impl FakeItems {
+        fn names(&self) -> Vec<String> {
+            self.items.borrow().keys().cloned().collect()
+        }
+
+        fn value(&self, account: &str) -> Option<String> {
+            self.items.borrow().get(account).cloned()
+        }
+    }
+
+    impl ItemStore for FakeItems {
+        fn get(&self, account: &str) -> Result<Option<String>, SecretError> {
+            if self.fail_get.borrow().as_deref() == Some(account) {
+                return Err(SecretError::Unavailable("simulated failure".into()));
+            }
+            Ok(self.value(account))
+        }
+
+        fn set(&self, account: &str, value: &str) -> Result<(), SecretError> {
+            if self.fail_set.borrow().as_deref() == Some(account) {
+                return Err(SecretError::Unavailable("simulated failure".into()));
+            }
+            if utf16_bytes(value) > 2560 {
+                return Err(unavailable("value is longer than the platform limit"));
+            }
+            self.items.borrow_mut().insert(account.to_string(), value.to_string());
+            Ok(())
+        }
+
+        fn delete(&self, account: &str) -> Result<(), SecretError> {
+            self.items.borrow_mut().remove(account);
+            Ok(())
+        }
+    }
+
+    /// A blob of `repeats` copies of `unit` inside a JSON object: large enough to need chunks when `repeats` is big.
+    fn big_blob(unit: &str, repeats: usize) -> String {
+        serde_json::json!({ "provider.p.api_key": unit.repeat(repeats) }).to_string()
+    }
+
+    #[test]
+    fn split_chunks_keeps_characters_whole_and_under_the_limit() {
+        let blob = format!("{}{}{}", "a".repeat(999), "\u{1F600}", "\u{e9}".repeat(1500));
+        let chunks = split_chunks(&blob, MAX_ITEM_BYTES);
+        assert!(chunks.len() > 1);
+        assert_eq!(chunks.concat(), blob);
+        for chunk in &chunks {
+            assert!(utf16_bytes(chunk) <= MAX_ITEM_BYTES, "chunk of {} bytes", utf16_bytes(chunk));
+        }
+    }
+
+    #[test]
+    fn a_small_blob_is_stored_in_the_main_item_as_before() {
+        let items = FakeItems::default();
+        save_blob(&items, "secrets", r#"{"a":"1"}"#).unwrap();
+        assert_eq!(items.names(), vec!["secrets".to_string()]);
+        assert_eq!(items.value("secrets").as_deref(), Some(r#"{"a":"1"}"#));
+        assert_eq!(load_blob(&items, "secrets").unwrap().as_deref(), Some(r#"{"a":"1"}"#));
+    }
+
+    #[test]
+    fn a_blob_at_the_item_limit_is_still_stored_plain() {
+        let items = FakeItems::default();
+        let blob = "x".repeat(MAX_ITEM_BYTES / 2);
+        assert_eq!(utf16_bytes(&blob), MAX_ITEM_BYTES);
+        save_blob(&items, "secrets", &blob).unwrap();
+        assert_eq!(items.names(), vec!["secrets".to_string()]);
+    }
+
+    #[test]
+    fn a_large_blob_is_chunked_and_round_trips() {
+        let items = FakeItems::default();
+        let blob = big_blob("0123456789\u{e9}abcdef", 900);
+        assert!(utf16_bytes(&blob) > 2560);
+        save_blob(&items, "secrets", &blob).unwrap();
+
+        let header = items.value("secrets").unwrap();
+        assert!(header.starts_with(CHUNKED_PREFIX), "the main item holds only the header");
+        assert!(header.len() < 64);
+        let count = parse_header(&header).unwrap().unwrap().0;
+        assert!(count >= 4, "{count} chunks");
+        let mut expected: Vec<String> = vec!["secrets".into()];
+        expected.extend((1..=count).map(|n| format!("secrets.{n}")));
+        expected.sort();
+        assert_eq!(items.names(), expected);
+        for number in 1..=count {
+            assert!(utf16_bytes(&items.value(&format!("secrets.{number}")).unwrap()) <= MAX_ITEM_BYTES);
+        }
+        assert_eq!(load_blob(&items, "secrets").unwrap().as_deref(), Some(blob.as_str()));
+    }
+
+    #[test]
+    fn a_blob_that_shrinks_back_under_the_limit_drops_every_chunk() {
+        let items = FakeItems::default();
+        save_blob(&items, "secrets", &big_blob("abcdefgh", 900)).unwrap();
+        let small = r#"{"a":"1"}"#;
+        save_blob(&items, "secrets", small).unwrap();
+        assert_eq!(items.names(), vec!["secrets".to_string()]);
+        assert_eq!(load_blob(&items, "secrets").unwrap().as_deref(), Some(small));
+    }
+
+    #[test]
+    fn a_blob_that_shrinks_to_fewer_chunks_drops_only_the_extra_ones() {
+        let items = FakeItems::default();
+        save_blob(&items, "secrets", &big_blob("abcdefgh", 2000)).unwrap();
+        let medium = big_blob("zyxwvuts", 600);
+        save_blob(&items, "secrets", &medium).unwrap();
+        let count = parse_header(&items.value("secrets").unwrap()).unwrap().unwrap().0;
+        assert_eq!(items.names().len(), count + 1, "{:?}", items.names());
+        assert_eq!(load_blob(&items, "secrets").unwrap().as_deref(), Some(medium.as_str()));
+    }
+
+    #[test]
+    fn a_missing_chunk_is_corrupt_and_never_a_shorter_blob() {
+        let items = FakeItems::default();
+        save_blob(&items, "secrets", &big_blob("abcdefgh", 900)).unwrap();
+        items.items.borrow_mut().remove("secrets.2");
+        assert_eq!(load_blob(&items, "secrets"), Err(SecretError::Corrupt));
+        *items.fail_get.borrow_mut() = Some("secrets.2".into());
+        assert!(matches!(load_blob(&items, "secrets"), Err(SecretError::Unavailable(_))));
+    }
+
+    #[test]
+    fn a_failed_header_write_leaves_chunks_the_load_refuses() {
+        let items = FakeItems::default();
+        let old = big_blob("abcdefgh", 900);
+        save_blob(&items, "secrets", &old).unwrap();
+
+        // The new blob's chunks overwrite the old ones, then the header write fails: the old header names mixed chunks.
+        *items.fail_set.borrow_mut() = Some("secrets".into());
+        let new = big_blob("ZYXWVUTS", 900);
+        assert!(save_blob(&items, "secrets", &new).is_err());
+        assert_eq!(load_blob(&items, "secrets"), Err(SecretError::Corrupt));
+    }
+
+    #[test]
+    fn a_malformed_header_is_corrupt() {
+        for header in ["watt-chunked:v1:0:0000000000000000", "watt-chunked:v1:2:xyz", "watt-chunked:v1:2", "watt-chunked:v1:1001:0000000000000000", "watt-chunked:v1:1:00000000000000zz"] {
+            let items = FakeItems::default();
+            items.items.borrow_mut().insert("secrets".into(), header.into());
+            assert_eq!(load_blob(&items, "secrets"), Err(SecretError::Corrupt), "{header}");
+        }
+    }
+
+    /// Real Keychain or Credential Manager round trip. Ignored by default because it touches the OS store. Run with
+    /// `cargo test -- --ignored keychain`. Uses a throwaway service name, a process-unique one, and dummy values. Deletes
+    /// the main item and every chunk it may have written, including when an assertion fails.
     #[test]
     #[ignore]
     fn keychain_round_trip() {
         struct Cleanup(KeychainStore);
         impl Drop for Cleanup {
             fn drop(&mut self) {
-                if let Ok(entry) = Entry::new(&self.0.service, &self.0.account) {
-                    let _ = entry.delete_credential();
+                let items = OsItems { service: &self.0.service };
+                let header = items.get(&self.0.account).ok().flatten().and_then(|value| parse_header(&value).ok().flatten());
+                if let Some((count, _)) = header {
+                    for number in 1..=count {
+                        let _ = items.delete(&chunk_account(&self.0.account, number));
+                    }
                 }
+                let _ = items.delete(&self.0.account);
             }
         }
 
@@ -725,21 +1012,24 @@ mod tests {
             account: "secrets".into(),
         };
         let _cleanup = Cleanup(store.clone());
+        let items = OsItems { service: &store.service };
 
         assert_eq!(store.load().unwrap(), None, "the test service should start empty");
 
-        // 4 KB of dummy text inside a JSON object, like a real blob.
-        let value = "0123456789abcdef".repeat(256);
+        // 8 KB of dummy text inside a JSON object, over the 2560-byte item limit, so it is stored in chunks.
+        let value = "0123456789abcdef".repeat(512);
         let blob = serde_json::json!({ "provider.test.api_key": value }).to_string();
-        assert!(blob.len() > 4096);
+        assert!(utf16_bytes(&blob) > 2560);
 
         store.save(&blob).unwrap();
         // assert! rather than assert_eq!, so a mismatch does not print the value.
         assert!(store.load().unwrap().as_deref() == Some(blob.as_str()), "round trip mismatch");
+        assert!(items.get("secrets.1").unwrap().is_some(), "the large blob should be stored in chunks");
 
         let secrets = Secrets::new(Box::new(store.clone()));
         assert!(secrets.has("provider.test.api_key").unwrap());
         secrets.remove("provider.test.api_key").unwrap();
         assert!(store.load().unwrap().as_deref() == Some("{}"), "blob after removal is not empty");
+        assert!(items.get("secrets.1").unwrap().is_none(), "chunks are removed when the blob shrinks");
     }
 }
