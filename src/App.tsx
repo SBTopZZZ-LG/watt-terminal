@@ -37,7 +37,8 @@ import { itemsFromMessages } from './lib/historyView';
 import { agentActivityText } from './lib/agentActivity';
 import { userAttachments } from './lib/attachments';
 import { defaultModelVision } from './lib/modelVision';
-import { createPatchSaver, fontPatch, hideMarksPatch, panelPatch, queueModePatch, reconcileFont, reconcileGroupBy, reconcileHideMarks, reconcilePanel, reconcileQueueMode, shouldRestoreLast } from './lib/uiState';
+import { createPatchSaver, fontPatch, hideMarksPatch, panelPatch, queueModePatch, reconcileFont, reconcileGroupBy, reconcileHideMarks, reconcilePanel, reconcileQueueMode, reconcileSuggestPrompts, shouldRestoreLast, suggestPromptsPatch } from './lib/uiState';
+import { acceptSuggestions, endsWithAgentText, shouldSuggest } from './lib/suggestions';
 import { drainBatch, enqueue, QUEUE_SLOT_POLL_MS, QUEUE_SLOT_WAIT_MS, removeQueued, shouldDrain } from './lib/messageQueue';
 import type { QueuedMessage } from './lib/messageQueue';
 import type { AttachmentInput, Cwd, HistoryGroupBy, InputState, IntegrationStatus, LevelInfo, LlmStatus, LoadedConversation, ObserverStatus, QueueMode, QuestionAnswerInput, SettingsStateView, Status, UiState, UiStatePatch, WireEvent } from './lib/types';
@@ -153,6 +154,14 @@ export default function App() {
   useEffect(() => {
     document.documentElement.dataset.hideMarks = String(hideMarks);
   }, [hideMarks]);
+  // Follow-up prompts after a reply (see suggestions.ts). Off until the file says otherwise. `suggestGen` moves whenever the
+  // suggestions no longer follow the reply (a send, a turn, a conversation change, the setting, a click), so a late answer is
+  // dropped. One request at a time; a trigger during one is run again after it.
+  const [suggestPrompts, setSuggestPrompts] = useState(false);
+  const [suggestions, setSuggestions] = useState<string[]>([]);
+  const suggestGen = useRef(0);
+  const suggesting = useRef(false);
+  const suggestAgain = useRef(false);
   // The UI state file, read at startup. Nothing is written to it until that read has been reconciled (see uiReady).
   const uiLoaded = useRef<Promise<UiState | null> | null>(null);
   const uiReady = useRef(false);
@@ -399,6 +408,10 @@ export default function App() {
       const marks = reconcileHideMarks(remote.hide_marks);
       if (marks !== null) {
         setHideMarks(marks);
+      }
+      const suggest = reconcileSuggestPrompts(remote.suggest_prompts);
+      if (suggest !== null) {
+        setSuggestPrompts(suggest);
       }
     });
     const unsubscribeFont = onFontSizeChange((size) => persist(fontPatch(size)));
@@ -656,6 +669,7 @@ export default function App() {
   };
 
   const sendAgent = async (text: string, attachments: AttachmentInput[]): Promise<string | null> => {
+    dropSuggestions();
     epoch.current += 1;
     clientIds.current += 1;
     const clientId = clientIds.current;
@@ -677,10 +691,18 @@ export default function App() {
     setQueue(next);
   };
 
+  /** The suggestions no longer follow the reply: they are cleared, and a request in flight is stale (its result is dropped). */
+  const dropSuggestions = () => {
+    suggestGen.current += 1;
+    suggestAgain.current = false;
+    setSuggestions([]);
+  };
+
   /** The conversation changed: what is queued was for the old one, so it is dropped rather than sent into the new one. */
   const clearQueue = () => {
     queueGen.current += 1;
     commitQueue([]);
+    dropSuggestions();
   };
 
   /**
@@ -745,6 +767,39 @@ export default function App() {
     }
   };
 
+  /**
+   * Asks for follow-up prompts for the reply that just ended. Read-only on the backend: it never touches busy, the
+   * transcript or the queue. Errors are dropped silently, so a failed request shows nothing. One at a time: a request
+   * asked for while one runs is run once more after it, unless the agent is busy or something is queued by then.
+   */
+  const requestSuggestions = async (): Promise<void> => {
+    if (suggesting.current) {
+      suggestAgain.current = true;
+      return;
+    }
+    suggesting.current = true;
+    const gen = suggestGen.current;
+    try {
+      const result = await api.suggestPrompts();
+      setSuggestions(acceptSuggestions(result, { current: suggestGen.current === gen, busy: isBusy(transcriptRef.current) }));
+    } catch {
+      // Nothing to show: the input bar keeps its plain look.
+    } finally {
+      suggesting.current = false;
+      if (suggestAgain.current) {
+        suggestAgain.current = false;
+        if (!isBusy(transcriptRef.current) && queueRef.current.length === 0) {
+          void requestSuggestions();
+        }
+      }
+    }
+  };
+
+  /** A suggested prompt was clicked: it is sent as a plain message, the same as a typed one but not through the command parser. */
+  const sendSuggestion = (text: string) => {
+    void sendAgent(text, []);
+  };
+
   /** Takes a queued message back, for the input to restore. Null when it is no longer queued. */
   const unqueue = (id: number): QueuedMessage | null => {
     const { queue: next, removed } = removeQueued(queueRef.current, id);
@@ -758,6 +813,13 @@ export default function App() {
   const setQueueModeSetting = (mode: QueueMode) => {
     setQueueMode(mode);
     persist(queueModePatch(mode));
+  };
+
+  /** The suggest-prompts setting is applied at once and saved. Turning it off drops what is shown or in flight. */
+  const setSuggestPromptsSetting = (on: boolean) => {
+    dropSuggestions();
+    setSuggestPrompts(on);
+    persist(suggestPromptsPatch(on));
   };
 
   // Clears the agent's conversation. The backend refuses while the agent is busy; the button is also disabled then. On
@@ -1227,6 +1289,20 @@ export default function App() {
         void drainQueue();
       }
     }
+    // The same edge asks for follow-up prompts (see suggestions.ts). A turn starting clears what was shown.
+    if (active) {
+      dropSuggestions();
+    } else if (
+      shouldSuggest({
+        enabled: suggestPrompts,
+        turnJustEnded: prev,
+        queueLength: queueRef.current.length,
+        sideBusy,
+        lastItemIsAgentText: endsWithAgentText(transcript.items),
+      })
+    ) {
+      void requestSuggestions();
+    }
   }, [active]);
   // Same busy as the input bar's loader (busy || sideBusy). An exited shell takes the border off even if a turn is still open.
   const border: BorderLevel = borderLevel(agentControl, (busy || sideBusy) && effective !== 'exited');
@@ -1466,6 +1542,8 @@ export default function App() {
               queueMode={queueMode}
               queueable={busy && !sideBusy}
               onUnqueue={unqueue}
+              suggestions={suggestions}
+              onSuggestion={sendSuggestion}
               onInterrupt={() => {
                 // A side command holds no shell command: cancel it without touching the terminal.
                 if (sideBusy) {
@@ -1510,6 +1588,8 @@ export default function App() {
           onHideMarksChange={setMarksHidden}
           queueMode={queueMode}
           onQueueModeChange={setQueueModeSetting}
+          suggestPrompts={suggestPrompts}
+          onSuggestPromptsChange={setSuggestPromptsSetting}
         />
       )}
       {helpOpen && <HelpDialog load={helpState} onRetry={loadHelp} onClose={closeHelp} />}

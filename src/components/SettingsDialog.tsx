@@ -31,6 +31,7 @@ import { SettingsTabs } from './SettingsTabs';
 import type { TabDef } from './SettingsTabs';
 import { TerminalSection } from './TerminalSection';
 import { QueueSection } from './QueueSection';
+import { SuggestSection } from './SuggestSection';
 import { secretStoreName } from '../lib/platform';
 
 /** The recovery actions in flight or waiting for their confirm step. `busy` names the action that is running. */
@@ -476,6 +477,9 @@ export interface SettingsDialogProps {
   /** The Terminal tab's queued-messages setting: how messages queued while the agent works are sent. Owned by the caller (UI state). */
   queueMode: QueueMode;
   onQueueModeChange(mode: QueueMode): void;
+  /** Whether the agent suggests follow-up prompts after each reply. Owned by the caller (UI state). */
+  suggestPrompts: boolean;
+  onSuggestPromptsChange(on: boolean): void;
 }
 
 /**
@@ -485,7 +489,7 @@ export interface SettingsDialogProps {
  * and goes back to where it was on close. Esc closes; a click on the backdrop closes. Unsaved changes are asked about
  * before they are dropped.
  */
-export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded, hideMarks, onHideMarksChange, queueMode, onQueueModeChange }: SettingsDialogProps) {
+export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded, hideMarks, onHideMarksChange, queueMode, onQueueModeChange, suggestPrompts, onSuggestPromptsChange }: SettingsDialogProps) {
   const titleId = useId();
   const dialogRef = useRef<HTMLDivElement>(null);
   const backdropPressed = useRef(false);
@@ -1121,6 +1125,7 @@ export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded, h
     <>
       <TerminalSection hideMarks={hideMarks} onHideMarksChange={onHideMarksChange} />
       <QueueSection queueMode={queueMode} onQueueModeChange={onQueueModeChange} />
+      <SuggestSection suggestPrompts={suggestPrompts} onSuggestPromptsChange={onSuggestPromptsChange} />
     </>
   );
 

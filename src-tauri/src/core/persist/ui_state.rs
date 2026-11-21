@@ -1,6 +1,6 @@
 //! UI state in `<config_dir>/ui-state.json`: the agent panel's dock, size and open state, the font size, the last
 //! conversation used, how the history list is grouped, how queued agent messages are sent, and whether the terminal's
-//! command separators and agent labels are hidden.
+//! command separators and agent labels are hidden, and whether follow-up prompts are suggested after each reply.
 //!
 //! Reading is tolerant. Unknown fields are ignored, and each field that is missing or invalid becomes `None` on its
 //! own, so one bad value never loses the rest. A file that is not JSON at all reads as the default state, and it is
@@ -66,6 +66,10 @@ pub struct UiState {
     /// in the file reads as the default, `true`.
     #[serde(default = "hide_marks_default")]
     pub hide_marks: bool,
+    /// After each reply, asks the model for a few follow-up prompts shown under the input. One extra model call per
+    /// reply, so it is off unless the file says otherwise. Missing or invalid reads as `false`.
+    #[serde(default)]
+    pub suggest_prompts: bool,
 }
 
 fn hide_marks_default() -> bool {
@@ -82,6 +86,7 @@ impl Default for UiState {
             history_group_by: None,
             queue_mode: None,
             hide_marks: HIDE_MARKS_DEFAULT,
+            suggest_prompts: false,
         }
     }
 }
@@ -102,6 +107,8 @@ pub struct UiStatePatch {
     pub queue_mode: Option<Option<String>>,
     /// A boolean has no "clear", so `null` is the same as absent: the value is left alone.
     pub hide_marks: Option<bool>,
+    /// As `hide_marks`: a boolean, so `null` leaves it alone.
+    pub suggest_prompts: Option<bool>,
 }
 
 /// Distinguishes an absent field (outer `None`, via `default`) from `null` (`Some(None)`).
@@ -155,6 +162,9 @@ impl UiStateStore {
         }
         if let Some(hide) = patch.hide_marks {
             state.hide_marks = hide;
+        }
+        if let Some(suggest) = patch.suggest_prompts {
+            state.suggest_prompts = suggest;
         }
         state.version = UI_STATE_VERSION;
         self.write(&state)?;
@@ -230,6 +240,7 @@ fn tolerant(value: &Value) -> UiState {
             .filter(|m| QUEUE_MODES.contains(m))
             .map(str::to_string),
         hide_marks: obj.get("hide_marks").and_then(Value::as_bool).unwrap_or(HIDE_MARKS_DEFAULT),
+        suggest_prompts: obj.get("suggest_prompts").and_then(Value::as_bool).unwrap_or(false),
     }
 }
 
@@ -351,6 +362,7 @@ mod tests {
             history_group_by: Some(Some("workspace".into())),
             queue_mode: Some(Some("one".into())),
             hide_marks: Some(false),
+            suggest_prompts: Some(true),
         };
         let written = s.patch(patch).unwrap();
         assert_eq!(s.load().unwrap(), written);
@@ -360,6 +372,7 @@ mod tests {
         assert_eq!(written.history_group_by.as_deref(), Some("workspace"));
         assert_eq!(written.queue_mode.as_deref(), Some("one"));
         assert!(!written.hide_marks);
+        assert!(written.suggest_prompts);
     }
 
     #[test]
@@ -648,6 +661,36 @@ mod tests {
     fn hide_marks_is_in_the_patch_default_as_absent() {
         assert_eq!(UiStatePatch::default().hide_marks, None);
         assert_eq!(patch_from(json!({"hide_marks": false})).hide_marks, Some(false));
+    }
+
+    #[test]
+    fn suggest_prompts_is_off_by_default_and_a_boolean_only() {
+        let tmp = TempDir::new();
+        assert!(!store(&tmp).load().unwrap().suggest_prompts, "no file");
+        assert!(!UiState::default().suggest_prompts);
+        assert!(!read_text(&tmp, r#"{"font_size": 12}"#).suggest_prompts, "an old file has none");
+        assert!(read_text(&tmp, r#"{"suggest_prompts": true}"#).suggest_prompts);
+        assert!(!read_text(&tmp, r#"{"suggest_prompts": "yes"}"#).suggest_prompts);
+        assert!(!read_text(&tmp, r#"{"suggest_prompts": 1}"#).suggest_prompts);
+    }
+
+    #[test]
+    fn suggest_prompts_patch_sets_persists_and_null_or_absent_leaves_it_alone() {
+        let tmp = TempDir::new();
+        let s = store(&tmp);
+        let on = s.patch(patch_from(json!({"suggest_prompts": true}))).unwrap();
+        assert!(on.suggest_prompts);
+        assert!(s.load().unwrap().suggest_prompts, "written to the file");
+
+        let untouched = s.patch(patch_from(json!({"font_size": 13}))).unwrap();
+        assert!(untouched.suggest_prompts, "an absent field leaves it alone");
+
+        let null = s.patch(patch_from(json!({"suggest_prompts": null}))).unwrap();
+        assert!(null.suggest_prompts, "null leaves it alone too");
+
+        let off = s.patch(patch_from(json!({"suggest_prompts": false}))).unwrap();
+        assert!(!off.suggest_prompts);
+        assert_eq!(patch_from(json!({})).suggest_prompts, None);
     }
 
     #[test]

@@ -59,6 +59,16 @@ export function hideMarksPatch(hide: boolean): UiStatePatch {
   return { hide_marks: hide };
 }
 
+/** The suggest-prompts setting from the file, or null when the file has no boolean for it (off then applies). Nothing is migrated. */
+export function reconcileSuggestPrompts(remote: boolean | null | undefined): boolean | null {
+  return typeof remote === 'boolean' ? remote : null;
+}
+
+/** The patch that saves the suggest-prompts setting. */
+export function suggestPromptsPatch(on: boolean): UiStatePatch {
+  return { suggest_prompts: on };
+}
+
 /** The patch that saves a panel layout. */
 export function panelPatch(layout: PanelLayout): UiStatePatch {
   return { panel: { dock: layout.dock, sizes: { ...layout.sizes }, open: layout.open } };

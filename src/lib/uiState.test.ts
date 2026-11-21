@@ -11,6 +11,8 @@ import {
   reconcileHideMarks,
   reconcileQueueMode,
   reconcilePanel,
+  reconcileSuggestPrompts,
+  suggestPromptsPatch,
   shouldRestoreLast,
 } from './uiState';
 import type { Timers } from './uiState';
@@ -101,10 +103,25 @@ describe('reconcileHideMarks', () => {
   });
 });
 
+describe('reconcileSuggestPrompts', () => {
+  it('takes a boolean from the file, either way; anything else leaves the default (off) to apply', () => {
+    expect(reconcileSuggestPrompts(true)).toBe(true);
+    expect(reconcileSuggestPrompts(false)).toBe(false);
+    expect(reconcileSuggestPrompts(null)).toBeNull();
+    expect(reconcileSuggestPrompts(undefined)).toBeNull();
+    expect(reconcileSuggestPrompts('yes' as unknown as boolean)).toBeNull();
+  });
+});
+
 describe('patch builders', () => {
   it('hideMarksPatch carries the boolean as hide_marks', () => {
     expect(hideMarksPatch(true)).toEqual({ hide_marks: true });
     expect(hideMarksPatch(false)).toEqual({ hide_marks: false });
+  });
+
+  it('suggestPromptsPatch carries the boolean as suggest_prompts', () => {
+    expect(suggestPromptsPatch(true)).toEqual({ suggest_prompts: true });
+    expect(suggestPromptsPatch(false)).toEqual({ suggest_prompts: false });
   });
 
   it('panelPatch carries the snake_case panel shape, with its own copy of the sizes', () => {

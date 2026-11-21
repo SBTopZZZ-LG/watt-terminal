@@ -2583,6 +2583,50 @@ input {
   cursor: default;
 }
 
+/* The suggested follow-up prompts under the field: a muted lead, then one small button per prompt, each on one line. */
+.bar-suggest {
+  flex-basis: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  font-size: 11px;
+}
+
+.bar-suggest-head {
+  flex: 0 0 auto;
+  color: var(--muted);
+}
+
+.bar-suggest-chip {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--bg);
+  color: var(--ink);
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.5;
+  text-align: left;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+.bar-suggest-chip:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.bar-suggest-chip:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+}
+
 /* The approval row above the input: a muted label and a text toggle, no border. Auto reads warn, manual muted. */
 .bar-approval {
   flex-basis: 100%;

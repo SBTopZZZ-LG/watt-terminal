@@ -126,6 +126,13 @@ export const api = {
   suggestName() {
     return invoke<string>('suggest_name', { sessionId: SESSION_ID });
   },
+  /**
+   * Suggests a few follow-up prompts after the latest reply. One read-only model call: it never blocks a turn or a send,
+   * and nothing is stored. Empty when there is nothing to suggest. Errors reject; the caller ignores them.
+   */
+  suggestPrompts() {
+    return invoke<string[]>('suggest_prompts', { sessionId: SESSION_ID });
+  },
   /** Summarizes the live conversation into a new conversation and switches to it. The old one stays in history. */
   compactConversation() {
     return invoke<LoadedConversation>('compact_conversation', { sessionId: SESSION_ID });

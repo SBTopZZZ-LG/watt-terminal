@@ -74,6 +74,10 @@ interface Props {
   queueable: boolean;
   /** Takes a queued message back: returns it, or null when it is gone. Its text goes back into the input, selected. */
   onUnqueue: (id: number) => QueuedMessage | null;
+  /** Follow-up prompts for the latest reply, as buttons under the field. Shown in chat mode only when the agent is idle. */
+  suggestions: string[];
+  /** A suggestion was clicked: it is sent as a plain message (not through the command parser). */
+  onSuggestion: (text: string) => void;
   onInterrupt: () => void;
   onApproveFirst: () => void;
   onDenyFirst: () => void;
@@ -643,6 +647,24 @@ export function InputBar(props: Props) {
       >
         {send.stop ? <StopIcon /> : <SendIcon />}
       </button>
+      {mode === 'chat' && !busy && !props.locked && props.suggestions.length > 0 && (
+        <div className="bar-suggest">
+          <span className="bar-suggest-head">Suggested:</span>
+          {props.suggestions.map((s) => (
+            <button
+              key={s}
+              type="button"
+              className="bar-suggest-chip"
+              title={s}
+              aria-label={s}
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => props.onSuggestion(s)}
+            >
+              {s}
+            </button>
+          ))}
+        </div>
+      )}
       {error !== null && <div className="bar-error">{error}</div>}
       {error === null && hint !== null && !hintInline && <div className="bar-hint">{hint}</div>}
     </div>

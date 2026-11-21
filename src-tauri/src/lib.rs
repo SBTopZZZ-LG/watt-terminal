@@ -1047,6 +1047,43 @@ async fn suggest_name(
     side::title_or_fallback(reply, fallback)
 }
 
+/// Suggests a few follow-up prompts: what the user might send next, after the latest reply. One read-only model call:
+/// it does not reserve the turn slot, so it never blocks a send or a turn, and it never touches the agent's busy
+/// state, the turn cancel, the stored history, the transcript or the saved conversation. Its own cancel token is never
+/// registered, so Ctrl-C does not reach it; the 20-second timeout bounds it. No conversation text yet gives an empty
+/// list, and so does an empty reply. Errors are returned, and the frontend ignores them.
+#[tauri::command]
+async fn suggest_prompts(
+    session_id: String,
+    reg: State<'_, Reg>,
+    settings: State<'_, SettingsState>,
+) -> Result<Vec<String>, String> {
+    let att = session(&reg, &session_id)?;
+    let old_id = att.conversation.id();
+    // The snapshot leaves the lock before any await.
+    let history = att.conversation.history();
+    let snapshot = lock(&history).snapshot();
+    let limit = lock(&att.conversation.last_usage()).clone().and_then(|u| u.limit);
+    let mut messages = side::conversation_context(&snapshot, side::budget_chars(limit, 200));
+    if messages.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Reading a saved model touches the Keychain, so it runs on the blocking pool.
+    let service = settings.0.clone();
+    let (llm_settings, client) = blocking(move || {
+        let chosen =
+            choose_llm(service.as_deref())?.ok_or_else(|| "No model is configured. Add one in Settings.".to_string())?;
+        let client = agent_loop::shared_client().cloned()?;
+        Ok((chosen.0, client))
+    })
+    .await?;
+    messages.push(json!({"role": "user", "content": "Suggest the next messages I might send."}));
+    let reply = SideCall::new(&client, &llm_settings, &old_id, 200, Arc::new(TurnCancel::new()))
+        .ask(side::SUGGEST_SYSTEM, messages, Duration::from_secs(20))
+        .await;
+    side::suggestions_or_empty(reply)
+}
+
 /// Replaces the live conversation with a summary of itself: one model call outside a turn, saved as a new conversation
 /// and adopted atomically. The old conversation stays untouched in storage. Refused while busy, and when the history
 /// has no user message yet.
@@ -1519,6 +1556,7 @@ pub fn run() {
             new_conversation,
             ask_btw,
             suggest_name,
+            suggest_prompts,
             compact_conversation,
             fork_conversation,
             export_conversation,

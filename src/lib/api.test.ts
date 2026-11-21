@@ -77,6 +77,11 @@ describe('api side commands', () => {
     expect(invoke).toHaveBeenCalledWith('ask_btw', { sessionId: 'main', text: 'why did this fail?' });
   });
 
+  it('suggestPrompts takes no arguments and asks for the suggestions', () => {
+    void api.suggestPrompts();
+    expect(invoke).toHaveBeenCalledWith('suggest_prompts', { sessionId: 'main' });
+  });
+
   it('compactConversation takes no arguments', () => {
     void api.compactConversation();
     expect(invoke).toHaveBeenCalledWith('compact_conversation', { sessionId: 'main' });

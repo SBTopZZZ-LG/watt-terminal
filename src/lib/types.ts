@@ -335,6 +335,8 @@ export interface UiState {
   queue_mode: QueueMode | null;
   /** Hides the terminal's command separators and agent labels. Always a boolean: true when the file has no value. */
   hide_marks: boolean;
+  /** Suggests follow-up prompts after each reply (one extra model call per reply). Always a boolean: false when the file has no value. */
+  suggest_prompts: boolean;
 }
 
 /** A change to the UI state. An absent field is left alone, `null` clears it, a value sets it. */
@@ -346,6 +348,8 @@ export interface UiStatePatch {
   queue_mode?: QueueMode | null;
   /** A boolean cannot be cleared: the backend ignores `null`, like an absent field. */
   hide_marks?: boolean;
+  /** As `hide_marks`: a boolean, so `null` is ignored too. */
+  suggest_prompts?: boolean;
 }
 
 // AI provider settings (src-tauri/src/core/settings). Secrets are never in these types: they are only written, as

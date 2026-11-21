@@ -27,6 +27,8 @@ const BASE = {
   queueMode: 'all' as QueueMode,
   queueable: false,
   onUnqueue: () => null,
+  suggestions: [] as string[],
+  onSuggestion: NOOP,
   onInterrupt: NOOP,
   onApproveFirst: NOOP,
   onDenyFirst: NOOP,
@@ -286,5 +288,51 @@ describe('InputBar: the queue', () => {
   it('is not shown in the exited or collapsed modes', () => {
     expect(render({ mode: 'exited', queue: QUEUED, queueMode: 'all' })).not.toContain('bar-queue');
     expect(render({ mode: 'collapsed', queue: QUEUED, queueMode: 'all' })).not.toContain('bar-queue');
+  });
+});
+
+describe('InputBar: suggested prompts', () => {
+  const SUGGESTED = ['Run the tests', 'Show the diff', 'Ship it'];
+
+  it('renders one button per suggestion, under the input row', () => {
+    const html = render({ suggestions: SUGGESTED });
+    expect(html.match(/class="bar-suggest-chip"/g)).toHaveLength(3);
+    expect(html).toContain('bar-suggest-head">Suggested:</span>');
+    expect(html.indexOf('bar-field')).toBeLessThan(html.indexOf('bar-suggest"'));
+    // After the send button in the markup, so it wraps onto its own line below the field.
+    expect(html.indexOf('bar-send')).toBeLessThan(html.indexOf('bar-suggest"'));
+  });
+
+  it('each chip carries the full text as its title and label', () => {
+    const html = render({ suggestions: ['Show the diff of the last change'] });
+    const chip = tagHolding(html, 'button', 'bar-suggest-chip');
+    expect(chip).toContain('title="Show the diff of the last change"');
+    expect(chip).toContain('aria-label="Show the diff of the last change"');
+    expect(chip).toContain('type="button"');
+  });
+
+  it('a suggestion that starts with a slash is an ordinary chip, not a command', () => {
+    const html = render({ suggestions: ['/help me pick a file'] });
+    expect(html.match(/class="bar-suggest-chip"/g)).toHaveLength(1);
+    expect(html).toContain('>/help me pick a file</button>');
+  });
+
+  it('is not rendered with no suggestions', () => {
+    expect(render()).not.toContain('bar-suggest');
+    expect(render({ suggestions: [] })).not.toContain('bar-suggest');
+  });
+
+  it('is hidden while the agent is busy, the bar is locked, or in the exited and collapsed modes', () => {
+    expect(render({ suggestions: SUGGESTED, busy: true })).not.toContain('bar-suggest');
+    expect(render({ suggestions: SUGGESTED, locked: true })).not.toContain('bar-suggest');
+    expect(render({ suggestions: SUGGESTED, mode: 'exited' })).not.toContain('bar-suggest');
+    expect(render({ suggestions: SUGGESTED, mode: 'collapsed' })).not.toContain('bar-suggest');
+  });
+
+  it('shows alongside a queue, and the queue row stays above the field', () => {
+    const queue: QueuedMessage[] = [{ id: 1, text: 'check the tests', attachments: [] }];
+    const html = render({ suggestions: SUGGESTED, queue, queueMode: 'all' });
+    expect(html).toContain('bar-suggest"');
+    expect(html.indexOf('bar-queue')).toBeLessThan(html.indexOf('bar-field'));
   });
 });
