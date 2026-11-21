@@ -356,6 +356,11 @@ impl Session {
         self.shared.lock().foreground()
     }
 
+    /// How long the command the foreground hint names has run (see `Core::foreground_age`). None when there is no hint.
+    pub fn foreground_age(&self) -> Option<Duration> {
+        self.shared.lock().foreground_age(Instant::now())
+    }
+
     /// Every shell level, the local one first. Only the status reads it, to show the nested levels.
     pub fn levels(&self) -> Vec<LevelInfo> {
         self.shared.lock().levels()

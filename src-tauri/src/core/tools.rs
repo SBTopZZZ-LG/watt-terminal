@@ -317,6 +317,10 @@ pub trait AgentTools {
     fn foreground(&self) -> Option<Foreground> {
         None
     }
+    /// How long the foreground hint's command has run (see `foreground`). Defaults to None, so a fake needs no change.
+    fn foreground_age(&self) -> Option<Duration> {
+        None
+    }
     /// The shell on top (see `TopLevel`). Defaults to the local shell, so a fake without a shell needs no change.
     fn top_level(&self) -> TopLevel {
         TopLevel::default()
@@ -571,6 +575,10 @@ impl AgentTools for SessionTools<'_> {
 
     fn foreground(&self) -> Option<Foreground> {
         self.session.foreground()
+    }
+
+    fn foreground_age(&self) -> Option<Duration> {
+        self.session.foreground_age()
     }
 
     fn top_level(&self) -> TopLevel {

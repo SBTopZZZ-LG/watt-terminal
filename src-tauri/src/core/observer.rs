@@ -1550,12 +1550,23 @@ impl Core {
     /// The foreground program hint: only while the shell is Running (not Alt, not Raw) with a command open, and the
     /// command text is not blank. Derived from the open record each time, so it cannot go stale.
     pub fn foreground(&self) -> Option<Foreground> {
+        let fg = foreground::classify(&self.foreground_record()?.record.command);
+        (!fg.command.is_empty()).then_some(fg)
+    }
+
+    /// How long the command the foreground hint reads has run, at `now`, counted from its start (C). It covers a command the
+    /// user runs too. None when there is no hint (see `foreground`). `now` is a parameter so a test can set the time.
+    pub fn foreground_age(&self, now: Instant) -> Option<Duration> {
+        let open = self.foreground_record()?;
+        Some(now.saturating_duration_since(open.started))
+    }
+
+    /// The open record the foreground hint reads: the top level's, while the shell is Running.
+    fn foreground_record(&self) -> Option<&OpenRecord> {
         if self.lifecycle_view() != InputState::Running {
             return None;
         }
-        let open = self.parser.callbacks().open.as_ref()?;
-        let fg = foreground::classify(&open.record.command);
-        (!fg.command.is_empty()).then_some(fg)
+        self.parser.callbacks().open.as_ref()
     }
 
     /// True while the foreground hint names a program that takes the typed keys itself: anything but `other`. An ordinary
@@ -3464,6 +3475,23 @@ mod tests {
         assert!(!parked[0].on_top, "the record is parked under the nested shell");
         assert!(c.record_is_open(1));
         assert!(!c.has_finished_record(1));
+    }
+
+    /// The foreground hint's command age counts from the start of the command, a user's command included. `now` is passed
+    /// in, so the test sets the time instead of sleeping. None with no command open, and again once it has ended.
+    #[test]
+    fn foreground_age_counts_from_the_start_of_the_user_command() {
+        let mut c = core();
+        assert_eq!(c.foreground_age(Instant::now()), None);
+        c.lifecycle = Lifecycle::Prompt;
+        c.handle(Event::CommandLine("ssh h".into()));
+        c.handle(Event::CommandStart);
+        assert!(c.foreground().is_some(), "the user's ssh is the foreground hint");
+        let started = c.parser.callbacks().open.as_ref().expect("a record is open").started;
+        assert_eq!(c.foreground_age(started), Some(Duration::ZERO));
+        assert_eq!(c.foreground_age(started + Duration::from_secs(180)), Some(Duration::from_secs(180)));
+        c.handle(Event::CommandEnd { exit: 0, pipestatus: vec![0] });
+        assert_eq!(c.foreground_age(Instant::now()), None, "no command open after it ends");
     }
 
     /// Throughput of the observer path (`Core::apply`) on ~50 MB of `seq` output, in four settings:
