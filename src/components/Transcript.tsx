@@ -48,8 +48,6 @@ interface Props {
   history?: ReactNode;
   /** A notice shown above the chat body (the settings banner). Shown with the chat view only, and it never moves the body's scroll. */
   banner?: ReactNode;
-  /** A notice pinned above the chat body, above `banner` (the approve-all warning). Same placement and rules as `banner`. */
-  warning?: ReactNode;
 }
 
 /** The agent conversation, docked above the input bar. Collapsible, scrollable, and capped by CSS. */
@@ -69,7 +67,6 @@ export function Transcript({
   onToggleHistory,
   history,
   banner = null,
-  warning = null,
 }: Props) {
   const bodyRef = useRef<HTMLDivElement>(null);
   const sectionRef = useRef<HTMLElement>(null);
@@ -238,7 +235,6 @@ export function Transcript({
       </div>
       {open && view === 'history' && history}
       {/* Pinned: siblings above the body, so they never scroll away and the body's scroll and follow logic is untouched. */}
-      {bodyShown && warning}
       {bodyShown && banner}
       {bodyShown && (
         <div className="transcript-body" ref={bodyRef} tabIndex={-1} onScroll={onScroll} onWheel={onWheel}>

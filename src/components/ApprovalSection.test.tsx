@@ -74,10 +74,10 @@ describe('ApprovalSection: rules', () => {
     expect(render()).not.toContain('aria-invalid');
   });
 
-  it('keeps the note on what can run by rule and on approve-all', () => {
+  it('keeps the note on what can run by rule and on bypass', () => {
     const html = render();
     expect(html).toContain('letters, digits, spaces and the characters _-./:=@+,');
-    expect(html).toContain('Approve-all in the status bar overrides the rules for the session.');
+    expect(html).toContain('Bypass in the status bar overrides the rules for the session.');
     expect(html).toContain('At most 8 commands run this way in one turn');
   });
 });

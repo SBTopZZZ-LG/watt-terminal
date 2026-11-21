@@ -13,6 +13,9 @@ export type AskReasonCode = Exclude<ApprovalReasonCode, 'approve_all' | 'rule' |
  */
 export const AUTO_PER_TURN = 8;
 
+/** The user-facing name of approve-all (the session-only bypass). Wire codes stay `approve_all`. Change it here only. */
+export const BYPASS_LABEL = 'bypass';
+
 /**
  * Why a call asks, as a clause: the card says "Asked because <clause>", and the try-a-command line says "Would ask: <clause>".
  */
@@ -26,7 +29,7 @@ const ASK_CLAUSE: Record<Exclude<AskReasonCode, 'unintegrated_shell'>, string> =
   no_rule: 'no allow rule matches this command.',
   auto_cap: `this turn has already used its ${AUTO_PER_TURN} automatic approvals.`,
   nested_level: 'this is a nested shell, so every command in it needs your approval.',
-  approve_all_suspended: 'approve-all is off in this shell, because it was turned on in another shell.',
+  approve_all_suspended: `${BYPASS_LABEL} is off in this shell, because it was turned on in another shell.`,
 };
 
 /** Reasons that are a whole sentence on their own, so the card shows them as they are (no "Asked because"). */
@@ -36,7 +39,7 @@ const ASK_SENTENCE: Record<'unintegrated_shell', string> = {
 
 /** Why a call ran without asking, as a sentence. */
 const RAN_TEXT: Record<'approve_all' | 'rule' | 'interrupt' | 'latched', string> = {
-  approve_all: 'Ran without asking: approve-all is on for this session.',
+  approve_all: `Ran without asking: ${BYPASS_LABEL} is on for this session.`,
   rule: 'Ran without asking: an allow rule matches this command.',
   interrupt: 'Ran without asking: Ctrl-C, Ctrl-D or Esc into the command the agent started.',
   latched: "Ran without asking: you approved this command's first keystrokes, so its later ones run too until you type.",
@@ -67,8 +70,14 @@ export function ranBecause(code: ApprovalReasonCode): string {
   return own(RAN_TEXT, code) ?? GENERIC_RAN;
 }
 
-/** The tool row's decision label. An automatic run shows its reason ("auto · rule"); the other decisions show their name. */
+/**
+ * The tool row's decision label. A bypass run shows BYPASS_LABEL, not "auto". Other automatic runs show their reason ("auto · rule");
+ * the other decisions show their name.
+ */
 export function decisionLabel(decision: ToolDecision, reason: ApprovalReasonCode | null): string {
+  if (decision === 'auto' && reason === 'approve_all') {
+    return BYPASS_LABEL;
+  }
   return decision === 'auto' && reason !== null ? `auto · ${reason}` : decision;
 }
 

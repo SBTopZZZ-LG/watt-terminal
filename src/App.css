@@ -31,6 +31,9 @@
   --fail: #e06c75;
   --warn: #e5c07b;
   --warn-tint: rgba(229, 192, 123, 0.1);
+  /* Bypass is on: orange, between the yellow --warn and the red --fail. Only the approval chip uses it. */
+  --bypass: #f0883e;
+  --bypass-tint: rgba(240, 136, 62, 0.12);
   --ok-glow: rgba(152, 195, 121, 0.35);
   --shadow: rgba(0, 0, 0, 0.35);
   /* The dimming behind a modal (.modal-backdrop). Darker than --shadow, so a dialog stands out on the navy background. */
@@ -2705,7 +2708,7 @@ input {
   outline-offset: 2px;
 }
 
-/* The approval row above the input: a muted label and a text toggle, no border. Auto reads warn, manual muted. */
+/* The approval row above the input: a muted label and a text toggle. Bypass reads orange in a box, manual muted. */
 .bar-approval {
   flex-basis: 100%;
   font-size: 11px;
@@ -2724,8 +2727,22 @@ input {
   cursor: pointer;
 }
 
-.bar-approval-toggle.is-auto {
-  color: var(--warn);
+/* Bypass is on: orange text in a faint orange box. The one warning signal in the approval row. */
+.bar-approval-toggle.is-bypass {
+  color: var(--bypass);
+  border: 1px solid var(--bypass);
+  background: var(--bypass-tint);
+  padding: 0 4px;
+  border-radius: 3px;
+}
+
+.bar-approval-toggle.is-bypass:hover {
+  color: var(--bypass);
+}
+
+/* On in another shell, off here: manual, with a dotted underline and no colour. */
+.bar-approval-toggle.is-suspended {
+  text-decoration: underline dotted;
 }
 
 .bar-approval-toggle:hover {
@@ -4061,7 +4078,7 @@ input {
   color: var(--fail);
 }
 
-/* The chip buttons (auto-approve and the settings gear) take the same focus ring. */
+/* The chip buttons (the settings gear) take the same focus ring. */
 .chip-button:focus-visible {
   outline: 1px solid var(--accent);
   outline-offset: 1px;

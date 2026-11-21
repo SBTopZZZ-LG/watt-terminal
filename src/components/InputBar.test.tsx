@@ -193,27 +193,49 @@ describe('InputBar: the approval row', () => {
     const tag = tagHolding(html, 'button', 'bar-approval-toggle');
     expect(tag).toContain('type="button"');
     expect(tag).toContain('aria-pressed="false"');
-    expect(tag).toContain('title="manual: each command asks"');
-    expect(tag).not.toContain('is-auto');
+    expect(tag).toContain('data-tip="manual: each command asks for approval. Click (or Shift+Tab) to bypass approval for this session."');
+    expect(tag).not.toContain('title=');
+    expect(tag).not.toContain('is-bypass');
+    expect(tag).not.toContain('is-suspended');
     expect(tag).not.toContain('disabled=""');
     expect(html).toContain('>manual</button>');
     // The toggle reads as small text: no border, not even a dashed one.
     expect(tag).not.toContain('border');
   });
 
-  it('reads auto, pressed, and in the warn colour when approve-all is on here', () => {
+  it('reads bypass, pressed and orange, with the warning in its tip, when bypass is on here', () => {
     const html = render({ autoApprove: true });
     const tag = tagHolding(html, 'button', 'bar-approval-toggle');
     expect(tag).toContain('aria-pressed="true"');
-    expect(tag).toContain('is-auto');
-    expect(tag).toContain('title="auto: runs commands without asking, resets when the app restarts"');
-    expect(html).toContain('>auto</button>');
+    expect(tag).toContain('is-bypass');
+    expect(tag).not.toContain('is-suspended');
+    expect(tag).toContain(
+      'data-tip="Bypass is ON: the agent runs every command without asking, even ones your deny rules or the built-in checks would block. It resets when Watt restarts. Click to turn off."',
+    );
+    expect(html).toContain('>bypass</button>');
   });
 
-  it('reads manual when approve-all was switched on in another shell', () => {
+  it('reads manual, not orange, with its own tip when bypass was switched on in another shell', () => {
     const html = render({ autoApprove: true, autoSuspended: true });
+    const tag = tagHolding(html, 'button', 'bar-approval-toggle');
     expect(html).toContain('>manual</button>');
-    expect(tagHolding(html, 'button', 'bar-approval-toggle')).not.toContain('is-auto');
+    expect(tag).toContain('aria-pressed="false"');
+    expect(tag).toContain('is-suspended');
+    expect(tag).not.toContain('is-bypass');
+    expect(tag).toContain(
+      'data-tip="Bypass was turned on in another shell, so it is off in this one: every command here asks for your approval. Click to turn it on here."',
+    );
+  });
+
+  it('puts the same tip on the row too, so a disabled chip still shows it, and has no native title', () => {
+    const html = render({ autoApprove: true, locked: true });
+    const row = tagHolding(html, 'div', 'class="bar-approval"');
+    const tag = tagHolding(html, 'button', 'bar-approval-toggle');
+    expect(row).toContain('data-tip="Bypass is ON:');
+    expect(tag).toContain('data-tip="Bypass is ON:');
+    expect(tag).toContain('disabled=""');
+    expect(row).not.toContain('title=');
+    expect(tag).not.toContain('title=');
   });
 
   it('is disabled while locked', () => {

@@ -59,7 +59,7 @@ describe('askedBecause', () => {
 describe('ranBecause', () => {
   it('says why an automatic run happened, for both automatic codes', () => {
     expect(ranBecause('rule')).toBe('Ran without asking: an allow rule matches this command.');
-    expect(ranBecause('approve_all')).toBe('Ran without asking: approve-all is on for this session.');
+    expect(ranBecause('approve_all')).toBe('Ran without asking: bypass is on for this session.');
   });
 
   it('falls back to a generic line for an unknown code', () => {
@@ -70,7 +70,7 @@ describe('ranBecause', () => {
 describe('decisionLabel', () => {
   it('shows the reason on an automatic run', () => {
     expect(decisionLabel('auto', 'rule')).toBe('auto · rule');
-    expect(decisionLabel('auto', 'approve_all')).toBe('auto · approve_all');
+    expect(decisionLabel('auto', 'approve_all')).toBe('bypass');
   });
 
   it('shows the bare decision otherwise', () => {

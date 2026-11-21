@@ -19,7 +19,7 @@ A terminal for macOS and Windows 11 where you and an AI agent share one persiste
 ## What it does
 
 - **One shared shell.** A real `zsh -l` session on macOS, or PowerShell on Windows, started through an integration shim. Your own dotfiles are read, never edited. The agent reads the same command history, output and screen you do.
-- **Agent with guard rails.** Read tools are always allowed. `run_command` needs your approval unless a rule or the session's auto-approve toggle allows it, and only runs at an idle prompt with shell integration live. `send_keys` can type into a command the agent started, and password prompts are refused. Secrets in tool output are redacted before they reach the model.
+- **Agent with guard rails.** Read tools are always allowed. `run_command` needs your approval unless a rule or the session's bypass toggle allows it, and only runs at an idle prompt with shell integration live. `send_keys` can type into a command the agent started, and password prompts are refused. Secrets in tool output are redacted before they reach the model.
 - **Bring your own model.** Any OpenAI-compatible chat endpoint. Presets for OpenRouter and OpenCode Go, plus a custom endpoint. API keys live in the macOS Keychain or the Windows Credential Manager, not in the settings file.
 - **Context meter.** A live estimate of how much of the model's context window is used, broken down by system instructions, tools, your messages, attachments, assistant replies and tool output. When the window fills, the oldest tool output, document text and whole turns are trimmed from what is sent, newest first kept; your stored conversation is never rewritten.
 - **Attachments.** Drop or paste images and text files onto the agent bar.
@@ -90,7 +90,7 @@ Typing `/` opens an autocomplete menu: ArrowUp/Down moves, Enter or Tab accepts,
 
 ## Approvals
 
-Approval mode is set in Settings, under **Approvals**. **Manual** (the default) asks before every `run_command` and the first `send_keys` into a command. **Regex rules** lets you allow or deny commands by pattern, with a built-in deny list and a cap on automatic approvals per turn. Auto-approve is a separate, session-only switch that resets when the app restarts and shows a banner while on.
+Approval mode is set in Settings, under **Approvals**. **Manual** (the default) asks before every `run_command` and the first `send_keys` into a command. **Regex rules** lets you allow or deny commands by pattern, with a built-in deny list and a cap on automatic approvals per turn. **Bypass** is a separate, session-only switch that resets when the app restarts. While it is on, the approval chip above the input turns orange and its tooltip says so.
 
 ## Configuration and data
 

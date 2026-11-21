@@ -62,7 +62,6 @@ import { HelpDialog } from './components/HelpDialog';
 import type { HelpLoad } from './components/HelpDialog';
 import { SettingsDialog } from './components/SettingsDialog';
 import { SettingsBanner } from './components/SettingsBanner';
-import { AutoApproveNotice } from './components/AutoApproveNotice';
 import { IntegrateDialog } from './components/IntegrateDialog';
 import { Tooltip } from './components/Tooltip';
 
@@ -1572,11 +1571,6 @@ export default function App() {
               onApprove={answer}
               onAnswerQuestions={answerQuestions}
               onNewConversation={newConversation}
-              warning={
-                autoApprove ? (
-                  <AutoApproveNotice suspended={autoSuspended} onTurnOff={toggleAutoApprove} onTurnOnHere={toggleAutoApprove} />
-                ) : null
-              }
               banner={
                 settingsState !== null && recoveryKind(settingsState) !== 'ok' && !settingsBannerHidden ? (
                   <SettingsBanner

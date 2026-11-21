@@ -5,6 +5,7 @@ import type { BarMode } from '../lib/inputState';
 import { agentPlaceholder, History, historyKeyTakesLine, messageFor, sendButtonFor } from '../lib/barInput';
 import { queuedAttachmentNote, queueHeader, restoreText } from '../lib/messageQueue';
 import type { QueuedMessage } from '../lib/messageQueue';
+import { BYPASS_LABEL } from '../lib/approvalReasons';
 import { acceptMenuItem, commandMenuItems, filterCommandMenu, menuAcceptRuns, menuKeyIntent, menuQuery, moveMenuIndex } from '../lib/commandMenu';
 import type { CommandMenuItem } from '../lib/commandMenu';
 import { admitRefusal, countRefusal, decodedSize, filesFromPaste, loadOf, prepareFile } from '../lib/attachments';
@@ -49,9 +50,9 @@ interface Props {
   locked: boolean;
   /** The agent's question is waiting for the user's answer. A blocker for taking focus back (see inputFocus.ts). */
   questionPending?: boolean;
-  /** Approve-all: the agent runs commands without asking. Shown above the input in chat mode; Shift+Tab flips it too. */
+  /** Bypass (approve-all): the agent runs commands without asking. Shown above the input in chat mode; Shift+Tab flips it too. */
   autoApprove: boolean;
-  /** Approve-all was switched on in another shell level, so it is off in the shell on top. The row says manual until it is switched on here. */
+  /** Bypass was switched on in another shell level, so it is off in the shell on top. The chip says manual until it is switched on here. */
   autoSuspended?: boolean;
   onToggleAutoApprove: () => void;
   /** Bumped by the parent to move focus into the input (or the restart button, when the shell exited). */
@@ -352,8 +353,15 @@ export function InputBar(props: Props) {
   const readyCount = drafts.filter((d) => d.input !== null).length;
   const processing = drafts.some((d) => d.input === null);
   const send = sendButtonFor(busy, text, props.locked, { ready: readyCount, processing });
-  // Approve-all is on in this shell only when it was switched on here: a suspended one reads manual for the shell on top.
-  const autoOn = props.autoApprove && !props.autoSuspended;
+  // Bypass is on in this shell only when it was switched on here: a suspended one reads manual for the shell on top.
+  const bypassOn = props.autoApprove && !props.autoSuspended;
+  const bypassSuspended = props.autoApprove && props.autoSuspended === true;
+  const approvalTip = bypassOn
+    ? 'Bypass is ON: the agent runs every command without asking, even ones your deny rules or the built-in checks would block. It resets when Watt restarts. Click to turn off.'
+    : bypassSuspended
+      ? 'Bypass was turned on in another shell, so it is off in this one: every command here asks for your approval. Click to turn it on here.'
+      : 'manual: each command asks for approval. Click (or Shift+Tab) to bypass approval for this session.';
+  const toggleClass = bypassOn ? 'bar-approval-toggle is-bypass' : bypassSuspended ? 'bar-approval-toggle is-suspended' : 'bar-approval-toggle';
 
   /** The send button: Stop while busy, otherwise the same as Enter. Focus stays in the input either way. */
   function onSendClick() {
@@ -429,7 +437,7 @@ export function InputBar(props: Props) {
     }
     // The menu first: plain keys move, accept or dismiss it. A Ctrl/Meta/Alt chord is not the menu's: it falls
     // through to the bar's own handling (Ctrl-C still interrupts), as does Shift+Enter (a newline). Shift+Tab
-    // toggles approve-all (Ctrl+Shift+Tab stays none, so focus moves on). Escape dismisses the menu instead of
+    // toggles bypass (Ctrl+Shift+Tab stays none, so focus moves on). Escape dismisses the menu instead of
     // denying or closing.
     if (menuOpen && !e.ctrlKey && !e.metaKey && !e.altKey) {
       const intent = menuKeyIntent(e.key, { shift: e.shiftKey, ctrl: false, meta: false, alt: false });
@@ -485,7 +493,7 @@ export function InputBar(props: Props) {
         props.onClose();
         return;
       case 'toggle_approval':
-        // Shift+Tab flips approve-all without moving focus. Locked and non-chat modes ignore it.
+        // Shift+Tab flips bypass without moving focus. Locked and non-chat modes ignore it.
         e.preventDefault();
         if (mode === 'chat' && !props.locked) {
           props.onToggleAutoApprove();
@@ -540,22 +548,18 @@ export function InputBar(props: Props) {
       onDrop={onDrop}
     >
       {mode === 'chat' && (
-        <div className="bar-approval">
+        <div className="bar-approval" data-tip={approvalTip}>
           <span className="bar-approval-label">approval:</span>{' '}
           <button
             type="button"
-            className={autoOn ? 'bar-approval-toggle is-auto' : 'bar-approval-toggle'}
-            aria-pressed={autoOn}
-            title={
-              autoOn
-                ? 'auto: runs commands without asking, resets when the app restarts'
-                : 'manual: each command asks'
-            }
+            className={toggleClass}
+            aria-pressed={bypassOn}
+            data-tip={approvalTip}
             disabled={props.locked}
             onMouseDown={(e) => e.preventDefault()}
             onClick={props.onToggleAutoApprove}
           >
-            {autoOn ? 'auto' : 'manual'}
+            {bypassOn ? BYPASS_LABEL : 'manual'}
           </button>
         </div>
       )}
