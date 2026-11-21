@@ -17,6 +17,8 @@
   --line: var(--rule);
   --rule-strong: rgba(111, 211, 255, 0.5);
   --tint: rgba(111, 211, 255, 0.1);
+  /* Every chat find match (::highlight(chat-find)). The current match is --accent with --tip-fg text. */
+  --find-match: rgba(111, 211, 255, 0.28);
   --ink: #c6e4f7;
   /* Brighter ink for headings and strong text in markdown. */
   --ink-strong: #eaf7ff;
@@ -337,6 +339,37 @@ a {
   font-size: 11px;
   white-space: nowrap;
   text-align: right;
+}
+
+/*
+ * Chat find: the same bar, in the flow at the top of the agent panel (not over the terminal). Its input takes the free width.
+ * The matches are CSS Custom Highlights (see chatFindDom.ts); where the API is missing, only the selection marks the match.
+ */
+.chat-find {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 4px;
+  align-items: center;
+  margin: 6px 12px 0;
+  padding: 4px 6px;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  background: var(--panel);
+  box-shadow: 0 2px 8px var(--shadow);
+}
+
+.chat-find .find-input {
+  flex: 1 1 0;
+  width: 0;
+}
+
+::highlight(chat-find) {
+  background-color: var(--find-match);
+}
+
+::highlight(chat-find-current) {
+  background-color: var(--accent);
+  color: var(--tip-fg);
 }
 
 .find-button {

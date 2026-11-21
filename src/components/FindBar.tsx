@@ -5,7 +5,7 @@ import { findLabel } from '../lib/find';
 import type { FindResults } from '../lib/find';
 
 interface Props {
-  /** Bumped by the parent (Cmd+F) to focus and select the input, also when the bar is already open. */
+  /** Bumped by the parent (Cmd+Shift+F, or Cmd+F with focus in the terminal) to focus and select the input, also when open. */
   focusToken: number;
   /** Esc, or the close button. The parent unmounts the bar, which clears the highlights. */
   onClose: () => void;
