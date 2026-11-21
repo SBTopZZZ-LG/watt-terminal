@@ -1231,6 +1231,13 @@ input {
   color: var(--muted);
 }
 
+/* The todo list the agent set, in the chat (TodoSetLine): the rows are the todo panel's, without the list's own layout. */
+.todo-set-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
 .msg {
   padding: 4px 0;
   white-space: pre-wrap;

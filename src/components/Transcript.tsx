@@ -4,7 +4,8 @@ import { copyText } from '../lib/clipboard';
 import { isAtBottom, shouldFollowAfterSend } from '../lib/stickScroll';
 import { approvalTitle } from '../lib/transcript';
 import type { TranscriptItem, UserAttachment } from '../lib/transcript';
-import type { QuestionAnswerInput } from '../lib/types';
+import type { QuestionAnswerInput, TodoItem } from '../lib/types';
+import { statusWord, todoRows } from '../lib/todoView';
 import { draftsFromAnswers, enterIntent, firstUnsettled, isComplete, newDrafts, payload, pickOption, setOther, settled, summary, toggleSkip } from '../lib/questions';
 import type { EnterIntent, QuestionDraft } from '../lib/questions';
 import { formatSize } from '../lib/attachments';
@@ -360,6 +361,27 @@ function MessageAttachments({ items }: { items: UserAttachment[] }) {
   );
 }
 
+/** The todo list the agent set, in the chat: every item with its status at that moment. An empty list is a clear. */
+function TodoSetLine({ items }: { items: TodoItem[] }) {
+  if (items.length === 0) {
+    return <div className="notice notice-muted">TODO list cleared</div>;
+  }
+  return (
+    <div className="todo-set">
+      <div className="notice notice-muted">TODO list</div>
+      <ol className="todo-set-list">
+        {todoRows(items).map((row) => (
+          <li key={row.index} className={`todo-item todo-${row.status}`}>
+            <span className="todo-mark" aria-hidden="true" />
+            <span className="todo-sr-only">{statusWord(row.status)}: </span>
+            <span className="todo-text">{row.text}</span>
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
+}
+
 function Entry({ item, onApprove, onAnswerQuestions }: { item: TranscriptItem; onApprove: Props['onApprove']; onAnswerQuestions: Props['onAnswerQuestions'] }) {
   switch (item.kind) {
     case 'user':
@@ -379,6 +401,8 @@ function Entry({ item, onApprove, onAnswerQuestions }: { item: TranscriptItem; o
       );
     case 'notice':
       return <div className={item.muted ? 'notice notice-muted' : 'notice'}>{item.text}</div>;
+    case 'todo_set':
+      return <TodoSetLine items={item.items} />;
     // Closes an interactive group (see renderEntries); with no group open there is nothing to show.
     case 'record_end':
       return null;

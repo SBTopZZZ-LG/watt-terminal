@@ -5,6 +5,7 @@ import type { AgentEvent, ApprovalReasonCode, ContextUsage, QuestionAnswerInput,
 import { APPROVAL_WINDOW_MS } from './approvalTime';
 import { visibleEscapes } from './visibleEscapes';
 import { TODO_TOOL } from './todoView';
+import { isListChange } from './todoPanel';
 import { ASK_USER_TOOL, closedResult, parseResult } from './questions';
 import { openFramesBelow, openRecordIds, openedBy } from './interactive';
 
@@ -53,6 +54,11 @@ export type TranscriptItem =
    * when a shell level was pushed above the command (levels_changed), so the group ends while the command may still run.
    */
   | { id: number; kind: 'record_end'; recordId: number; exit: number | null; integrated?: boolean }
+  /**
+   * The todo list the agent set, in full, with each item's status at that moment. Added when the list's content or order
+   * changes (see isListChange): a status-only update adds none. `items` is empty for a clear.
+   */
+  | { id: number; kind: 'todo_set'; items: TodoItem[] }
   /** `muted` is a quiet note (the trim note), drawn in the muted colour rather than the warning one. */
   | { id: number; kind: 'notice'; text: string; muted?: boolean };
 
@@ -406,8 +412,10 @@ function applyAgentEvent(t: Transcript, ev: AgentEvent, at: number | undefined):
     // The integration dialog and strip chip follow these (see integrate.ts). The row is the tool call's own (tool_result).
     case 'integration_request':
       return t;
-    case 'todo_update':
-      return { ...t, todos: ev.items };
+    case 'todo_update': {
+      const next: Transcript = { ...t, todos: ev.items };
+      return isListChange(t.todos, ev.items) ? add(next, (id) => ({ id, kind: 'todo_set', items: ev.items })) : next;
+    }
     case 'notice':
       return add(t, (id) => ({ id, kind: 'notice', text: ev.text, muted: true }));
     case 'context_usage':

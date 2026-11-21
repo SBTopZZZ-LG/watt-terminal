@@ -635,3 +635,38 @@ describe('Transcript: a clarification question card', () => {
     expect(html).not.toContain('class="tool');
   });
 });
+
+describe('Transcript: the todo list the agent set', () => {
+  const update = (items: Array<{ content: string; status: 'pending' | 'in_progress' | 'completed' }>): TranscriptAction => ({
+    type: 'agent_event',
+    event: { type: 'todo_update', items },
+  });
+
+  it('shows a title, then every item with its status word and text', () => {
+    const html = render([
+      update([
+        { content: 'Read the spec', status: 'completed' },
+        { content: 'Write <code> & tests', status: 'in_progress' },
+        { content: 'Ship', status: 'pending' },
+      ]),
+    ]);
+    expect(html).toContain('<div class="todo-set"><div class="notice notice-muted">TODO list</div>');
+    expect(html).toContain('<li class="todo-item todo-completed"><span class="todo-mark" aria-hidden="true"></span><span class="todo-sr-only">Done: </span><span class="todo-text">Read the spec</span></li>');
+    expect(html).toContain('<span class="todo-sr-only">In progress: </span><span class="todo-text">Write &lt;code&gt; &amp; tests</span>');
+    expect(html).toContain('<span class="todo-sr-only">Pending: </span><span class="todo-text">Ship</span>');
+  });
+
+  it('a clear shows the cleared line, with no rows', () => {
+    const html = render([update([{ content: 'a', status: 'pending' }]), update([])]);
+    expect(html).toContain('<div class="notice notice-muted">TODO list cleared</div>');
+    expect(html.match(/todo-item/g)?.length).toBe(1);
+  });
+
+  it('a status-only tick adds no second line', () => {
+    const html = render([
+      update([{ content: 'a', status: 'pending' }]),
+      update([{ content: 'a', status: 'completed' }]),
+    ]);
+    expect(html.match(/TODO list</g)?.length ?? 0).toBe(1);
+  });
+});

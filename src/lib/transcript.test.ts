@@ -626,10 +626,10 @@ describe('transcriptReducer: todo list', () => {
     expect(second.todos).toEqual([todo('b', 'in_progress')]);
   });
 
-  it('todo_update does not add a transcript item or change the in-flight count', () => {
+  it('todo_update adds only its set line and does not change the in-flight count', () => {
     const before = run([{ type: 'user_sent', clientId: 1, text: 'plan' }]);
     const after = transcriptReducer(before, update([todo('a', 'in_progress')]));
-    expect(after.items).toEqual(before.items);
+    expect(after.items.filter((i) => i.kind !== 'todo_set')).toEqual(before.items);
     expect(after.inFlight).toBe(before.inFlight);
   });
 
@@ -673,6 +673,66 @@ describe('transcriptReducer: todo list', () => {
     const after = run([call('c1', 'todo_write'), call('c2', 'run_command'), result('c2', 'run_command'), result('c1', 'todo_write')]);
     expect(after.items.map((i) => (i.kind === 'tool' ? i.name : i.kind))).toEqual(['run_command']);
     expect(after.items[0]).toMatchObject({ kind: 'tool', status: 'ok' });
+  });
+
+  describe('the set line', () => {
+    const lines = (t: Transcript) => t.items.filter((i) => i.kind === 'todo_set');
+    const last = (t: Transcript) => t.items[t.items.length - 1];
+
+    it('the first set adds a line with the exact items', () => {
+      const after = run([update([todo('a', 'in_progress'), todo('b')])]);
+      expect(after.items).toEqual([{ id: 1, kind: 'todo_set', items: [todo('a', 'in_progress'), todo('b')] }]);
+    });
+
+    it('a status-only tick adds no line, but the list is still updated', () => {
+      const before = run([update([todo('a', 'in_progress'), todo('b')])]);
+      const after = transcriptReducer(before, update([todo('a', 'completed'), todo('b', 'in_progress')]));
+      expect(lines(after)).toHaveLength(1);
+      expect(after.nextId).toBe(before.nextId);
+      expect(after.todos).toEqual([todo('a', 'completed'), todo('b', 'in_progress')]);
+    });
+
+    it('a renamed, reordered, added or removed item adds a line', () => {
+      const base = [todo('a'), todo('b')];
+      const before = run([update(base)]);
+      expect(last(transcriptReducer(before, update([todo('a'), todo('c')])))).toMatchObject({ items: [todo('a'), todo('c')] });
+      expect(last(transcriptReducer(before, update([todo('b'), todo('a')])))).toMatchObject({ items: [todo('b'), todo('a')] });
+      expect(last(transcriptReducer(before, update([...base, todo('c')])))).toMatchObject({ items: [...base, todo('c')] });
+      expect(last(transcriptReducer(before, update([todo('a')])))).toMatchObject({ items: [todo('a')] });
+    });
+
+    it('a clear adds a line with no items, and a clear on an empty list adds none', () => {
+      const before = run([update([todo('a')])]);
+      const after = transcriptReducer(before, update([]));
+      expect(last(after)).toEqual({ id: before.nextId, kind: 'todo_set', items: [] });
+      expect(after.todos).toEqual([]);
+      expect(transcriptReducer(EMPTY_TRANSCRIPT, update([])).items).toEqual([]);
+    });
+
+    it('an identical resend adds no line', () => {
+      const before = run([update([todo('a', 'in_progress')])]);
+      const after = transcriptReducer(before, update([todo('a', 'in_progress')]));
+      expect(after.items).toEqual(before.items);
+    });
+
+    it('a conversation reset makes the next set a first set again (the reset clears the items too)', () => {
+      const after = run([update([todo('a')]), { type: 'conversation_reset' }, update([todo('a')])]);
+      expect(lines(after)).toEqual([{ id: 2, kind: 'todo_set', items: [todo('a')] }]);
+    });
+
+    it('a session reset keeps the list, so the same list adds no line', () => {
+      const after = run([update([todo('a')]), { type: 'session_reset' }, update([todo('a', 'completed')])]);
+      expect(lines(after)).toHaveLength(1);
+    });
+
+    it('a set line keeps its place among the other items', () => {
+      const after = run([
+        { type: 'user_sent', clientId: 1, text: 'plan' },
+        update([todo('a')]),
+        { type: 'agent_event', event: { type: 'text', text: 'working' } },
+      ]);
+      expect(after.items.map((i) => i.kind)).toEqual(['user', 'todo_set', 'agent']);
+    });
   });
 });
 

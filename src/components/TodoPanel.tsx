@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import type { TodoItem } from '../lib/types';
-import { currentIndex, titleText, todoRows, todoSummary } from '../lib/todoView';
+import { currentIndex, statusWord, titleText, todoRows, todoSummary } from '../lib/todoView';
 import { listMaxHeight, revealIndex, scrollTopToReveal, shouldExpand, todoShape, TODO_LIST_MAX_PX } from '../lib/todoPanel';
 import { settleTight, TIGHT_ATTR } from '../lib/panelTight';
 
@@ -206,14 +206,3 @@ function prefersReducedMotion(): boolean {
   return typeof window.matchMedia === 'function' && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 }
 
-/** The status as a word for screen readers. The marks are drawn in CSS and carry no text. */
-function statusWord(status: TodoItem['status']): string {
-  switch (status) {
-    case 'completed':
-      return 'Done';
-    case 'in_progress':
-      return 'In progress';
-    default:
-      return 'Pending';
-  }
-}

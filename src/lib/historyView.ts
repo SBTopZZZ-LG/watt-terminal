@@ -6,10 +6,14 @@
 // tool calls (name and arguments) joined with their tool messages. Not shown, because they are not stored: approval
 // cards, decision labels, UI notices, and raw tool results (only the projected text is kept).
 
-import type { ChatMessage, ConversationMeta } from './types';
+import type { ChatMessage, ConversationMeta, TodoItem } from './types';
 import type { NewItem, ToolStatus, UserAttachment } from './transcript';
 import { ASK_USER_TOOL, closedResult, parseQuestions, parseResult } from './questions';
-import { TODO_TOOL } from './todoView';
+import { parseTodoArgs, TODO_TOOL } from './todoView';
+import { isListChange } from './todoPanel';
+
+/** The start of a refused tool call's result text: a todo_write error is projected as `error: <reason>` (project.rs). */
+const TODO_ERROR_PREFIX = 'error:';
 
 /**
  * The start of a denied call's error text. Mirrors DENIED in src-tauri/src/core/agent.rs. A stored tool message carries the
@@ -180,7 +184,8 @@ function callsOf(toolCalls: unknown): ToolCall[] {
  * gives an agent item (when it has text), then one tool item per tool call. Each tool item takes the content of the tool
  * message with the same tool_call_id: failed when that content starts with `error:`, the DENIED prefix or `skipped:`, ok otherwise.
  * A call with no tool message is failed, with NO_RESULT_TEXT. Tool messages that answer no call are dropped. Empty
- * assistant text is skipped. A todo_write call gets no item (nor its tool message): the todo panel shows the list instead.
+ * assistant text is skipped. A todo_write call gets no tool item (nor its tool message). It gives a todo_set item when it changes
+ * the list's content or order (replayed from empty, as the live list is; see transcript.ts), and none for a refused call.
  * A settled ask_user call gives a resolved question item (rebuilt from its saved arguments and result); an unsettled
  * one gives a closed card (never a tool row, and never answerable). Only an unreadable call gives a generic tool row,
  * like any other call.
@@ -194,6 +199,8 @@ export function itemsFromMessages(messages: ChatMessage[]): NewItem[] {
     }
   }
   const items: NewItem[] = [];
+  // The todo list as the calls before this one left it. It starts empty, as the live list does for a new conversation.
+  let todos: TodoItem[] = [];
   for (const m of messages) {
     if (m.role === 'user') {
       const text = textOf(m.content);
@@ -211,10 +218,20 @@ export function itemsFromMessages(messages: ChatMessage[]): NewItem[] {
         items.push({ kind: 'agent', text, streaming: false });
       }
       for (const call of callsOf(m.tool_calls)) {
+        const content = results.get(call.id);
         if (call.name === TODO_TOOL) {
+          // A refused call sets nothing (no line, no change to the list): the backend's validation (parseTodoArgs), or its
+          // error result. Any other call sets the list it carries, so a line is shown when that changes it.
+          const next = parseTodoArgs(call.args);
+          if (next === null || (content ?? '').startsWith(TODO_ERROR_PREFIX)) {
+            continue;
+          }
+          if (isListChange(todos, next)) {
+            items.push({ kind: 'todo_set', items: next });
+          }
+          todos = next;
           continue;
         }
-        const content = results.get(call.id);
         // A settled question is its resolved card, rebuilt from the saved arguments and result; an unsettled one is
         // a closed card. A call that cannot be rebuilt (or whose present result cannot be read) is a generic tool row,
         // as any other call is.
