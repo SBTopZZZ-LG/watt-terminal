@@ -403,6 +403,116 @@ describe('itemsFromMessages: todo_write', () => {
     const items = itemsFromMessages([{ role: 'assistant', content: '', tool_calls: [todoCall('t1')] }]);
     expect(items).toEqual([]);
   });
+
+  describe('the set lines', () => {
+    type Status = 'pending' | 'in_progress' | 'completed';
+    const todo = (content: string, status: Status = 'pending') => ({ content, status });
+    const setCall = (id: string, items: unknown) => ({
+      id,
+      type: 'function',
+      function: { name: 'todo_write', arguments: JSON.stringify({ items }) },
+    });
+    const ok = (id: string) => ({ role: 'tool', tool_call_id: id, content: 'todo list updated: 0 done, 0 in progress, 2 pending' });
+    const refused = (id: string) => ({ role: 'tool', tool_call_id: id, content: 'error: 2 items are in_progress; keep exactly one in_progress' });
+    const sets = (items: ReturnType<typeof itemsFromMessages>) => items.filter((i) => i.kind === 'todo_set');
+
+    it('the first set and each content or order change give a line, with the exact items', () => {
+      const items = itemsFromMessages([
+        { role: 'assistant', content: '', tool_calls: [setCall('t1', [todo('a', 'in_progress'), todo('b')])] },
+        { role: 'tool', tool_call_id: 't1', content: 'todo list updated: 0 done, 1 in progress, 1 pending' },
+        { role: 'assistant', content: '', tool_calls: [setCall('t2', [todo('b', 'in_progress'), todo('a')])] },
+        ok('t2'),
+        { role: 'assistant', content: '', tool_calls: [setCall('t3', [todo('a'), todo('b'), todo('c')])] },
+        ok('t3'),
+      ]);
+      expect(items).toEqual([
+        { kind: 'todo_set', items: [todo('a', 'in_progress'), todo('b')] },
+        { kind: 'todo_set', items: [todo('b', 'in_progress'), todo('a')] },
+        { kind: 'todo_set', items: [todo('a'), todo('b'), todo('c')] },
+      ]);
+    });
+
+    it('a status-only tick gives no line', () => {
+      const items = itemsFromMessages([
+        { role: 'assistant', content: '', tool_calls: [setCall('t1', [todo('a', 'in_progress'), todo('b')])] },
+        ok('t1'),
+        { role: 'assistant', content: '', tool_calls: [setCall('t2', [todo('a', 'completed'), todo('b', 'in_progress')])] },
+        ok('t2'),
+      ]);
+      expect(sets(items)).toHaveLength(1);
+    });
+
+    it('a clear gives a line with no items, and a clear of an empty list gives none', () => {
+      const items = itemsFromMessages([
+        { role: 'assistant', content: '', tool_calls: [setCall('t1', [])] },
+        ok('t1'),
+        { role: 'assistant', content: '', tool_calls: [setCall('t2', [todo('a')])] },
+        ok('t2'),
+        { role: 'assistant', content: '', tool_calls: [setCall('t3', [])] },
+        { role: 'tool', tool_call_id: 't3', content: 'todo list cleared' },
+      ]);
+      expect(items).toEqual([
+        { kind: 'todo_set', items: [todo('a')] },
+        { kind: 'todo_set', items: [] },
+      ]);
+    });
+
+    it('a refused call gives no line and does not change the list the next call is compared with', () => {
+      const items = itemsFromMessages([
+        { role: 'assistant', content: '', tool_calls: [setCall('t1', [todo('a', 'in_progress')])] },
+        ok('t1'),
+        // Two in_progress items: refused by the backend, so this list never existed.
+        { role: 'assistant', content: '', tool_calls: [setCall('t2', [todo('a', 'in_progress'), todo('b', 'in_progress')])] },
+        refused('t2'),
+        // Same as the stored list: a tick, not a change, so no line.
+        { role: 'assistant', content: '', tool_calls: [setCall('t3', [todo('a', 'completed')])] },
+        ok('t3'),
+      ]);
+      expect(sets(items)).toHaveLength(1);
+    });
+
+    it('a call with a valid list whose result is an error gives no line', () => {
+      const items = itemsFromMessages([
+        { role: 'assistant', content: '', tool_calls: [setCall('t1', [todo('a')])] },
+        { role: 'tool', tool_call_id: 't1', content: 'error: item 1: content is empty' },
+      ]);
+      expect(items).toEqual([]);
+    });
+
+    it('refused arguments are refused by the validator, even with no tool message', () => {
+      const bad: unknown[] = [
+        [{ content: '  ', status: 'pending' }],
+        [{ content: 'a\tb', status: 'pending' }],
+        [{ content: 'a', status: 'done' }],
+        [{ content: 'a' }],
+        [{ content: 'x'.repeat(201), status: 'pending' }],
+        Array.from({ length: 31 }, (_, n) => todo(`t${n}`)),
+        [todo('a', 'in_progress'), todo('b', 'in_progress')],
+      ];
+      for (const list of bad) {
+        expect(sets(itemsFromMessages([{ role: 'assistant', content: '', tool_calls: [setCall('t', list)] }]))).toEqual([]);
+      }
+    });
+
+    it('malformed arguments give no line and no tool row', () => {
+      const items = itemsFromMessages([
+        { role: 'assistant', content: '', tool_calls: [{ id: 't1', type: 'function', function: { name: 'todo_write', arguments: 'not json' } }] },
+        { role: 'assistant', content: '', tool_calls: [{ id: 't2', type: 'function', function: { name: 'todo_write', arguments: '{"items":"x"}' } }] },
+      ]);
+      expect(items).toEqual([]);
+    });
+
+    it('the lines keep their place among the other items', () => {
+      const items = itemsFromMessages([
+        { role: 'user', content: 'plan it' },
+        { role: 'assistant', content: 'Planning.', tool_calls: [setCall('t1', [todo('a')])] },
+        ok('t1'),
+        { role: 'assistant', content: '', tool_calls: [{ id: 'c2', type: 'function', function: { name: 'run_command', arguments: '{"command":"ls"}' } }] },
+        { role: 'tool', tool_call_id: 'c2', content: 'ok' },
+      ]);
+      expect(items.map((i) => (i.kind === 'tool' ? `tool:${i.name}` : i.kind))).toEqual(['user', 'agent', 'todo_set', 'tool:run_command']);
+    });
+  });
 });
 
 describe('itemsFromMessages: a user message with attachments (array content)', () => {  const PNG_THUMB = 'data:image/png;base64,iVBORw0KGgo=';

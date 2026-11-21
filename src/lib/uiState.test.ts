@@ -4,9 +4,17 @@ import {
   fontPatch,
   panelPatch,
   PATCH_DELAY_MS,
+  hideMarksPatch,
   reconcileFont,
   reconcileGroupBy,
+  queueModePatch,
+  reconcileHideMarks,
+  reconcileQueueMode,
   reconcilePanel,
+  reconcileSuggestPrompts,
+  suggestPromptsPatch,
+  notificationsPatch,
+  reconcileNotifications,
   shouldRestoreLast,
 } from './uiState';
 import type { Timers } from './uiState';
@@ -73,7 +81,66 @@ describe('reconcileGroupBy', () => {
   });
 });
 
+describe('reconcileQueueMode and queueModePatch', () => {
+  it('takes the two known modes from the file, and nothing else', () => {
+    expect(reconcileQueueMode('all')).toBe('all');
+    expect(reconcileQueueMode('one')).toBe('one');
+    expect(reconcileQueueMode('some')).toBeNull();
+    expect(reconcileQueueMode(null)).toBeNull();
+    expect(reconcileQueueMode(undefined)).toBeNull();
+  });
+
+  it('queueModePatch carries the mode as queue_mode', () => {
+    expect(queueModePatch('one')).toEqual({ queue_mode: 'one' });
+  });
+});
+
+describe('reconcileHideMarks', () => {
+  it('takes a boolean from the file, either way; anything else leaves the default to apply', () => {
+    expect(reconcileHideMarks(true)).toBe(true);
+    expect(reconcileHideMarks(false)).toBe(false);
+    expect(reconcileHideMarks(null)).toBeNull();
+    expect(reconcileHideMarks(undefined)).toBeNull();
+    expect(reconcileHideMarks('no' as unknown as boolean)).toBeNull();
+  });
+});
+
+describe('reconcileSuggestPrompts', () => {
+  it('takes a boolean from the file, either way; anything else leaves the default (off) to apply', () => {
+    expect(reconcileSuggestPrompts(true)).toBe(true);
+    expect(reconcileSuggestPrompts(false)).toBe(false);
+    expect(reconcileSuggestPrompts(null)).toBeNull();
+    expect(reconcileSuggestPrompts(undefined)).toBeNull();
+    expect(reconcileSuggestPrompts('yes' as unknown as boolean)).toBeNull();
+  });
+});
+
+describe('reconcileNotifications', () => {
+  it('takes a boolean from the file, either way; anything else leaves the default (on) to apply', () => {
+    expect(reconcileNotifications(true)).toBe(true);
+    expect(reconcileNotifications(false)).toBe(false);
+    expect(reconcileNotifications(null)).toBeNull();
+    expect(reconcileNotifications(undefined)).toBeNull();
+    expect(reconcileNotifications('no' as unknown as boolean)).toBeNull();
+  });
+});
+
 describe('patch builders', () => {
+  it('notificationsPatch carries the boolean as notifications', () => {
+    expect(notificationsPatch(true)).toEqual({ notifications: true });
+    expect(notificationsPatch(false)).toEqual({ notifications: false });
+  });
+
+  it('hideMarksPatch carries the boolean as hide_marks', () => {
+    expect(hideMarksPatch(true)).toEqual({ hide_marks: true });
+    expect(hideMarksPatch(false)).toEqual({ hide_marks: false });
+  });
+
+  it('suggestPromptsPatch carries the boolean as suggest_prompts', () => {
+    expect(suggestPromptsPatch(true)).toEqual({ suggest_prompts: true });
+    expect(suggestPromptsPatch(false)).toEqual({ suggest_prompts: false });
+  });
+
   it('panelPatch carries the snake_case panel shape, with its own copy of the sizes', () => {
     const layout = defaultLayout();
     const patch = panelPatch(layout);

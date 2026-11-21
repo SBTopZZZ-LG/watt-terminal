@@ -2,8 +2,9 @@
 // length caps are tested without the DOM. The model sends `summary` alongside the call's arguments (see the backend
 // tool schemas); it is shown, never executed.
 
-import { capDisplay, sendKeysDisplay } from './keysDisplay';
+import { capDisplay, displayText, sendKeysDisplay } from './keysDisplay';
 import { visibleEscapes } from './visibleEscapes';
+import type { ToolStatus } from './transcript';
 
 /** A caption keeps at most this many words; the cut is marked with an ellipsis. */
 export const MAX_CAPTION_WORDS = 10;
@@ -20,15 +21,8 @@ export const MAX_SEND_KEYS_PREVIEW_CHARS = 60;
  * Null when there is no usable summary (absent, empty, or not a string).
  */
 export function toolCaption(args: unknown): string | null {
-  if (typeof args !== 'object' || args === null) {
-    return null;
-  }
-  const { summary } = args as { summary?: unknown };
-  if (typeof summary !== 'string') {
-    return null;
-  }
-  const words = summary.trim().split(/\s+/).filter((w) => w !== '');
-  if (words.length === 0) {
+  const words = summaryWords(args);
+  if (words === null) {
     return null;
   }
   const wordCut = words.length > MAX_CAPTION_WORDS;
@@ -44,11 +38,30 @@ export function toolCaption(args: unknown): string | null {
   return wordCut || charCut ? `${escaped}…` : escaped;
 }
 
+/** The summary's words, or null when there is no usable summary (absent, empty, or not a string). */
+function summaryWords(args: unknown): string[] | null {
+  if (typeof args !== 'object' || args === null) {
+    return null;
+  }
+  const { summary } = args as { summary?: unknown };
+  if (typeof summary !== 'string') {
+    return null;
+  }
+  const words = summary.trim().split(/\s+/).filter((w) => w !== '');
+  return words.length === 0 ? null : words;
+}
+
 /**
- * The row's second line: the run_command's command (newlines shown as ⏎, capped at 80 characters), or the send_keys
- * decoded input (capped at 60). Null for other tools, and when there is nothing to show.
+ * The whole caption, not cut: the tooltip's text when toolCaption cut it. Escaped the same way. Null when there is no
+ * usable summary.
  */
-export function toolPreview(name: string, args: unknown): string | null {
+export function toolCaptionFull(args: unknown): string | null {
+  const words = summaryWords(args);
+  return words === null ? null : visibleEscapes(words.join(' '));
+}
+
+/** The detail line before its cap: the run_command's command (newlines as ⏎), or the send_keys decoded input. */
+function previewSource(name: string, args: unknown): { text: string; max: number } | null {
   if (name === 'run_command') {
     if (typeof args !== 'object' || args === null) {
       return null;
@@ -57,16 +70,34 @@ export function toolPreview(name: string, args: unknown): string | null {
     if (typeof command !== 'string' || command === '') {
       return null;
     }
-    return capDisplay(command.replace(/\r\n|\n|\r/g, '⏎'), MAX_COMMAND_PREVIEW_CHARS);
+    return { text: command.replace(/\r\n|\n|\r/g, '⏎'), max: MAX_COMMAND_PREVIEW_CHARS };
   }
   if (name === 'send_keys') {
     const typed = sendKeysDisplay(args);
     if (typed === '') {
       return null;
     }
-    return capDisplay(typed, MAX_SEND_KEYS_PREVIEW_CHARS);
+    return { text: typed, max: MAX_SEND_KEYS_PREVIEW_CHARS };
   }
   return null;
+}
+
+/**
+ * The row's second line: the run_command's command (newlines shown as ⏎, capped at 80 characters), or the send_keys
+ * decoded input (capped at 60). Null for other tools, and when there is nothing to show.
+ */
+export function toolPreview(name: string, args: unknown): string | null {
+  const source = previewSource(name, args);
+  return source === null ? null : capDisplay(source.text, source.max);
+}
+
+/**
+ * The detail line without its cap, shown as toolPreview shows it (escaped): the tooltip's text when toolPreview cut it.
+ * Null when toolPreview has none.
+ */
+export function toolPreviewFull(name: string, args: unknown): string | null {
+  const source = previewSource(name, args);
+  return source === null ? null : displayText(source.text);
 }
 
 /** A tool row's summary: the bare tool name, its caption, and its detail line. */
@@ -78,4 +109,47 @@ export interface ToolRowHead {
 
 export function toolRowHead(name: string, args: unknown): ToolRowHead {
   return { label: visibleEscapes(name), caption: toolCaption(args), detail: toolPreview(name, args) };
+}
+
+/** The backend's default and largest `wait` seconds (core/tools DEFAULT_WAIT_SECONDS, MAX_WAIT_SECONDS). */
+const DEFAULT_WAIT_SECONDS = 10;
+const MAX_WAIT_SECONDS = 120;
+
+/** The seconds a wait was asked for, as the backend clamps them: the default when absent or not an integer. */
+function requestedWaitSeconds(args: unknown): number {
+  const seconds = typeof args === 'object' && args !== null ? (args as { seconds?: unknown }).seconds : undefined;
+  if (typeof seconds !== 'number' || !Number.isInteger(seconds)) {
+    return DEFAULT_WAIT_SECONDS;
+  }
+  return Math.min(Math.max(seconds, 1), MAX_WAIT_SECONDS);
+}
+
+/** The time a wait took: from `waited_ms` of a live result, or from the text the model saw (`waited 4.9s: ...`). */
+function waitedSeconds(result: unknown): string | null {
+  if (typeof result === 'string') {
+    const m = /^waited (\d+(?:\.\d+)?)s:/.exec(result);
+    return m ? m[1] : null;
+  }
+  if (typeof result === 'object' && result !== null) {
+    const ms = (result as { waited_ms?: unknown }).waited_ms;
+    if (typeof ms === 'number' && Number.isFinite(ms) && ms >= 0) {
+      return (ms / 1000).toFixed(1);
+    }
+  }
+  return null;
+}
+
+/**
+ * The duration a `wait` row shows in place of its bare status: `waiting 5s` while it runs (the requested seconds), then
+ * `waited 4.9s` once it ends (the time it took, or the requested seconds when the result has no time). Null for other tools,
+ * and for a failed wait (its status word stays).
+ */
+export function waitDuration(name: string, args: unknown, result: unknown, status: ToolStatus): string | null {
+  if (name !== 'wait' || status === 'failed') {
+    return null;
+  }
+  if (status === 'running') {
+    return `waiting ${requestedWaitSeconds(args)}s`;
+  }
+  return `waited ${waitedSeconds(result) ?? String(requestedWaitSeconds(args))}s`;
 }

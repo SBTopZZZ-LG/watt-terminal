@@ -77,6 +77,11 @@ const SHELLS: [&str; 9] = ["zsh", "bash", "sh", "fish", "dash", "ksh", "tcsh", "
 /// (see `ShellFamily`). Only the shell rules read this list; ssh and container logins stay POSIX-only, so `ssh host pwsh`
 /// is not a login the POSIX loader would be typed into.
 const POWERSHELLS: [&str; 2] = ["pwsh", "powershell"];
+/// True when `name` is a PowerShell program this build recognises. Only on Windows: on macOS and Linux `pwsh` is an ordinary
+/// command (`ForegroundKind::Other`), as it was before PowerShell was supported there.
+fn is_powershell(name: &str) -> bool {
+    cfg!(windows) && POWERSHELLS.contains(&name)
+}
 
 /// Which integration loader and blob a shell takes (see core/inject.rs). PowerShell is its own family; everything else is
 /// the POSIX one (zsh, bash).
@@ -118,7 +123,7 @@ pub fn shell_family(command: &str) -> ShellFamily {
 
 fn family_of_words(words: &[&str]) -> ShellFamily {
     match program_words(words).first() {
-        Some(program) if POWERSHELLS.contains(&basename(program)) => ShellFamily::PowerShell,
+        Some(program) if is_powershell(basename(program)) => ShellFamily::PowerShell,
         _ => ShellFamily::Posix,
     }
 }
@@ -193,7 +198,7 @@ fn login_of_words(words: &[&str]) -> Option<bool> {
     match basename(program) {
         "ssh" => Some(ssh_login(args)),
         "mosh" => Some(mosh_login(args)),
-        name if POWERSHELLS.contains(&name) => Some(powershell_login(args)),
+        name if is_powershell(name) => Some(powershell_login(args)),
         name if SHELLS.contains(&name) => Some(shell_login(args)),
         "su" => Some(su_login(args)),
         "sudo" => sudo_login(args),
@@ -331,7 +336,7 @@ fn kind_of_words(words: &[&str]) -> Option<ForegroundKind> {
     let (program, args) = program_words(words).split_first()?;
     match basename(program) {
         "ssh" | "mosh" => Some(ForegroundKind::Ssh),
-        name if SHELLS.contains(&name) || POWERSHELLS.contains(&name) => Some(ForegroundKind::Shell),
+        name if SHELLS.contains(&name) || is_powershell(name) => Some(ForegroundKind::Shell),
         "su" => Some(ForegroundKind::Su),
         "sudo" => sudo_kind(args),
         "docker" | "podman" => docker_kind(args),
@@ -586,6 +591,7 @@ mod tests {
     /// Nested PowerShell is a shell (its own integration family, see `shell_family`). cmd is not recognised: it stays `other`
     /// (no chip, and the agent waits instead of asking for an integration that cannot work).
     #[test]
+    #[cfg(windows)]
     fn powershell_is_a_nested_shell_and_cmd_stays_other() {
         for line in ["pwsh", "pwsh.exe -NoLogo", "powershell", r"C:\tools\pwsh.exe", "powershell.exe -c x", "pwsh -Command x"] {
             assert_eq!(kind(line), ForegroundKind::Shell, "{line}");
@@ -602,6 +608,7 @@ mod tests {
     /// The login rule for PowerShell: only the flags that keep it interactive, in any case. A command, a script, a value or
     /// any other flag is not a login.
     #[test]
+    #[cfg(windows)]
     fn powershell_logins_are_the_bare_interactive_forms() {
         for line in [
             "pwsh",
@@ -631,9 +638,23 @@ mod tests {
         }
     }
 
+    /// Off Windows `pwsh` and `powershell` are ordinary commands, as on main: no nested shell, no login, POSIX family.
+    /// `cmd` is other everywhere.
+    #[test]
+    #[cfg(not(windows))]
+    fn powershell_names_are_other_off_windows() {
+        for line in ["pwsh", "pwsh.exe -NoLogo", "powershell", "cd x && pwsh", "pwsh -Command x"] {
+            assert_eq!(kind(line), ForegroundKind::Other, "{line}");
+            assert_eq!(shell_family(line), ShellFamily::Posix, "{line}");
+            assert!(!login(line), "{line}");
+        }
+        assert_eq!(kind("cmd /c dir"), ForegroundKind::Other);
+    }
+
     /// PowerShell is its own family; every other shell, ssh and container shell stay POSIX. `ssh -t host pwsh` is a remote
     /// PowerShell this build does not integrate: it is ssh, POSIX, and not a login.
     #[test]
+    #[cfg(windows)]
     fn shell_family_is_powershell_only_for_the_powershell_programs() {
         for line in ["pwsh", "pwsh.exe -NoLogo", "powershell", r"C:\tools\pwsh.exe -NoExit", "LANG=C pwsh", "cd x && pwsh"] {
             assert_eq!(shell_family(line), ShellFamily::PowerShell, "{line}");

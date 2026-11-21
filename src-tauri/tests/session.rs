@@ -401,8 +401,9 @@ fn history_file_is_not_in_the_shim_dir_and_real_history_untouched() {
     assert_eq!(meta_of(&real_hist), before, "real ~/.zsh_history changed during the test");
 }
 
-/// The shim's own repair: /etc/zshrc on macOS sets HISTFILE inside the shim dir. With an empty real
-/// ZDOTDIR (no user config, so nothing writes history), the shim must point HISTFILE at the real dir.
+/// The shim's own repair: macOS /etc/zshrc sets HISTFILE inside the shim dir. Debian's does not, so this test
+/// simulates that by exporting HISTFILE into the shim dir. With an empty real ZDOTDIR (no user config, so
+/// nothing writes history), the shim must point HISTFILE at the real dir.
 #[test]
 fn histfile_repair_points_at_real_dir_when_etc_zshrc_sets_the_shim_path() {
     let _g = serial();
@@ -417,6 +418,7 @@ fn histfile_repair_points_at_real_dir_when_etc_zshrc_sets_the_shim_path() {
         .env("PATH", std::env::var("PATH").expect("PATH"))
         .env("TERM", "xterm-256color")
         .env("ZDOTDIR", &shim_dir)
+        .env("HISTFILE", shim_dir.join(".zsh_history"))
         .env("WATT_REAL_ZDOTDIR", &real)
         .env("WATT_NONCE", "00112233445566778899aabbccddeeff")
         .stdin(Stdio::null())

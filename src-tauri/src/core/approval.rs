@@ -41,24 +41,28 @@ const SAFE_PUNCTUATION: &str = " _-./:=@+,";
 /// from the list followed by version characters). Kept sorted (byte order), all lowercase and unique: a unit test checks
 /// it, and `binary_search` relies on it.
 pub const BUILTIN_DENY: &[&str] = &[
-    ".", "alias", "arch", "at", "autoload", "awk", "bash", "bcdedit", "bindkey", "bitsadmin", "builtin", "bun", "bye",
-    "caffeinate", "case", "certutil", "chgrp", "chmod", "chown", "cmd", "command", "compdef", "coproc", "cp", "crontab",
-    "csh", "curl", "dash", "dd", "declare", "defaults", "del", "deno", "disable", "diskpart", "diskutil", "do", "doas",
+    ".", "ac", "add-content", "add-type", "alias", "arch", "at", "autoload", "awk", "bash", "bcdedit", "bindkey",
+    "bitsadmin", "builtin", "bun", "bye", "caffeinate", "case", "certutil", "chgrp", "chmod", "choco", "chown",
+    "cipher", "cmd", "command", "compdef", "coproc", "copy", "copy-item", "cp", "cpi", "crontab", "cscript", "csh",
+    "curl", "dash", "dd", "declare", "defaults", "del", "deno", "disable", "diskpart", "diskutil", "do", "doas",
     "docker", "done", "ed", "elif", "else", "emacs", "emulate", "enable", "end", "env", "erase", "esac", "eval", "ex",
-    "exec", "exit", "expect", "export", "fc", "fi", "find", "fish", "float", "for", "foreach", "format", "ftp",
-    "function", "functions", "gawk", "gopass", "hash", "icacls", "iex", "if", "install", "integer", "invoke-expression",
-    "invoke-restmethod", "invoke-webrequest", "irm", "iwr", "kill", "killall", "ksh", "kubectl", "launchctl", "less",
-    "ln", "local", "logout", "lua", "man", "mkfs", "more", "mount", "mshta", "msiexec", "mv", "nano", "nc", "ncat", "net",
-    "netsh", "new-service", "nice", "nmap", "nocorrect", "node", "noglob", "nohup", "npx", "nvim", "op", "open",
-    "osascript", "parallel", "pass", "perl", "php", "pip", "pipx", "pkill", "pnpm", "podman", "powershell", "printenv",
-    "pwsh", "python", "python3", "r", "rd", "read", "readonly", "reboot", "reg", "regedit", "rehash", "remove-item",
-    "repeat", "ri", "rm", "rmdir", "rsync", "ruby", "runas", "rundll32", "sandbox-exec", "sc", "sched", "schtasks", "scp",
-    "screen", "script", "security", "sed", "select", "set", "set-executionpolicy", "set-itemproperty", "setopt", "sftp",
-    "sh", "shred", "shutdown", "source", "sqlite3", "ssh", "start", "start-process", "stdbuf", "stop-process", "su",
-    "sudo", "takeown", "tar", "taskkill", "taskpolicy", "tclsh", "tcsh", "tee", "telnet", "then", "time", "timeout",
-    "tmutil", "tmux", "trap", "truncate", "typeset", "umount", "unalias", "unlink", "unset", "unsetopt", "until", "unzip",
-    "uvx", "vi", "view", "vim", "watch", "wget", "while", "wmic", "wsl", "xargs", "yarn", "zftp", "zip", "zle",
-    "zmodload", "zpty", "zsh", "ztcp",
+    "exec", "exit", "expect", "explorer", "export", "fc", "fi", "find", "fish", "float", "for", "foreach", "forfiles",
+    "format", "fsutil", "ftp", "function", "functions", "gawk", "gopass", "hash", "icacls", "icm", "iex", "if", "ii",
+    "import-module", "install", "integer", "invoke-command", "invoke-expression", "invoke-item", "invoke-restmethod",
+    "invoke-webrequest", "ipmo", "irm", "iwr", "kill", "killall", "ksh", "kubectl", "launchctl", "less", "ln", "local",
+    "logout", "lua", "man", "mi", "mkfs", "mklink", "more", "mount", "move", "move-item", "mshta", "msiexec", "mv",
+    "nano", "nc", "ncat", "net", "netsh", "new-item", "new-service", "ni", "nice", "nmap", "nocorrect", "node",
+    "noglob", "nohup", "npx", "nvim", "op", "open", "osascript", "out-file", "parallel", "pass", "perl", "php", "pip",
+    "pipx", "pkill", "pnpm", "podman", "powershell", "printenv", "pwsh", "python", "python3", "r", "rd", "read",
+    "readonly", "reboot", "reg", "regedit", "regsvr32", "rehash", "remove-item", "ren", "rename-item", "repeat",
+    "restart-computer", "ri", "rm", "rmdir", "rni", "robocopy", "rsync", "ruby", "runas", "rundll32", "sajb",
+    "sandbox-exec", "saps", "sc", "sched", "schtasks", "scoop", "scp", "screen", "script", "security", "sed", "select",
+    "set", "set-content", "set-executionpolicy", "set-item", "set-itemproperty", "setopt", "sftp", "sh", "shred",
+    "shutdown", "si", "source", "spps", "sqlite3", "ssh", "start", "start-job", "start-process", "stdbuf",
+    "stop-computer", "stop-process", "su", "sudo", "takeown", "tar", "taskkill", "taskpolicy", "tclsh", "tcsh", "tee",
+    "telnet", "then", "time", "timeout", "tmutil", "tmux", "trap", "truncate", "typeset", "umount", "unalias", "unlink",
+    "unset", "unsetopt", "until", "unzip", "uvx", "vi", "view", "vim", "vssadmin", "watch", "wget", "while", "winget",
+    "wmic", "wscript", "wsl", "xargs", "xcopy", "yarn", "zftp", "zip", "zle", "zmodload", "zpty", "zsh", "ztcp",
 ];
 
 /// Why a call asks or runs without asking. The code is the wire string in the events and in `test_approval`.
@@ -505,6 +509,16 @@ mod tests {
         for pair in BUILTIN_DENY.windows(2) {
             assert!(pair[0] < pair[1], "not sorted or repeated: {:?} then {:?}", pair[0], pair[1]);
         }
+    }
+
+    /// Windows copy, write, remote-run and install commands are refused by the gate, in any case and with a Windows
+    /// program extension, so an allow rule cannot approve them.
+    #[test]
+    fn windows_copy_write_and_remote_run_commands_are_refused_by_the_gate() {
+        for command in ["copy a b", "Set-Content x", "robocopy a b", "icm host x", "MOVE-ITEM a b", "xcopy.exe a b", "mi a b"] {
+            assert_eq!(gate(command), Some(Reason::GateDenylist), "{command:?}");
+        }
+        assert_eq!(run(&regex_policy(&[".*"], &[]), "robocopy a b"), Verdict::Ask(Reason::GateDenylist));
     }
 
     #[test]

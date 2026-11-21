@@ -44,10 +44,11 @@ describe('TodoPanel: a list with unfinished items starts expanded', () => {
     expect(html([t('only one')])).not.toContain('multi');
   });
 
-  it('the summary carries the full current task in the title, cut when it is long', () => {
+  it('the toggle carries the current task in its tip, cut when it is long', () => {
     const long = 'y'.repeat(300);
     const out = html([t(long, 'in_progress')]);
-    expect(out).toContain(`title="Hide the todo list. Current: ${'y'.repeat(199)}…"`);
+    expect(out).toContain(`data-tip="Hide the todo list. Current: ${'y'.repeat(199)}…"`);
+    expect(out).not.toContain('title=');
     // The text itself is not cut: the summary and the row keep all of it, and CSS ellipsises the summary line.
     expect(out).toContain(`TODO 0/1 · ${'y'.repeat(300)}`);
   });
@@ -56,7 +57,7 @@ describe('TodoPanel: a list with unfinished items starts expanded', () => {
 describe('TodoPanel: the list', () => {
   it('shows every row in order', () => {
     const out = html(LIST);
-    // The current task also appears in the toggle's title, so the order is checked inside the list only.
+    // The current task also appears in the toggle's tip, so the order is checked inside the list only.
     const list = out.slice(out.indexOf('<ol'));
     const order = ['read the code', 'write the fix', 'run the tests'].map((s) => list.indexOf(s));
     expect(order.every((i) => i > 0)).toBe(true);

@@ -23,6 +23,14 @@ export function todoShape(items: TodoItem[]): string {
 }
 
 /**
+ * Whether an update changes the list's content or order (see todoShape). A status-only update does not, so it is no change
+ * to show. Covers the first set (from none) and the clear (to none) too.
+ */
+export function isListChange(prev: TodoItem[], next: TodoItem[]): boolean {
+  return todoShape(prev) !== todoShape(next);
+}
+
+/**
  * Whether the panel is expanded. A choice the user made (`manual`, true or false) holds; without one the list decides: expanded
  * while any item is unfinished, collapsed once every item is done.
  */

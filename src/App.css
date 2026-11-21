@@ -31,11 +31,22 @@
   --fail: #e06c75;
   --warn: #e5c07b;
   --warn-tint: rgba(229, 192, 123, 0.1);
+  /* Bypass is on: orange, between the yellow --warn and the red --fail. Only the approval chip uses it. */
+  --bypass: #f0883e;
+  --bypass-tint: rgba(240, 136, 62, 0.12);
   --ok-glow: rgba(152, 195, 121, 0.35);
   --shadow: rgba(0, 0, 0, 0.35);
   /* The dimming behind a modal (.modal-backdrop). Darker than --shadow, so a dialog stands out on the navy background. */
   --scrim: rgba(0, 0, 0, 0.6);
+  /* The scrollbar thumb: rest, while its scroll container is hovered, and on the thumb itself (see the scrollbar block below). */
+  --scroll-thumb: var(--rule);
+  --scroll-thumb-hover: var(--rule-strong);
+  --scroll-thumb-active: var(--accent);
   --code-bg: #04131d;
+  /* The tooltip (.tooltip): an inverted light card on the navy page. --tip-rule is its corner ticks. */
+  --tip-bg: #eaf7ff;
+  --tip-fg: #04131d;
+  --tip-rule: #0a2233;
   /* The terminal's background. Keep in step with the fallback in src/lib/terminal.ts. */
   --term-bg: #061823;
   --ui-font: "IBM Plex Mono", ui-monospace, Menlo, monospace;
@@ -44,6 +55,46 @@
 
 * {
   box-sizing: border-box;
+}
+
+/*
+ * Scrollbars: one custom style for every scroll container (WebView2 and WKWebView both honour ::-webkit-scrollbar).
+ * The thumb is a 4px rounded bar inside a 10px track: the transparent border is the gap, and background-clip keeps the
+ * colour off it. Do not set scrollbar-width or scrollbar-color anywhere: a browser ignores ::-webkit-scrollbar on an
+ * element whose scrollbar-color is not auto, and scrollbar-color is inherited.
+ */
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+  background: transparent;
+}
+
+*::-webkit-scrollbar-track,
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-button {
+  display: none;
+}
+
+*::-webkit-scrollbar-thumb {
+  background-color: var(--scroll-thumb);
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background-clip: padding-box;
+}
+
+*:hover::-webkit-scrollbar-thumb {
+  background-color: var(--scroll-thumb-hover);
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background-color: var(--scroll-thumb-active);
+}
+
+*::-webkit-scrollbar-thumb:active {
+  background-color: var(--scroll-thumb-active);
 }
 
 html,
@@ -185,6 +236,19 @@ input {
   font: 11px/16px var(--mono);
   text-transform: uppercase;
   letter-spacing: 0.08em;
+}
+
+/*
+ * The "hide command separators and agent labels" setting (ui_state hide_marks, on by default). The root attribute is set
+ * from App.tsx. It hides the separator lines (and their badges, which are inside them) and the agent badge on each stripe.
+ * The exit-coloured stripe bars stay. StripeLayer is not unmounted, so the marks come back at once when the setting is off.
+ */
+:root[data-hide-marks="true"] .separator {
+  display: none;
+}
+
+:root[data-hide-marks="true"] .stripe[data-agent="true"]::after {
+  content: none;
 }
 
 /*
@@ -365,6 +429,13 @@ input {
   color: var(--fail);
 }
 
+/* The state word keeps a fixed width (about the longest common word, "submitted"), so the chips to its left do not move
+   as the state changes. A longer word (e.g. "full-screen app") still widens it. */
+.chip-state {
+  min-width: 10ch;
+  text-align: center;
+}
+
 .chip-grid {
   font-family: var(--mono);
 }
@@ -383,6 +454,18 @@ input {
    auto, basis auto; no flex-grow, so it stays snug around its text instead of filling empty space). No max-width cap:
    long model/variant labels use free strip space. The full text stays in the title attribute. */
 .chip-model {
+  font-family: var(--mono);
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+/* The provider's name, just left of the model chip. Same look and ellipsis as the model chip; its full name is in the title. */
+.chip-provider {
   font-family: var(--mono);
   flex: 0 1 auto;
   min-width: 0;
@@ -741,7 +824,7 @@ input {
   cursor: pointer;
 }
 
-.transcript-new:not(:disabled):hover {
+.transcript-new:not(:disabled):not([aria-disabled="true"]):hover {
   border-color: var(--accent);
   color: var(--accent);
 }
@@ -751,7 +834,8 @@ input {
   outline-offset: 1px;
 }
 
-.transcript-new:disabled {
+.transcript-new:disabled,
+.transcript-new[aria-disabled="true"] {
   opacity: 0.5;
   cursor: default;
 }
@@ -1068,8 +1152,6 @@ input {
   list-style: none;
   overflow-y: hidden;
   overflow-wrap: anywhere;
-  scrollbar-width: thin;
-  scrollbar-color: var(--rule-strong) transparent;
 }
 
 .todo-list.is-scrollable {
@@ -1155,6 +1237,13 @@ input {
 /* A quiet note in the transcript, such as the trim note: the muted colour, not the warning one. */
 .notice.notice-muted {
   color: var(--muted);
+}
+
+/* The todo list the agent set, in the chat (TodoSetLine): the rows are the todo panel's, without the list's own layout. */
+.todo-set-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
 }
 
 .msg {
@@ -1462,6 +1551,80 @@ input {
   font-size: inherit;
 }
 
+/* A fenced block sits in a wrapper that holds the copy button, so the button does not scroll with a wide line. The
+   wrapper takes the pre's margin. The button shows on hover, on focus within, and while a copy result is shown. */
+.msg.agent .md .md-code {
+  position: relative;
+  margin: 0.9em 0;
+}
+
+.msg.agent .md .md-code > pre {
+  margin: 0;
+}
+
+.msg.agent .md .md-code-copy {
+  position: absolute;
+  top: 3px;
+  right: 4px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  opacity: 0;
+  transition: opacity 120ms ease;
+  user-select: none;
+}
+
+.msg.agent .md .md-code:hover .md-code-copy,
+.msg.agent .md .md-code:focus-within .md-code-copy,
+.msg.agent .md .md-code-copy.shown {
+  opacity: 1;
+}
+
+.msg.agent .md .md-code-status {
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ok);
+}
+
+.msg.agent .md .md-code-status.failed {
+  color: var(--warn);
+}
+
+.msg.agent .md .md-code-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 1px dashed var(--rule);
+  border-radius: 2px;
+  background: var(--code-bg);
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.msg.agent .md .md-code-button svg {
+  display: block;
+}
+
+.msg.agent .md .md-code-button:hover {
+  border-color: var(--rule-strong);
+  color: var(--accent);
+}
+
+.msg.agent .md .md-code-button:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .msg.agent .md .md-code-copy {
+    transition: none;
+  }
+}
+
 /* Wide tables scroll inside the wrapper, so they never stretch the panel. */
 .msg.agent .md .md-table {
   max-width: 100%;
@@ -1638,6 +1801,52 @@ input {
   background: var(--code-bg);
   font: 11px/1.4 var(--mono);
   white-space: pre-wrap;
+}
+
+/* A tool row's body: a compact tab strip (Input / Output, JSON), then the selected panel. The panels' <pre> blocks scroll. */
+.tool-tabs {
+  margin-top: 4px;
+}
+
+.tool-tab-strip {
+  display: flex;
+  gap: 2px;
+  border-bottom: 1px dashed var(--rule);
+}
+
+.tool-tab {
+  margin: 0 0 -1px;
+  padding: 3px 8px 2px;
+  border: 0;
+  background: none;
+  box-shadow: inset 0 -2px 0 transparent;
+  color: var(--muted);
+  font: 11px var(--mono);
+  cursor: pointer;
+}
+
+.tool-tab.is-active {
+  color: var(--accent);
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+
+.tool-tab:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.tool-io-label {
+  margin-top: 6px;
+  font: 10px var(--mono);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.tool-io-note {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--muted);
 }
 
 .approval {
@@ -2142,6 +2351,12 @@ input {
   border-color: var(--accent);
 }
 
+/* Locked (an integration runs): read-only, so it keeps focus, but it looks taken out of use, as a disabled field did. */
+.bar-input.is-locked {
+  color: var(--muted);
+  cursor: default;
+}
+
 /*
  * While the agent is busy, a 2px ring of light travels around the field's border: a conic highlight whose start angle
  * turns (the custom property is registered so it interpolates). The ring is a mask over the layer, so only the border
@@ -2380,10 +2595,134 @@ input {
   font-size: 11px;
 }
 
-/* The approval row above the input: a muted label and a text toggle, no border. Auto reads warn, manual muted. */
+/* The messages queued while the agent works, above the input: a header, then a row per message with its remove button. */
+.bar-queue {
+  flex-basis: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  font-size: 11px;
+}
+
+.bar-queue-head {
+  color: var(--muted);
+}
+
+.bar-queue-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 2px 4px 2px 6px;
+  border-left: 2px solid var(--line);
+  color: var(--ink);
+}
+
+.bar-queue-text {
+  min-width: 0;
+  flex: 1 1 auto;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.bar-queue-note {
+  flex: 0 0 auto;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.bar-queue-remove {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  background: var(--bg);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.bar-queue-remove:hover {
+  border-color: var(--fail);
+  color: var(--fail);
+}
+
+.bar-queue-remove:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.bar-queue-remove:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* The suggested follow-up prompts under the field: a muted lead, then one small button per prompt, each on one line. */
+.bar-suggest {
+  flex-basis: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  font-size: 11px;
+}
+
+.bar-suggest-head {
+  flex: 0 0 auto;
+  color: var(--muted);
+}
+
+.bar-suggest-chip {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--bg);
+  color: var(--ink);
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.5;
+  text-align: left;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+.bar-suggest-chip:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.bar-suggest-chip:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* The approval row above the input: a muted label and a text toggle. Bypass reads orange in a box, manual muted. */
 .bar-approval {
   flex-basis: 100%;
   font-size: 11px;
+}
+
+/* In the collapsed and exited bars the chip shares the row: it takes its own width, and sits at the end in the exited bar. */
+.bar-approval.is-inline {
+  flex-basis: auto;
+  white-space: nowrap;
+}
+
+.bar-exited .bar-approval.is-inline {
+  margin-left: auto;
 }
 
 .bar-approval-label {
@@ -2399,8 +2738,22 @@ input {
   cursor: pointer;
 }
 
-.bar-approval-toggle.is-auto {
-  color: var(--warn);
+/* Bypass is on: orange text in a faint orange box. The one warning signal in the approval row. */
+.bar-approval-toggle.is-bypass {
+  color: var(--bypass);
+  border: 1px solid var(--bypass);
+  background: var(--bypass-tint);
+  padding: 0 4px;
+  border-radius: 3px;
+}
+
+.bar-approval-toggle.is-bypass:hover {
+  color: var(--bypass);
+}
+
+/* On in another shell, off here: manual, with a dotted underline and no colour. */
+.bar-approval-toggle.is-suspended {
+  text-decoration: underline dotted;
 }
 
 .bar-approval-toggle:hover {
@@ -2910,6 +3263,13 @@ input {
   margin-left: auto;
 }
 
+/* Blocked while the agent works (aria-disabled keeps the reason's tooltip reachable). */
+.history-row-actions .history-delete[aria-disabled="true"],
+.history-footer [aria-disabled="true"] {
+  opacity: 0.5;
+  cursor: default;
+}
+
 /* ---------- Modals ---------- */
 
 /* The shared backdrop of a modal over the whole window: it dims everything behind the dialog. Above the find bar (7). A modal
@@ -2996,7 +3356,6 @@ input {
   min-width: 0;
   overflow-x: auto;
   overflow-y: hidden;
-  scrollbar-width: thin;
   padding: 0 14px;
   border-bottom: 1px dashed var(--rule);
 }
@@ -3737,7 +4096,7 @@ input {
   color: var(--fail);
 }
 
-/* The chip buttons (auto-approve and the settings gear) take the same focus ring. */
+/* The chip buttons (the settings gear) take the same focus ring. */
 .chip-button:focus-visible {
   outline: 1px solid var(--accent);
   outline-offset: 1px;
@@ -3966,8 +4325,6 @@ input {
   overflow-y: auto;
   overflow-wrap: anywhere;
   font-size: 12px;
-  scrollbar-width: thin;
-  scrollbar-color: var(--rule-strong) transparent;
 }
 
 .context-headline {
@@ -4301,6 +4658,73 @@ input {
   /* No spin, no pulse: the toast keeps its spinner ring and the rail its static green dot. */
   .agent-activity-spinner,
   .agent-rail-busy {
+    animation: none;
+  }
+}
+
+/*
+ * The tooltip (src/components/Tooltip.tsx): one fixed box for the whole app. An inverted light card on the navy page, so it
+ * stands out from the ordinary components: a 1px accent edge, a hard offset shadow and a faint accent glow, and corner ticks
+ * as on the blueprint cards. It never takes pointer events, so it cannot steal the hover, the click or the focus.
+ */
+.tooltip {
+  position: fixed;
+  z-index: 60;
+  max-width: 420px;
+  max-height: 40vh;
+  overflow: hidden;
+  padding: 6px 9px;
+  border: 1px solid var(--accent);
+  border-radius: 2px;
+  background: var(--tip-bg);
+  color: var(--tip-fg);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  pointer-events: none;
+  box-shadow: 3px 3px 0 var(--scrim), 0 0 14px rgba(111, 211, 255, 0.3);
+  animation: tooltip-in 120ms ease-out;
+}
+
+.tooltip::before,
+.tooltip::after {
+  content: "";
+  position: absolute;
+  width: 7px;
+  height: 7px;
+  border: 0 solid var(--tip-rule);
+  pointer-events: none;
+}
+
+.tooltip::before {
+  top: 0;
+  left: 0;
+  border-top-width: 2px;
+  border-left-width: 2px;
+}
+
+.tooltip::after {
+  right: 0;
+  bottom: 0;
+  border-right-width: 2px;
+  border-bottom-width: 2px;
+}
+
+@keyframes tooltip-in {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tooltip {
     animation: none;
   }
 }

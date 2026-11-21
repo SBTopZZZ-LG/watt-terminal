@@ -9,6 +9,57 @@ import type { TodoItem, TodoStatus } from './types';
 /** The tool name of the todo tool. Its rows are not shown in the transcript: the panel is the view of the list. */
 export const TODO_TOOL = 'todo_write';
 
+/** The limits the backend's todo_write validation enforces (src-tauri/src/core/chat/todo.rs: MAX_ITEMS, MAX_CONTENT_CHARS). */
+const MAX_ITEMS = 30;
+const MAX_CONTENT_CHARS = 200;
+
+/** Format and control characters: a control character is refused by the backend, so it is refused here too. */
+const CONTROL = /\p{Cc}/u;
+
+/**
+ * The list a `todo_write` call would set, or null when the backend refuses the call (todo.rs `parse`): the items are not an
+ * array, an item has no non-empty content (trimmed, no control characters, at most 200 characters) or a known status, there
+ * are more than 30 items, or more than one is in_progress. A refused call sets nothing and is shown nothing. The content is
+ * returned trimmed, as the backend stores it.
+ */
+export function parseTodoArgs(args: unknown): TodoItem[] | null {
+  if (typeof args !== 'object' || args === null || !Array.isArray((args as Record<string, unknown>).items)) {
+    return null;
+  }
+  const raw = (args as { items: unknown[] }).items;
+  if (raw.length > MAX_ITEMS) {
+    return null;
+  }
+  const items: TodoItem[] = [];
+  for (const entry of raw) {
+    const item = typeof entry === 'object' && entry !== null ? (entry as Record<string, unknown>) : {};
+    const content = typeof item.content === 'string' ? item.content.trim() : '';
+    if (content === '' || CONTROL.test(content) || Array.from(content).length > MAX_CONTENT_CHARS) {
+      return null;
+    }
+    if (item.status !== 'pending' && item.status !== 'in_progress' && item.status !== 'completed') {
+      return null;
+    }
+    items.push({ content, status: item.status });
+  }
+  if (items.filter((i) => i.status === 'in_progress').length > 1) {
+    return null;
+  }
+  return items;
+}
+
+/** The status as a word for screen readers. The marks are drawn in CSS and carry no text. */
+export function statusWord(status: TodoStatus): string {
+  switch (status) {
+    case 'completed':
+      return 'Done';
+    case 'in_progress':
+      return 'In progress';
+    default:
+      return 'Pending';
+  }
+}
+
 /** The longest task text kept in a title attribute, in characters. The backend refuses longer items, so this is a guard. */
 export const TITLE_MAX = 200;
 

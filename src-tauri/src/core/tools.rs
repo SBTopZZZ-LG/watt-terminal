@@ -317,6 +317,10 @@ pub trait AgentTools {
     fn foreground(&self) -> Option<Foreground> {
         None
     }
+    /// How long the foreground hint's command has run (see `foreground`). Defaults to None, so a fake needs no change.
+    fn foreground_age(&self) -> Option<Duration> {
+        None
+    }
     /// The shell on top (see `TopLevel`). Defaults to the local shell, so a fake without a shell needs no change.
     fn top_level(&self) -> TopLevel {
         TopLevel::default()
@@ -571,6 +575,10 @@ impl AgentTools for SessionTools<'_> {
 
     fn foreground(&self) -> Option<Foreground> {
         self.session.foreground()
+    }
+
+    fn foreground_age(&self) -> Option<Duration> {
+        self.session.foreground_age()
     }
 
     fn top_level(&self) -> TopLevel {
@@ -979,13 +987,17 @@ pub fn running_hint(record_id: Option<u64>) -> String {
     match record_id {
         Some(id) => format!(
             "Still running. Call wait with id {id} to wait for it to finish, or get_screen with lines to read more of its output. \
-             run_command is unavailable until it ends."
+             run_command is unavailable until it ends. {SCREEN_TAIL_NOTE}"
         ),
-        None => "The shell has not started the command yet. Call wait to wait for it, or get_screen to see the screen. \
-                 run_command is unavailable until the command ends."
-            .to_string(),
+        None => format!(
+            "The shell has not started the command yet. Call wait to wait for it, or get_screen to see the screen. \
+             run_command is unavailable until the command ends. {SCREEN_TAIL_NOTE}"
+        ),
     }
 }
+
+/// What the model is told about `screen_tail` on a timed-out `run_command`: the rows are the screen, not this command's output.
+const SCREEN_TAIL_NOTE: &str = "screen_tail is the last visible screen rows: they may include output of earlier commands, not only this one.";
 
 /// What the model is told to wait for, when a foreground program has no shell integration and there is nothing to integrate.
 pub const WAIT_HINT: &str = "Wait for it to end (wait), or ask the user to stop it.";
@@ -1194,7 +1206,7 @@ pub fn schemas() -> Vec<ToolSchema> {
         },
         ToolSchema {
             name: "run_command",
-            description: "Run a command in the shell on top: the user's own shell, or a shell the user opened inside another program (such as ssh) that the app integrated. Only works at an idle prompt with shell integration live. Waits up to wait_seconds (default 5, max 120) for the command to finish. If it is still running then, the result gives its record_id and the command keeps running: use wait with that id, or get_screen with lines, until it ends. run_command is unavailable until it ends. The result can also come back early with reason remote_shell (the command opened a shell without shell integration, such as ssh with no remote command) or needs_user (the screen shows a password or other prompt). The user approves each call unless a saved rule or auto-approve allows it.",
+            description: "Run a command in the shell on top: the user's own shell, or a shell the user opened inside another program (such as ssh) that the app integrated. Only works at an idle prompt with shell integration live. Waits up to wait_seconds (default 5, max 120) for the command to finish. If it is still running then, the result gives its record_id and the command keeps running: use wait with that id, or get_screen with lines, until it ends. run_command is unavailable until it ends. On a timeout, screen_tail is the last visible screen rows: they may include output of earlier commands, not only this one. The result can also come back early with reason remote_shell (the command opened a shell without shell integration, such as ssh with no remote command) or needs_user (the screen shows a password or other prompt). The user approves each call unless a saved rule or auto-approve allows it.",
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -1662,6 +1674,15 @@ mod tests {
         assert!(!with_id.contains("send_keys"), "{with_id}");
         let without = running_hint(None);
         assert!(without.contains("has not started") && !without.contains("send_keys"), "{without}");
+    }
+
+    /// The model is told that `screen_tail` may hold earlier commands' output, with or without an id.
+    #[test]
+    fn the_running_hint_says_the_screen_tail_may_include_earlier_output() {
+        for hint in [running_hint(Some(7)), running_hint(None)] {
+            assert!(hint.contains("screen_tail is the last visible screen rows"), "{hint}");
+            assert!(hint.contains("may include output of earlier commands, not only this one"), "{hint}");
+        }
     }
 
     /// The refusal names the agent's open command and its id, and says to wait for it. A plain command the agent started is

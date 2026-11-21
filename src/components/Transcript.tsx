@@ -1,25 +1,25 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { MouseEvent, ReactNode, UIEvent, WheelEvent } from 'react';
 import { copyText } from '../lib/clipboard';
-import { previewJson } from '../lib/format';
 import { isAtBottom, shouldFollowAfterSend } from '../lib/stickScroll';
 import { approvalTitle } from '../lib/transcript';
 import type { TranscriptItem, UserAttachment } from '../lib/transcript';
-import type { QuestionAnswerInput } from '../lib/types';
+import type { QuestionAnswerInput, TodoItem } from '../lib/types';
+import { statusWord, todoRows } from '../lib/todoView';
 import { draftsFromAnswers, enterIntent, firstUnsettled, isComplete, newDrafts, payload, pickOption, setOther, settled, summary, toggleSkip } from '../lib/questions';
 import type { EnterIntent, QuestionDraft } from '../lib/questions';
 import { formatSize } from '../lib/attachments';
 import { safeText } from '../lib/historyView';
-import { askedBecause, decisionLabel, decisionTooltip } from '../lib/approvalReasons';
+import { askedBecause } from '../lib/approvalReasons';
 import { displayText } from '../lib/keysDisplay';
-import { toolRowHead } from '../lib/toolDisplay';
-import { interactiveHeader } from '../lib/interactive';
-import { isDeclinedIntegration } from '../lib/integrate';
+import { HEADER_COMMAND_CHARS, interactiveHeader } from '../lib/interactive';
 import { groupTranscript, toolGroupSummary } from '../lib/toolGroups';
 import type { GroupItem, InteractiveGroup, TranscriptEntry } from '../lib/toolGroups';
 import { visibleEscapes } from '../lib/visibleEscapes';
+import { BUSY_TIP } from '../lib/switchGuard';
 import { Markdown } from './Markdown';
 import { ApprovalCountdown } from './ApprovalCountdown';
+import { ToolRow } from './ToolRow';
 import { chatBodyShown } from '../lib/panelLayout';
 import { settleTight } from '../lib/panelTight';
 import type { Dock } from '../lib/panelLayout';
@@ -38,6 +38,8 @@ interface Props {
   /** Answers the agent's clarification question. Never touches the shell: it only calls `answer_questions`. */
   onAnswerQuestions: (callId: string, answers: QuestionAnswerInput[]) => void;
   onNewConversation: () => void;
+  /** The New button is blocked (the agent is busy, or a side command runs). Defaults to `busy`. Only the button reads it. */
+  newBlocked?: boolean;
   /** The dock the panel is in. With onDock, the header shows the four dock buttons, with this one marked. */
   dock?: Dock;
   onDock?: (dock: Dock) => void;
@@ -49,8 +51,6 @@ interface Props {
   history?: ReactNode;
   /** A notice shown above the chat body (the settings banner). Shown with the chat view only, and it never moves the body's scroll. */
   banner?: ReactNode;
-  /** A notice pinned above the chat body, above `banner` (the approve-all warning). Same placement and rules as `banner`. */
-  warning?: ReactNode;
 }
 
 /** The agent conversation, docked above the input bar. Collapsible, scrollable, and capped by CSS. */
@@ -64,16 +64,17 @@ export function Transcript({
   onApprove,
   onAnswerQuestions,
   onNewConversation,
+  newBlocked,
   dock,
   onDock,
   view = 'chat',
   onToggleHistory,
   history,
   banner = null,
-  warning = null,
 }: Props) {
   const bodyRef = useRef<HTMLDivElement>(null);
   const sectionRef = useRef<HTMLElement>(null);
+  const newOff = newBlocked ?? busy;
   const entries = useMemo(() => groupTranscript(items), [items]);
   /** Whether the view follows new content. A ref, read in effects and handlers, so changing it does not re-render. */
   const following = useRef(true);
@@ -227,19 +228,23 @@ export function Transcript({
         </button>
         {onDock && dock && <DockButtons dock={dock} onDock={onDock} />}
         {onToggleHistory && <HistoryButton pressed={view === 'history'} onClick={onToggleHistory} />}
+        {/* aria-disabled, not disabled: the tooltip stays reachable on hover and focus, and the click does nothing. */}
         <button
           type="button"
           className="transcript-new"
-          disabled={busy}
-          onClick={onNewConversation}
-          title={busy ? 'Wait for the agent to finish, or cancel it with Ctrl-C, first' : 'Clears the agent conversation'}
+          aria-disabled={newOff ? true : undefined}
+          onClick={() => {
+            if (!newOff) {
+              onNewConversation();
+            }
+          }}
+          data-tip={newOff ? BUSY_TIP : 'Clears the agent conversation'}
         >
           New conversation
         </button>
       </div>
       {open && view === 'history' && history}
       {/* Pinned: siblings above the body, so they never scroll away and the body's scroll and follow logic is untouched. */}
-      {bodyShown && warning}
       {bodyShown && banner}
       {bodyShown && (
         <div className="transcript-body" ref={bodyRef} tabIndex={-1} onScroll={onScroll} onWheel={onWheel}>
@@ -309,7 +314,13 @@ function InteractiveGroupView({ group, onApprove, onAnswerQuestions }: { group: 
           {header.state}
         </span>
         {header.command !== '' && (
-          <span className="interactive-command" aria-hidden="true">
+          // The header cuts the command to HEADER_COMMAND_CHARS. A cut command's tip always shows; an uncut one's only where CSS clips it.
+          <span
+            className="interactive-command"
+            aria-hidden="true"
+            data-tip={displayText(group.command).replace(/\n/g, '\\n')}
+            data-tip-clip={[...group.command].length > HEADER_COMMAND_CHARS ? undefined : ''}
+          >
             {` · ${header.command}`}
           </span>
         )}
@@ -351,13 +362,34 @@ function MessageAttachments({ items }: { items: UserAttachment[] }) {
         }
         return (
           <div key={i} className={a.kind === 'image' ? 'msg-attach is-placeholder' : 'msg-attach is-file'}>
-            <span className="msg-attach-name" title={name}>
+            <span className="msg-attach-name" data-tip={name} data-tip-clip="">
               {name}
             </span>
             <span className="msg-attach-size">{formatSize(a.bytes)}</span>
           </div>
         );
       })}
+    </div>
+  );
+}
+
+/** The todo list the agent set, in the chat: every item with its status at that moment. An empty list is a clear. */
+function TodoSetLine({ items }: { items: TodoItem[] }) {
+  if (items.length === 0) {
+    return <div className="notice notice-muted">TODO list cleared</div>;
+  }
+  return (
+    <div className="todo-set">
+      <div className="notice notice-muted">TODO list</div>
+      <ol className="todo-set-list">
+        {todoRows(items).map((row) => (
+          <li key={row.index} className={`todo-item todo-${row.status}`}>
+            <span className="todo-mark" aria-hidden="true" />
+            <span className="todo-sr-only">{statusWord(row.status)}: </span>
+            <span className="todo-text">{row.text}</span>
+          </li>
+        ))}
+      </ol>
     </div>
   );
 }
@@ -381,38 +413,13 @@ function Entry({ item, onApprove, onAnswerQuestions }: { item: TranscriptItem; o
       );
     case 'notice':
       return <div className={item.muted ? 'notice notice-muted' : 'notice'}>{item.text}</div>;
+    case 'todo_set':
+      return <TodoSetLine items={item.items} />;
     // Closes an interactive group (see renderEntries); with no group open there is nothing to show.
     case 'record_end':
       return null;
-    case 'tool': {
-      // A declined integration request is its own status, not a failure: the user chose it.
-      const declined = isDeclinedIntegration(item.name, item.decision);
-      const status = declined ? 'declined' : item.status === 'running' ? 'running' : item.status === 'ok' ? 'ok' : 'failed';
-      const head = toolRowHead(item.name, item.args);
-      return (
-        <details className={`tool tool-${status}`}>
-          <summary>
-            <span className="tool-summary">
-              <span className="tool-line">
-                {head.label}
-                {head.caption !== null && <span className="tool-caption">{` · ${head.caption}`}</span>}
-                {item.decision !== null && !declined && (
-                  <span
-                    className={`decision decision-${item.decision}`}
-                    title={decisionTooltip(item.decision, item.reason) ?? undefined}
-                  >
-                    {` ${decisionLabel(item.decision, item.reason)}`}
-                  </span>
-                )}
-                {`: ${status}`}
-              </span>
-              {head.detail !== null && <span className="tool-detail">{head.detail}</span>}
-            </span>
-          </summary>
-          <pre>{previewJson({ args: item.args, result: item.result })}</pre>
-        </details>
-      );
-    }
+    case 'tool':
+      return <ToolRow item={item} />;
     case 'approval': {
       const why = askedBecause(item.reason);
       return (

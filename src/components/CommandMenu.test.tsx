@@ -37,7 +37,7 @@ describe('CommandMenu', () => {
     const out = html();
     expect(out).toContain('<span class="command-menu-name">/plan</span>');
     expect(out).toContain('<span class="command-menu-hint">[task]</span>');
-    expect(out).toContain('<span class="command-menu-description">Ask for a plan first.</span>');
+    expect(out).toContain('<span class="command-menu-description" data-tip="Ask for a plan first." data-tip-clip="">Ask for a plan first.</span>');
     // No hint, no hint span.
     expect(out.match(/command-menu-hint/g)).toHaveLength(2);
   });

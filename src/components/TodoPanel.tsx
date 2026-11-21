@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import type { TodoItem } from '../lib/types';
-import { currentIndex, titleText, todoRows, todoSummary } from '../lib/todoView';
+import { currentIndex, statusWord, titleText, todoRows, todoSummary } from '../lib/todoView';
 import { listMaxHeight, revealIndex, scrollTopToReveal, shouldExpand, todoShape, TODO_LIST_MAX_PX } from '../lib/todoPanel';
 import { settleTight, TIGHT_ATTR } from '../lib/panelTight';
 
@@ -169,9 +169,11 @@ export function TodoPanel({ items }: Props) {
         aria-expanded={expanded}
         aria-controls={listId}
         onClick={() => setChoice({ shape, expanded: !expanded })}
-        title={currentTitle !== undefined ? `${expanded ? 'Hide' : 'Show'} the todo list. Current: ${currentTitle}` : `${expanded ? 'Hide' : 'Show'} the todo list`}
+        data-tip={currentTitle !== undefined ? `${expanded ? 'Hide' : 'Show'} the todo list. Current: ${currentTitle}` : `${expanded ? 'Hide' : 'Show'} the todo list`}
       >
-        <span className="todo-summary">{summary}</span>
+        <span className="todo-summary" data-tip={summary} data-tip-clip="">
+          {summary}
+        </span>
         <svg className="todo-chevron" viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
           <path d="M4 6l4 4 4-4" />
         </svg>
@@ -206,14 +208,3 @@ function prefersReducedMotion(): boolean {
   return typeof window.matchMedia === 'function' && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 }
 
-/** The status as a word for screen readers. The marks are drawn in CSS and carry no text. */
-function statusWord(status: TodoItem['status']): string {
-  switch (status) {
-    case 'completed':
-      return 'Done';
-    case 'in_progress':
-      return 'In progress';
-    default:
-      return 'Pending';
-  }
-}

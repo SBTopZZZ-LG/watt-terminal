@@ -67,7 +67,9 @@ export function SettingsTabs(p: SettingsTabsProps) {
               className={`tab${active ? ' is-active' : ''}`}
               onClick={() => p.onSelect(t.id)}
             >
-              <span className="tab-label">{t.label}</span>
+              <span className="tab-label" data-tip={t.label} data-tip-clip="">
+                {t.label}
+              </span>
               {dirty && <span className="tab-dot" aria-hidden="true" />}
               {dirty && <span className="tab-unsaved"> unsaved changes</span>}
             </button>

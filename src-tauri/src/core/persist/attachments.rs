@@ -182,7 +182,7 @@ fn remove_dir_if_exists(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::settings::test_support::TempDir;
+    use crate::core::settings::test_support::{TempDir, open_dir_for_mtime};
 
     fn id(n: u32) -> String {
         format!("ses_{n:032x}")
@@ -276,7 +276,7 @@ mod tests {
     /// Sets a directory's modification time, as the sweep reads it.
     fn set_age(dir: &Path, age: Duration) {
         let when = SystemTime::now() - age;
-        fs::File::open(dir).unwrap().set_modified(when).unwrap();
+        open_dir_for_mtime(dir).unwrap().set_modified(when).unwrap();
     }
 
     #[test]
@@ -306,7 +306,10 @@ mod tests {
         let s = store(&tmp);
         s.write(&id(13), &sha256_hex(b"x"), "png", b"x").unwrap();
         let dir = s.root().join(id(13));
-        fs::File::open(&dir).unwrap().set_modified(SystemTime::now() + Duration::from_secs(3600)).unwrap();
+        open_dir_for_mtime(&dir)
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_secs(3600))
+            .unwrap();
         s.sweep(&HashSet::new(), SWEEP_GRACE).unwrap();
         assert_eq!(dir_names(s.root()), vec![id(13)]);
     }

@@ -423,6 +423,11 @@ impl<'a> AgentCtx<'a> {
         self.tools.foreground()
     }
 
+    /// How long the foreground hint's command has run (see `AgentTools::foreground_age`). Read per model call.
+    pub fn foreground_age(&self) -> Option<Duration> {
+        self.tools.foreground_age()
+    }
+
     /// The shell the agent acts in at this moment (see `AgentTools::top_level`). The agent loop reads it per model call.
     pub fn top_level(&self) -> TopLevel {
         self.tools.top_level()

@@ -1,5 +1,6 @@
 //! UI state in `<config_dir>/ui-state.json`: the agent panel's dock, size and open state, the font size, the last
-//! conversation used, and how the history list is grouped.
+//! conversation used, how the history list is grouped, how queued agent messages are sent, and whether the terminal's
+//! command separators and agent labels are hidden, and whether follow-up prompts are suggested after each reply.
 //!
 //! Reading is tolerant. Unknown fields are ignored, and each field that is missing or invalid becomes `None` on its
 //! own, so one bad value never loses the rest. A file that is not JSON at all reads as the default state, and it is
@@ -26,7 +27,13 @@ pub const UI_STATE_VERSION: u32 = 1;
 pub const UI_STATE_FILE: &str = "ui-state.json";
 const DOCKS: [&str; 4] = ["left", "top", "right", "bottom"];
 const HISTORY_GROUPS: [&str; 2] = ["date", "workspace"];
+/// How queued agent messages are sent: all together, or one per turn.
+const QUEUE_MODES: [&str; 2] = ["all", "one"];
 const FONT_SIZES: RangeInclusive<u32> = 8..=32;
+/// The separators and agent labels are hidden unless the file says otherwise.
+const HIDE_MARKS_DEFAULT: bool = true;
+/// Desktop notifications (agent done, or asking something, while Watt is in the background) are on unless the file says otherwise.
+const NOTIFICATIONS_DEFAULT: bool = true;
 /// Largest accepted panel size, in pixels.
 const MAX_PANEL_SIZE: f64 = 20_000.0;
 
@@ -55,6 +62,28 @@ pub struct UiState {
     pub last_conversation_id: Option<String>,
     /// `date` or `workspace`.
     pub history_group_by: Option<String>,
+    /// `all` or `one`: how messages queued while the agent works are sent. Missing or invalid reads as `None` (all).
+    pub queue_mode: Option<String>,
+    /// Hides the terminal's command separators and agent labels (the exit-coloured stripes stay). Missing or invalid
+    /// in the file reads as the default, `true`.
+    #[serde(default = "hide_marks_default")]
+    pub hide_marks: bool,
+    /// After each reply, asks the model for a few follow-up prompts shown under the input. One extra model call per
+    /// reply, so it is off unless the file says otherwise. Missing or invalid reads as `false`.
+    #[serde(default)]
+    pub suggest_prompts: bool,
+    /// System notification when the agent is done or asks something while Watt is in the background. Missing or invalid
+    /// in the file reads as the default, `true`.
+    #[serde(default = "notifications_default")]
+    pub notifications: bool,
+}
+
+fn hide_marks_default() -> bool {
+    HIDE_MARKS_DEFAULT
+}
+
+fn notifications_default() -> bool {
+    NOTIFICATIONS_DEFAULT
 }
 
 impl Default for UiState {
@@ -65,6 +94,10 @@ impl Default for UiState {
             font_size: None,
             last_conversation_id: None,
             history_group_by: None,
+            queue_mode: None,
+            hide_marks: HIDE_MARKS_DEFAULT,
+            suggest_prompts: false,
+            notifications: NOTIFICATIONS_DEFAULT,
         }
     }
 }
@@ -81,6 +114,14 @@ pub struct UiStatePatch {
     pub last_conversation_id: Option<Option<String>>,
     #[serde(deserialize_with = "double_option")]
     pub history_group_by: Option<Option<String>>,
+    #[serde(deserialize_with = "double_option")]
+    pub queue_mode: Option<Option<String>>,
+    /// A boolean has no "clear", so `null` is the same as absent: the value is left alone.
+    pub hide_marks: Option<bool>,
+    /// As `hide_marks`: a boolean, so `null` leaves it alone.
+    pub suggest_prompts: Option<bool>,
+    /// As `hide_marks`: a boolean, so `null` leaves it alone.
+    pub notifications: Option<bool>,
 }
 
 /// Distinguishes an absent field (outer `None`, via `default`) from `null` (`Some(None)`).
@@ -128,6 +169,18 @@ impl UiStateStore {
         }
         if let Some(group) = patch.history_group_by {
             state.history_group_by = group;
+        }
+        if let Some(mode) = patch.queue_mode {
+            state.queue_mode = mode;
+        }
+        if let Some(hide) = patch.hide_marks {
+            state.hide_marks = hide;
+        }
+        if let Some(suggest) = patch.suggest_prompts {
+            state.suggest_prompts = suggest;
+        }
+        if let Some(notify) = patch.notifications {
+            state.notifications = notify;
         }
         state.version = UI_STATE_VERSION;
         self.write(&state)?;
@@ -197,6 +250,14 @@ fn tolerant(value: &Value) -> UiState {
             .and_then(Value::as_str)
             .filter(|g| HISTORY_GROUPS.contains(g))
             .map(str::to_string),
+        queue_mode: obj
+            .get("queue_mode")
+            .and_then(Value::as_str)
+            .filter(|m| QUEUE_MODES.contains(m))
+            .map(str::to_string),
+        hide_marks: obj.get("hide_marks").and_then(Value::as_bool).unwrap_or(HIDE_MARKS_DEFAULT),
+        suggest_prompts: obj.get("suggest_prompts").and_then(Value::as_bool).unwrap_or(false),
+        notifications: obj.get("notifications").and_then(Value::as_bool).unwrap_or(NOTIFICATIONS_DEFAULT),
     }
 }
 
@@ -247,6 +308,11 @@ fn validate_patch(patch: &UiStatePatch) -> Result<(), PersistError> {
         && !HISTORY_GROUPS.contains(&group.as_str())
     {
         return Err(PersistError::Invalid("history grouping must be date or workspace".into()));
+    }
+    if let Some(Some(mode)) = &patch.queue_mode
+        && !QUEUE_MODES.contains(&mode.as_str())
+    {
+        return Err(PersistError::Invalid("queue mode must be all or one".into()));
     }
     Ok(())
 }
@@ -311,6 +377,10 @@ mod tests {
             font_size: Some(Some(14)),
             last_conversation_id: Some(Some(id(1))),
             history_group_by: Some(Some("workspace".into())),
+            queue_mode: Some(Some("one".into())),
+            hide_marks: Some(false),
+            suggest_prompts: Some(true),
+            notifications: Some(false),
         };
         let written = s.patch(patch).unwrap();
         assert_eq!(s.load().unwrap(), written);
@@ -318,6 +388,10 @@ mod tests {
         assert_eq!(written.font_size, Some(14));
         assert_eq!(written.last_conversation_id, Some(id(1)));
         assert_eq!(written.history_group_by.as_deref(), Some("workspace"));
+        assert_eq!(written.queue_mode.as_deref(), Some("one"));
+        assert!(!written.hide_marks);
+        assert!(written.suggest_prompts);
+        assert!(!written.notifications);
     }
 
     #[test]
@@ -498,6 +572,7 @@ mod tests {
             json!({"font_size": 7}),
             json!({"last_conversation_id": "../etc"}),
             json!({"history_group_by": "month"}),
+            json!({"queue_mode": "some"}),
         ];
         for value in bad {
             let result = s.patch(patch_from(value.clone()));
@@ -532,6 +607,141 @@ mod tests {
         assert!(!s.path.parent().unwrap().exists());
         s.patch(patch_from(json!({"font_size": 11}))).unwrap();
         assert!(s.path.exists());
+    }
+
+    #[test]
+    fn hide_marks_defaults_to_true_and_an_old_file_without_it_loads_as_true() {
+        let tmp = TempDir::new();
+        assert!(store(&tmp).load().unwrap().hide_marks, "no file");
+        assert!(UiState::default().hide_marks);
+        // A file written before the setting existed has no hide_marks field.
+        let old = read_text(&tmp, r#"{"version": 1, "font_size": 12, "history_group_by": "date"}"#);
+        assert!(old.hide_marks);
+        assert_eq!(old.font_size, Some(12));
+    }
+
+    #[test]
+    fn hide_marks_must_be_a_boolean_or_it_reads_as_the_default() {
+        let tmp = TempDir::new();
+        assert!(read_text(&tmp, r#"{"hide_marks": "no"}"#).hide_marks);
+        assert!(read_text(&tmp, r#"{"hide_marks": 0}"#).hide_marks);
+        assert!(read_text(&tmp, r#"{"hide_marks": null}"#).hide_marks);
+        assert!(!read_text(&tmp, r#"{"hide_marks": false}"#).hide_marks);
+    }
+
+    #[test]
+    fn hide_marks_patch_sets_persists_and_null_leaves_it_alone() {
+        let tmp = TempDir::new();
+        let s = store(&tmp);
+        let off = s.patch(patch_from(json!({"hide_marks": false}))).unwrap();
+        assert!(!off.hide_marks);
+        assert!(!s.load().unwrap().hide_marks, "written to the file");
+
+        let untouched = s.patch(patch_from(json!({"font_size": 13}))).unwrap();
+        assert!(!untouched.hide_marks, "an absent field leaves it alone");
+
+        let null = s.patch(patch_from(json!({"hide_marks": null}))).unwrap();
+        assert!(!null.hide_marks, "null leaves it alone too");
+
+        let on = s.patch(patch_from(json!({"hide_marks": true}))).unwrap();
+        assert!(on.hide_marks);
+        assert!(s.load().unwrap().hide_marks);
+    }
+
+    #[test]
+    fn queue_mode_is_all_or_one_only_and_reads_as_none_otherwise() {
+        let tmp = TempDir::new();
+        assert_eq!(read_text(&tmp, r#"{"queue_mode": "all"}"#).queue_mode.as_deref(), Some("all"));
+        assert_eq!(read_text(&tmp, r#"{"queue_mode": "one"}"#).queue_mode.as_deref(), Some("one"));
+        assert_eq!(read_text(&tmp, r#"{"queue_mode": "many"}"#).queue_mode, None);
+        assert_eq!(read_text(&tmp, r#"{"queue_mode": true}"#).queue_mode, None);
+        assert_eq!(read_text(&tmp, r#"{"font_size": 12}"#).queue_mode, None, "an old file has none");
+        assert_eq!(UiState::default().queue_mode, None);
+    }
+
+    #[test]
+    fn queue_mode_patch_sets_clears_and_absent_leaves_it_alone() {
+        let tmp = TempDir::new();
+        let s = store(&tmp);
+        let one = s.patch(patch_from(json!({"queue_mode": "one"}))).unwrap();
+        assert_eq!(one.queue_mode.as_deref(), Some("one"));
+        assert_eq!(s.load().unwrap().queue_mode.as_deref(), Some("one"), "written to the file");
+
+        let untouched = s.patch(patch_from(json!({"font_size": 13}))).unwrap();
+        assert_eq!(untouched.queue_mode.as_deref(), Some("one"), "an absent field leaves it alone");
+
+        let cleared = s.patch(patch_from(json!({"queue_mode": null}))).unwrap();
+        assert_eq!(cleared.queue_mode, None, "null clears it, back to the default");
+        assert_eq!(patch_from(json!({"queue_mode": "all"})).queue_mode, Some(Some("all".into())));
+        assert_eq!(UiStatePatch::default().queue_mode, None);
+    }
+
+    #[test]
+    fn hide_marks_is_in_the_patch_default_as_absent() {
+        assert_eq!(UiStatePatch::default().hide_marks, None);
+        assert_eq!(patch_from(json!({"hide_marks": false})).hide_marks, Some(false));
+    }
+
+    #[test]
+    fn suggest_prompts_is_off_by_default_and_a_boolean_only() {
+        let tmp = TempDir::new();
+        assert!(!store(&tmp).load().unwrap().suggest_prompts, "no file");
+        assert!(!UiState::default().suggest_prompts);
+        assert!(!read_text(&tmp, r#"{"font_size": 12}"#).suggest_prompts, "an old file has none");
+        assert!(read_text(&tmp, r#"{"suggest_prompts": true}"#).suggest_prompts);
+        assert!(!read_text(&tmp, r#"{"suggest_prompts": "yes"}"#).suggest_prompts);
+        assert!(!read_text(&tmp, r#"{"suggest_prompts": 1}"#).suggest_prompts);
+    }
+
+    #[test]
+    fn suggest_prompts_patch_sets_persists_and_null_or_absent_leaves_it_alone() {
+        let tmp = TempDir::new();
+        let s = store(&tmp);
+        let on = s.patch(patch_from(json!({"suggest_prompts": true}))).unwrap();
+        assert!(on.suggest_prompts);
+        assert!(s.load().unwrap().suggest_prompts, "written to the file");
+
+        let untouched = s.patch(patch_from(json!({"font_size": 13}))).unwrap();
+        assert!(untouched.suggest_prompts, "an absent field leaves it alone");
+
+        let null = s.patch(patch_from(json!({"suggest_prompts": null}))).unwrap();
+        assert!(null.suggest_prompts, "null leaves it alone too");
+
+        let off = s.patch(patch_from(json!({"suggest_prompts": false}))).unwrap();
+        assert!(!off.suggest_prompts);
+        assert_eq!(patch_from(json!({})).suggest_prompts, None);
+    }
+
+    #[test]
+    fn notifications_are_on_by_default_and_a_boolean_only() {
+        let tmp = TempDir::new();
+        assert!(store(&tmp).load().unwrap().notifications, "no file");
+        assert!(UiState::default().notifications);
+        assert!(read_text(&tmp, r#"{"font_size": 12}"#).notifications, "an old file has none");
+        assert!(!read_text(&tmp, r#"{"notifications": false}"#).notifications);
+        assert!(read_text(&tmp, r#"{"notifications": "no"}"#).notifications);
+        assert!(read_text(&tmp, r#"{"notifications": 0}"#).notifications);
+        assert!(read_text(&tmp, r#"{"notifications": null}"#).notifications);
+    }
+
+    #[test]
+    fn notifications_patch_sets_persists_and_null_or_absent_leaves_it_alone() {
+        let tmp = TempDir::new();
+        let s = store(&tmp);
+        let off = s.patch(patch_from(json!({"notifications": false}))).unwrap();
+        assert!(!off.notifications);
+        assert!(!s.load().unwrap().notifications, "written to the file");
+
+        let untouched = s.patch(patch_from(json!({"font_size": 13}))).unwrap();
+        assert!(!untouched.notifications, "an absent field leaves it alone");
+
+        let null = s.patch(patch_from(json!({"notifications": null}))).unwrap();
+        assert!(!null.notifications, "null leaves it alone too");
+
+        let on = s.patch(patch_from(json!({"notifications": true}))).unwrap();
+        assert!(on.notifications);
+        assert!(s.load().unwrap().notifications);
+        assert_eq!(patch_from(json!({})).notifications, None);
     }
 
     #[test]

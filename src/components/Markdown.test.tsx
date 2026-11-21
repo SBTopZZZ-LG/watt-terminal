@@ -16,12 +16,12 @@ describe('Markdown: untrusted model text', () => {
     expect(out).toContain('&lt;img src=x onerror=alert(1)&gt;');
   });
 
-  it('renders a link as a non-navigating span that keeps the text and shows the URL in title', () => {
+  it('renders a link as a non-navigating span that keeps the text and shows the URL in its tip', () => {
     const out = html('[x](https://evil.example)');
     expect(out).not.toContain('<a');
     expect(out).not.toContain('href');
     expect(out).toContain('>x</span>');
-    expect(out).toContain('title="https://evil.example"');
+    expect(out).toContain('data-tip="https://evil.example"');
   });
 
   it('renders an image as no img element and no remote URL, keeping the alt text', () => {
@@ -60,6 +60,17 @@ describe('Markdown: rendering', () => {
 
   it('keeps plain text as plain text', () => {
     expect(html('Hello there.')).toBe('<div class="md"><p>Hello there.</p></div>');
+  });
+
+  it('puts one copy button beside each fenced block and none on inline code', () => {
+    const out = html('Run `ls` first.\n\n```sh\nls -la\n```\n\n```\nplain\n```');
+    expect(out.match(/aria-label="Copy code"/g)).toHaveLength(2);
+    expect(out.match(/<button type="button" class="md-code-button" aria-label="Copy code"/g)).toHaveLength(2);
+    expect(out).toMatch(/<div class="md-code"><pre data-lang="sh">[\s\S]*?<\/pre><div class="md-code-copy">/);
+  });
+
+  it('puts no copy button in a message without a fenced block', () => {
+    expect(html('Use `ls`.')).not.toContain('Copy code');
   });
 
   it('does not throw on an unclosed fence and keeps the partial text', () => {

@@ -21,7 +21,7 @@ import {
 } from '../lib/settingsForm';
 import type { ProviderDraft } from '../lib/settingsForm';
 import { RECOVERY_BUSY_LABEL, REVERT_CONFIRM, reasonText, recoveryExplanation, recoveryKind } from '../lib/settingsRecovery';
-import type { AgentRequests, ModelRef, ProviderPreset, RecoverAction, SettingsStateView, SettingsView } from '../lib/types';
+import type { AgentRequests, ModelRef, ProviderPreset, QueueMode, RecoverAction, SettingsStateView, SettingsView } from '../lib/types';
 import { AboutSection } from './AboutSection';
 import { ApprovalSection } from './ApprovalSection';
 import { LimitsSection } from './LimitsSection';
@@ -29,6 +29,10 @@ import { ProviderEditor } from './ProviderEditor';
 import type { TestState } from './ProviderEditor';
 import { SettingsTabs } from './SettingsTabs';
 import type { TabDef } from './SettingsTabs';
+import { TerminalSection } from './TerminalSection';
+import { QueueSection } from './QueueSection';
+import { NotifySection } from './NotifySection';
+import { SuggestSection } from './SuggestSection';
 import { secretStoreName } from '../lib/platform';
 
 /** The recovery actions in flight or waiting for their confirm step. `busy` names the action that is running. */
@@ -63,13 +67,14 @@ export interface EditorState {
 
 /**
  * The tabs of the AI settings, in order. Models holds the default model, the context limit, the providers and the editor;
- * Approvals holds the approval rules; Limits holds the per-turn caps; About shows the app's name and version. A new tab is one
- * entry here and one panel in the dialog's render.
+ * Approvals holds the approval rules; Limits holds the per-turn caps; Terminal holds the terminal's display preferences; About
+ * shows the app's name and version. A new tab is one entry here and one panel in the dialog's render.
  */
 export const SETTINGS_TABS: readonly TabDef[] = [
   { id: 'models', label: 'Models' },
   { id: 'approvals', label: 'Approvals' },
   { id: 'limits', label: 'Limits' },
+  { id: 'terminal', label: 'Terminal' },
   { id: 'about', label: 'About' },
 ];
 
@@ -467,6 +472,18 @@ export interface SettingsDialogProps {
   onChanged(): void;
   /** The settings were loaded (on open, Retry or Check again): the caller reads the settings state again. */
   onViewLoaded?(): void;
+  /** The Terminal tab's setting: true hides the command separators and agent labels. Owned by the caller (UI state). */
+  hideMarks: boolean;
+  onHideMarksChange(hide: boolean): void;
+  /** The Terminal tab's queued-messages setting: how messages queued while the agent works are sent. Owned by the caller (UI state). */
+  queueMode: QueueMode;
+  onQueueModeChange(mode: QueueMode): void;
+  /** Whether the agent suggests follow-up prompts after each reply. Owned by the caller (UI state). */
+  suggestPrompts: boolean;
+  onSuggestPromptsChange(on: boolean): void;
+  /** Whether Watt notifies the user when the agent is done or needs them in the background. Owned by the caller (UI state). */
+  notifications: boolean;
+  onNotificationsChange(on: boolean): void;
 }
 
 /**
@@ -476,7 +493,7 @@ export interface SettingsDialogProps {
  * and goes back to where it was on close. Esc closes; a click on the backdrop closes. Unsaved changes are asked about
  * before they are dropped.
  */
-export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded }: SettingsDialogProps) {
+export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded, hideMarks, onHideMarksChange, queueMode, onQueueModeChange, suggestPrompts, onSuggestPromptsChange, notifications, onNotificationsChange }: SettingsDialogProps) {
   const titleId = useId();
   const dialogRef = useRef<HTMLDivElement>(null);
   const backdropPressed = useRef(false);
@@ -1108,6 +1125,15 @@ export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded }:
       />
     ) : null;
 
+  const terminalPanel = (
+    <>
+      <TerminalSection hideMarks={hideMarks} onHideMarksChange={onHideMarksChange} />
+      <QueueSection queueMode={queueMode} onQueueModeChange={onQueueModeChange} />
+      <SuggestSection suggestPrompts={suggestPrompts} onSuggestPromptsChange={onSuggestPromptsChange} />
+      <NotifySection notifications={notifications} onNotificationsChange={onNotificationsChange} />
+    </>
+  );
+
   const aboutPanel = <AboutSection />;
 
   return (
@@ -1155,7 +1181,15 @@ export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded }:
           dirty={dirtyTabs}
           onSelect={setTab}
           panel={(id) =>
-            id === 'approvals' ? approvalsPanel : id === 'limits' ? limitsPanel : id === 'about' ? aboutPanel : modelsPanel
+            id === 'approvals'
+              ? approvalsPanel
+              : id === 'limits'
+                ? limitsPanel
+                : id === 'terminal'
+                  ? terminalPanel
+                  : id === 'about'
+                    ? aboutPanel
+                    : modelsPanel
           }
         />
         <footer className="settings-foot">

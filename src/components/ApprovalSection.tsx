@@ -121,7 +121,7 @@ export function ApprovalSection(p: ApprovalSectionProps) {
       <p className="settings-hint">
         One regular expression per line, matched against the whole command as it is run. A deny rule wins over an allow rule.
         Only commands made of letters, digits, spaces and the characters _-./:=@+, can run by rule; anything else always asks.
-        Approve-all in the status bar overrides the rules for the session.
+        Bypass in the status bar overrides the rules for the session.
       </p>
       <p className="settings-hint">
         Allow rules match the whole command, but options like `git -c …` or `make -f …` can run other programs under a broad
@@ -159,7 +159,7 @@ export function ApprovalSection(p: ApprovalSectionProps) {
           Auto-approve in SSH and nested shells
         </label>
         <p className="settings-warn" id={`${uid}-nested-note`}>
-          Off by default. Remote aliases, PATH and users differ from this machine, so with this on, allow rules and approve-all
+          Off by default. Remote aliases, PATH and users differ from this machine, so with this on, allow rules and bypass
           apply in SSH and nested shells too. The hard gate and the deny rules still apply everywhere. Applies when you save
           approvals.
         </p>

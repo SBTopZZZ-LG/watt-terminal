@@ -25,6 +25,7 @@ import { effectiveState, focusAfter, inputReducer, INITIAL_INPUT, isFocusBarHotk
 import type { BarMode, Route } from './lib/inputState';
 import { agentDialogPhase, agentIntegratingQuietly, agentRequestAfter, agentRequestClosedBySession, agentRunning, canIntegrate, integratesLocalShell, nestedLevels } from './lib/integrate';
 import type { AgentRequest, IntegratePhase } from './lib/integrate';
+import { useSettledStrip } from './lib/stripSettle';
 import { agentControlAfter, borderActive, borderLevel, NO_CONTROL, settleControl } from './lib/agentControl';
 import type { AgentControl, BorderLevel } from './lib/agentControl';
 import { EMPTY_TRANSCRIPT, firstPendingApproval, isBusy, transcriptReducer } from './lib/transcript';
@@ -33,11 +34,19 @@ import { chatBodyShown, isSideDock, loadPanelLayout, panelReducer, panelView, sa
 import type { Container } from './lib/panelLayout';
 import { defaultSizeStorage } from './lib/zoom';
 import { itemsFromMessages } from './lib/historyView';
-import { agentActivityText } from './lib/agentActivity';
+import { agentActivity } from './lib/agentActivity';
 import { userAttachments } from './lib/attachments';
 import { defaultModelVision } from './lib/modelVision';
-import { createPatchSaver, fontPatch, panelPatch, reconcileFont, reconcileGroupBy, reconcilePanel, shouldRestoreLast } from './lib/uiState';
-import type { AttachmentInput, Cwd, HistoryGroupBy, InputState, IntegrationStatus, LevelInfo, LlmStatus, LoadedConversation, ObserverStatus, QuestionAnswerInput, SettingsStateView, Status, UiState, UiStatePatch, WireEvent } from './lib/types';
+import { createPatchSaver, fontPatch, hideMarksPatch, notificationsPatch, panelPatch, queueModePatch, reconcileFont, reconcileGroupBy, reconcileHideMarks, reconcileNotifications, reconcilePanel, reconcileQueueMode, reconcileSuggestPrompts, shouldRestoreLast, suggestPromptsPatch } from './lib/uiState';
+import { decideAttention } from './lib/attention';
+import type { AttentionEvent } from './lib/attention';
+import { onNotificationClick, sendAttention, watchWindowFocus } from './lib/attentionClient';
+import { acceptSuggestions, endsWithAgentText, shouldSuggest } from './lib/suggestions';
+import { NEW_DRAFT_KEY, forgetAllSuggestions, forgetConversation, forgetEverything, forgetSuggestions, loadSuggestions, saveSuggestions, transcriptSig } from './lib/conversationCache';
+import { SEND_WHILE_SWITCHING_NOTICE, switchRefusal } from './lib/switchGuard';
+import { drainBatch, enqueue, QUEUE_SLOT_POLL_MS, QUEUE_SLOT_WAIT_MS, removeQueued, shouldDrain } from './lib/messageQueue';
+import type { QueuedMessage } from './lib/messageQueue';
+import type { AttachmentInput, Cwd, HistoryGroupBy, InputState, IntegrationStatus, LevelInfo, LlmStatus, LoadedConversation, ObserverStatus, QueueMode, QuestionAnswerInput, SettingsStateView, Status, UiState, UiStatePatch, WireEvent } from './lib/types';
 import { recoveryKind } from './lib/settingsRecovery';
 import { TerminalView } from './components/TerminalView';
 import { InputBar } from './components/InputBar';
@@ -55,8 +64,8 @@ import { HelpDialog } from './components/HelpDialog';
 import type { HelpLoad } from './components/HelpDialog';
 import { SettingsDialog } from './components/SettingsDialog';
 import { SettingsBanner } from './components/SettingsBanner';
-import { AutoApproveNotice } from './components/AutoApproveNotice';
 import { IntegrateDialog } from './components/IntegrateDialog';
+import { Tooltip } from './components/Tooltip';
 
 const CTRL_C = '\u0003';
 
@@ -65,10 +74,15 @@ const uiSaver = createPatchSaver((patch: UiStatePatch) => {
   api.patchUiState(patch).catch(() => undefined);
 });
 
+/** The per-conversation memory in localStorage: drafts and saved follow-up prompts (see conversationCache.ts). */
+const cacheStorage = defaultSizeStorage();
+
 export default function App() {
   const [input, dispatchInput] = useReducer(inputReducer, INITIAL_INPUT);
   const effective = effectiveState(input);
   const route = routeFor(effective, input.foreground);
+  // What the status strip shows of the state and the foreground hint: the prompt is held while a quick command runs (see stripSettle.ts).
+  const strip = useSettledStrip(effective, input.foreground);
   // The Integrate dialog's phase. While the handshake runs (`running`) no key goes to the shell and the bar takes none: the
   // backend is typing the loader and the blob, and a key typed then would land in the middle of them.
   const [integrate, setIntegrate] = useState<IntegratePhase>({ kind: 'closed' });
@@ -130,9 +144,42 @@ export default function App() {
   // A side command (`/btw`, `/compact`, `/fork`) is running: one model call outside a turn, or none at all. The bar
   // and History stay busy until it answers, and a send is refused so the text is kept.
   const [sideBusy, setSideBusy] = useState(false);
+  // Messages typed while the agent works, sent after its turn (see messageQueue.ts). Not kept across a restart. The ref is the
+  // same list for the steps that run outside a render. `queueGen` moves when the conversation changes, so a send in flight
+  // never lands in another one. `queueMode` is the saved setting: all together, or one per turn.
+  const [queue, setQueue] = useState<QueuedMessage[]>([]);
+  const queueRef = useRef<QueuedMessage[]>([]);
+  const queueSeq = useRef(0);
+  const queueGen = useRef(0);
+  const draining = useRef(false);
+  const drainAgain = useRef(false);
+  const [queueMode, setQueueMode] = useState<QueueMode>('all');
   // Bumped when the live conversation is renamed, so an open HistoryView remounts and refetches its rows.
   const [historyKey, setHistoryKey] = useState(0);
   const [historyGroupBy, setHistoryGroupBy] = useState<HistoryGroupBy>('date');
+  // Hides the terminal's separators and agent labels (CSS on the root element, see App.css). Hidden until the file says otherwise.
+  const [hideMarks, setHideMarks] = useState(true);
+  useEffect(() => {
+    document.documentElement.dataset.hideMarks = String(hideMarks);
+  }, [hideMarks]);
+  // Follow-up prompts after a reply (see suggestions.ts). Off until the file says otherwise. `suggestGen` moves whenever the
+  // suggestions no longer follow the reply (a send, a turn, a conversation change, the setting, a click), so a late answer is
+  // dropped. One request at a time; a trigger during one is run again after it.
+  const [suggestPrompts, setSuggestPrompts] = useState(false);
+  const [suggestions, setSuggestions] = useState<string[]>([]);
+  const suggestGen = useRef(0);
+  const suggesting = useRef(false);
+  const suggestAgain = useRef(false);
+  // Bumped when a conversation is deleted, so the input bar drops its unsent text for it instead of saving it under the deleted id.
+  const [discardDraft, setDiscardDraft] = useState(0);
+  // True while an open or a new conversation is in flight. Sends and queue drains wait, so no message lands in the other one.
+  const switching = useRef(false);
+  // Desktop notifications when the agent is done or needs the user while Watt is in the background (see attention.ts). On
+  // until the file says otherwise. `windowFocused` is the native focus state, kept by a listener; it starts true, so nothing
+  // is sent before the state is known. `attentionKey` is the last question or approval already handled, so each shows once.
+  const [notifications, setNotifications] = useState(true);
+  const windowFocused = useRef(true);
+  const attentionKey = useRef<string | null>(null);
   // The UI state file, read at startup. Nothing is written to it until that read has been reconciled (see uiReady).
   const uiLoaded = useRef<Promise<UiState | null> | null>(null);
   const uiReady = useRef(false);
@@ -173,6 +220,11 @@ export default function App() {
   useEffect(() => {
     transcriptRef.current = transcript;
   });
+  // Read by the suggestion request and the saved-suggestions steps, which run after awaits.
+  const conversationRef = useRef<string | null>(null);
+  useEffect(() => {
+    conversationRef.current = conversationId;
+  });
   const clientIds = useRef(0);
   const prevEffective = useRef<InputState>(effective);
 
@@ -199,10 +251,8 @@ export default function App() {
     }
   }, []);
 
-  /** Takes the status snapshot again, e.g. after the live conversation changed. */
-  const refreshStatus = () => {
-    api.getStatus().then(applyStatus).catch(reportError);
-  };
+  /** Takes the status snapshot again, e.g. after the live conversation changed. Resolves once it is applied. */
+  const refreshStatus = (): Promise<void> => api.getStatus().then(applyStatus).catch(reportError);
 
   /**
    * Re-reads the control hold after `done`. `done` is emitted by `run_turn` before the worker's `OnDrop` calls
@@ -236,9 +286,7 @@ export default function App() {
   }, []);
 
   /** Reads only the live conversation's id again. The busy state stays the transcript's own, so a send still in transit is not lost. */
-  const syncConversationId = () => {
-    api.getStatus().then((s) => setConversationId(s.conversation_id)).catch(reportError);
-  };
+  const syncConversationId = (): Promise<void> => api.getStatus().then((s) => setConversationId(s.conversation_id)).catch(reportError);
 
   // The settings refresh's guards: a response is ignored after unmount, and when a newer refresh has started since.
   const settingsAlive = useRef(true);
@@ -371,6 +419,22 @@ export default function App() {
       const group = reconcileGroupBy(remote.history_group_by);
       if (group !== null) {
         setHistoryGroupBy(group);
+      }
+      const queued = reconcileQueueMode(remote.queue_mode);
+      if (queued !== null) {
+        setQueueMode(queued);
+      }
+      const marks = reconcileHideMarks(remote.hide_marks);
+      if (marks !== null) {
+        setHideMarks(marks);
+      }
+      const suggest = reconcileSuggestPrompts(remote.suggest_prompts);
+      if (suggest !== null) {
+        setSuggestPrompts(suggest);
+      }
+      const notify = reconcileNotifications(remote.notifications);
+      if (notify !== null) {
+        setNotifications(notify);
       }
     });
     const unsubscribeFont = onFontSizeChange((size) => persist(fontPatch(size)));
@@ -628,6 +692,13 @@ export default function App() {
   };
 
   const sendAgent = async (text: string, attachments: AttachmentInput[]): Promise<string | null> => {
+    // Refused while a switch is in flight: the text stays in the bar, and nothing lands in the conversation being switched to.
+    if (switching.current) {
+      return SEND_WHILE_SWITCHING_NOTICE;
+    }
+    dropSuggestions();
+    // A message is a new turn: what was saved for the reply before it no longer follows the chat.
+    forgetLiveSuggestions();
     epoch.current += 1;
     clientIds.current += 1;
     const clientId = clientIds.current;
@@ -643,18 +714,190 @@ export default function App() {
     }
   };
 
-  // Clears the agent's conversation. The backend refuses while the agent is busy; the button is also disabled then. On
-  // error the reason is shown in the transcript, and the conversation stays as it was.
+  /** Replaces the queue: the state for the render, and the ref for the steps that run outside it. */
+  const commitQueue = (next: QueuedMessage[]) => {
+    queueRef.current = next;
+    setQueue(next);
+  };
+
+  /** The suggestions no longer follow the reply: they are cleared, and a request in flight is stale (its result is dropped). */
+  const dropSuggestions = () => {
+    suggestGen.current += 1;
+    suggestAgain.current = false;
+    setSuggestions([]);
+  };
+
+  /** The live conversation's saved suggestions are removed: a turn started, so they no longer follow the chat. */
+  const forgetLiveSuggestions = () => {
+    if (conversationRef.current !== null) {
+      forgetSuggestions(cacheStorage, conversationRef.current);
+    }
+  };
+
+  /** The conversation changed: what is queued was for the old one, so it is dropped rather than sent into the new one. */
+  const clearQueue = () => {
+    queueGen.current += 1;
+    commitQueue([]);
+    dropSuggestions();
+  };
+
+  /**
+   * Waits until the backend's turn slot is free. `done` is emitted before the slot is released (see refreshControl), so a
+   * send right after it can be refused. Polls the status; after QUEUE_SLOT_WAIT_MS it gives up waiting, and the send goes
+   * anyway (a refusal then puts the messages back in the queue).
+   */
+  const waitForSlot = async (): Promise<void> => {
+    const deadline = Date.now() + QUEUE_SLOT_WAIT_MS;
+    for (;;) {
+      try {
+        const status = await api.getStatus();
+        if (!status.agent_busy) {
+          return;
+        }
+      } catch {
+        return;
+      }
+      if (Date.now() >= deadline) {
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, QUEUE_SLOT_POLL_MS));
+    }
+  };
+
+  /**
+   * Sends what is queued, once a turn has ended: all of it as one message, or the first message in `one` mode. The
+   * queue is read after the slot wait, so a message removed meanwhile is not sent. A refused send puts the messages back
+   * at the front of the queue (no retry; the user sees the queue and the error in the transcript). One drain at a time.
+   */
+  const drainQueue = async () => {
+    // While a conversation is being switched, the queue is left alone: the switch clears it (clearQueue) when it lands.
+    if (draining.current || switching.current) {
+      return;
+    }
+    draining.current = true;
+    const gen = queueGen.current;
+    try {
+      await waitForSlot();
+      if (queueGen.current !== gen) {
+        return;
+      }
+      const pending = queueRef.current;
+      const { send, rest } = drainBatch(pending, queueMode);
+      if (send === null) {
+        return;
+      }
+      const taken = pending.slice(0, pending.length - rest.length);
+      commitQueue(rest);
+      const err = await sendAgent(send.text, send.attachments);
+      if (err !== null && queueGen.current === gen) {
+        commitQueue([...taken, ...queueRef.current]);
+      }
+    } finally {
+      draining.current = false;
+      // A turn ended while this drain was running (its `done` can come before the send returns): the edge was not drained then.
+      if (drainAgain.current) {
+        drainAgain.current = false;
+        if (queueRef.current.length > 0) {
+          void drainQueue();
+        }
+      }
+    }
+  };
+
+  /**
+   * Asks for follow-up prompts for the reply that just ended. Read-only on the backend: it never touches busy, the
+   * transcript or the queue. Errors are dropped silently, so a failed request shows nothing. One at a time: a request
+   * asked for while one runs is run once more after it, unless the agent is busy or something is queued by then.
+   */
+  const requestSuggestions = async (): Promise<void> => {
+    if (suggesting.current) {
+      suggestAgain.current = true;
+      return;
+    }
+    suggesting.current = true;
+    const gen = suggestGen.current;
+    const conversation = conversationRef.current;
+    try {
+      const result = await api.suggestPrompts();
+      const shown = acceptSuggestions(result, { current: suggestGen.current === gen, busy: isBusy(transcriptRef.current) });
+      setSuggestions(shown);
+      // Kept under the conversation they were asked in, for its tail as it is now (see conversationCache.ts). A result shown
+      // only when that conversation is still the live one.
+      if (shown.length > 0 && conversation !== null && conversationRef.current === conversation) {
+        saveSuggestions(cacheStorage, conversation, shown, transcriptSig(transcriptRef.current.items));
+      }
+    } catch {
+      // Nothing to show: the input bar keeps its plain look.
+    } finally {
+      suggesting.current = false;
+      if (suggestAgain.current) {
+        suggestAgain.current = false;
+        if (!isBusy(transcriptRef.current) && queueRef.current.length === 0) {
+          void requestSuggestions();
+        }
+      }
+    }
+  };
+
+  /** A suggested prompt was clicked: it is sent as a plain message, the same as a typed one but not through the command parser. */
+  const sendSuggestion = (text: string) => {
+    void sendAgent(text, []);
+  };
+
+  /** Takes a queued message back, for the input to restore. Null when it is no longer queued. */
+  const unqueue = (id: number): QueuedMessage | null => {
+    const { queue: next, removed } = removeQueued(queueRef.current, id);
+    if (removed !== null) {
+      commitQueue(next);
+    }
+    return removed;
+  };
+
+  /** The queue mode is applied at once and saved with the UI state. */
+  const setQueueModeSetting = (mode: QueueMode) => {
+    setQueueMode(mode);
+    persist(queueModePatch(mode));
+  };
+
+  /** The suggest-prompts setting is applied at once and saved. Turning it off drops what is shown or in flight, and what was saved. */
+  const setSuggestPromptsSetting = (on: boolean) => {
+    dropSuggestions();
+    if (!on) {
+      forgetAllSuggestions(cacheStorage);
+    }
+    setSuggestPrompts(on);
+    persist(suggestPromptsPatch(on));
+  };
+
+  /** The notifications setting is applied at once and saved with the UI state. */
+  const setNotificationsSetting = (on: boolean) => {
+    setNotifications(on);
+    persist(notificationsPatch(on));
+  };
+
+  // Clears the agent's conversation. Refused while the agent is busy or a side command runs (the button is also disabled then),
+  // before the backend is asked. On error the reason is shown in the transcript, and the conversation stays as it was.
   const newConversation = () => {
+    const refusal = switchRefusal({ busy: isBusy(transcriptRef.current), sideBusy, switching: switching.current });
+    if (refusal !== null) {
+      dispatchTranscript({ type: 'notice', text: refusal });
+      return;
+    }
+    switching.current = true;
     epoch.current += 1;
-    api.newConversation().then(
-      () => {
-        dispatchTranscript({ type: 'conversation_reset' });
-        // The new conversation has a new id, which the history view marks as current.
-        refreshStatus();
-      },
-      (e) => dispatchTranscript({ type: 'notice', text: errorText(e) }),
-    );
+    api.newConversation()
+      .then(
+        () => {
+          clearQueue();
+          dispatchTranscript({ type: 'conversation_reset' });
+          // The new conversation has a new id, which the history view marks as current. Read before the switch ends.
+          return refreshStatus();
+        },
+        (e) => dispatchTranscript({ type: 'notice', text: errorText(e) }),
+      )
+      .finally(() => {
+        switching.current = false;
+      });
   };
 
   /** Opens the agent panel on the chat view and moves focus to the bar. */
@@ -681,6 +924,7 @@ export default function App() {
    */
   const applyLoaded = (loaded: LoadedConversation) => {
     epoch.current += 1;
+    clearQueue();
     dispatchTranscript({ type: 'conversation_loaded', items: itemsFromMessages(loaded.messages), todos: loaded.todos, context: loaded.context });
     setConversationId(loaded.id);
     setPanelBody('chat');
@@ -965,16 +1209,23 @@ export default function App() {
     if (sideBusy) {
       return 'A side command is still running.';
     }
+    // While a turn runs, a plain message (or an unknown `/...`, which is one) waits in the queue instead of being refused.
+    // Read again after any await: the turn may have ended meanwhile.
+    const queueIt = (): null => {
+      queueSeq.current += 1;
+      commitQueue(enqueue(queueRef.current, queueSeq.current, text, attachments));
+      return null;
+    };
     const parsed = parseCommand(text);
     if (parsed === null) {
-      return sendAgent(text, attachments);
+      return isBusy(transcriptRef.current) ? queueIt() : sendAgent(text, attachments);
     }
     const outcome = await runCommand(parsed.name, parsed.args, text);
     if (outcome.kind === 'send') {
       return sendAgent(outcome.text, attachments);
     }
     if (outcome.kind === 'unknown') {
-      return sendAgent(text, attachments);
+      return isBusy(transcriptRef.current) ? queueIt() : sendAgent(text, attachments);
     }
     return null;
   };
@@ -986,32 +1237,54 @@ export default function App() {
    * Resolves with the reason it was refused, or null when it was opened.
    */
   const openConversation = async (id: string): Promise<string | null> => {
-    const started = epoch.current;
-    let loaded: LoadedConversation;
+    const refusal = switchRefusal({ busy: isBusy(transcriptRef.current), sideBusy, switching: switching.current });
+    if (refusal !== null) {
+      return refusal;
+    }
+    switching.current = true;
     try {
-      loaded = await api.loadConversation(id);
-    } catch (e) {
-      return errorText(e);
+      const started = epoch.current;
+      let loaded: LoadedConversation;
+      try {
+        loaded = await api.loadConversation(id);
+      } catch (e) {
+        return errorText(e);
+      }
+      if (epoch.current !== started || isBusy(transcriptRef.current)) {
+        await syncConversationId();
+        return 'The chat changed while this conversation was loading, so it was not opened. Open it again.';
+      }
+      epoch.current += 1;
+      clearQueue();
+      dispatchTranscript({ type: 'conversation_loaded', items: itemsFromMessages(loaded.messages), todos: loaded.todos, context: loaded.context });
+      setConversationId(loaded.id);
+      setPanelBody('chat');
+      setFocusToken((t) => t + 1);
+      await refreshStatus();
+      return null;
+    } finally {
+      switching.current = false;
     }
-    if (epoch.current !== started || isBusy(transcriptRef.current)) {
-      syncConversationId();
-      return 'The chat changed while this conversation was loading, so it was not opened. Open it again.';
-    }
-    epoch.current += 1;
-    dispatchTranscript({ type: 'conversation_loaded', items: itemsFromMessages(loaded.messages), todos: loaded.todos, context: loaded.context });
-    setConversationId(loaded.id);
-    setPanelBody('chat');
-    setFocusToken((t) => t + 1);
-    refreshStatus();
-    return null;
   };
 
   /** The live conversation was deleted from the History view: the backend started a new one, so the chat is reset to match. */
   const liveDeleted = () => {
     epoch.current += 1;
+    clearQueue();
     dispatchTranscript({ type: 'conversation_reset' });
+    // Its unsent text is dropped with it (see InputBar's draftDiscard), not saved under the deleted id.
+    setDiscardDraft((d) => d + 1);
     setConversationId(null);
     refreshStatus();
+  };
+
+  /** A conversation was deleted from the History view (or all of them). What was kept for it goes too. */
+  const conversationDeleted = (id: string | 'all') => {
+    if (id === 'all') {
+      forgetEverything(cacheStorage);
+    } else {
+      forgetConversation(cacheStorage, id);
+    }
   };
 
   /** Moves focus to the History header button, so it is not lost when the view closes. */
@@ -1039,6 +1312,11 @@ export default function App() {
     persist({ history_group_by: groupBy });
   };
 
+  const setMarksHidden = (hide: boolean) => {
+    setHideMarks(hide);
+    persist(hideMarksPatch(hide));
+  };
+
   const answer = (callId: string, approve: boolean) => {
     dispatchTranscript({ type: 'approval_answering', callId, approve });
     api.approveTool(callId, approve).catch((e) => {
@@ -1058,6 +1336,8 @@ export default function App() {
   };
 
   const pendingApproval = firstPendingApproval(transcript);
+  // A question waiting for the user's answer: a focus blocker for the input bar (see inputFocus.ts).
+  const questionPending = transcript.items.some((i) => i.kind === 'question' && i.state === 'pending');
   // The waiting card itself, for the toast while the chat body is hidden. Null when no card waits.
   const pendingApprovalItem =
     pendingApproval !== null
@@ -1079,6 +1359,124 @@ export default function App() {
   }, [pendingApproval]);
   const canApprove = approvalArmed && chatBodyShown(panel.open, panelBody);
   const busy = isBusy(transcript);
+  // A turn or side command that has just ended sends what is queued (see drainQueue). The ref is the previous render's value.
+  const active = busy || sideBusy;
+  const wasActive = useRef(active);
+  useEffect(() => {
+    const prev = wasActive.current;
+    wasActive.current = active;
+    if (shouldDrain(prev, active, queueRef.current.length)) {
+      if (draining.current) {
+        drainAgain.current = true;
+      } else {
+        void drainQueue();
+      }
+    }
+    // The same edge asks for follow-up prompts (see suggestions.ts). A turn starting clears what was shown, and what was saved.
+    if (active) {
+      dropSuggestions();
+      forgetLiveSuggestions();
+    } else if (
+      shouldSuggest({
+        enabled: suggestPrompts,
+        turnJustEnded: prev,
+        queueLength: queueRef.current.length,
+        sideBusy,
+        lastItemIsAgentText: endsWithAgentText(transcript.items),
+      })
+    ) {
+      void requestSuggestions();
+    }
+  }, [active]);
+  // The follow-up prompts saved for the live conversation come back when its transcript still ends with the reply they followed
+  // (the signature matches), the setting is on, and nothing is running. Read on open, on start, and when the setting turns on.
+  // A saved entry for another tail is stale: it is removed, once there is a transcript to compare with.
+  useEffect(() => {
+    if (!suggestPrompts || active || conversationId === null || suggestions.length > 0) {
+      return;
+    }
+    const saved = loadSuggestions(cacheStorage, conversationId, transcriptSig(transcript.items));
+    if (saved === 'stale') {
+      if (transcript.items.length > 0) {
+        forgetSuggestions(cacheStorage, conversationId);
+      }
+      return;
+    }
+    if (saved !== null) {
+      setSuggestions(saved.items);
+    }
+  }, [conversationId, suggestPrompts, active, transcript.items]);
+  // Desktop notifications (see attention.ts): sent with the current setting and focus. Failures are handled in attentionClient.
+  const notifyAttention = (event: AttentionEvent) => {
+    const decision = decideAttention(event, {
+      enabled: notifications,
+      focused: windowFocused.current,
+      queueLength: queueRef.current.length,
+    });
+    if (decision !== null) {
+      void sendAttention(decision);
+    }
+  };
+  /** True the first time a key is seen, so each question or approval is notified once. */
+  const firstAttention = (key: string): boolean => {
+    if (attentionKey.current === key) {
+      return false;
+    }
+    attentionKey.current = key;
+    return true;
+  };
+  // The window's focus, and a click on a notification (it brings the window forward). Registered once. When a listener
+  // cannot be set up, the defaults stay: focused, and a click does nothing.
+  useEffect(() => {
+    const stops: Array<() => void> = [];
+    let gone = false;
+    const keep = (stop: () => void) => {
+      if (gone) {
+        stop();
+      } else {
+        stops.push(stop);
+      }
+    };
+    watchWindowFocus((focused) => {
+      windowFocused.current = focused;
+    }).then(keep, () => undefined);
+    onNotificationClick(() => {
+      api.focusMainWindow().catch(() => undefined);
+    }).then(keep, () => undefined);
+    return () => {
+      gone = true;
+      stops.forEach((stop) => stop());
+    };
+  }, []);
+  // The turn ended (the busy edge). Not for a side command. A queued message is about to be sent, so it is not idle.
+  const wasBusy = useRef(busy);
+  useEffect(() => {
+    const prev = wasBusy.current;
+    wasBusy.current = busy;
+    if (prev && !busy) {
+      const last = transcript.items[transcript.items.length - 1];
+      notifyAttention({ type: 'turn_idle', lastText: last !== undefined && last.kind === 'agent' ? last.text : null });
+    }
+  }, [busy]);
+  // A question or an approval waiting for the user. Each card notifies once, keyed by its call id.
+  const pendingQuestionItem =
+    transcript.items.find(
+      (i): i is Extract<TranscriptItem, { kind: 'question' }> => i.kind === 'question' && i.state === 'pending',
+    ) ?? null;
+  useEffect(() => {
+    if (pendingQuestionItem === null || !firstAttention(`question:${pendingQuestionItem.callId}`)) {
+      return;
+    }
+    notifyAttention({ type: 'question', text: pendingQuestionItem.questions[0]?.question ?? '' });
+  }, [pendingQuestionItem?.callId]);
+  useEffect(() => {
+    if (pendingApprovalItem === null || !firstAttention(`approval:${pendingApprovalItem.callId}`)) {
+      return;
+    }
+    const text =
+      pendingApprovalItem.name === 'send_keys' ? (pendingApprovalItem.display ?? pendingApprovalItem.text) : pendingApprovalItem.text;
+    notifyAttention({ type: 'approval', text });
+  }, [pendingApprovalItem?.callId]);
   // Same busy as the input bar's loader (busy || sideBusy). An exited shell takes the border off even if a turn is still open.
   const border: BorderLevel = borderLevel(agentControl, (busy || sideBusy) && effective !== 'exited');
   const borderClass: Record<BorderLevel, string> = {
@@ -1151,6 +1549,7 @@ export default function App() {
     }
     setRestarting(true);
     resetForNewSession();
+    clearQueue();
     dispatchTranscript({ type: 'session_reset' });
     setAgentControl(NO_CONTROL);
     setAgentReq((cur) => agentRequestClosedBySession(cur));
@@ -1186,17 +1585,18 @@ export default function App() {
     const box = el.getBoundingClientRect();
     return view.side ? box.width : box.height;
   };
+  const activity = agentActivity(transcript.items, transcript.thinking, sideBusy);
 
   return (
     <div className="app">
       <StatusChip
         integration={integration}
         observer={observer}
-        input={effective}
-        foreground={input.foreground}
+        input={strip.state}
+        foreground={strip.foreground}
         cwd={cwd}
         location={levels.length > 0 ? levels[levels.length - 1] : null}
-        canIntegrate={integrate.kind === 'closed' && agentReq === null && canIntegrate(effective, input.foreground)}
+        canIntegrate={integrate.kind === 'closed' && agentReq === null && canIntegrate(strip.state, strip.foreground)}
         onIntegrate={openIntegrate}
         integrating={agentIntegratingQuietly(agentReq)}
         llm={llm}
@@ -1254,11 +1654,7 @@ export default function App() {
               onApprove={answer}
               onAnswerQuestions={answerQuestions}
               onNewConversation={newConversation}
-              warning={
-                autoApprove ? (
-                  <AutoApproveNotice suspended={autoSuspended} onTurnOff={toggleAutoApprove} onTurnOnHere={toggleAutoApprove} />
-                ) : null
-              }
+              newBlocked={busy || sideBusy}
               banner={
                 settingsState !== null && recoveryKind(settingsState) !== 'ok' && !settingsBannerHidden ? (
                   <SettingsBanner
@@ -1286,6 +1682,7 @@ export default function App() {
                     onGroupBy={setGroupBy}
                     onOpen={openConversation}
                     onLiveDeleted={liveDeleted}
+                    onDeleted={conversationDeleted}
                     onClose={closeHistory}
                   />
                 ) : null
@@ -1298,6 +1695,7 @@ export default function App() {
               hint={locked ? 'Integrating this shell. Keys are not sent until it is done.' : route.hint}
               hintInline={locked ? false : route.hintInline}
               locked={locked}
+              questionPending={questionPending}
               hasPendingApproval={pendingApproval !== null}
               canApprove={canApprove}
               busy={busy || sideBusy}
@@ -1311,6 +1709,12 @@ export default function App() {
               autoSuspended={autoSuspended}
               onToggleAutoApprove={toggleAutoApprove}
               modelVision={modelVision}
+              queue={queue}
+              queueMode={queueMode}
+              queueable={busy && !sideBusy}
+              onUnqueue={unqueue}
+              suggestions={suggestions}
+              onSuggestion={sendSuggestion}
               onInterrupt={() => {
                 // A side command holds no shell command: cancel it without touching the terminal.
                 if (sideBusy) {
@@ -1331,6 +1735,8 @@ export default function App() {
               onApproveFirst={approveFirst}
               onDenyFirst={denyFirst}
               onClose={closeBar}
+              draftKey={conversationId ?? NEW_DRAFT_KEY}
+              draftDiscard={discardDraft}
             />
           </AgentPanel>
         }
@@ -1338,20 +1744,37 @@ export default function App() {
       {(busy || sideBusy) && pendingApprovalItem === null && !chatBodyShown(panel.open, panelBody) && (
         <AgentActivityToast
           dock={panel.dock}
-          text={agentActivityText(transcript.items, transcript.thinking, sideBusy)}
+          text={activity.text}
+          full={activity.full}
           onOpen={showChat}
         />
       )}
       {pendingApprovalItem !== null && !chatBodyShown(panel.open, panelBody) && (
         <ApprovalToast approval={pendingApprovalItem} dock={panel.dock} onApprove={answer} onOpen={showChat} />
       )}
-      {settingsOpen && <SettingsDialog focusModel={settingsFocusModel} onClose={closeSettings} onChanged={refreshStatus} onViewLoaded={refreshSettingsState} />}
+      {settingsOpen && (
+        <SettingsDialog
+          focusModel={settingsFocusModel}
+          onClose={closeSettings}
+          onChanged={refreshStatus}
+          onViewLoaded={refreshSettingsState}
+          hideMarks={hideMarks}
+          onHideMarksChange={setMarksHidden}
+          queueMode={queueMode}
+          onQueueModeChange={setQueueModeSetting}
+          suggestPrompts={suggestPrompts}
+          onSuggestPromptsChange={setSuggestPromptsSetting}
+          notifications={notifications}
+          onNotificationsChange={setNotificationsSetting}
+        />
+      )}
       {helpOpen && <HelpDialog load={helpState} onRetry={loadHelp} onClose={closeHelp} />}
       {agentPhase !== null ? (
         <IntegrateDialog key="agent" phase={agentPhase} agent={{ onDecline: declineAgent }} onStart={acceptAgent} onClose={closeAgent} local={localShell} />
       ) : (
         integrate.kind !== 'closed' && <IntegrateDialog key="user" phase={integrate} onStart={startIntegrate} onClose={closeIntegrate} local={localShell} />
       )}
+      <Tooltip />
     </div>
   );
 }

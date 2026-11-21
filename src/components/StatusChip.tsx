@@ -66,27 +66,35 @@ export function StatusChip(props: Props) {
   const modelLabel = chipLabel(settingsState, llm);
   const broken = recoveryKind(settingsState) !== 'ok';
   const modelTitle = chipBrokenTitle(settingsState) ?? `${llm.provider ? `${llm.provider} · ` : ''}${modelLabel}`;
+  // The provider's name is shown only while the model label shows the model: a broken or last-good state says so instead.
+  const providerName = !broken && llm.provider ? llm.provider : null;
   return (
     <div className="status-chip" role="status">
-      <span className={`chip chip-${integration}`}>{INTEGRATION_LABEL[integration]}</span>
-      <span className={`chip chip-${observer}`}>{observer === 'ok' ? 'observer ok' : 'observer desynced'}</span>
+      {/* Shown only when there is something to fix: a live integration and an ok observer are the normal case. */}
+      {integration !== 'live' && <span className={`chip chip-${integration}`}>{INTEGRATION_LABEL[integration]}</span>}
+      {observer !== 'ok' && <span className={`chip chip-${observer}`}>observer desynced</span>}
       {fgChip ? (
-        <span className="chip chip-foreground" title={fgChip.title}>
+        <span className="chip chip-foreground" data-tip={fgChip.title}>
           {fgChip.label}
         </span>
       ) : (
-        <span className="chip">{INPUT_LABEL[input]}</span>
+        <span className="chip chip-state">{INPUT_LABEL[input]}</span>
       )}
       {loc !== null && (
-        <span className="chip chip-location" title={loc.title}>
+        <span className="chip chip-location" data-tip={loc.title}>
           {loc.label}
         </span>
       )}
       <GridChip />
-      <span className={`chip chip-model${broken ? ' chip-warn' : ''}`} title={modelTitle}>
+      {providerName !== null && (
+        <span className="chip chip-provider" data-tip={providerName}>
+          {`provider: ${providerName}`}
+        </span>
+      )}
+      <span className={`chip chip-model${broken ? ' chip-warn' : ''}`} data-tip={modelTitle}>
         {modelLabel}
       </span>
-      <span className="chip chip-cwd" title={cwd ? `${cwd.host}:${cwd.path}` : undefined}>
+      <span className="chip chip-cwd" data-tip={cwd ? `${cwd.host}:${cwd.path}` : undefined}>
         {formatCwd(cwd)}
       </span>
       {integrating && (
@@ -100,6 +108,7 @@ export function StatusChip(props: Props) {
           className="chip chip-integrate"
           aria-label="Integrate this shell"
           title="Integrate this shell: the agent can then run commands in it. It asks first."
+          onMouseDown={(e) => e.preventDefault()}
           onClick={onIntegrate}
         >
           Integrate
@@ -110,6 +119,7 @@ export function StatusChip(props: Props) {
         className={`chip chip-button chip-icon${broken ? ' chip-warn' : ''}`}
         aria-label={broken ? 'AI settings (needs attention)' : 'AI settings'}
         title={`AI settings (${shortcutLabel('settings')})`}
+        onMouseDown={(e) => e.preventDefault()}
         onClick={onOpenSettings}
       >
         <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.25" aria-hidden="true">

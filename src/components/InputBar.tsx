@@ -2,21 +2,29 @@ import { useEffect, useRef, useState } from 'react';
 import type { ChangeEvent, ClipboardEvent as ReactClipboardEvent, DragEvent as ReactDragEvent, KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { barKeyIntent } from '../lib/inputState';
 import type { BarMode } from '../lib/inputState';
-import { History, historyKeyTakesLine, messageFor, sendButtonFor } from '../lib/barInput';
+import { agentPlaceholder, History, historyKeyTakesLine, messageFor, sendButtonFor } from '../lib/barInput';
+import { queuedAttachmentNote, queueHeader, restoreText } from '../lib/messageQueue';
+import type { QueuedMessage } from '../lib/messageQueue';
+import { BYPASS_LABEL } from '../lib/approvalReasons';
 import { acceptMenuItem, commandMenuItems, filterCommandMenu, menuAcceptRuns, menuKeyIntent, menuQuery, moveMenuIndex } from '../lib/commandMenu';
 import type { CommandMenuItem } from '../lib/commandMenu';
-import { admitRefusal, countRefusal, filesFromPaste, loadOf, prepareFile } from '../lib/attachments';
+import { admitRefusal, countRefusal, decodedSize, filesFromPaste, loadOf, prepareFile } from '../lib/attachments';
 import type { Prepared } from '../lib/attachments';
 import { carriesFiles } from '../lib/dropGuard';
+import { shouldRestoreInputFocus } from '../lib/inputFocus';
 import { showsVisionWarning } from '../lib/modelVision';
 import { visibleEscapes } from '../lib/visibleEscapes';
 import { shortcutLabel } from '../lib/platform';
-import type { AttachmentInput, CommandCatalog } from '../lib/types';
+import type { AttachmentInput, CommandCatalog, QueueMode } from '../lib/types';
 import { AttachmentChips } from './AttachmentChips';
 import type { ChipItem } from './AttachmentChips';
 import { CommandMenu, commandMenuItemId, COMMAND_MENU_ID } from './CommandMenu';
+import { clearDraftIfSame, draftOnKeyChange, loadDraft, NEW_DRAFT_KEY, readCache, saveDraft } from '../lib/conversationCache';
+import { defaultSizeStorage } from '../lib/zoom';
 
-const DEFAULT_PLACEHOLDER = 'Ask the agent…';
+/** The unsent text is saved this long after the last change (and at once on a key change, unmount, or page hide). */
+const DRAFT_SAVE_MS = 400;
+
 /** The shortcut hint, kept as the input's tooltip so the placeholder stays one line at every panel width. */
 const SHORTCUT_HINT = `${shortcutLabel('agent')} to focus, Esc to return`;
 
@@ -43,11 +51,13 @@ interface Props {
   canApprove: boolean;
   /** The agent is mid-turn. The button becomes Stop, and the field's border shows a light while it lasts. */
   busy: boolean;
-  /** An integration is running: the input takes no text and sends nothing until it answers. */
+  /** An integration is running: the input takes no text and sends nothing until it answers. Read-only, not disabled, so it keeps focus. */
   locked: boolean;
-  /** Approve-all: the agent runs commands without asking. Shown above the input in chat mode; Shift+Tab flips it too. */
+  /** The agent's question is waiting for the user's answer. A blocker for taking focus back (see inputFocus.ts). */
+  questionPending?: boolean;
+  /** Bypass (approve-all): the agent runs commands without asking. Shown above the input in chat mode; Shift+Tab flips it too. */
   autoApprove: boolean;
-  /** Approve-all was switched on in another shell level, so it is off in the shell on top. The row says manual until it is switched on here. */
+  /** Bypass was switched on in another shell level, so it is off in the shell on top. The chip says manual until it is switched on here. */
   autoSuspended?: boolean;
   onToggleAutoApprove: () => void;
   /** Bumped by the parent to move focus into the input (or the restart button, when the shell exited). */
@@ -63,16 +73,40 @@ interface Props {
   onAgent: (text: string, attachments: AttachmentInput[]) => Promise<string | null>;
   /** Whether the selected model takes images (Model.vision): false shows a note under the attachments. Null or true: no note. */
   modelVision?: boolean | null;
+  /** The messages queued while the agent works, in order. Shown above the field in chat mode, each removable. */
+  queue: QueuedMessage[];
+  queueMode: QueueMode;
+  /** A send now is queued rather than sent (the agent is mid-turn, and no side command runs). Only sets the placeholder. */
+  queueable: boolean;
+  /** Takes a queued message back: returns it, or null when it is gone. Its text goes back into the input, selected. */
+  onUnqueue: (id: number) => QueuedMessage | null;
+  /** Follow-up prompts for the latest reply, as buttons under the field. Shown in chat mode only when the agent is idle. */
+  suggestions: string[];
+  /** A suggestion was clicked: it is sent as a plain message (not through the command parser). */
+  onSuggestion: (text: string) => void;
   onInterrupt: () => void;
   onApproveFirst: () => void;
   onDenyFirst: () => void;
   /** Escape with nothing to deny: focus goes back to the terminal. */
   onClose: () => void;
+  /** The conversation the unsent text belongs to (its id, or NEW_DRAFT_KEY before the id is known). A change swaps the draft. */
+  draftKey?: string;
+  /** Bumped when the live conversation was deleted: its text is dropped on the key change, not saved under the deleted id. */
+  draftDiscard?: number;
 }
 
 export function InputBar(props: Props) {
   const { mode, hint, hintInline, hasPendingApproval, busy, focusToken } = props;
-  const [text, setText] = useState('');
+  const convKey = props.draftKey ?? NEW_DRAFT_KEY;
+  const discardToken = props.draftDiscard ?? 0;
+  const [text, setText] = useState(() => loadDraft(defaultSizeStorage(), convKey));
+  // The latest text, for the steps that run outside a render. `shownKey` is the conversation the text belongs to.
+  const textRef = useRef(text);
+  const shownKey = useRef(convKey);
+  // The text not saved yet, with its key, and the timer that saves it.
+  const unsaved = useRef<{ key: string; text: string } | null>(null);
+  const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const discardSeen = useRef(discardToken);
   const [error, setError] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const [drafts, setDrafts] = useState<Draft[]>([]);
@@ -92,12 +126,75 @@ export function InputBar(props: Props) {
   const [menuIndex, setMenuIndex] = useState(0);
   const [menuDismissed, setMenuDismissed] = useState(false);
   const placeCaretEnd = useRef(false);
+  // Bumped when a queued message comes back into the input: the input takes focus and its text is selected.
+  const [restoreToken, setRestoreToken] = useState(0);
+
+  /** Saves the unsaved text now (under the key it belongs to), and stops the pending save. */
+  const flushDraft = () => {
+    if (saveTimer.current !== null) {
+      clearTimeout(saveTimer.current);
+      saveTimer.current = null;
+    }
+    const pending = unsaved.current;
+    unsaved.current = null;
+    if (pending !== null) {
+      saveDraft(defaultSizeStorage(), pending.key, pending.text);
+    }
+  };
+
+  /** Sets the input's text: typed, or restored. It is saved for the conversation shown, shortly after. */
+  const updateText = (next: string) => {
+    textRef.current = next;
+    setText(next);
+    unsaved.current = { key: shownKey.current, text: next };
+    if (saveTimer.current !== null) {
+      clearTimeout(saveTimer.current);
+    }
+    saveTimer.current = setTimeout(flushDraft, DRAFT_SAVE_MS);
+  };
+
+  /**
+   * The conversation changed: the text is saved under the one it belonged to, and the new one's draft is shown. No focus
+   * is moved. Runs after the render that changed the key, so the text is still the old conversation's.
+   */
+  useEffect(() => {
+    const discard = discardToken !== discardSeen.current;
+    discardSeen.current = discardToken;
+    const prevKey = shownKey.current;
+    if (prevKey === convKey) {
+      return;
+    }
+    const storage = defaultSizeStorage();
+    const next = draftOnKeyChange(readCache(storage), prevKey, convKey, textRef.current, discard);
+    if (saveTimer.current !== null) {
+      clearTimeout(saveTimer.current);
+      saveTimer.current = null;
+    }
+    unsaved.current = null;
+    if (next.save !== null) {
+      saveDraft(storage, next.save.key, next.save.text);
+    }
+    shownKey.current = convKey;
+    textRef.current = next.load;
+    setText(next.load);
+  }, [convKey, discardToken]);
+
+  // Saves what is still unsaved when the page goes away or the bar unmounts.
+  useEffect(() => {
+    window.addEventListener('pagehide', flushDraft);
+    window.addEventListener('beforeunload', flushDraft);
+    return () => {
+      window.removeEventListener('pagehide', flushDraft);
+      window.removeEventListener('beforeunload', flushDraft);
+      flushDraft();
+    };
+  }, []);
 
   // The menu's rows: built-ins at once, customs when the catalog loads. Visible while the whole text is a slash
   // prefix, unless dismissed, and there is a row to show.
   const query = menuQuery(text);
   const menuItems = filterCommandMenu(commandMenuItems(catalog ?? EMPTY_CATALOG), query ?? '');
-  const menuOpen = mode === 'chat' && query !== null && !menuDismissed && menuItems.length > 0;
+  const menuOpen = mode === 'chat' && !props.locked && query !== null && !menuDismissed && menuItems.length > 0;
   const selectedIndex = menuItems.length === 0 ? 0 : menuIndex % menuItems.length;
 
   // Fetches the customs once per slash session (the transition into a command token, not the menu
@@ -137,6 +234,19 @@ export function InputBar(props: Props) {
     }
   }, [text]);
 
+  // A queued message came back: the input has focus and its whole text selected, so typing replaces it. Runs after the
+  // text is committed (the click on its remove button did not move focus, see the button's mousedown).
+  useEffect(() => {
+    if (restoreToken === 0) {
+      return;
+    }
+    const el = inputRef.current;
+    if (el) {
+      el.focus();
+      el.select();
+    }
+  }, [restoreToken]);
+
   // A new token moves focus. The effect reads the mode at that moment, when the input is rendered.
   useEffect(() => {
     if (focusToken === 0) {
@@ -149,10 +259,67 @@ export function InputBar(props: Props) {
     }
   }, [focusToken]);
 
+  // Focus the bar had when the lock began. The lock itself never moves focus (the field is read-only), but if something
+  // took it to the page body during the lock, the bar takes it back once the lock ends, unless a blocker is up.
+  const focusedAtLock = useRef(false);
+  useEffect(() => {
+    if (props.locked) {
+      focusedAtLock.current = document.activeElement === inputRef.current;
+      return;
+    }
+    if (!focusedAtLock.current) {
+      return;
+    }
+    focusedAtLock.current = false;
+    const active = document.activeElement;
+    if (
+      shouldRestoreInputFocus({
+        inputWasFocused: true,
+        focusLost: active === null || active === document.body,
+        dialogOpen: document.querySelector('[role="dialog"]') !== null,
+        questionPending: props.questionPending ?? false,
+      })
+    ) {
+      inputRef.current?.focus();
+    }
+  }, [props.locked]);
+
+  // Bypass is on in this shell only when it was switched on here: a suspended one reads manual for the shell on top.
+  const bypassOn = props.autoApprove && !props.autoSuspended;
+  const bypassSuspended = props.autoApprove && props.autoSuspended === true;
+  const approvalTip = bypassOn
+    ? 'Bypass is ON: the agent runs every command without asking, even ones your deny rules or the built-in checks would block. It resets when Watt restarts. Click to turn off.'
+    : bypassSuspended
+      ? 'Bypass was turned on in another shell, so it is off in this one: every command here asks for your approval. Click to turn it on here.'
+      : 'manual: each command asks for approval. Click (or Shift+Tab) to bypass approval for this session.';
+  const toggleClass = bypassOn ? 'bar-approval-toggle is-bypass' : bypassSuspended ? 'bar-approval-toggle is-suspended' : 'bar-approval-toggle';
+
+  /**
+   * The approval chip. The chat bar always shows it. The collapsed and exited bars show it only while bypass is on here
+   * (`inline`: one row with the rest of the bar), so a bypass left on can still be seen and turned off.
+   */
+  const approvalChip = (inline: boolean) => (
+    <div className={inline ? 'bar-approval is-inline' : 'bar-approval'} data-tip={approvalTip}>
+      <span className="bar-approval-label">approval:</span>{' '}
+      <button
+        type="button"
+        className={toggleClass}
+        aria-pressed={bypassOn}
+        data-tip={approvalTip}
+        disabled={props.locked}
+        onMouseDown={(e) => e.preventDefault()}
+        onClick={props.onToggleAutoApprove}
+      >
+        {bypassOn ? BYPASS_LABEL : 'manual'}
+      </button>
+    </div>
+  );
+
   if (mode === 'exited') {
     return (
       <div className="bar bar-exited">
         <span className="bar-notice">{hint}</span>
+        {bypassOn && approvalChip(true)}
         <button ref={restartRef} type="button" className="bar-restart" disabled={props.restarting} onClick={props.onRestart}>
           Start new session
         </button>
@@ -164,6 +331,7 @@ export function InputBar(props: Props) {
     return (
       <div className="bar bar-collapsed" title={`${shortcutLabel('agent')} to message the agent`}>
         <span className="bar-hint">{hint}</span>
+        {bypassOn && approvalChip(true)}
       </div>
     );
   }
@@ -230,10 +398,29 @@ export function InputBar(props: Props) {
     inputRef.current?.focus();
   }
 
+  /**
+   * Takes a queued message back. Its text goes into the input (before any text already there), selected, and its files
+   * come back as drafts, so nothing is lost. Nothing is sent.
+   */
+  function unqueue(id: number) {
+    const removed = props.onUnqueue(id);
+    if (removed === null) {
+      return;
+    }
+    const restored: Draft[] = removed.attachments.map((input) => {
+      draftKey.current += 1;
+      return { key: draftKey.current, name: input.name, bytes: decodedSize(input.data_b64), input };
+    });
+    commit([...draftsRef.current, ...restored]);
+    updateText(restoreText(removed.text, textRef.current));
+    setError(null);
+    setRestoreToken((t) => t + 1);
+  }
+
   /** Takes a menu row: the text becomes `/name` (plus a space when it takes arguments) and the menu shuts, so it does not reopen for the new text. */
   function acceptItem(item: CommandMenuItem) {
     placeCaretEnd.current = true;
-    setText(acceptMenuItem(item));
+    updateText(acceptMenuItem(item));
     setMenuIndex(0);
     setMenuDismissed(true);
     setError(null);
@@ -249,6 +436,8 @@ export function InputBar(props: Props) {
       return;
     }
     const sent = new Set(current.filter((d) => d.input !== null).map((d) => d.key));
+    // The conversation and the text as they were sent: the await below may end in another conversation, or with more typed.
+    const sentKey = shownKey.current;
     setSending(true);
     let err: string | null;
     try {
@@ -261,7 +450,7 @@ export function InputBar(props: Props) {
       // error; plain messages keep their text so the user can retry.
       if (text.trimStart().startsWith('/')) {
         history.current.record(text);
-        setText('');
+        clearSent(sentKey, text);
         commit(draftsRef.current.filter((d) => !sent.has(d.key)));
         setError(null);
         return;
@@ -270,16 +459,27 @@ export function InputBar(props: Props) {
       return;
     }
     history.current.record(text);
-    setText('');
+    clearSent(sentKey, text);
     commit(draftsRef.current.filter((d) => !sent.has(d.key)));
     setError(null);
+  }
+
+  /**
+   * After a send (or a slash command that ran): the input is cleared only while it still holds what was sent, in the same
+   * conversation. Text typed meanwhile stays. The saved draft of the sent text is removed in either case.
+   */
+  function clearSent(key: string, sentText: string) {
+    if (shownKey.current === key && textRef.current === sentText) {
+      updateText('');
+      flushDraft();
+      return;
+    }
+    clearDraftIfSame(defaultSizeStorage(), key, sentText);
   }
 
   const readyCount = drafts.filter((d) => d.input !== null).length;
   const processing = drafts.some((d) => d.input === null);
   const send = sendButtonFor(busy, text, props.locked, { ready: readyCount, processing });
-  // Approve-all is on in this shell only when it was switched on here: a suspended one reads manual for the shell on top.
-  const autoOn = props.autoApprove && !props.autoSuspended;
 
   /** The send button: Stop while busy, otherwise the same as Enter. Focus stays in the input either way. */
   function onSendClick() {
@@ -295,6 +495,10 @@ export function InputBar(props: Props) {
 
   /** Files in the paste win over the text that comes with them. A paste with no files is pasted as text. */
   function onPaste(e: ReactClipboardEvent<HTMLTextAreaElement>) {
+    if (props.locked) {
+      e.preventDefault();
+      return;
+    }
     const files = filesFromPaste(e.clipboardData);
     if (files.length === 0) {
       return;
@@ -345,12 +549,13 @@ export function InputBar(props: Props) {
   }));
 
   function onKeyDown(e: ReactKeyboardEvent<HTMLTextAreaElement>) {
-    if (e.nativeEvent.isComposing) {
+    // Locked: no key acts here (the field used to be disabled, which took its keys too). Focus stays, the keys do nothing.
+    if (props.locked || e.nativeEvent.isComposing) {
       return;
     }
     // The menu first: plain keys move, accept or dismiss it. A Ctrl/Meta/Alt chord is not the menu's: it falls
     // through to the bar's own handling (Ctrl-C still interrupts), as does Shift+Enter (a newline). Shift+Tab
-    // toggles approve-all (Ctrl+Shift+Tab stays none, so focus moves on). Escape dismisses the menu instead of
+    // toggles bypass (Ctrl+Shift+Tab stays none, so focus moves on). Escape dismisses the menu instead of
     // denying or closing.
     if (menuOpen && !e.ctrlKey && !e.metaKey && !e.altKey) {
       const intent = menuKeyIntent(e.key, { shift: e.shiftKey, ctrl: false, meta: false, alt: false });
@@ -406,7 +611,7 @@ export function InputBar(props: Props) {
         props.onClose();
         return;
       case 'toggle_approval':
-        // Shift+Tab flips approve-all without moving focus. Locked and non-chat modes ignore it.
+        // Shift+Tab flips bypass without moving focus. Locked and non-chat modes ignore it.
         e.preventDefault();
         if (mode === 'chat' && !props.locked) {
           props.onToggleAutoApprove();
@@ -426,7 +631,7 @@ export function InputBar(props: Props) {
         e.preventDefault();
         const older = history.current.back(text);
         if (older !== null) {
-          setText(older);
+          updateText(older);
         }
         return;
       }
@@ -438,7 +643,7 @@ export function InputBar(props: Props) {
         e.preventDefault();
         const newer = history.current.forward();
         if (newer !== null) {
-          setText(newer);
+          updateText(newer);
         }
         return;
       }
@@ -450,7 +655,7 @@ export function InputBar(props: Props) {
   // The inline hint is the placeholder, so it shows only while the input is empty. An error takes the row instead,
   // and the placeholder goes back to the normal text.
   const inlineHint = hintInline && hint !== null && error === null ? hint : null;
-  const placeholder = inlineHint ?? DEFAULT_PLACEHOLDER;
+  const placeholder = inlineHint ?? agentPlaceholder(props.queueable && !props.locked);
 
   return (
     <div
@@ -460,24 +665,30 @@ export function InputBar(props: Props) {
       onDragLeave={onDragLeave}
       onDrop={onDrop}
     >
-      {mode === 'chat' && (
-        <div className="bar-approval">
-          <span className="bar-approval-label">approval:</span>{' '}
-          <button
-            type="button"
-            className={autoOn ? 'bar-approval-toggle is-auto' : 'bar-approval-toggle'}
-            aria-pressed={autoOn}
-            title={
-              autoOn
-                ? 'auto: runs commands without asking, resets when the app restarts'
-                : 'manual: each command asks'
-            }
-            disabled={props.locked}
-            onMouseDown={(e) => e.preventDefault()}
-            onClick={props.onToggleAutoApprove}
-          >
-            {autoOn ? 'auto' : 'manual'}
-          </button>
+      {mode === 'chat' && approvalChip(false)}
+      {mode === 'chat' && props.queue.length > 0 && (
+        <div className="bar-queue">
+          <span className="bar-queue-head">{queueHeader(props.queueMode)}</span>
+          {props.queue.map((q) => (
+            <div key={q.id} className="bar-queue-item">
+              <span className="bar-queue-text" data-tip={q.text === '' ? 'Attachments only' : q.text} data-tip-clip="">
+                {q.text === '' ? 'Attachments only' : q.text}
+              </span>
+              {q.attachments.length > 0 && <span className="bar-queue-note">{queuedAttachmentNote(q.attachments.length)}</span>}
+              {/* mousedown keeps focus where it is; the click then puts the text in the input and selects it. */}
+              <button
+                type="button"
+                className="bar-queue-remove"
+                aria-label="Remove queued message"
+                title="Remove queued message"
+                disabled={props.locked}
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => unqueue(q.id)}
+              >
+                ×
+              </button>
+            </div>
+          ))}
         </div>
       )}
       {drafts.length > 0 && <AttachmentChips items={chips} onRemove={removeDraft} />}
@@ -508,7 +719,7 @@ export function InputBar(props: Props) {
         </div>
         <textarea
           ref={inputRef}
-          className="bar-input"
+          className={props.locked ? 'bar-input is-locked' : 'bar-input'}
           rows={1}
           value={text}
           placeholder={placeholder}
@@ -516,9 +727,9 @@ export function InputBar(props: Props) {
           aria-label="Message the agent"
           spellCheck={false}
           autoComplete="off"
-          disabled={props.locked}
+          readOnly={props.locked}
           onChange={(e) => {
-            setText(e.currentTarget.value);
+            updateText(e.currentTarget.value);
             setMenuIndex(0);
             setMenuDismissed(false);
             setError(null);
@@ -545,6 +756,25 @@ export function InputBar(props: Props) {
       >
         {send.stop ? <StopIcon /> : <SendIcon />}
       </button>
+      {mode === 'chat' && !busy && !props.locked && props.suggestions.length > 0 && (
+        <div className="bar-suggest">
+          <span className="bar-suggest-head">Suggested:</span>
+          {props.suggestions.map((s) => (
+            <button
+              key={s}
+              type="button"
+              className="bar-suggest-chip"
+              data-tip={s}
+              data-tip-clip=""
+              aria-label={s}
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => props.onSuggestion(s)}
+            >
+              {s}
+            </button>
+          ))}
+        </div>
+      )}
       {error !== null && <div className="bar-error">{error}</div>}
       {error === null && hint !== null && !hintInline && <div className="bar-hint">{hint}</div>}
     </div>

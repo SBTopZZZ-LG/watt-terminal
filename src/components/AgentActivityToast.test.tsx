@@ -9,7 +9,8 @@ describe('AgentActivityToast', () => {
     const html = renderToStaticMarkup(<AgentActivityToast dock="right" text="Thinking…" onOpen={() => {}} />);
     expect(html).toContain('class="agent-activity dock-right"');
     expect(html).toContain('aria-live="polite"');
-    expect(html).toContain('title="Show the agent"');
+    expect(html).toContain('data-tip="Show the agent"');
+    expect(html).not.toContain('title=');
     expect(html).toContain('Agent is working');
     expect(html).toContain('Thinking…');
     expect(html).toContain('agent-activity-spinner');

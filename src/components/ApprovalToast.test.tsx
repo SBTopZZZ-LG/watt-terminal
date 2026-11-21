@@ -42,7 +42,7 @@ describe('ApprovalToast', () => {
 
   it('shows a run_command as escaped text with Approve, Deny and Show buttons', () => {
     const html = render();
-    expect(html).toContain('<code class="approval-toast-command">git status</code>');
+    expect(html).toContain('<code class="approval-toast-command" data-tip="git status" data-tip-clip="">git status</code>');
     expect(html).toContain('aria-label="Approve">Approve</button>');
     expect(html).toContain('aria-label="Deny">Deny</button>');
     expect(html).toContain('aria-label="Show the approval">Show</button>');
@@ -51,7 +51,10 @@ describe('ApprovalToast', () => {
   it('truncates a long command with an ellipsis', () => {
     const html = render({ ...RUN, text: `git log ${'x'.repeat(200)}` });
     expect(html).toContain('…');
-    expect(html).not.toContain('x'.repeat(200));
+    // The visible text is cut; the tip carries the whole command and always shows (no data-tip-clip: the cut is in JS).
+    expect(html.replace(/data-tip="[^"]*"/, '')).not.toContain('x'.repeat(200));
+    expect(html).toContain(`data-tip="git log ${'x'.repeat(200)}"`);
+    expect(/<code[^>]*>/.exec(html)?.[0]).not.toContain('data-tip-clip');
   });
 
   it('escapes hidden characters in the command', () => {
@@ -62,7 +65,7 @@ describe('ApprovalToast', () => {
 
   it('shows a send_keys card as the decoded, escaped input', () => {
     const html = render({ ...RUN, name: 'send_keys', text: 'ls', display: 'echo hi⏎' });
-    expect(html).toContain('<code class="approval-toast-command">echo hi⏎</code>');
+    expect(html).toContain('<code class="approval-toast-command" data-tip="echo hi⏎" data-tip-clip="">echo hi⏎</code>');
   });
 
   it('escapes the decoded send_keys input', () => {

@@ -24,7 +24,7 @@ export function AttachmentChips({ items, onRemove }: Props) {
         if (item.processing) {
           return (
             <div key={item.key} className="bar-attach is-processing">
-              <span className="bar-attach-name" title={item.name}>
+              <span className="bar-attach-name" data-tip={item.name} data-tip-clip="">
                 {item.name}
               </span>
               <span className="bar-attach-size">processing...</span>
@@ -46,7 +46,7 @@ export function AttachmentChips({ items, onRemove }: Props) {
         }
         return (
           <div key={item.key} className="bar-attach is-file">
-            <span className="bar-attach-name" title={item.name}>
+            <span className="bar-attach-name" data-tip={item.name} data-tip-clip="">
               {item.name}
             </span>
             <span className="bar-attach-size">{item.bytes === null ? '' : formatSize(item.bytes)}</span>

@@ -6,7 +6,7 @@
 import { layoutFromUnknown, sameLayout } from './panelLayout';
 import type { PanelLayout } from './panelLayout';
 import { FONT_SIZE_MAX, FONT_SIZE_MIN } from './zoom';
-import type { PanelState, UiStatePatch } from './types';
+import type { PanelState, QueueMode, UiStatePatch } from './types';
 
 /** What a reconcile step does: `apply` takes a remote value into the UI, `migrate` writes a local value to the file. */
 export interface Reconciled<T> {
@@ -37,6 +37,46 @@ export function reconcileFont(local: number, remote: number | null | undefined):
 /** The history grouping from the file, or null when it has none (the default then applies). Nothing is migrated: it has no local copy. */
 export function reconcileGroupBy(remote: string | null | undefined): 'date' | 'workspace' | null {
   return remote === 'date' || remote === 'workspace' ? remote : null;
+}
+
+/** The queue mode from the file, or null when it has none (all together then applies). Nothing is migrated: it has no local copy. */
+export function reconcileQueueMode(remote: string | null | undefined): QueueMode | null {
+  return remote === 'all' || remote === 'one' ? remote : null;
+}
+
+/** The marks setting from the file, or null when the file has no boolean for it (the default then applies). Nothing is migrated. */
+export function reconcileHideMarks(remote: boolean | null | undefined): boolean | null {
+  return typeof remote === 'boolean' ? remote : null;
+}
+
+/** The patch that saves the queue mode. */
+export function queueModePatch(mode: QueueMode): UiStatePatch {
+  return { queue_mode: mode };
+}
+
+/** The patch that saves the marks setting. */
+export function hideMarksPatch(hide: boolean): UiStatePatch {
+  return { hide_marks: hide };
+}
+
+/** The suggest-prompts setting from the file, or null when the file has no boolean for it (off then applies). Nothing is migrated. */
+export function reconcileSuggestPrompts(remote: boolean | null | undefined): boolean | null {
+  return typeof remote === 'boolean' ? remote : null;
+}
+
+/** The patch that saves the suggest-prompts setting. */
+export function suggestPromptsPatch(on: boolean): UiStatePatch {
+  return { suggest_prompts: on };
+}
+
+/** The notifications setting from the file, or null when the file has no boolean for it (on then applies). Nothing is migrated. */
+export function reconcileNotifications(remote: boolean | null | undefined): boolean | null {
+  return typeof remote === 'boolean' ? remote : null;
+}
+
+/** The patch that saves the notifications setting. */
+export function notificationsPatch(on: boolean): UiStatePatch {
+  return { notifications: on };
 }
 
 /** The patch that saves a panel layout. */
