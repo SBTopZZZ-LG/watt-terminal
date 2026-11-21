@@ -263,8 +263,8 @@ describe('InputBar: the queue', () => {
   it('lists each queued message with its header for the mode, and a remove button', () => {
     const html = render({ queue: QUEUED, queueMode: 'all' });
     expect(html).toContain('class="bar-queue-head">Queued · sent together when the agent finishes</span>');
-    expect(html).toContain('bar-queue-text">check the tests</span>');
-    expect(html).toContain('bar-queue-text">Attachments only</span>');
+    expect(html).toContain('bar-queue-text" data-tip="check the tests" data-tip-clip="">check the tests</span>');
+    expect(html).toContain('bar-queue-text" data-tip="Attachments only" data-tip-clip="">Attachments only</span>');
     expect(html).toContain('1 attachment</span>');
     expect(html.match(/aria-label="Remove queued message"/g)).toHaveLength(2);
     expect(tagHolding(html, 'button', 'bar-queue-remove')).not.toContain('disabled=""');
@@ -306,7 +306,8 @@ describe('InputBar: suggested prompts', () => {
   it('each chip carries the full text as its title and label', () => {
     const html = render({ suggestions: ['Show the diff of the last change'] });
     const chip = tagHolding(html, 'button', 'bar-suggest-chip');
-    expect(chip).toContain('title="Show the diff of the last change"');
+    expect(chip).toContain('data-tip="Show the diff of the last change" data-tip-clip=""');
+    expect(chip).not.toContain('title=');
     expect(chip).toContain('aria-label="Show the diff of the last change"');
     expect(chip).toContain('type="button"');
   });

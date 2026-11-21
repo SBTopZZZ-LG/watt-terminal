@@ -34,7 +34,7 @@ import { chatBodyShown, isSideDock, loadPanelLayout, panelReducer, panelView, sa
 import type { Container } from './lib/panelLayout';
 import { defaultSizeStorage } from './lib/zoom';
 import { itemsFromMessages } from './lib/historyView';
-import { agentActivityText } from './lib/agentActivity';
+import { agentActivity } from './lib/agentActivity';
 import { userAttachments } from './lib/attachments';
 import { defaultModelVision } from './lib/modelVision';
 import { createPatchSaver, fontPatch, hideMarksPatch, notificationsPatch, panelPatch, queueModePatch, reconcileFont, reconcileGroupBy, reconcileHideMarks, reconcileNotifications, reconcilePanel, reconcileQueueMode, reconcileSuggestPrompts, shouldRestoreLast, suggestPromptsPatch } from './lib/uiState';
@@ -64,6 +64,7 @@ import { SettingsDialog } from './components/SettingsDialog';
 import { SettingsBanner } from './components/SettingsBanner';
 import { AutoApproveNotice } from './components/AutoApproveNotice';
 import { IntegrateDialog } from './components/IntegrateDialog';
+import { Tooltip } from './components/Tooltip';
 
 const CTRL_C = '\u0003';
 
@@ -1502,6 +1503,7 @@ export default function App() {
     const box = el.getBoundingClientRect();
     return view.side ? box.width : box.height;
   };
+  const activity = agentActivity(transcript.items, transcript.thinking, sideBusy);
 
   return (
     <div className="app">
@@ -1661,7 +1663,8 @@ export default function App() {
       {(busy || sideBusy) && pendingApprovalItem === null && !chatBodyShown(panel.open, panelBody) && (
         <AgentActivityToast
           dock={panel.dock}
-          text={agentActivityText(transcript.items, transcript.thinking, sideBusy)}
+          text={activity.text}
+          full={activity.full}
           onOpen={showChat}
         />
       )}
@@ -1690,6 +1693,7 @@ export default function App() {
       ) : (
         integrate.kind !== 'closed' && <IntegrateDialog key="user" phase={integrate} onStart={startIntegrate} onClose={closeIntegrate} local={localShell} />
       )}
+      <Tooltip />
     </div>
   );
 }

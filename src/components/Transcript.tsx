@@ -12,7 +12,7 @@ import { formatSize } from '../lib/attachments';
 import { safeText } from '../lib/historyView';
 import { askedBecause } from '../lib/approvalReasons';
 import { displayText } from '../lib/keysDisplay';
-import { interactiveHeader } from '../lib/interactive';
+import { HEADER_COMMAND_CHARS, interactiveHeader } from '../lib/interactive';
 import { groupTranscript, toolGroupSummary } from '../lib/toolGroups';
 import type { GroupItem, InteractiveGroup, TranscriptEntry } from '../lib/toolGroups';
 import { visibleEscapes } from '../lib/visibleEscapes';
@@ -308,7 +308,13 @@ function InteractiveGroupView({ group, onApprove, onAnswerQuestions }: { group: 
           {header.state}
         </span>
         {header.command !== '' && (
-          <span className="interactive-command" aria-hidden="true">
+          // The header cuts the command to HEADER_COMMAND_CHARS. A cut command's tip always shows; an uncut one's only where CSS clips it.
+          <span
+            className="interactive-command"
+            aria-hidden="true"
+            data-tip={displayText(group.command).replace(/\n/g, '\\n')}
+            data-tip-clip={[...group.command].length > HEADER_COMMAND_CHARS ? undefined : ''}
+          >
             {` · ${header.command}`}
           </span>
         )}
@@ -350,7 +356,7 @@ function MessageAttachments({ items }: { items: UserAttachment[] }) {
         }
         return (
           <div key={i} className={a.kind === 'image' ? 'msg-attach is-placeholder' : 'msg-attach is-file'}>
-            <span className="msg-attach-name" title={name}>
+            <span className="msg-attach-name" data-tip={name} data-tip-clip="">
               {name}
             </span>
             <span className="msg-attach-size">{formatSize(a.bytes)}</span>

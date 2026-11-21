@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { toolCaption, toolPreview, toolRowHead, waitDuration } from './toolDisplay';
+import { toolCaption, toolCaptionFull, toolPreview, toolPreviewFull, toolRowHead, waitDuration } from './toolDisplay';
 
 describe('toolCaption', () => {
   it('is null when the summary is absent, empty, or not a string', () => {
@@ -72,6 +72,25 @@ describe('toolPreview', () => {
   it('other tools have no preview', () => {
     expect(toolPreview('get_cwd', {})).toBeNull();
     expect(toolPreview('wait', { command: 'ls' })).toBeNull();
+  });
+});
+
+describe('toolCaptionFull and toolPreviewFull', () => {
+  it('give the whole caption and detail, where the capped ones are cut', () => {
+    const summary = 'one two three four five six seven eight nine ten eleven twelve';
+    expect(toolCaption({ summary })).toBe('one two three four five six seven eight nine ten…');
+    expect(toolCaptionFull({ summary })).toBe(summary);
+    expect(toolCaptionFull({ summary: 'a\nb  c' })).toBe('a b c');
+    expect(toolCaptionFull({})).toBeNull();
+    const command = 'x'.repeat(100);
+    expect(toolPreview('run_command', { command })).toBe(`${'x'.repeat(79)}…`);
+    expect(toolPreviewFull('run_command', { command })).toBe(command);
+    expect(toolPreviewFull('run_command', { command: 'a\nb' })).toBe('a⏎b');
+    expect(toolPreviewFull('send_keys', { text: 'x'.repeat(80) })).toBe('x'.repeat(80));
+    // Escaped as the row shows it, so the tip cannot say something else.
+    expect(toolPreviewFull('run_command', { command: 'rm ‮evil' })).toBe('rm \\u{202E}evil');
+    expect(toolPreviewFull('get_cwd', {})).toBeNull();
+    expect(toolPreviewFull('run_command', {})).toBeNull();
   });
 });
 

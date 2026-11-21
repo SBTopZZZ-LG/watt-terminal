@@ -3,7 +3,7 @@ import type { KeyboardEvent } from 'react';
 import { isDeclinedIntegration } from '../lib/integrate';
 import { decisionLabel, decisionTooltip } from '../lib/approvalReasons';
 import { nextTabId } from '../lib/tabKeys';
-import { toolRowHead, waitDuration } from '../lib/toolDisplay';
+import { toolCaptionFull, toolPreviewFull, toolRowHead, waitDuration } from '../lib/toolDisplay';
 import { toolInput, toolJson, toolOutput } from '../lib/toolIo';
 import type { TranscriptItem } from '../lib/transcript';
 
@@ -29,6 +29,10 @@ export function ToolRow({ item }: { item: ToolItem }) {
   const declined = isDeclinedIntegration(item.name, item.decision);
   const status = declined ? 'declined' : item.status === 'running' ? 'running' : item.status === 'ok' ? 'ok' : 'failed';
   const head = toolRowHead(item.name, item.args);
+  // The caption and the detail are cut for the row. Their tips show the whole text, when the row cut them.
+  const captionFull = toolCaptionFull(item.args);
+  const captionTip = head.caption !== null && captionFull !== head.caption ? captionFull : null;
+  const detailFull = toolPreviewFull(item.name, item.args);
   const duration = waitDuration(item.name, item.args, item.result, item.status);
   // A conversation restored from disk has no start time, and its result is the text the model saw, not the raw result.
   const restored = typeof item.result === 'string' && item.startedAt === undefined;
@@ -53,7 +57,7 @@ export function ToolRow({ item }: { item: ToolItem }) {
         <span className="tool-summary">
           <span className="tool-line">
             {head.label}
-            {head.caption !== null && <span className="tool-caption">{` · ${head.caption}`}</span>}
+            {head.caption !== null && <span className="tool-caption" data-tip={captionTip ?? undefined}>{` · ${head.caption}`}</span>}
             {item.decision !== null && !declined && (
               <span className={`decision decision-${item.decision}`} title={decisionTooltip(item.decision, item.reason) ?? undefined}>
                 {` ${decisionLabel(item.decision, item.reason)}`}
@@ -61,7 +65,12 @@ export function ToolRow({ item }: { item: ToolItem }) {
             )}
             {`: ${duration ?? status}`}
           </span>
-          {head.detail !== null && <span className="tool-detail">{head.detail}</span>}
+          {head.detail !== null && (
+            // Not cut in the row: the tip shows only where CSS clips it. Cut in the row: the tip always shows.
+            <span className="tool-detail" data-tip={detailFull ?? undefined} data-tip-clip={detailFull === head.detail ? '' : undefined}>
+              {head.detail}
+            </span>
+          )}
         </span>
       </summary>
       <div className="tool-tabs">

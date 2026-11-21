@@ -17,5 +17,10 @@ export function ApprovalCountdown({ expiresAt }: { expiresAt?: number }) {
   if (expiresAt === undefined) {
     return null;
   }
-  return <div className="approval-countdown">{remainingLabel(expiresAt, now)}</div>;
+  const label = remainingLabel(expiresAt, now);
+  return (
+    <div className="approval-countdown" data-tip={label} data-tip-clip="">
+      {label}
+    </div>
+  );
 }

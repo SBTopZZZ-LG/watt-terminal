@@ -169,9 +169,11 @@ export function TodoPanel({ items }: Props) {
         aria-expanded={expanded}
         aria-controls={listId}
         onClick={() => setChoice({ shape, expanded: !expanded })}
-        title={currentTitle !== undefined ? `${expanded ? 'Hide' : 'Show'} the todo list. Current: ${currentTitle}` : `${expanded ? 'Hide' : 'Show'} the todo list`}
+        data-tip={currentTitle !== undefined ? `${expanded ? 'Hide' : 'Show'} the todo list. Current: ${currentTitle}` : `${expanded ? 'Hide' : 'Show'} the todo list`}
       >
-        <span className="todo-summary">{summary}</span>
+        <span className="todo-summary" data-tip={summary} data-tip-clip="">
+          {summary}
+        </span>
         <svg className="todo-chevron" viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
           <path d="M4 6l4 4 4-4" />
         </svg>

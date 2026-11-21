@@ -58,7 +58,9 @@ export function CommandMenu({ items, index, onAccept, onHover }: Props) {
         >
           <span className="command-menu-name">/{item.name}</span>
           {item.hint !== null && <span className="command-menu-hint">{item.hint}</span>}
-          <span className="command-menu-description">{item.description}</span>
+          <span className="command-menu-description" data-tip={item.description} data-tip-clip="">
+            {item.description}
+          </span>
           {item.source !== null && <span className="command-menu-source">{item.source}</span>}
         </div>
       ))}

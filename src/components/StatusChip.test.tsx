@@ -54,7 +54,7 @@ describe('StatusChip: the model chip is a label, not a button', () => {
     const label = modelChip(chip(LLM_OFF, BROKEN));
     expect(label).toContain('settings error');
     expect(label).toContain('chip-warn');
-    expect(label).toContain(`title="settings.json is broken: ${REASON}"`);
+    expect(label).toContain(`data-tip="settings.json is broken: ${REASON}"`);
     expect(label.startsWith('<span')).toBe(true);
   });
 
@@ -65,13 +65,13 @@ describe('StatusChip: the model chip is a label, not a button', () => {
   });
 
   it('ok: the hover text is the provider and the model', () => {
-    expect(modelChip(chip(LLM_ON, OK))).toContain('title="Acme · model: big"');
+    expect(modelChip(chip(LLM_ON, OK))).toContain('data-tip="Acme · model: big"');
   });
 
   it('ok with a variant: the label and the hover text carry #variant', () => {
     const out = chip({ ...LLM_ON, variant: 'high' }, OK);
     expect(modelChip(out)).toContain('model: big#high');
-    expect(modelChip(out)).toContain('title="Acme · model: big#high"');
+    expect(modelChip(out)).toContain('data-tip="Acme · model: big#high"');
   });
 });
 
@@ -140,7 +140,7 @@ describe('StatusChip: the state chip names a program without shell integration',
     expect(tag).toContain('chip-foreground');
     expect(tag).toContain('RUNNING · ssh ubuntu@lidia');
     expect(tag).toContain(
-      'title="ssh ubuntu@lidia: a shell on another machine. It has no shell integration, so the agent can read the screen but cannot run commands here."',
+      'data-tip="ssh ubuntu@lidia: a shell on another machine. It has no shell integration, so the agent can read the screen but cannot run commands here."',
     );
     expect(tag).not.toContain('chip-warn');
   });
@@ -204,7 +204,7 @@ describe('StatusChip: the location chip and the Integrate button', () => {
 
   it('a nested level on top: its label in the location chip, with the full label in the title', () => {
     const out = nestedStrip({ location: REMOTE });
-    expect(out).toMatch(/<span class="chip chip-location" title="ssh ubuntu@lidia: zsh as ubuntu@lidia\. [^"]*">ssh ubuntu@lidia<\/span>/);
+    expect(out).toMatch(/<span class="chip chip-location" data-tip="ssh ubuntu@lidia: zsh as ubuntu@lidia\. [^"]*">ssh ubuntu@lidia<\/span>/);
   });
 
   it('Integrate is a labelled button only when it is offered', () => {
@@ -224,7 +224,7 @@ describe('StatusChip: the location chip and the Integrate button', () => {
   it('with no Integrate offer, the location chip keeps the full label in its title', () => {
     const out = nestedStrip({ location: REMOTE, canIntegrate: false });
     expect(out).not.toContain('Integrate');
-    expect(out).toMatch(/<span class="chip chip-location" title="ssh ubuntu@lidia: zsh as ubuntu@lidia\. [^"]*">ssh ubuntu@lidia<\/span>/);
+    expect(out).toMatch(/<span class="chip chip-location" data-tip="ssh ubuntu@lidia: zsh as ubuntu@lidia\. [^"]*">ssh ubuntu@lidia<\/span>/);
   });
 });
 
@@ -323,7 +323,7 @@ describe('StatusChip: the provider chip sits just left of the model chip', () =>
 
   it('shows the saved provider name, with the full name in the title', () => {
     const out = chip(LLM_ON, OK);
-    expect(providerChip(out)).toBe('<span class="chip chip-provider" title="Acme">provider: Acme</span>');
+    expect(providerChip(out)).toBe('<span class="chip chip-provider" data-tip="Acme">provider: Acme</span>');
   });
 
   it('is before the model chip in the markup', () => {
@@ -336,13 +336,13 @@ describe('StatusChip: the provider chip sits just left of the model chip', () =>
 
   it('the model chip keeps its label and its title', () => {
     expect(modelChip(chip(LLM_ON, OK))).toContain('model: big');
-    expect(modelChip(chip(LLM_ON, OK))).toContain('title="Acme · model: big"');
+    expect(modelChip(chip(LLM_ON, OK))).toContain('data-tip="Acme · model: big"');
   });
 
   it('a long provider name is cut with an ellipsis (CSS) and the title keeps the full name', () => {
     const long = 'A very long provider name for the status strip';
     const out = chip({ ...LLM_ON, provider: long }, OK);
-    expect(out).toContain(`<span class="chip chip-provider" title="${long}">provider: ${long}</span>`);
+    expect(out).toContain(`<span class="chip chip-provider" data-tip="${long}">provider: ${long}</span>`);
   });
 
   it('hidden without a provider: the mock agent and the environment settings', () => {

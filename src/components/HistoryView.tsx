@@ -182,8 +182,14 @@ function ListBody(p: HistoryContentProps) {
               aria-expanded={expanded}
               onClick={() => p.onToggleGroup(group.key)}
             >
-              <span className="history-group-label">{safeText(group.label)}</span>
-              {sub !== '' && <span className="history-root">{sub}</span>}
+              <span className="history-group-label" data-tip={safeText(group.label)} data-tip-clip="">
+                {safeText(group.label)}
+              </span>
+              {sub !== '' && (
+                <span className="history-root" data-tip={sub} data-tip-clip="">
+                  {sub}
+                </span>
+              )}
               <span className="history-count">{group.items.length}</span>
             </button>
             {expanded && (
@@ -232,6 +238,7 @@ function HistoryRow({ meta, groupBy, now, isCurrent, busy, opening, anyOpening, 
   const title = shownTitle === '' ? 'Untitled conversation' : shownTitle;
   const root = safeText(meta.workspace.root);
   const label = safeText(meta.workspace.label);
+  const rowTip = [title, root, absoluteWhen(meta.updated_at)].filter((s) => s !== '').join('\n');
   // A blocked row stays focusable (aria-disabled, not disabled), so keyboard users reach its title that says why.
   const blocked = busy || anyOpening;
   return (
@@ -241,17 +248,20 @@ function HistoryRow({ meta, groupBy, now, isCurrent, busy, opening, anyOpening, 
         className="history-open"
         aria-disabled={blocked ? true : undefined}
         aria-current={isCurrent ? 'true' : undefined}
-        title={busy ? BUSY_TITLE : [title, root, absoluteWhen(meta.updated_at)].filter((s) => s !== '').join('\n')}
+        // Its tip is the row's text; while the agent is busy, the reason comes first. The title span has its own tip when cut.
+        data-tip={busy ? `${BUSY_TITLE}\n${rowTip}` : rowTip}
         onClick={() => {
           if (!blocked) {
             onOpen(meta.id);
           }
         }}
       >
-        <span className="history-title">{title}</span>
+        <span className="history-title" data-tip={title} data-tip-clip="">
+          {title}
+        </span>
         <span className="history-meta">
           {groupBy === 'date' && (
-            <span className="history-chip" title={root === '' ? undefined : root}>
+            <span className="history-chip" data-tip={root === '' ? undefined : root}>
               {label}
             </span>
           )}

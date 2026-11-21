@@ -74,27 +74,27 @@ export function StatusChip(props: Props) {
       {integration !== 'live' && <span className={`chip chip-${integration}`}>{INTEGRATION_LABEL[integration]}</span>}
       {observer !== 'ok' && <span className={`chip chip-${observer}`}>observer desynced</span>}
       {fgChip ? (
-        <span className="chip chip-foreground" title={fgChip.title}>
+        <span className="chip chip-foreground" data-tip={fgChip.title}>
           {fgChip.label}
         </span>
       ) : (
         <span className="chip chip-state">{INPUT_LABEL[input]}</span>
       )}
       {loc !== null && (
-        <span className="chip chip-location" title={loc.title}>
+        <span className="chip chip-location" data-tip={loc.title}>
           {loc.label}
         </span>
       )}
       <GridChip />
       {providerName !== null && (
-        <span className="chip chip-provider" title={providerName}>
+        <span className="chip chip-provider" data-tip={providerName}>
           {`provider: ${providerName}`}
         </span>
       )}
-      <span className={`chip chip-model${broken ? ' chip-warn' : ''}`} title={modelTitle}>
+      <span className={`chip chip-model${broken ? ' chip-warn' : ''}`} data-tip={modelTitle}>
         {modelLabel}
       </span>
-      <span className="chip chip-cwd" title={cwd ? `${cwd.host}:${cwd.path}` : undefined}>
+      <span className="chip chip-cwd" data-tip={cwd ? `${cwd.host}:${cwd.path}` : undefined}>
         {formatCwd(cwd)}
       </span>
       {integrating && (

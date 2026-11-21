@@ -211,7 +211,7 @@ describe('HistoryContent: current conversation and busy rows', () => {
   it('when idle the open buttons are enabled, with the title and root', () => {
     const out = html();
     expect(out).not.toMatch(/class="history-open"[^>]*disabled/);
-    expect(out).toContain('title="Fix the build\n/Users/me/alpha\nNov 10, 2026 09:00"');
+    expect(out).toContain('data-tip="Fix the build\n/Users/me/alpha\nNov 10, 2026 09:00"');
   });
 
   it('while one conversation is opening the others are disabled and it says so', () => {

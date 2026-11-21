@@ -253,7 +253,7 @@ describe('Transcript: interactive command groups', () => {
     const html = render([...started(Date.now()), ...wait]);
     expect(html).toContain('class="interactive interactive-running"');
     expect(html).toMatch(/<span class="interactive-state" aria-hidden="true">Interactive · running \d+s<\/span>/);
-    expect(html).toContain('<span class="interactive-command" aria-hidden="true"> · ssh ubuntu@lidia</span>');
+    expect(html).toContain('<span class="interactive-command" aria-hidden="true" data-tip="ssh ubuntu@lidia" data-tip-clip=""> · ssh ubuntu@lidia</span>');
     expect(html).toMatch(/<div class="interactive-header" role="group" aria-label="Interactive · running \d+s · ssh ubuntu@lidia">/);
     expect(html).toContain('class="interactive-items"');
     // The run_command row is the header, not a row inside the group.
@@ -298,10 +298,11 @@ describe('Transcript: interactive command groups', () => {
   it('a long typed text is cut in the row summary', () => {
     const long = 'x'.repeat(80);
     const html = render([{ type: 'agent_event', event: { type: 'tool_call', call_id: 'k2', name: 'send_keys', args: { text: long } } }]);
-    // The summary is cut; the full text stays in the row's details (its <pre>).
+    // The summary's text is cut; the full text is in its tip (data-tip, not visible) and in the row's details (its <pre>).
     const summary = /<summary>([^]*?)<\/summary>/.exec(html)?.[1] ?? '';
     expect(summary).toContain(`${'x'.repeat(59)}…`);
-    expect(summary).not.toContain('x'.repeat(60));
+    expect(summary.replace(/data-tip="[^"]*"/, '')).not.toContain('x'.repeat(60));
+    expect(summary).toContain(`data-tip="${'x'.repeat(80)}"`);
     expect(html).toContain('x'.repeat(80));
   });
 
@@ -311,7 +312,7 @@ describe('Transcript: interactive command groups', () => {
       { type: 'agent_event', event: { type: 'tool_result', call_id: 'c1', name: 'run_command', ok: true, decision: 'read', result: {} } },
     ]);
     expect(html).toContain('<span class="tool-line">run_command<span class="tool-caption"> · Check the working tree</span>');
-    expect(html).toContain('<span class="tool-detail">git status</span>');
+    expect(html).toContain('<span class="tool-detail" data-tip="git status" data-tip-clip="">git status</span>');
   });
 
   it('a tool row without a caption or preview is one line with the bare name', () => {
@@ -329,7 +330,7 @@ describe('Transcript: interactive command groups', () => {
       { type: 'agent_event', event: { type: 'tool_result', call_id: 'k1', name: 'send_keys', ok: true, decision: 'read', result: {} } },
     ]);
     expect(html).toContain('<span class="tool-line">send_keys<span class="decision decision-read"> read</span>: ok</span>');
-    expect(html).toContain('<span class="tool-detail">echo hi⏎</span>');
+    expect(html).toContain('<span class="tool-detail" data-tip="echo hi⏎" data-tip-clip="">echo hi⏎</span>');
     expect(html).not.toContain('send_keys &quot;');
   });
 });
@@ -351,20 +352,20 @@ describe('Transcript: attachments on a message the user sent', () => {
     ]);
     expect(html).toContain('<div class="msg-attachments">');
     expect(html).toContain(`<img class="msg-attach-thumb" src="${THUMB}" alt="shot.png" title="shot.png"/>`);
-    expect(html).toContain('<span class="msg-attach-name" title="notes.md">notes.md</span><span class="msg-attach-size">300 B</span>');
+    expect(html).toContain('<span class="msg-attach-name" data-tip="notes.md" data-tip-clip="">notes.md</span><span class="msg-attach-size">300 B</span>');
     // The text comes first, then the attachments.
     expect(html.indexOf('what is in these')).toBeLessThan(html.indexOf('msg-attachments'));
   });
 
   it('an attachment-only message renders with no text, and no empty text row is needed', () => {
     const html = render([{ type: 'user_sent', clientId: 2, text: '', attachments: [{ kind: 'file', name: 'only.md', bytes: 4096 }] }]);
-    expect(html).toContain('<span class="msg-attach-name" title="only.md">only.md</span><span class="msg-attach-size">4 KB</span>');
+    expect(html).toContain('<span class="msg-attach-name" data-tip="only.md" data-tip-clip="">only.md</span><span class="msg-attach-size">4 KB</span>');
   });
 
   it('an image with no stored thumbnail is a chip with its name, not an image', () => {
     const html = render([{ type: 'user_sent', clientId: 3, text: 'x', attachments: [{ kind: 'image', name: 'p.jpg', bytes: 900 }] }]);
     expect(html).toContain('class="msg-attach is-placeholder"');
-    expect(html).toContain('<span class="msg-attach-name" title="p.jpg">p.jpg</span>');
+    expect(html).toContain('<span class="msg-attach-name" data-tip="p.jpg" data-tip-clip="">p.jpg</span>');
     expect(html).not.toContain('msg-attach-thumb');
   });
 

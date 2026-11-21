@@ -564,7 +564,9 @@ export function InputBar(props: Props) {
           <span className="bar-queue-head">{queueHeader(props.queueMode)}</span>
           {props.queue.map((q) => (
             <div key={q.id} className="bar-queue-item">
-              <span className="bar-queue-text">{q.text === '' ? 'Attachments only' : q.text}</span>
+              <span className="bar-queue-text" data-tip={q.text === '' ? 'Attachments only' : q.text} data-tip-clip="">
+                {q.text === '' ? 'Attachments only' : q.text}
+              </span>
               {q.attachments.length > 0 && <span className="bar-queue-note">{queuedAttachmentNote(q.attachments.length)}</span>}
               {/* mousedown keeps focus where it is; the click then puts the text in the input and selects it. */}
               <button
@@ -655,7 +657,8 @@ export function InputBar(props: Props) {
               key={s}
               type="button"
               className="bar-suggest-chip"
-              title={s}
+              data-tip={s}
+              data-tip-clip=""
               aria-label={s}
               onMouseDown={(e) => e.preventDefault()}
               onClick={() => props.onSuggestion(s)}

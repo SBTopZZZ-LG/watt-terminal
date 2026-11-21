@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { agentActivityText, MAX_ACTIVITY_CHARS } from './agentActivity';
+import { agentActivity, agentActivityText, MAX_ACTIVITY_CHARS } from './agentActivity';
 import type { TranscriptItem } from './transcript';
 
 const agent = (id: number, text: string): TranscriptItem => ({ id, kind: 'agent', text, streaming: false });
@@ -56,5 +56,25 @@ describe('agentActivityText', () => {
     expect(agentActivityText([], true, false)).toBe('Thinking…');
     expect(agentActivityText([], false, false)).toBe('Working…');
     expect(agentActivityText([], true, true)).toBe('Working…');
+  });
+});
+
+describe('agentActivity', () => {
+  it('gives the whole agent text as full, and the capped one as text', () => {
+    const long = 'x'.repeat(200);
+    expect(agentActivity([agent(1, long)], false, false)).toEqual({ text: `${'x'.repeat(MAX_ACTIVITY_CHARS - 1)}…`, full: long });
+  });
+
+  it('gives the same text for both when nothing was cut', () => {
+    expect(agentActivity([agent(1, 'short  reply')], false, false)).toEqual({ text: 'short reply', full: 'short reply' });
+    expect(agentActivity([], true, false)).toEqual({ text: 'Thinking…', full: 'Thinking…' });
+  });
+
+  it('gives the uncut caption as full for a tool line', () => {
+    const summary = 'one two three four five six seven eight nine ten eleven';
+    expect(agentActivity([tool(1, 'run_command', { summary, command: 'ls' })], false, false)).toEqual({
+      text: 'run_command · one two three four five six seven eight nine ten…',
+      full: `run_command · ${summary}`,
+    });
   });
 });

@@ -85,7 +85,7 @@ function CopyCodeButton({ text }: { text: string }) {
         {state === 'copied' ? 'Copied' : state === 'failed' ? 'Copy failed' : ''}
       </span>
       {/* Mouse-down keeps focus where it was, so the prompt keeps the focus it has (see inputFocus.ts). */}
-      <button type="button" className="md-code-button" aria-label="Copy code" onMouseDown={(e) => e.preventDefault()} onClick={onClick}>
+      <button type="button" className="md-code-button" aria-label="Copy code" data-tip="Copy code" onMouseDown={(e) => e.preventDefault()} onClick={onClick}>
         <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="1.25" aria-hidden="true">
           <rect x="5.5" y="5.5" width="8" height="8" rx="1" />
           <path d="M10.5 5.5V3.5a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2" />
@@ -96,8 +96,8 @@ function CopyCodeButton({ text }: { text: string }) {
 }
 
 const components: Components = {
-  // Keep the link text. The URL is on hover, and nothing navigates.
-  a: ({ href, children }) => <span className="md-link" title={href}>{children}</span>,
+  // Keep the link text. The URL is on hover (its tip, in the same style as the others), and nothing navigates.
+  a: ({ href, children }) => <span className="md-link" data-tip={href}>{children}</span>,
   // Never fetch an image. Show the alt text as plain text, and nothing when there is none.
   img: ({ alt }) => (alt ? <span className="md-img">{alt}</span> : null),
   pre: ({ node, ...props }) => <CodeBlock {...props} lang={fenceLanguage(node)} />,

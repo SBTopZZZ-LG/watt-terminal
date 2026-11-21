@@ -16,12 +16,12 @@ describe('Markdown: untrusted model text', () => {
     expect(out).toContain('&lt;img src=x onerror=alert(1)&gt;');
   });
 
-  it('renders a link as a non-navigating span that keeps the text and shows the URL in title', () => {
+  it('renders a link as a non-navigating span that keeps the text and shows the URL in its tip', () => {
     const out = html('[x](https://evil.example)');
     expect(out).not.toContain('<a');
     expect(out).not.toContain('href');
     expect(out).toContain('>x</span>');
-    expect(out).toContain('title="https://evil.example"');
+    expect(out).toContain('data-tip="https://evil.example"');
   });
 
   it('renders an image as no img element and no remote URL, keeping the alt text', () => {
