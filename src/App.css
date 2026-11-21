@@ -2142,6 +2142,12 @@ input {
   border-color: var(--accent);
 }
 
+/* Locked (an integration runs): read-only, so it keeps focus, but it looks taken out of use, as a disabled field did. */
+.bar-input.is-locked {
+  color: var(--muted);
+  cursor: default;
+}
+
 /*
  * While the agent is busy, a 2px ring of light travels around the field's border: a conic highlight whose start angle
  * turns (the custom property is registered so it interpolates). The ring is a mask over the layer, so only the border

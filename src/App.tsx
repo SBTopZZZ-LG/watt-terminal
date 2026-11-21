@@ -1058,6 +1058,8 @@ export default function App() {
   };
 
   const pendingApproval = firstPendingApproval(transcript);
+  // A question waiting for the user's answer: a focus blocker for the input bar (see inputFocus.ts).
+  const questionPending = transcript.items.some((i) => i.kind === 'question' && i.state === 'pending');
   // The waiting card itself, for the toast while the chat body is hidden. Null when no card waits.
   const pendingApprovalItem =
     pendingApproval !== null
@@ -1298,6 +1300,7 @@ export default function App() {
               hint={locked ? 'Integrating this shell. Keys are not sent until it is done.' : route.hint}
               hintInline={locked ? false : route.hintInline}
               locked={locked}
+              questionPending={questionPending}
               hasPendingApproval={pendingApproval !== null}
               canApprove={canApprove}
               busy={busy || sideBusy}

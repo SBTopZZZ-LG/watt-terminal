@@ -100,6 +100,7 @@ export function StatusChip(props: Props) {
           className="chip chip-integrate"
           aria-label="Integrate this shell"
           title="Integrate this shell: the agent can then run commands in it. It asks first."
+          onMouseDown={(e) => e.preventDefault()}
           onClick={onIntegrate}
         >
           Integrate
@@ -110,6 +111,7 @@ export function StatusChip(props: Props) {
         className={`chip chip-button chip-icon${broken ? ' chip-warn' : ''}`}
         aria-label={broken ? 'AI settings (needs attention)' : 'AI settings'}
         title={`AI settings (${shortcutLabel('settings')})`}
+        onMouseDown={(e) => e.preventDefault()}
         onClick={onOpenSettings}
       >
         <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.25" aria-hidden="true">

@@ -8,6 +8,7 @@ import type { CommandMenuItem } from '../lib/commandMenu';
 import { admitRefusal, countRefusal, filesFromPaste, loadOf, prepareFile } from '../lib/attachments';
 import type { Prepared } from '../lib/attachments';
 import { carriesFiles } from '../lib/dropGuard';
+import { shouldRestoreInputFocus } from '../lib/inputFocus';
 import { showsVisionWarning } from '../lib/modelVision';
 import { visibleEscapes } from '../lib/visibleEscapes';
 import { shortcutLabel } from '../lib/platform';
@@ -43,8 +44,10 @@ interface Props {
   canApprove: boolean;
   /** The agent is mid-turn. The button becomes Stop, and the field's border shows a light while it lasts. */
   busy: boolean;
-  /** An integration is running: the input takes no text and sends nothing until it answers. */
+  /** An integration is running: the input takes no text and sends nothing until it answers. Read-only, not disabled, so it keeps focus. */
   locked: boolean;
+  /** The agent's question is waiting for the user's answer. A blocker for taking focus back (see inputFocus.ts). */
+  questionPending?: boolean;
   /** Approve-all: the agent runs commands without asking. Shown above the input in chat mode; Shift+Tab flips it too. */
   autoApprove: boolean;
   /** Approve-all was switched on in another shell level, so it is off in the shell on top. The row says manual until it is switched on here. */
@@ -97,7 +100,7 @@ export function InputBar(props: Props) {
   // prefix, unless dismissed, and there is a row to show.
   const query = menuQuery(text);
   const menuItems = filterCommandMenu(commandMenuItems(catalog ?? EMPTY_CATALOG), query ?? '');
-  const menuOpen = mode === 'chat' && query !== null && !menuDismissed && menuItems.length > 0;
+  const menuOpen = mode === 'chat' && !props.locked && query !== null && !menuDismissed && menuItems.length > 0;
   const selectedIndex = menuItems.length === 0 ? 0 : menuIndex % menuItems.length;
 
   // Fetches the customs once per slash session (the transition into a command token, not the menu
@@ -148,6 +151,31 @@ export function InputBar(props: Props) {
       inputRef.current?.focus();
     }
   }, [focusToken]);
+
+  // Focus the bar had when the lock began. The lock itself never moves focus (the field is read-only), but if something
+  // took it to the page body during the lock, the bar takes it back once the lock ends, unless a blocker is up.
+  const focusedAtLock = useRef(false);
+  useEffect(() => {
+    if (props.locked) {
+      focusedAtLock.current = document.activeElement === inputRef.current;
+      return;
+    }
+    if (!focusedAtLock.current) {
+      return;
+    }
+    focusedAtLock.current = false;
+    const active = document.activeElement;
+    if (
+      shouldRestoreInputFocus({
+        inputWasFocused: true,
+        focusLost: active === null || active === document.body,
+        dialogOpen: document.querySelector('[role="dialog"]') !== null,
+        questionPending: props.questionPending ?? false,
+      })
+    ) {
+      inputRef.current?.focus();
+    }
+  }, [props.locked]);
 
   if (mode === 'exited') {
     return (
@@ -295,6 +323,10 @@ export function InputBar(props: Props) {
 
   /** Files in the paste win over the text that comes with them. A paste with no files is pasted as text. */
   function onPaste(e: ReactClipboardEvent<HTMLTextAreaElement>) {
+    if (props.locked) {
+      e.preventDefault();
+      return;
+    }
     const files = filesFromPaste(e.clipboardData);
     if (files.length === 0) {
       return;
@@ -345,7 +377,8 @@ export function InputBar(props: Props) {
   }));
 
   function onKeyDown(e: ReactKeyboardEvent<HTMLTextAreaElement>) {
-    if (e.nativeEvent.isComposing) {
+    // Locked: no key acts here (the field used to be disabled, which took its keys too). Focus stays, the keys do nothing.
+    if (props.locked || e.nativeEvent.isComposing) {
       return;
     }
     // The menu first: plain keys move, accept or dismiss it. A Ctrl/Meta/Alt chord is not the menu's: it falls
@@ -508,7 +541,7 @@ export function InputBar(props: Props) {
         </div>
         <textarea
           ref={inputRef}
-          className="bar-input"
+          className={props.locked ? 'bar-input is-locked' : 'bar-input'}
           rows={1}
           value={text}
           placeholder={placeholder}
@@ -516,7 +549,7 @@ export function InputBar(props: Props) {
           aria-label="Message the agent"
           spellCheck={false}
           autoComplete="off"
-          disabled={props.locked}
+          readOnly={props.locked}
           onChange={(e) => {
             setText(e.currentTarget.value);
             setMenuIndex(0);

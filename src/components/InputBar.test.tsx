@@ -81,9 +81,15 @@ describe('InputBar: the input', () => {
     expect(html).not.toMatch(/<input(?! type="file")/);
   });
 
-  it('is disabled while locked', () => {
-    expect(tagHolding(render({ locked: true }), 'textarea', 'bar-input')).toContain('disabled=""');
-    expect(tagHolding(render(), 'textarea', 'bar-input')).not.toContain('disabled=""');
+  it('is read-only, not disabled, while locked, so it keeps focus', () => {
+    const locked = tagHolding(render({ locked: true }), 'textarea', 'bar-input');
+    expect(locked).toContain('readOnly=""');
+    expect(locked).not.toContain('disabled=""');
+    expect(locked).toContain('is-locked');
+    const free = tagHolding(render(), 'textarea', 'bar-input');
+    expect(free).not.toContain('readOnly=""');
+    expect(free).not.toContain('disabled=""');
+    expect(free).not.toContain('is-locked');
   });
 });
 
