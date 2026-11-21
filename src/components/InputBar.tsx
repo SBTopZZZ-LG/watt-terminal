@@ -2,22 +2,23 @@ import { useEffect, useRef, useState } from 'react';
 import type { ChangeEvent, ClipboardEvent as ReactClipboardEvent, DragEvent as ReactDragEvent, KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { barKeyIntent } from '../lib/inputState';
 import type { BarMode } from '../lib/inputState';
-import { History, historyKeyTakesLine, messageFor, sendButtonFor } from '../lib/barInput';
+import { agentPlaceholder, History, historyKeyTakesLine, messageFor, sendButtonFor } from '../lib/barInput';
+import { queuedAttachmentNote, queueHeader, restoreText } from '../lib/messageQueue';
+import type { QueuedMessage } from '../lib/messageQueue';
 import { acceptMenuItem, commandMenuItems, filterCommandMenu, menuAcceptRuns, menuKeyIntent, menuQuery, moveMenuIndex } from '../lib/commandMenu';
 import type { CommandMenuItem } from '../lib/commandMenu';
-import { admitRefusal, countRefusal, filesFromPaste, loadOf, prepareFile } from '../lib/attachments';
+import { admitRefusal, countRefusal, decodedSize, filesFromPaste, loadOf, prepareFile } from '../lib/attachments';
 import type { Prepared } from '../lib/attachments';
 import { carriesFiles } from '../lib/dropGuard';
 import { shouldRestoreInputFocus } from '../lib/inputFocus';
 import { showsVisionWarning } from '../lib/modelVision';
 import { visibleEscapes } from '../lib/visibleEscapes';
 import { shortcutLabel } from '../lib/platform';
-import type { AttachmentInput, CommandCatalog } from '../lib/types';
+import type { AttachmentInput, CommandCatalog, QueueMode } from '../lib/types';
 import { AttachmentChips } from './AttachmentChips';
 import type { ChipItem } from './AttachmentChips';
 import { CommandMenu, commandMenuItemId, COMMAND_MENU_ID } from './CommandMenu';
 
-const DEFAULT_PLACEHOLDER = 'Ask the agent…';
 /** The shortcut hint, kept as the input's tooltip so the placeholder stays one line at every panel width. */
 const SHORTCUT_HINT = `${shortcutLabel('agent')} to focus, Esc to return`;
 
@@ -66,6 +67,13 @@ interface Props {
   onAgent: (text: string, attachments: AttachmentInput[]) => Promise<string | null>;
   /** Whether the selected model takes images (Model.vision): false shows a note under the attachments. Null or true: no note. */
   modelVision?: boolean | null;
+  /** The messages queued while the agent works, in order. Shown above the field in chat mode, each removable. */
+  queue: QueuedMessage[];
+  queueMode: QueueMode;
+  /** A send now is queued rather than sent (the agent is mid-turn, and no side command runs). Only sets the placeholder. */
+  queueable: boolean;
+  /** Takes a queued message back: returns it, or null when it is gone. Its text goes back into the input, selected. */
+  onUnqueue: (id: number) => QueuedMessage | null;
   onInterrupt: () => void;
   onApproveFirst: () => void;
   onDenyFirst: () => void;
@@ -95,6 +103,8 @@ export function InputBar(props: Props) {
   const [menuIndex, setMenuIndex] = useState(0);
   const [menuDismissed, setMenuDismissed] = useState(false);
   const placeCaretEnd = useRef(false);
+  // Bumped when a queued message comes back into the input: the input takes focus and its text is selected.
+  const [restoreToken, setRestoreToken] = useState(0);
 
   // The menu's rows: built-ins at once, customs when the catalog loads. Visible while the whole text is a slash
   // prefix, unless dismissed, and there is a row to show.
@@ -139,6 +149,19 @@ export function InputBar(props: Props) {
       el.setSelectionRange(text.length, text.length);
     }
   }, [text]);
+
+  // A queued message came back: the input has focus and its whole text selected, so typing replaces it. Runs after the
+  // text is committed (the click on its remove button did not move focus, see the button's mousedown).
+  useEffect(() => {
+    if (restoreToken === 0) {
+      return;
+    }
+    const el = inputRef.current;
+    if (el) {
+      el.focus();
+      el.select();
+    }
+  }, [restoreToken]);
 
   // A new token moves focus. The effect reads the mode at that moment, when the input is rendered.
   useEffect(() => {
@@ -256,6 +279,25 @@ export function InputBar(props: Props) {
     commit(draftsRef.current.filter((d) => d.key !== key));
     setError(null);
     inputRef.current?.focus();
+  }
+
+  /**
+   * Takes a queued message back. Its text goes into the input (before any text already there), selected, and its files
+   * come back as drafts, so nothing is lost. Nothing is sent.
+   */
+  function unqueue(id: number) {
+    const removed = props.onUnqueue(id);
+    if (removed === null) {
+      return;
+    }
+    const restored: Draft[] = removed.attachments.map((input) => {
+      draftKey.current += 1;
+      return { key: draftKey.current, name: input.name, bytes: decodedSize(input.data_b64), input };
+    });
+    commit([...draftsRef.current, ...restored]);
+    setText((current) => restoreText(removed.text, current));
+    setError(null);
+    setRestoreToken((t) => t + 1);
   }
 
   /** Takes a menu row: the text becomes `/name` (plus a space when it takes arguments) and the menu shuts, so it does not reopen for the new text. */
@@ -483,7 +525,7 @@ export function InputBar(props: Props) {
   // The inline hint is the placeholder, so it shows only while the input is empty. An error takes the row instead,
   // and the placeholder goes back to the normal text.
   const inlineHint = hintInline && hint !== null && error === null ? hint : null;
-  const placeholder = inlineHint ?? DEFAULT_PLACEHOLDER;
+  const placeholder = inlineHint ?? agentPlaceholder(props.queueable && !props.locked);
 
   return (
     <div
@@ -511,6 +553,29 @@ export function InputBar(props: Props) {
           >
             {autoOn ? 'auto' : 'manual'}
           </button>
+        </div>
+      )}
+      {mode === 'chat' && props.queue.length > 0 && (
+        <div className="bar-queue">
+          <span className="bar-queue-head">{queueHeader(props.queueMode)}</span>
+          {props.queue.map((q) => (
+            <div key={q.id} className="bar-queue-item">
+              <span className="bar-queue-text">{q.text === '' ? 'Attachments only' : q.text}</span>
+              {q.attachments.length > 0 && <span className="bar-queue-note">{queuedAttachmentNote(q.attachments.length)}</span>}
+              {/* mousedown keeps focus where it is; the click then puts the text in the input and selects it. */}
+              <button
+                type="button"
+                className="bar-queue-remove"
+                aria-label="Remove queued message"
+                title="Remove queued message"
+                disabled={props.locked}
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => unqueue(q.id)}
+              >
+                ×
+              </button>
+            </div>
+          ))}
         </div>
       )}
       {drafts.length > 0 && <AttachmentChips items={chips} onRemove={removeDraft} />}

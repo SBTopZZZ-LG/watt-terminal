@@ -21,7 +21,7 @@ import {
 } from '../lib/settingsForm';
 import type { ProviderDraft } from '../lib/settingsForm';
 import { RECOVERY_BUSY_LABEL, REVERT_CONFIRM, reasonText, recoveryExplanation, recoveryKind } from '../lib/settingsRecovery';
-import type { AgentRequests, ModelRef, ProviderPreset, RecoverAction, SettingsStateView, SettingsView } from '../lib/types';
+import type { AgentRequests, ModelRef, ProviderPreset, QueueMode, RecoverAction, SettingsStateView, SettingsView } from '../lib/types';
 import { AboutSection } from './AboutSection';
 import { ApprovalSection } from './ApprovalSection';
 import { LimitsSection } from './LimitsSection';
@@ -30,6 +30,7 @@ import type { TestState } from './ProviderEditor';
 import { SettingsTabs } from './SettingsTabs';
 import type { TabDef } from './SettingsTabs';
 import { TerminalSection } from './TerminalSection';
+import { QueueSection } from './QueueSection';
 import { secretStoreName } from '../lib/platform';
 
 /** The recovery actions in flight or waiting for their confirm step. `busy` names the action that is running. */
@@ -472,6 +473,9 @@ export interface SettingsDialogProps {
   /** The Terminal tab's setting: true hides the command separators and agent labels. Owned by the caller (UI state). */
   hideMarks: boolean;
   onHideMarksChange(hide: boolean): void;
+  /** The Terminal tab's queued-messages setting: how messages queued while the agent works are sent. Owned by the caller (UI state). */
+  queueMode: QueueMode;
+  onQueueModeChange(mode: QueueMode): void;
 }
 
 /**
@@ -481,7 +485,7 @@ export interface SettingsDialogProps {
  * and goes back to where it was on close. Esc closes; a click on the backdrop closes. Unsaved changes are asked about
  * before they are dropped.
  */
-export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded, hideMarks, onHideMarksChange }: SettingsDialogProps) {
+export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded, hideMarks, onHideMarksChange, queueMode, onQueueModeChange }: SettingsDialogProps) {
   const titleId = useId();
   const dialogRef = useRef<HTMLDivElement>(null);
   const backdropPressed = useRef(false);
@@ -1113,7 +1117,12 @@ export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded, h
       />
     ) : null;
 
-  const terminalPanel = <TerminalSection hideMarks={hideMarks} onHideMarksChange={onHideMarksChange} />;
+  const terminalPanel = (
+    <>
+      <TerminalSection hideMarks={hideMarks} onHideMarksChange={onHideMarksChange} />
+      <QueueSection queueMode={queueMode} onQueueModeChange={onQueueModeChange} />
+    </>
+  );
 
   const aboutPanel = <AboutSection />;
 

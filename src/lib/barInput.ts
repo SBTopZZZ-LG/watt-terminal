@@ -16,6 +16,14 @@ export function historyKeyTakesLine(dir: 'up' | 'down', text: string, caret: num
   return dir === 'up' ? !text.slice(0, caret).includes('\n') : !text.slice(caret).includes('\n');
 }
 
+/**
+ * The input's placeholder in chat. While the agent takes a turn, a message typed now is queued (see messageQueue.ts), so the
+ * placeholder says so. `queueing` is false while a side command runs: a send is refused then, so the bar does not offer a queue.
+ */
+export function agentPlaceholder(queueing: boolean): string {
+  return queueing ? 'Queue message for the agent…' : 'Ask the agent…';
+}
+
 /** The attachments on the bar: how many are ready to send, and whether any is still being prepared. */
 export interface DraftAttachments {
   ready: number;

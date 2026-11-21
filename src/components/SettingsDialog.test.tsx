@@ -443,7 +443,7 @@ describe('SettingsBody: focusModel', () => {
   it('the dialog takes focusModel without changing the card', () => {
     vi.stubGlobal('document', { activeElement: null });
     try {
-      const out = renderToStaticMarkup(<SettingsDialog focusModel onClose={NOOP} onChanged={NOOP} hideMarks onHideMarksChange={NOOP} />);
+      const out = renderToStaticMarkup(<SettingsDialog focusModel onClose={NOOP} onChanged={NOOP} hideMarks onHideMarksChange={NOOP} queueMode="all" onQueueModeChange={NOOP} />);
       expect(out).toMatch(/<div class="modal-backdrop"><div class="settings-dialog" role="dialog"/);
     } finally {
       vi.unstubAllGlobals();
@@ -456,7 +456,7 @@ describe('SettingsDialog: backdrop', () => {
     // The dialog reads document.activeElement when it first renders, and the test environment is node, so stub it.
     vi.stubGlobal('document', { activeElement: null });
     try {
-      const out = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} hideMarks onHideMarksChange={NOOP} />);
+      const out = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} hideMarks onHideMarksChange={NOOP} queueMode="all" onQueueModeChange={NOOP} />);
       // Not anchored at the start: React's server renderer puts <link rel="preload"> tags before the markup for the About images.
       expect(out).toMatch(/<div class="modal-backdrop"><div class="settings-dialog" role="dialog"/);
       expect(out).not.toContain('settings-backdrop');
@@ -470,7 +470,7 @@ describe('SettingsDialog: About tab', () => {
   it('has an About tab whose panel holds the about section, and the footer Close button is still there', () => {
     vi.stubGlobal('document', { activeElement: null });
     try {
-      const out = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} hideMarks onHideMarksChange={NOOP} />);
+      const out = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} hideMarks onHideMarksChange={NOOP} queueMode="all" onQueueModeChange={NOOP} />);
       expect(out).toMatch(/<button[^>]*role="tab"[^>]*>(?:(?!<\/button>).)*About/);
       expect(out).toContain('class="about"');
       expect(out).toContain('Watt Terminal');
@@ -485,13 +485,30 @@ describe('SettingsDialog: Terminal tab', () => {
   it('has a Terminal tab, and its panel holds the hide-marks checkbox, checked when the setting is on', () => {
     vi.stubGlobal('document', { activeElement: null });
     try {
-      const on = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} hideMarks onHideMarksChange={NOOP} />);
+      const on = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} hideMarks onHideMarksChange={NOOP} queueMode="all" onQueueModeChange={NOOP} />);
       expect(on).toMatch(/<button[^>]*role="tab"[^>]*>(?:(?!<\/button>).)*Terminal/);
       expect(on).toContain('Hide command separators and agent labels in the terminal');
       expect(on).toMatch(/<input type="checkbox"[^>]*checked=""[^>]*\/>Hide command separators/);
-      const off = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} hideMarks={false} onHideMarksChange={NOOP} />);
+      const off = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} hideMarks={false} onHideMarksChange={NOOP} queueMode="all" onQueueModeChange={NOOP} />);
       expect(off).toMatch(/<input type="checkbox"[^>]*\/>Hide command separators/);
-      expect(off).not.toContain('checked=""');
+      expect(off).not.toMatch(/<input type="checkbox"[^>]*checked=""/);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+describe('SettingsDialog: queued messages', () => {
+  it('the Terminal tab holds the queue mode radios, with the saved mode checked', () => {
+    vi.stubGlobal('document', { activeElement: null });
+    try {
+      const all = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} hideMarks onHideMarksChange={NOOP} queueMode="all" onQueueModeChange={NOOP} />);
+      expect(all).toContain('When messages are queued while the agent works');
+      expect(all).toMatch(/<input type="radio"(?=[^>]*value="all")(?=[^>]*checked="")[^>]*\/>Send them together/);
+      expect(all).toMatch(/<input type="radio"(?![^>]*checked="")[^>]*value="one"[^>]*\/>Send them one at a time/);
+      const one = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} hideMarks onHideMarksChange={NOOP} queueMode="one" onQueueModeChange={NOOP} />);
+      expect(one).toMatch(/<input type="radio"(?=[^>]*value="one")(?=[^>]*checked="")[^>]*\/>Send them one at a time/);
+      expect(one).not.toMatch(/<input type="radio"(?=[^>]*value="all")(?=[^>]*checked="")/);
     } finally {
       vi.unstubAllGlobals();
     }

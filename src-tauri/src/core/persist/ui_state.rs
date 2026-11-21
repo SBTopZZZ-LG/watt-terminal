@@ -1,6 +1,6 @@
 //! UI state in `<config_dir>/ui-state.json`: the agent panel's dock, size and open state, the font size, the last
-//! conversation used, how the history list is grouped, and whether the terminal's command separators and agent labels
-//! are hidden.
+//! conversation used, how the history list is grouped, how queued agent messages are sent, and whether the terminal's
+//! command separators and agent labels are hidden.
 //!
 //! Reading is tolerant. Unknown fields are ignored, and each field that is missing or invalid becomes `None` on its
 //! own, so one bad value never loses the rest. A file that is not JSON at all reads as the default state, and it is
@@ -27,6 +27,8 @@ pub const UI_STATE_VERSION: u32 = 1;
 pub const UI_STATE_FILE: &str = "ui-state.json";
 const DOCKS: [&str; 4] = ["left", "top", "right", "bottom"];
 const HISTORY_GROUPS: [&str; 2] = ["date", "workspace"];
+/// How queued agent messages are sent: all together, or one per turn.
+const QUEUE_MODES: [&str; 2] = ["all", "one"];
 const FONT_SIZES: RangeInclusive<u32> = 8..=32;
 /// The separators and agent labels are hidden unless the file says otherwise.
 const HIDE_MARKS_DEFAULT: bool = true;
@@ -58,6 +60,8 @@ pub struct UiState {
     pub last_conversation_id: Option<String>,
     /// `date` or `workspace`.
     pub history_group_by: Option<String>,
+    /// `all` or `one`: how messages queued while the agent works are sent. Missing or invalid reads as `None` (all).
+    pub queue_mode: Option<String>,
     /// Hides the terminal's command separators and agent labels (the exit-coloured stripes stay). Missing or invalid
     /// in the file reads as the default, `true`.
     #[serde(default = "hide_marks_default")]
@@ -76,6 +80,7 @@ impl Default for UiState {
             font_size: None,
             last_conversation_id: None,
             history_group_by: None,
+            queue_mode: None,
             hide_marks: HIDE_MARKS_DEFAULT,
         }
     }
@@ -93,6 +98,8 @@ pub struct UiStatePatch {
     pub last_conversation_id: Option<Option<String>>,
     #[serde(deserialize_with = "double_option")]
     pub history_group_by: Option<Option<String>>,
+    #[serde(deserialize_with = "double_option")]
+    pub queue_mode: Option<Option<String>>,
     /// A boolean has no "clear", so `null` is the same as absent: the value is left alone.
     pub hide_marks: Option<bool>,
 }
@@ -142,6 +149,9 @@ impl UiStateStore {
         }
         if let Some(group) = patch.history_group_by {
             state.history_group_by = group;
+        }
+        if let Some(mode) = patch.queue_mode {
+            state.queue_mode = mode;
         }
         if let Some(hide) = patch.hide_marks {
             state.hide_marks = hide;
@@ -214,6 +224,11 @@ fn tolerant(value: &Value) -> UiState {
             .and_then(Value::as_str)
             .filter(|g| HISTORY_GROUPS.contains(g))
             .map(str::to_string),
+        queue_mode: obj
+            .get("queue_mode")
+            .and_then(Value::as_str)
+            .filter(|m| QUEUE_MODES.contains(m))
+            .map(str::to_string),
         hide_marks: obj.get("hide_marks").and_then(Value::as_bool).unwrap_or(HIDE_MARKS_DEFAULT),
     }
 }
@@ -265,6 +280,11 @@ fn validate_patch(patch: &UiStatePatch) -> Result<(), PersistError> {
         && !HISTORY_GROUPS.contains(&group.as_str())
     {
         return Err(PersistError::Invalid("history grouping must be date or workspace".into()));
+    }
+    if let Some(Some(mode)) = &patch.queue_mode
+        && !QUEUE_MODES.contains(&mode.as_str())
+    {
+        return Err(PersistError::Invalid("queue mode must be all or one".into()));
     }
     Ok(())
 }
@@ -329,6 +349,7 @@ mod tests {
             font_size: Some(Some(14)),
             last_conversation_id: Some(Some(id(1))),
             history_group_by: Some(Some("workspace".into())),
+            queue_mode: Some(Some("one".into())),
             hide_marks: Some(false),
         };
         let written = s.patch(patch).unwrap();
@@ -337,6 +358,7 @@ mod tests {
         assert_eq!(written.font_size, Some(14));
         assert_eq!(written.last_conversation_id, Some(id(1)));
         assert_eq!(written.history_group_by.as_deref(), Some("workspace"));
+        assert_eq!(written.queue_mode.as_deref(), Some("one"));
         assert!(!written.hide_marks);
     }
 
@@ -518,6 +540,7 @@ mod tests {
             json!({"font_size": 7}),
             json!({"last_conversation_id": "../etc"}),
             json!({"history_group_by": "month"}),
+            json!({"queue_mode": "some"}),
         ];
         for value in bad {
             let result = s.patch(patch_from(value.clone()));
@@ -591,6 +614,34 @@ mod tests {
         let on = s.patch(patch_from(json!({"hide_marks": true}))).unwrap();
         assert!(on.hide_marks);
         assert!(s.load().unwrap().hide_marks);
+    }
+
+    #[test]
+    fn queue_mode_is_all_or_one_only_and_reads_as_none_otherwise() {
+        let tmp = TempDir::new();
+        assert_eq!(read_text(&tmp, r#"{"queue_mode": "all"}"#).queue_mode.as_deref(), Some("all"));
+        assert_eq!(read_text(&tmp, r#"{"queue_mode": "one"}"#).queue_mode.as_deref(), Some("one"));
+        assert_eq!(read_text(&tmp, r#"{"queue_mode": "many"}"#).queue_mode, None);
+        assert_eq!(read_text(&tmp, r#"{"queue_mode": true}"#).queue_mode, None);
+        assert_eq!(read_text(&tmp, r#"{"font_size": 12}"#).queue_mode, None, "an old file has none");
+        assert_eq!(UiState::default().queue_mode, None);
+    }
+
+    #[test]
+    fn queue_mode_patch_sets_clears_and_absent_leaves_it_alone() {
+        let tmp = TempDir::new();
+        let s = store(&tmp);
+        let one = s.patch(patch_from(json!({"queue_mode": "one"}))).unwrap();
+        assert_eq!(one.queue_mode.as_deref(), Some("one"));
+        assert_eq!(s.load().unwrap().queue_mode.as_deref(), Some("one"), "written to the file");
+
+        let untouched = s.patch(patch_from(json!({"font_size": 13}))).unwrap();
+        assert_eq!(untouched.queue_mode.as_deref(), Some("one"), "an absent field leaves it alone");
+
+        let cleared = s.patch(patch_from(json!({"queue_mode": null}))).unwrap();
+        assert_eq!(cleared.queue_mode, None, "null clears it, back to the default");
+        assert_eq!(patch_from(json!({"queue_mode": "all"})).queue_mode, Some(Some("all".into())));
+        assert_eq!(UiStatePatch::default().queue_mode, None);
     }
 
     #[test]

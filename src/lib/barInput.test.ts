@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { History, historyKeyTakesLine, messageFor, sendButtonFor } from './barInput';
+import { agentPlaceholder, History, historyKeyTakesLine, messageFor, sendButtonFor } from './barInput';
 
 describe('messageFor', () => {
   it('empty and whitespace-only text sends nothing', () => {
@@ -35,6 +35,15 @@ describe('History', () => {
     expect(h.forward()).toBeNull();
   });
 
+  it('a message queued while the agent works is recorded like a sent one, so Up reaches it', () => {
+    // App queues the text and returns success; InputBar records it on that success, as for a send.
+    const h = new History();
+    h.record('sent first');
+    h.record('queued while busy');
+    expect(h.back('')).toBe('queued while busy');
+    expect(h.back('queued while busy')).toBe('sent first');
+  });
+
   it('does not record blank lines or repeat the last entry', () => {
     const h = new History();
     h.record('   ');
@@ -68,6 +77,13 @@ describe('historyKeyTakesLine', () => {
     expect(historyKeyTakesLine('down', text, 5)).toBe(false); // end of the first line, the newline is after the caret
     expect(historyKeyTakesLine('down', text, 6)).toBe(true);
     expect(historyKeyTakesLine('down', text, text.length)).toBe(true);
+  });
+});
+
+describe('agentPlaceholder', () => {
+  it('says the message will be queued while the agent works, and asks otherwise', () => {
+    expect(agentPlaceholder(true)).toBe('Queue message for the agent…');
+    expect(agentPlaceholder(false)).toBe('Ask the agent…');
   });
 });
 

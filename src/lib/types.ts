@@ -309,6 +309,7 @@ export interface DeleteResult {
 
 export type Dock = 'left' | 'top' | 'right' | 'bottom';
 export type HistoryGroupBy = 'date' | 'workspace';
+export type QueueMode = 'all' | 'one';
 
 export interface PanelSizes {
   left: number | null;
@@ -330,6 +331,8 @@ export interface UiState {
   font_size: number | null;
   last_conversation_id: string | null;
   history_group_by: HistoryGroupBy | null;
+  /** How messages queued while the agent works are sent. Null when the file has no value (all together). */
+  queue_mode: QueueMode | null;
   /** Hides the terminal's command separators and agent labels. Always a boolean: true when the file has no value. */
   hide_marks: boolean;
 }
@@ -340,6 +343,7 @@ export interface UiStatePatch {
   font_size?: number | null;
   last_conversation_id?: string | null;
   history_group_by?: HistoryGroupBy | null;
+  queue_mode?: QueueMode | null;
   /** A boolean cannot be cleared: the backend ignores `null`, like an absent field. */
   hide_marks?: boolean;
 }

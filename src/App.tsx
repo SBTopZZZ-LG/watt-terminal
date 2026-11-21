@@ -37,8 +37,10 @@ import { itemsFromMessages } from './lib/historyView';
 import { agentActivityText } from './lib/agentActivity';
 import { userAttachments } from './lib/attachments';
 import { defaultModelVision } from './lib/modelVision';
-import { createPatchSaver, fontPatch, hideMarksPatch, panelPatch, reconcileFont, reconcileGroupBy, reconcileHideMarks, reconcilePanel, shouldRestoreLast } from './lib/uiState';
-import type { AttachmentInput, Cwd, HistoryGroupBy, InputState, IntegrationStatus, LevelInfo, LlmStatus, LoadedConversation, ObserverStatus, QuestionAnswerInput, SettingsStateView, Status, UiState, UiStatePatch, WireEvent } from './lib/types';
+import { createPatchSaver, fontPatch, hideMarksPatch, panelPatch, queueModePatch, reconcileFont, reconcileGroupBy, reconcileHideMarks, reconcilePanel, reconcileQueueMode, shouldRestoreLast } from './lib/uiState';
+import { drainBatch, enqueue, QUEUE_SLOT_POLL_MS, QUEUE_SLOT_WAIT_MS, removeQueued, shouldDrain } from './lib/messageQueue';
+import type { QueuedMessage } from './lib/messageQueue';
+import type { AttachmentInput, Cwd, HistoryGroupBy, InputState, IntegrationStatus, LevelInfo, LlmStatus, LoadedConversation, ObserverStatus, QueueMode, QuestionAnswerInput, SettingsStateView, Status, UiState, UiStatePatch, WireEvent } from './lib/types';
 import { recoveryKind } from './lib/settingsRecovery';
 import { TerminalView } from './components/TerminalView';
 import { InputBar } from './components/InputBar';
@@ -133,6 +135,16 @@ export default function App() {
   // A side command (`/btw`, `/compact`, `/fork`) is running: one model call outside a turn, or none at all. The bar
   // and History stay busy until it answers, and a send is refused so the text is kept.
   const [sideBusy, setSideBusy] = useState(false);
+  // Messages typed while the agent works, sent after its turn (see messageQueue.ts). Not kept across a restart. The ref is the
+  // same list for the steps that run outside a render. `queueGen` moves when the conversation changes, so a send in flight
+  // never lands in another one. `queueMode` is the saved setting: all together, or one per turn.
+  const [queue, setQueue] = useState<QueuedMessage[]>([]);
+  const queueRef = useRef<QueuedMessage[]>([]);
+  const queueSeq = useRef(0);
+  const queueGen = useRef(0);
+  const draining = useRef(false);
+  const drainAgain = useRef(false);
+  const [queueMode, setQueueMode] = useState<QueueMode>('all');
   // Bumped when the live conversation is renamed, so an open HistoryView remounts and refetches its rows.
   const [historyKey, setHistoryKey] = useState(0);
   const [historyGroupBy, setHistoryGroupBy] = useState<HistoryGroupBy>('date');
@@ -379,6 +391,10 @@ export default function App() {
       const group = reconcileGroupBy(remote.history_group_by);
       if (group !== null) {
         setHistoryGroupBy(group);
+      }
+      const queued = reconcileQueueMode(remote.queue_mode);
+      if (queued !== null) {
+        setQueueMode(queued);
       }
       const marks = reconcileHideMarks(remote.hide_marks);
       if (marks !== null) {
@@ -655,12 +671,102 @@ export default function App() {
     }
   };
 
+  /** Replaces the queue: the state for the render, and the ref for the steps that run outside it. */
+  const commitQueue = (next: QueuedMessage[]) => {
+    queueRef.current = next;
+    setQueue(next);
+  };
+
+  /** The conversation changed: what is queued was for the old one, so it is dropped rather than sent into the new one. */
+  const clearQueue = () => {
+    queueGen.current += 1;
+    commitQueue([]);
+  };
+
+  /**
+   * Waits until the backend's turn slot is free. `done` is emitted before the slot is released (see refreshControl), so a
+   * send right after it can be refused. Polls the status; after QUEUE_SLOT_WAIT_MS it gives up waiting, and the send goes
+   * anyway (a refusal then puts the messages back in the queue).
+   */
+  const waitForSlot = async (): Promise<void> => {
+    const deadline = Date.now() + QUEUE_SLOT_WAIT_MS;
+    for (;;) {
+      try {
+        const status = await api.getStatus();
+        if (!status.agent_busy) {
+          return;
+        }
+      } catch {
+        return;
+      }
+      if (Date.now() >= deadline) {
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, QUEUE_SLOT_POLL_MS));
+    }
+  };
+
+  /**
+   * Sends what is queued, once a turn has ended: all of it as one message, or the first message in `one` mode. The
+   * queue is read after the slot wait, so a message removed meanwhile is not sent. A refused send puts the messages back
+   * at the front of the queue (no retry; the user sees the queue and the error in the transcript). One drain at a time.
+   */
+  const drainQueue = async () => {
+    if (draining.current) {
+      return;
+    }
+    draining.current = true;
+    const gen = queueGen.current;
+    try {
+      await waitForSlot();
+      if (queueGen.current !== gen) {
+        return;
+      }
+      const pending = queueRef.current;
+      const { send, rest } = drainBatch(pending, queueMode);
+      if (send === null) {
+        return;
+      }
+      const taken = pending.slice(0, pending.length - rest.length);
+      commitQueue(rest);
+      const err = await sendAgent(send.text, send.attachments);
+      if (err !== null && queueGen.current === gen) {
+        commitQueue([...taken, ...queueRef.current]);
+      }
+    } finally {
+      draining.current = false;
+      // A turn ended while this drain was running (its `done` can come before the send returns): the edge was not drained then.
+      if (drainAgain.current) {
+        drainAgain.current = false;
+        if (queueRef.current.length > 0) {
+          void drainQueue();
+        }
+      }
+    }
+  };
+
+  /** Takes a queued message back, for the input to restore. Null when it is no longer queued. */
+  const unqueue = (id: number): QueuedMessage | null => {
+    const { queue: next, removed } = removeQueued(queueRef.current, id);
+    if (removed !== null) {
+      commitQueue(next);
+    }
+    return removed;
+  };
+
+  /** The queue mode is applied at once and saved with the UI state. */
+  const setQueueModeSetting = (mode: QueueMode) => {
+    setQueueMode(mode);
+    persist(queueModePatch(mode));
+  };
+
   // Clears the agent's conversation. The backend refuses while the agent is busy; the button is also disabled then. On
   // error the reason is shown in the transcript, and the conversation stays as it was.
   const newConversation = () => {
     epoch.current += 1;
     api.newConversation().then(
       () => {
+        clearQueue();
         dispatchTranscript({ type: 'conversation_reset' });
         // The new conversation has a new id, which the history view marks as current.
         refreshStatus();
@@ -693,6 +799,7 @@ export default function App() {
    */
   const applyLoaded = (loaded: LoadedConversation) => {
     epoch.current += 1;
+    clearQueue();
     dispatchTranscript({ type: 'conversation_loaded', items: itemsFromMessages(loaded.messages), todos: loaded.todos, context: loaded.context });
     setConversationId(loaded.id);
     setPanelBody('chat');
@@ -977,16 +1084,23 @@ export default function App() {
     if (sideBusy) {
       return 'A side command is still running.';
     }
+    // While a turn runs, a plain message (or an unknown `/...`, which is one) waits in the queue instead of being refused.
+    // Read again after any await: the turn may have ended meanwhile.
+    const queueIt = (): null => {
+      queueSeq.current += 1;
+      commitQueue(enqueue(queueRef.current, queueSeq.current, text, attachments));
+      return null;
+    };
     const parsed = parseCommand(text);
     if (parsed === null) {
-      return sendAgent(text, attachments);
+      return isBusy(transcriptRef.current) ? queueIt() : sendAgent(text, attachments);
     }
     const outcome = await runCommand(parsed.name, parsed.args, text);
     if (outcome.kind === 'send') {
       return sendAgent(outcome.text, attachments);
     }
     if (outcome.kind === 'unknown') {
-      return sendAgent(text, attachments);
+      return isBusy(transcriptRef.current) ? queueIt() : sendAgent(text, attachments);
     }
     return null;
   };
@@ -1010,6 +1124,7 @@ export default function App() {
       return 'The chat changed while this conversation was loading, so it was not opened. Open it again.';
     }
     epoch.current += 1;
+    clearQueue();
     dispatchTranscript({ type: 'conversation_loaded', items: itemsFromMessages(loaded.messages), todos: loaded.todos, context: loaded.context });
     setConversationId(loaded.id);
     setPanelBody('chat');
@@ -1021,6 +1136,7 @@ export default function App() {
   /** The live conversation was deleted from the History view: the backend started a new one, so the chat is reset to match. */
   const liveDeleted = () => {
     epoch.current += 1;
+    clearQueue();
     dispatchTranscript({ type: 'conversation_reset' });
     setConversationId(null);
     refreshStatus();
@@ -1098,6 +1214,20 @@ export default function App() {
   }, [pendingApproval]);
   const canApprove = approvalArmed && chatBodyShown(panel.open, panelBody);
   const busy = isBusy(transcript);
+  // A turn or side command that has just ended sends what is queued (see drainQueue). The ref is the previous render's value.
+  const active = busy || sideBusy;
+  const wasActive = useRef(active);
+  useEffect(() => {
+    const prev = wasActive.current;
+    wasActive.current = active;
+    if (shouldDrain(prev, active, queueRef.current.length)) {
+      if (draining.current) {
+        drainAgain.current = true;
+      } else {
+        void drainQueue();
+      }
+    }
+  }, [active]);
   // Same busy as the input bar's loader (busy || sideBusy). An exited shell takes the border off even if a turn is still open.
   const border: BorderLevel = borderLevel(agentControl, (busy || sideBusy) && effective !== 'exited');
   const borderClass: Record<BorderLevel, string> = {
@@ -1170,6 +1300,7 @@ export default function App() {
     }
     setRestarting(true);
     resetForNewSession();
+    clearQueue();
     dispatchTranscript({ type: 'session_reset' });
     setAgentControl(NO_CONTROL);
     setAgentReq((cur) => agentRequestClosedBySession(cur));
@@ -1331,6 +1462,10 @@ export default function App() {
               autoSuspended={autoSuspended}
               onToggleAutoApprove={toggleAutoApprove}
               modelVision={modelVision}
+              queue={queue}
+              queueMode={queueMode}
+              queueable={busy && !sideBusy}
+              onUnqueue={unqueue}
               onInterrupt={() => {
                 // A side command holds no shell command: cancel it without touching the terminal.
                 if (sideBusy) {
@@ -1373,6 +1508,8 @@ export default function App() {
           onViewLoaded={refreshSettingsState}
           hideMarks={hideMarks}
           onHideMarksChange={setMarksHidden}
+          queueMode={queueMode}
+          onQueueModeChange={setQueueModeSetting}
         />
       )}
       {helpOpen && <HelpDialog load={helpState} onRetry={loadHelp} onClose={closeHelp} />}

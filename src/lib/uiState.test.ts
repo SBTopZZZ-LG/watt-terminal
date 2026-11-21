@@ -7,7 +7,9 @@ import {
   hideMarksPatch,
   reconcileFont,
   reconcileGroupBy,
+  queueModePatch,
   reconcileHideMarks,
+  reconcileQueueMode,
   reconcilePanel,
   shouldRestoreLast,
 } from './uiState';
@@ -72,6 +74,20 @@ describe('reconcileGroupBy', () => {
     expect(reconcileGroupBy('name')).toBeNull();
     expect(reconcileGroupBy(null)).toBeNull();
     expect(reconcileGroupBy(undefined)).toBeNull();
+  });
+});
+
+describe('reconcileQueueMode and queueModePatch', () => {
+  it('takes the two known modes from the file, and nothing else', () => {
+    expect(reconcileQueueMode('all')).toBe('all');
+    expect(reconcileQueueMode('one')).toBe('one');
+    expect(reconcileQueueMode('some')).toBeNull();
+    expect(reconcileQueueMode(null)).toBeNull();
+    expect(reconcileQueueMode(undefined)).toBeNull();
+  });
+
+  it('queueModePatch carries the mode as queue_mode', () => {
+    expect(queueModePatch('one')).toEqual({ queue_mode: 'one' });
   });
 });
 

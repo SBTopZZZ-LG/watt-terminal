@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { InputBar } from './InputBar';
 import type { BarMode } from '../lib/inputState';
+import type { QueuedMessage } from '../lib/messageQueue';
+import type { QueueMode } from '../lib/types';
 
 const NOOP = () => undefined;
 
@@ -21,6 +23,10 @@ const BASE = {
   restarting: false,
   onAgent: async () => null,
   modelVision: null as boolean | null,
+  queue: [] as QueuedMessage[],
+  queueMode: 'all' as QueueMode,
+  queueable: false,
+  onUnqueue: () => null,
   onInterrupt: NOOP,
   onApproveFirst: NOOP,
   onDenyFirst: NOOP,
@@ -228,5 +234,57 @@ describe('InputBar: the vision note', () => {
     expect(render({ modelVision: false })).not.toContain('bar-vision');
     expect(render({ modelVision: true })).not.toContain('bar-vision');
     expect(render()).not.toContain('bar-vision');
+  });
+});
+
+describe('InputBar: the queue', () => {
+  const QUEUED: QueuedMessage[] = [
+    { id: 1, text: 'check the tests', attachments: [] },
+    { id: 2, text: '', attachments: [{ name: 'a.txt', mime: 'text/plain', kind: 'text', data_b64: 'aGk=' }] },
+  ];
+
+  it('the placeholder says the message is queued while the agent works, and asks otherwise', () => {
+    expect(render({ busy: true, queueable: true })).toContain('bar-mirror" aria-hidden="true">Queue message for the agent… </div>');
+    expect(tagHolding(render({ busy: true, queueable: true }), 'textarea', 'bar-input')).toContain('placeholder="Queue message for the agent…"');
+    expect(render({ busy: false })).toContain('placeholder="Ask the agent…"');
+  });
+
+  it('a side command or a lock keeps the placeholder as asking, even while busy', () => {
+    expect(render({ busy: true, queueable: false })).toContain('placeholder="Ask the agent…"');
+    expect(render({ busy: true, queueable: true, locked: true })).toContain('placeholder="Ask the agent…"');
+  });
+
+  it('renders no queue when empty', () => {
+    expect(render()).not.toContain('bar-queue');
+  });
+
+  it('lists each queued message with its header for the mode, and a remove button', () => {
+    const html = render({ queue: QUEUED, queueMode: 'all' });
+    expect(html).toContain('class="bar-queue-head">Queued · sent together when the agent finishes</span>');
+    expect(html).toContain('bar-queue-text">check the tests</span>');
+    expect(html).toContain('bar-queue-text">Attachments only</span>');
+    expect(html).toContain('1 attachment</span>');
+    expect(html.match(/aria-label="Remove queued message"/g)).toHaveLength(2);
+    expect(tagHolding(html, 'button', 'bar-queue-remove')).not.toContain('disabled=""');
+  });
+
+  it('the header names the one-at-a-time mode', () => {
+    expect(render({ queue: QUEUED, queueMode: 'one' })).toContain('Queued · sent one at a time when the agent finishes');
+  });
+
+  it('the remove buttons are disabled while the bar is locked', () => {
+    const html = render({ queue: QUEUED, queueMode: 'all', locked: true });
+    expect(tagHolding(html, 'button', 'bar-queue-remove')).toContain('disabled=""');
+  });
+
+  it('sits above the input row, below the approval row', () => {
+    const html = render({ queue: QUEUED, queueMode: 'all' });
+    expect(html.indexOf('bar-approval')).toBeLessThan(html.indexOf('bar-queue'));
+    expect(html.indexOf('bar-queue')).toBeLessThan(html.indexOf('bar-field'));
+  });
+
+  it('is not shown in the exited or collapsed modes', () => {
+    expect(render({ mode: 'exited', queue: QUEUED, queueMode: 'all' })).not.toContain('bar-queue');
+    expect(render({ mode: 'collapsed', queue: QUEUED, queueMode: 'all' })).not.toContain('bar-queue');
   });
 });
