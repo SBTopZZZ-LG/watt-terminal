@@ -52,7 +52,8 @@ pub fn make_real_home() -> PathBuf {
     fs::write(dir.join(".zprofile"), source(".zprofile")).expect("write");
     fs::write(dir.join(".zlogin"), source(".zlogin")).expect("write");
     let mut rc = source(".zshrc");
-    rc.push_str(&format!("HISTFILE='{}'\n", dir.join(".zsh_history").display()));
+    // HISTSIZE/SAVEHIST: zsh defaults (SAVEHIST=0 on Debian) would make `fc -W` write nothing.
+    rc.push_str(&format!("HISTFILE='{}'\nHISTSIZE=100\nSAVEHIST=100\n", dir.join(".zsh_history").display()));
     fs::write(dir.join(".zshrc"), rc).expect("write");
     dir
 }

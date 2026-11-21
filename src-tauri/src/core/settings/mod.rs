@@ -736,6 +736,7 @@ fn set_private_file_mode(_: &mut OpenOptions) {}
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::fs;
+    use std::io;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -761,6 +762,24 @@ pub(crate) mod test_support {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// Opens a directory so its modification time can be set with set_modified.
+    /// Windows needs backup semantics to get a directory handle, and write access for SetFileTime.
+    #[cfg(windows)]
+    pub fn open_dir_for_mtime(dir: &Path) -> io::Result<fs::File> {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(dir)
+    }
+
+    /// Unix: a plain open works for directories (write access would fail with EISDIR).
+    #[cfg(not(windows))]
+    pub fn open_dir_for_mtime(dir: &Path) -> io::Result<fs::File> {
+        fs::File::open(dir)
     }
 }
 

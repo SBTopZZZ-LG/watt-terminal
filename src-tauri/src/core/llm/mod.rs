@@ -780,7 +780,6 @@ mod tests {
         let mut on_delta = |d: Delta| seen.push(d);
         let done = feed(parser.push(raw.as_bytes()).unwrap(), "", &mut acc, &mut on_delta).unwrap();
         assert!(done);
-        drop(on_delta);
         assert!(seen.iter().any(|d| matches!(d, Delta::Reasoning(_))));
         assert_eq!(acc.finish().unwrap().tool_calls[0].name, "get_cwd");
     }

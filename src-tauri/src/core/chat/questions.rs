@@ -552,7 +552,7 @@ mod tests {
         assert!(ok(None, true));
         assert!(ok(Some("   "), true), "an empty other counts as absent on a skip too");
         assert!(!ok(Some("typed"), true), "a skip carries nothing");
-        assert!(!validate_answers(&questions, &[answer("q1", &[0], None, true)]).is_ok(), "a skip selects nothing");
+        assert!(validate_answers(&questions, &[answer("q1", &[0], None, true)]).is_err(), "a skip selects nothing");
         let long = "x".repeat(MAX_OTHER + 1);
         let why = validate_answers(&questions, &[answer("q1", &[], Some(&long), false)]).unwrap_err();
         assert!(why.contains("2001 characters") && why.contains("limit is 2000"), "{why}");

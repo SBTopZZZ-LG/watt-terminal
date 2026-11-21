@@ -661,7 +661,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::core::settings::test_support::TempDir;
+    use crate::core::settings::test_support::{TempDir, open_dir_for_mtime};
 
     const SECRET: &str = "known-secret-value-123";
 
@@ -1666,7 +1666,10 @@ mod tests {
     /// Makes conversation `n`'s attachment directory look older than the sweep grace period.
     fn age_attachment_dir(s: &ConversationStore, n: u32) {
         let when = std::time::SystemTime::now() - std::time::Duration::from_secs(60 * 60);
-        fs::File::open(attachment_dir(s, n)).unwrap().set_modified(when).unwrap();
+        open_dir_for_mtime(&attachment_dir(s, n))
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
     }
 
     #[test]
