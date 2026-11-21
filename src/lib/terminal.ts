@@ -46,6 +46,11 @@ const THEME = {
   cursor: '#d7dae0',
   cursorAccent: TERM_BG,
   selectionBackground: '#3a4150',
+  // xterm's own scrollbar. The colours are the --scroll-thumb / --scroll-thumb-hover / --scroll-thumb-active tokens (App.css),
+  // written out here because xterm takes plain colour strings. Keep them in step.
+  scrollbarSliderBackground: 'rgba(111, 211, 255, 0.28)',
+  scrollbarSliderHoverBackground: 'rgba(111, 211, 255, 0.5)',
+  scrollbarSliderActiveBackground: '#6fd3ff',
   black: '#1b1e24',
   red: '#e06c75',
   green: '#98c379',

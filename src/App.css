@@ -35,6 +35,10 @@
   --shadow: rgba(0, 0, 0, 0.35);
   /* The dimming behind a modal (.modal-backdrop). Darker than --shadow, so a dialog stands out on the navy background. */
   --scrim: rgba(0, 0, 0, 0.6);
+  /* The scrollbar thumb: rest, while its scroll container is hovered, and on the thumb itself (see the scrollbar block below). */
+  --scroll-thumb: var(--rule);
+  --scroll-thumb-hover: var(--rule-strong);
+  --scroll-thumb-active: var(--accent);
   --code-bg: #04131d;
   /* The terminal's background. Keep in step with the fallback in src/lib/terminal.ts. */
   --term-bg: #061823;
@@ -44,6 +48,46 @@
 
 * {
   box-sizing: border-box;
+}
+
+/*
+ * Scrollbars: one custom style for every scroll container (WebView2 and WKWebView both honour ::-webkit-scrollbar).
+ * The thumb is a 4px rounded bar inside a 10px track: the transparent border is the gap, and background-clip keeps the
+ * colour off it. Do not set scrollbar-width or scrollbar-color anywhere: a browser ignores ::-webkit-scrollbar on an
+ * element whose scrollbar-color is not auto, and scrollbar-color is inherited.
+ */
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+  background: transparent;
+}
+
+*::-webkit-scrollbar-track,
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-button {
+  display: none;
+}
+
+*::-webkit-scrollbar-thumb {
+  background-color: var(--scroll-thumb);
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background-clip: padding-box;
+}
+
+*:hover::-webkit-scrollbar-thumb {
+  background-color: var(--scroll-thumb-hover);
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background-color: var(--scroll-thumb-active);
+}
+
+*::-webkit-scrollbar-thumb:active {
+  background-color: var(--scroll-thumb-active);
 }
 
 html,
@@ -1075,8 +1119,6 @@ input {
   list-style: none;
   overflow-y: hidden;
   overflow-wrap: anywhere;
-  scrollbar-width: thin;
-  scrollbar-color: var(--rule-strong) transparent;
 }
 
 .todo-list.is-scrollable {
@@ -3009,7 +3051,6 @@ input {
   min-width: 0;
   overflow-x: auto;
   overflow-y: hidden;
-  scrollbar-width: thin;
   padding: 0 14px;
   border-bottom: 1px dashed var(--rule);
 }
@@ -3979,8 +4020,6 @@ input {
   overflow-y: auto;
   overflow-wrap: anywhere;
   font-size: 12px;
-  scrollbar-width: thin;
-  scrollbar-color: var(--rule-strong) transparent;
 }
 
 .context-headline {
