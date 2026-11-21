@@ -19,6 +19,11 @@ import type { AttachmentInput, CommandCatalog, QueueMode } from '../lib/types';
 import { AttachmentChips } from './AttachmentChips';
 import type { ChipItem } from './AttachmentChips';
 import { CommandMenu, commandMenuItemId, COMMAND_MENU_ID } from './CommandMenu';
+import { clearDraftIfSame, draftOnKeyChange, loadDraft, NEW_DRAFT_KEY, readCache, saveDraft } from '../lib/conversationCache';
+import { defaultSizeStorage } from '../lib/zoom';
+
+/** The unsent text is saved this long after the last change (and at once on a key change, unmount, or page hide). */
+const DRAFT_SAVE_MS = 400;
 
 /** The shortcut hint, kept as the input's tooltip so the placeholder stays one line at every panel width. */
 const SHORTCUT_HINT = `${shortcutLabel('agent')} to focus, Esc to return`;
@@ -84,11 +89,24 @@ interface Props {
   onDenyFirst: () => void;
   /** Escape with nothing to deny: focus goes back to the terminal. */
   onClose: () => void;
+  /** The conversation the unsent text belongs to (its id, or NEW_DRAFT_KEY before the id is known). A change swaps the draft. */
+  draftKey?: string;
+  /** Bumped when the live conversation was deleted: its text is dropped on the key change, not saved under the deleted id. */
+  draftDiscard?: number;
 }
 
 export function InputBar(props: Props) {
   const { mode, hint, hintInline, hasPendingApproval, busy, focusToken } = props;
-  const [text, setText] = useState('');
+  const convKey = props.draftKey ?? NEW_DRAFT_KEY;
+  const discardToken = props.draftDiscard ?? 0;
+  const [text, setText] = useState(() => loadDraft(defaultSizeStorage(), convKey));
+  // The latest text, for the steps that run outside a render. `shownKey` is the conversation the text belongs to.
+  const textRef = useRef(text);
+  const shownKey = useRef(convKey);
+  // The text not saved yet, with its key, and the timer that saves it.
+  const unsaved = useRef<{ key: string; text: string } | null>(null);
+  const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const discardSeen = useRef(discardToken);
   const [error, setError] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const [drafts, setDrafts] = useState<Draft[]>([]);
@@ -110,6 +128,67 @@ export function InputBar(props: Props) {
   const placeCaretEnd = useRef(false);
   // Bumped when a queued message comes back into the input: the input takes focus and its text is selected.
   const [restoreToken, setRestoreToken] = useState(0);
+
+  /** Saves the unsaved text now (under the key it belongs to), and stops the pending save. */
+  const flushDraft = () => {
+    if (saveTimer.current !== null) {
+      clearTimeout(saveTimer.current);
+      saveTimer.current = null;
+    }
+    const pending = unsaved.current;
+    unsaved.current = null;
+    if (pending !== null) {
+      saveDraft(defaultSizeStorage(), pending.key, pending.text);
+    }
+  };
+
+  /** Sets the input's text: typed, or restored. It is saved for the conversation shown, shortly after. */
+  const updateText = (next: string) => {
+    textRef.current = next;
+    setText(next);
+    unsaved.current = { key: shownKey.current, text: next };
+    if (saveTimer.current !== null) {
+      clearTimeout(saveTimer.current);
+    }
+    saveTimer.current = setTimeout(flushDraft, DRAFT_SAVE_MS);
+  };
+
+  /**
+   * The conversation changed: the text is saved under the one it belonged to, and the new one's draft is shown. No focus
+   * is moved. Runs after the render that changed the key, so the text is still the old conversation's.
+   */
+  useEffect(() => {
+    const discard = discardToken !== discardSeen.current;
+    discardSeen.current = discardToken;
+    const prevKey = shownKey.current;
+    if (prevKey === convKey) {
+      return;
+    }
+    const storage = defaultSizeStorage();
+    const next = draftOnKeyChange(readCache(storage), prevKey, convKey, textRef.current, discard);
+    if (saveTimer.current !== null) {
+      clearTimeout(saveTimer.current);
+      saveTimer.current = null;
+    }
+    unsaved.current = null;
+    if (next.save !== null) {
+      saveDraft(storage, next.save.key, next.save.text);
+    }
+    shownKey.current = convKey;
+    textRef.current = next.load;
+    setText(next.load);
+  }, [convKey, discardToken]);
+
+  // Saves what is still unsaved when the page goes away or the bar unmounts.
+  useEffect(() => {
+    window.addEventListener('pagehide', flushDraft);
+    window.addEventListener('beforeunload', flushDraft);
+    return () => {
+      window.removeEventListener('pagehide', flushDraft);
+      window.removeEventListener('beforeunload', flushDraft);
+      flushDraft();
+    };
+  }, []);
 
   // The menu's rows: built-ins at once, customs when the catalog loads. Visible while the whole text is a slash
   // prefix, unless dismissed, and there is a row to show.
@@ -300,7 +379,7 @@ export function InputBar(props: Props) {
       return { key: draftKey.current, name: input.name, bytes: decodedSize(input.data_b64), input };
     });
     commit([...draftsRef.current, ...restored]);
-    setText((current) => restoreText(removed.text, current));
+    updateText(restoreText(removed.text, textRef.current));
     setError(null);
     setRestoreToken((t) => t + 1);
   }
@@ -308,7 +387,7 @@ export function InputBar(props: Props) {
   /** Takes a menu row: the text becomes `/name` (plus a space when it takes arguments) and the menu shuts, so it does not reopen for the new text. */
   function acceptItem(item: CommandMenuItem) {
     placeCaretEnd.current = true;
-    setText(acceptMenuItem(item));
+    updateText(acceptMenuItem(item));
     setMenuIndex(0);
     setMenuDismissed(true);
     setError(null);
@@ -324,6 +403,8 @@ export function InputBar(props: Props) {
       return;
     }
     const sent = new Set(current.filter((d) => d.input !== null).map((d) => d.key));
+    // The conversation and the text as they were sent: the await below may end in another conversation, or with more typed.
+    const sentKey = shownKey.current;
     setSending(true);
     let err: string | null;
     try {
@@ -336,7 +417,7 @@ export function InputBar(props: Props) {
       // error; plain messages keep their text so the user can retry.
       if (text.trimStart().startsWith('/')) {
         history.current.record(text);
-        setText('');
+        clearSent(sentKey, text);
         commit(draftsRef.current.filter((d) => !sent.has(d.key)));
         setError(null);
         return;
@@ -345,9 +426,22 @@ export function InputBar(props: Props) {
       return;
     }
     history.current.record(text);
-    setText('');
+    clearSent(sentKey, text);
     commit(draftsRef.current.filter((d) => !sent.has(d.key)));
     setError(null);
+  }
+
+  /**
+   * After a send (or a slash command that ran): the input is cleared only while it still holds what was sent, in the same
+   * conversation. Text typed meanwhile stays. The saved draft of the sent text is removed in either case.
+   */
+  function clearSent(key: string, sentText: string) {
+    if (shownKey.current === key && textRef.current === sentText) {
+      updateText('');
+      flushDraft();
+      return;
+    }
+    clearDraftIfSame(defaultSizeStorage(), key, sentText);
   }
 
   const readyCount = drafts.filter((d) => d.input !== null).length;
@@ -513,7 +607,7 @@ export function InputBar(props: Props) {
         e.preventDefault();
         const older = history.current.back(text);
         if (older !== null) {
-          setText(older);
+          updateText(older);
         }
         return;
       }
@@ -525,7 +619,7 @@ export function InputBar(props: Props) {
         e.preventDefault();
         const newer = history.current.forward();
         if (newer !== null) {
-          setText(newer);
+          updateText(newer);
         }
         return;
       }
@@ -626,7 +720,7 @@ export function InputBar(props: Props) {
           autoComplete="off"
           readOnly={props.locked}
           onChange={(e) => {
-            setText(e.currentTarget.value);
+            updateText(e.currentTarget.value);
             setMenuIndex(0);
             setMenuDismissed(false);
             setError(null);

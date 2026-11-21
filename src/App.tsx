@@ -42,6 +42,8 @@ import { decideAttention } from './lib/attention';
 import type { AttentionEvent } from './lib/attention';
 import { onNotificationClick, sendAttention, watchWindowFocus } from './lib/attentionClient';
 import { acceptSuggestions, endsWithAgentText, shouldSuggest } from './lib/suggestions';
+import { NEW_DRAFT_KEY, forgetAllSuggestions, forgetConversation, forgetEverything, forgetSuggestions, loadSuggestions, saveSuggestions, transcriptSig } from './lib/conversationCache';
+import { SEND_WHILE_SWITCHING_NOTICE, switchRefusal } from './lib/switchGuard';
 import { drainBatch, enqueue, QUEUE_SLOT_POLL_MS, QUEUE_SLOT_WAIT_MS, removeQueued, shouldDrain } from './lib/messageQueue';
 import type { QueuedMessage } from './lib/messageQueue';
 import type { AttachmentInput, Cwd, HistoryGroupBy, InputState, IntegrationStatus, LevelInfo, LlmStatus, LoadedConversation, ObserverStatus, QueueMode, QuestionAnswerInput, SettingsStateView, Status, UiState, UiStatePatch, WireEvent } from './lib/types';
@@ -71,6 +73,9 @@ const CTRL_C = '\u0003';
 const uiSaver = createPatchSaver((patch: UiStatePatch) => {
   api.patchUiState(patch).catch(() => undefined);
 });
+
+/** The per-conversation memory in localStorage: drafts and saved follow-up prompts (see conversationCache.ts). */
+const cacheStorage = defaultSizeStorage();
 
 export default function App() {
   const [input, dispatchInput] = useReducer(inputReducer, INITIAL_INPUT);
@@ -165,6 +170,10 @@ export default function App() {
   const suggestGen = useRef(0);
   const suggesting = useRef(false);
   const suggestAgain = useRef(false);
+  // Bumped when a conversation is deleted, so the input bar drops its unsent text for it instead of saving it under the deleted id.
+  const [discardDraft, setDiscardDraft] = useState(0);
+  // True while an open or a new conversation is in flight. Sends and queue drains wait, so no message lands in the other one.
+  const switching = useRef(false);
   // Desktop notifications when the agent is done or needs the user while Watt is in the background (see attention.ts). On
   // until the file says otherwise. `windowFocused` is the native focus state, kept by a listener; it starts true, so nothing
   // is sent before the state is known. `attentionKey` is the last question or approval already handled, so each shows once.
@@ -211,6 +220,11 @@ export default function App() {
   useEffect(() => {
     transcriptRef.current = transcript;
   });
+  // Read by the suggestion request and the saved-suggestions steps, which run after awaits.
+  const conversationRef = useRef<string | null>(null);
+  useEffect(() => {
+    conversationRef.current = conversationId;
+  });
   const clientIds = useRef(0);
   const prevEffective = useRef<InputState>(effective);
 
@@ -237,10 +251,8 @@ export default function App() {
     }
   }, []);
 
-  /** Takes the status snapshot again, e.g. after the live conversation changed. */
-  const refreshStatus = () => {
-    api.getStatus().then(applyStatus).catch(reportError);
-  };
+  /** Takes the status snapshot again, e.g. after the live conversation changed. Resolves once it is applied. */
+  const refreshStatus = (): Promise<void> => api.getStatus().then(applyStatus).catch(reportError);
 
   /**
    * Re-reads the control hold after `done`. `done` is emitted by `run_turn` before the worker's `OnDrop` calls
@@ -274,9 +286,7 @@ export default function App() {
   }, []);
 
   /** Reads only the live conversation's id again. The busy state stays the transcript's own, so a send still in transit is not lost. */
-  const syncConversationId = () => {
-    api.getStatus().then((s) => setConversationId(s.conversation_id)).catch(reportError);
-  };
+  const syncConversationId = (): Promise<void> => api.getStatus().then((s) => setConversationId(s.conversation_id)).catch(reportError);
 
   // The settings refresh's guards: a response is ignored after unmount, and when a newer refresh has started since.
   const settingsAlive = useRef(true);
@@ -682,7 +692,13 @@ export default function App() {
   };
 
   const sendAgent = async (text: string, attachments: AttachmentInput[]): Promise<string | null> => {
+    // Refused while a switch is in flight: the text stays in the bar, and nothing lands in the conversation being switched to.
+    if (switching.current) {
+      return SEND_WHILE_SWITCHING_NOTICE;
+    }
     dropSuggestions();
+    // A message is a new turn: what was saved for the reply before it no longer follows the chat.
+    forgetLiveSuggestions();
     epoch.current += 1;
     clientIds.current += 1;
     const clientId = clientIds.current;
@@ -709,6 +725,13 @@ export default function App() {
     suggestGen.current += 1;
     suggestAgain.current = false;
     setSuggestions([]);
+  };
+
+  /** The live conversation's saved suggestions are removed: a turn started, so they no longer follow the chat. */
+  const forgetLiveSuggestions = () => {
+    if (conversationRef.current !== null) {
+      forgetSuggestions(cacheStorage, conversationRef.current);
+    }
   };
 
   /** The conversation changed: what is queued was for the old one, so it is dropped rather than sent into the new one. */
@@ -747,7 +770,8 @@ export default function App() {
    * at the front of the queue (no retry; the user sees the queue and the error in the transcript). One drain at a time.
    */
   const drainQueue = async () => {
-    if (draining.current) {
+    // While a conversation is being switched, the queue is left alone: the switch clears it (clearQueue) when it lands.
+    if (draining.current || switching.current) {
       return;
     }
     draining.current = true;
@@ -792,9 +816,16 @@ export default function App() {
     }
     suggesting.current = true;
     const gen = suggestGen.current;
+    const conversation = conversationRef.current;
     try {
       const result = await api.suggestPrompts();
-      setSuggestions(acceptSuggestions(result, { current: suggestGen.current === gen, busy: isBusy(transcriptRef.current) }));
+      const shown = acceptSuggestions(result, { current: suggestGen.current === gen, busy: isBusy(transcriptRef.current) });
+      setSuggestions(shown);
+      // Kept under the conversation they were asked in, for its tail as it is now (see conversationCache.ts). A result shown
+      // only when that conversation is still the live one.
+      if (shown.length > 0 && conversation !== null && conversationRef.current === conversation) {
+        saveSuggestions(cacheStorage, conversation, shown, transcriptSig(transcriptRef.current.items));
+      }
     } catch {
       // Nothing to show: the input bar keeps its plain look.
     } finally {
@@ -828,9 +859,12 @@ export default function App() {
     persist(queueModePatch(mode));
   };
 
-  /** The suggest-prompts setting is applied at once and saved. Turning it off drops what is shown or in flight. */
+  /** The suggest-prompts setting is applied at once and saved. Turning it off drops what is shown or in flight, and what was saved. */
   const setSuggestPromptsSetting = (on: boolean) => {
     dropSuggestions();
+    if (!on) {
+      forgetAllSuggestions(cacheStorage);
+    }
     setSuggestPrompts(on);
     persist(suggestPromptsPatch(on));
   };
@@ -841,19 +875,29 @@ export default function App() {
     persist(notificationsPatch(on));
   };
 
-  // Clears the agent's conversation. The backend refuses while the agent is busy; the button is also disabled then. On
-  // error the reason is shown in the transcript, and the conversation stays as it was.
+  // Clears the agent's conversation. Refused while the agent is busy or a side command runs (the button is also disabled then),
+  // before the backend is asked. On error the reason is shown in the transcript, and the conversation stays as it was.
   const newConversation = () => {
+    const refusal = switchRefusal({ busy: isBusy(transcriptRef.current), sideBusy, switching: switching.current });
+    if (refusal !== null) {
+      dispatchTranscript({ type: 'notice', text: refusal });
+      return;
+    }
+    switching.current = true;
     epoch.current += 1;
-    api.newConversation().then(
-      () => {
-        clearQueue();
-        dispatchTranscript({ type: 'conversation_reset' });
-        // The new conversation has a new id, which the history view marks as current.
-        refreshStatus();
-      },
-      (e) => dispatchTranscript({ type: 'notice', text: errorText(e) }),
-    );
+    api.newConversation()
+      .then(
+        () => {
+          clearQueue();
+          dispatchTranscript({ type: 'conversation_reset' });
+          // The new conversation has a new id, which the history view marks as current. Read before the switch ends.
+          return refreshStatus();
+        },
+        (e) => dispatchTranscript({ type: 'notice', text: errorText(e) }),
+      )
+      .finally(() => {
+        switching.current = false;
+      });
   };
 
   /** Opens the agent panel on the chat view and moves focus to the bar. */
@@ -1193,25 +1237,34 @@ export default function App() {
    * Resolves with the reason it was refused, or null when it was opened.
    */
   const openConversation = async (id: string): Promise<string | null> => {
-    const started = epoch.current;
-    let loaded: LoadedConversation;
+    const refusal = switchRefusal({ busy: isBusy(transcriptRef.current), sideBusy, switching: switching.current });
+    if (refusal !== null) {
+      return refusal;
+    }
+    switching.current = true;
     try {
-      loaded = await api.loadConversation(id);
-    } catch (e) {
-      return errorText(e);
+      const started = epoch.current;
+      let loaded: LoadedConversation;
+      try {
+        loaded = await api.loadConversation(id);
+      } catch (e) {
+        return errorText(e);
+      }
+      if (epoch.current !== started || isBusy(transcriptRef.current)) {
+        await syncConversationId();
+        return 'The chat changed while this conversation was loading, so it was not opened. Open it again.';
+      }
+      epoch.current += 1;
+      clearQueue();
+      dispatchTranscript({ type: 'conversation_loaded', items: itemsFromMessages(loaded.messages), todos: loaded.todos, context: loaded.context });
+      setConversationId(loaded.id);
+      setPanelBody('chat');
+      setFocusToken((t) => t + 1);
+      await refreshStatus();
+      return null;
+    } finally {
+      switching.current = false;
     }
-    if (epoch.current !== started || isBusy(transcriptRef.current)) {
-      syncConversationId();
-      return 'The chat changed while this conversation was loading, so it was not opened. Open it again.';
-    }
-    epoch.current += 1;
-    clearQueue();
-    dispatchTranscript({ type: 'conversation_loaded', items: itemsFromMessages(loaded.messages), todos: loaded.todos, context: loaded.context });
-    setConversationId(loaded.id);
-    setPanelBody('chat');
-    setFocusToken((t) => t + 1);
-    refreshStatus();
-    return null;
   };
 
   /** The live conversation was deleted from the History view: the backend started a new one, so the chat is reset to match. */
@@ -1219,8 +1272,19 @@ export default function App() {
     epoch.current += 1;
     clearQueue();
     dispatchTranscript({ type: 'conversation_reset' });
+    // Its unsent text is dropped with it (see InputBar's draftDiscard), not saved under the deleted id.
+    setDiscardDraft((d) => d + 1);
     setConversationId(null);
     refreshStatus();
+  };
+
+  /** A conversation was deleted from the History view (or all of them). What was kept for it goes too. */
+  const conversationDeleted = (id: string | 'all') => {
+    if (id === 'all') {
+      forgetEverything(cacheStorage);
+    } else {
+      forgetConversation(cacheStorage, id);
+    }
   };
 
   /** Moves focus to the History header button, so it is not lost when the view closes. */
@@ -1308,9 +1372,10 @@ export default function App() {
         void drainQueue();
       }
     }
-    // The same edge asks for follow-up prompts (see suggestions.ts). A turn starting clears what was shown.
+    // The same edge asks for follow-up prompts (see suggestions.ts). A turn starting clears what was shown, and what was saved.
     if (active) {
       dropSuggestions();
+      forgetLiveSuggestions();
     } else if (
       shouldSuggest({
         enabled: suggestPrompts,
@@ -1323,6 +1388,24 @@ export default function App() {
       void requestSuggestions();
     }
   }, [active]);
+  // The follow-up prompts saved for the live conversation come back when its transcript still ends with the reply they followed
+  // (the signature matches), the setting is on, and nothing is running. Read on open, on start, and when the setting turns on.
+  // A saved entry for another tail is stale: it is removed, once there is a transcript to compare with.
+  useEffect(() => {
+    if (!suggestPrompts || active || conversationId === null || suggestions.length > 0) {
+      return;
+    }
+    const saved = loadSuggestions(cacheStorage, conversationId, transcriptSig(transcript.items));
+    if (saved === 'stale') {
+      if (transcript.items.length > 0) {
+        forgetSuggestions(cacheStorage, conversationId);
+      }
+      return;
+    }
+    if (saved !== null) {
+      setSuggestions(saved.items);
+    }
+  }, [conversationId, suggestPrompts, active, transcript.items]);
   // Desktop notifications (see attention.ts): sent with the current setting and focus. Failures are handled in attentionClient.
   const notifyAttention = (event: AttentionEvent) => {
     const decision = decideAttention(event, {
@@ -1571,6 +1654,7 @@ export default function App() {
               onApprove={answer}
               onAnswerQuestions={answerQuestions}
               onNewConversation={newConversation}
+              newBlocked={busy || sideBusy}
               banner={
                 settingsState !== null && recoveryKind(settingsState) !== 'ok' && !settingsBannerHidden ? (
                   <SettingsBanner
@@ -1598,6 +1682,7 @@ export default function App() {
                     onGroupBy={setGroupBy}
                     onOpen={openConversation}
                     onLiveDeleted={liveDeleted}
+                    onDeleted={conversationDeleted}
                     onClose={closeHistory}
                   />
                 ) : null
@@ -1650,6 +1735,8 @@ export default function App() {
               onApproveFirst={approveFirst}
               onDenyFirst={denyFirst}
               onClose={closeBar}
+              draftKey={conversationId ?? NEW_DRAFT_KEY}
+              draftDiscard={discardDraft}
             />
           </AgentPanel>
         }

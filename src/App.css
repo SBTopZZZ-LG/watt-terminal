@@ -824,7 +824,7 @@ input {
   cursor: pointer;
 }
 
-.transcript-new:not(:disabled):hover {
+.transcript-new:not(:disabled):not([aria-disabled="true"]):hover {
   border-color: var(--accent);
   color: var(--accent);
 }
@@ -834,7 +834,8 @@ input {
   outline-offset: 1px;
 }
 
-.transcript-new:disabled {
+.transcript-new:disabled,
+.transcript-new[aria-disabled="true"] {
   opacity: 0.5;
   cursor: default;
 }
@@ -3250,6 +3251,13 @@ input {
 
 .history-delete-all {
   margin-left: auto;
+}
+
+/* Blocked while the agent works (aria-disabled keeps the reason's tooltip reachable). */
+.history-row-actions .history-delete[aria-disabled="true"],
+.history-footer [aria-disabled="true"] {
+  opacity: 0.5;
+  cursor: default;
 }
 
 /* ---------- Modals ---------- */

@@ -16,6 +16,7 @@ import { HEADER_COMMAND_CHARS, interactiveHeader } from '../lib/interactive';
 import { groupTranscript, toolGroupSummary } from '../lib/toolGroups';
 import type { GroupItem, InteractiveGroup, TranscriptEntry } from '../lib/toolGroups';
 import { visibleEscapes } from '../lib/visibleEscapes';
+import { BUSY_TIP } from '../lib/switchGuard';
 import { Markdown } from './Markdown';
 import { ApprovalCountdown } from './ApprovalCountdown';
 import { ToolRow } from './ToolRow';
@@ -37,6 +38,8 @@ interface Props {
   /** Answers the agent's clarification question. Never touches the shell: it only calls `answer_questions`. */
   onAnswerQuestions: (callId: string, answers: QuestionAnswerInput[]) => void;
   onNewConversation: () => void;
+  /** The New button is blocked (the agent is busy, or a side command runs). Defaults to `busy`. Only the button reads it. */
+  newBlocked?: boolean;
   /** The dock the panel is in. With onDock, the header shows the four dock buttons, with this one marked. */
   dock?: Dock;
   onDock?: (dock: Dock) => void;
@@ -61,6 +64,7 @@ export function Transcript({
   onApprove,
   onAnswerQuestions,
   onNewConversation,
+  newBlocked,
   dock,
   onDock,
   view = 'chat',
@@ -70,6 +74,7 @@ export function Transcript({
 }: Props) {
   const bodyRef = useRef<HTMLDivElement>(null);
   const sectionRef = useRef<HTMLElement>(null);
+  const newOff = newBlocked ?? busy;
   const entries = useMemo(() => groupTranscript(items), [items]);
   /** Whether the view follows new content. A ref, read in effects and handlers, so changing it does not re-render. */
   const following = useRef(true);
@@ -223,12 +228,17 @@ export function Transcript({
         </button>
         {onDock && dock && <DockButtons dock={dock} onDock={onDock} />}
         {onToggleHistory && <HistoryButton pressed={view === 'history'} onClick={onToggleHistory} />}
+        {/* aria-disabled, not disabled: the tooltip stays reachable on hover and focus, and the click does nothing. */}
         <button
           type="button"
           className="transcript-new"
-          disabled={busy}
-          onClick={onNewConversation}
-          title={busy ? 'Wait for the agent to finish, or cancel it with Ctrl-C, first' : 'Clears the agent conversation'}
+          aria-disabled={newOff ? true : undefined}
+          onClick={() => {
+            if (!newOff) {
+              onNewConversation();
+            }
+          }}
+          data-tip={newOff ? BUSY_TIP : 'Clears the agent conversation'}
         >
           New conversation
         </button>

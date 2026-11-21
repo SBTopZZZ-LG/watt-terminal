@@ -3,6 +3,7 @@ import type { KeyboardEvent } from 'react';
 import { api, errorText } from '../lib/api';
 import { filterMetas, groupByDate, groupByWorkspace, relativeTime, safeText, UNKNOWN_DATE } from '../lib/historyView';
 import type { ConversationMeta, HistoryGroupBy } from '../lib/types';
+import { BUSY_TIP } from '../lib/switchGuard';
 
 /** A delete waiting for its second click: one row, or the whole history. */
 export type Confirm = { kind: 'row'; id: string } | { kind: 'all' };
@@ -17,8 +18,6 @@ export interface HistoryGroup {
   sub: string;
   items: ConversationMeta[];
 }
-
-const BUSY_TITLE = 'Wait for the agent to finish, or cancel it with Ctrl-C, first';
 
 /** The groups for the list. The keys are prefixed by mode, so a collapsed group stays collapsed only in its own grouping. */
 export function groupsFor(metas: ConversationMeta[], groupBy: HistoryGroupBy, now: number): HistoryGroup[] {
@@ -119,7 +118,17 @@ export function HistoryContent(p: HistoryContentProps) {
           {p.confirm?.kind === 'all' ? (
             <>
               <span className="history-confirm-text">Delete all conversations?</span>
-              <button type="button" className="history-danger" onClick={p.onDeleteAll}>
+              <button
+                type="button"
+                className="history-danger"
+                aria-disabled={p.busy ? true : undefined}
+                data-tip={p.busy ? BUSY_TIP : undefined}
+                onClick={() => {
+                  if (!p.busy) {
+                    p.onDeleteAll();
+                  }
+                }}
+              >
                 Yes
               </button>
               <button type="button" onClick={() => p.onConfirm(null)}>
@@ -127,7 +136,17 @@ export function HistoryContent(p: HistoryContentProps) {
               </button>
             </>
           ) : (
-            <button type="button" className="history-delete-all" onClick={() => p.onConfirm({ kind: 'all' })}>
+            <button
+              type="button"
+              className="history-delete-all"
+              aria-disabled={p.busy ? true : undefined}
+              data-tip={p.busy ? BUSY_TIP : undefined}
+              onClick={() => {
+                if (!p.busy) {
+                  p.onConfirm({ kind: 'all' });
+                }
+              }}
+            >
               Delete all history
             </button>
           )}
@@ -249,7 +268,7 @@ function HistoryRow({ meta, groupBy, now, isCurrent, busy, opening, anyOpening, 
         aria-disabled={blocked ? true : undefined}
         aria-current={isCurrent ? 'true' : undefined}
         // Its tip is the row's text; while the agent is busy, the reason comes first. The title span has its own tip when cut.
-        data-tip={busy ? `${BUSY_TITLE}\n${rowTip}` : rowTip}
+        data-tip={busy ? `${BUSY_TIP}\n${rowTip}` : rowTip}
         onClick={() => {
           if (!blocked) {
             onOpen(meta.id);
@@ -275,7 +294,17 @@ function HistoryRow({ meta, groupBy, now, isCurrent, busy, opening, anyOpening, 
         {confirmingDelete ? (
           <>
             <span className="history-confirm-text">Delete?</span>
-            <button type="button" className="history-danger" onClick={() => onDelete(meta.id)}>
+            <button
+              type="button"
+              className="history-danger"
+              aria-disabled={busy ? true : undefined}
+              data-tip={busy ? BUSY_TIP : undefined}
+              onClick={() => {
+                if (!busy) {
+                  onDelete(meta.id);
+                }
+              }}
+            >
               Yes
             </button>
             <button type="button" onClick={() => onConfirm(null)}>
@@ -287,8 +316,13 @@ function HistoryRow({ meta, groupBy, now, isCurrent, busy, opening, anyOpening, 
             type="button"
             className="history-delete"
             aria-label={`Delete ${title}`}
-            title="Delete this conversation"
-            onClick={() => onConfirm({ kind: 'row', id: meta.id })}
+            aria-disabled={busy ? true : undefined}
+            data-tip={busy ? BUSY_TIP : 'Delete this conversation'}
+            onClick={() => {
+              if (!busy) {
+                onConfirm({ kind: 'row', id: meta.id });
+              }
+            }}
           >
             <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
               <path d="M3.5 3.5l9 9M12.5 3.5l-9 9" />
@@ -312,6 +346,8 @@ interface HistoryViewProps {
   onOpen(id: string): Promise<string | null>;
   /** The live conversation was deleted: the caller resets the chat, since the backend started a new one. */
   onLiveDeleted(): void;
+  /** A delete went through: one conversation's id, or 'all'. Called before onLiveDeleted. The caller forgets what it kept for them. */
+  onDeleted?(id: string | 'all'): void;
   onClose(): void;
 }
 
@@ -327,7 +363,7 @@ function focusFilterIfLost() {
  * The History view with its state: the list (loaded on mount, so each visit refreshes it), the filter, the collapsed groups,
  * the pending delete, and the open and delete calls. Failures are shown in the view and never block the chat.
  */
-export function HistoryView({ currentId, busy, groupBy, onGroupBy, onOpen, onLiveDeleted, onClose }: HistoryViewProps) {
+export function HistoryView({ currentId, busy, groupBy, onGroupBy, onOpen, onLiveDeleted, onDeleted, onClose }: HistoryViewProps) {
   const [load, setLoad] = useState<LoadState>({ kind: 'loading' });
   const [attempt, setAttempt] = useState(0);
   const [query, setQuery] = useState('');
@@ -396,6 +432,7 @@ export function HistoryView({ currentId, busy, groupBy, onGroupBy, onOpen, onLiv
     api.deleteConversation(id).then(
       (result) => {
         removeMetas((m) => m.id !== id);
+        onDeleted?.(id);
         if (result.deleted_live) {
           onLiveDeleted();
         }
@@ -414,6 +451,7 @@ export function HistoryView({ currentId, busy, groupBy, onGroupBy, onOpen, onLiv
     api.deleteAllConversations().then(
       (result) => {
         removeMetas(() => false);
+        onDeleted?.('all');
         if (result.deleted_live) {
           onLiveDeleted();
         }

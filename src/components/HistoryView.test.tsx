@@ -221,9 +221,13 @@ describe('HistoryContent: current conversation and busy rows', () => {
     expect(buttons.every((b) => b.includes('aria-disabled="true"'))).toBe(true);
   });
 
-  it('busy does not disable the delete buttons', () => {
+  // Changed: a delete is blocked while the agent works (the server refuses it too). aria-disabled, not disabled, so the
+  // reason stays in the tooltip. Idle, the button is enabled (see conversationSwitch.test.tsx for the tooltip).
+  it('busy blocks the delete buttons: aria-disabled, not disabled', () => {
     const out = html({ busy: true });
-    expect(out).not.toMatch(/class="history-delete"[^>]*disabled/);
+    expect(out).toMatch(/class="history-delete"[^>]*aria-disabled="true"/);
+    expect(out).not.toMatch(/class="history-delete"[^>]*\sdisabled(=|\s|>)/);
+    expect(html()).not.toMatch(/class="history-delete"[^>]*aria-disabled/);
   });
 });
 
