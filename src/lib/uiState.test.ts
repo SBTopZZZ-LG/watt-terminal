@@ -13,6 +13,8 @@ import {
   reconcilePanel,
   reconcileSuggestPrompts,
   suggestPromptsPatch,
+  notificationsPatch,
+  reconcileNotifications,
   shouldRestoreLast,
 } from './uiState';
 import type { Timers } from './uiState';
@@ -113,7 +115,22 @@ describe('reconcileSuggestPrompts', () => {
   });
 });
 
+describe('reconcileNotifications', () => {
+  it('takes a boolean from the file, either way; anything else leaves the default (on) to apply', () => {
+    expect(reconcileNotifications(true)).toBe(true);
+    expect(reconcileNotifications(false)).toBe(false);
+    expect(reconcileNotifications(null)).toBeNull();
+    expect(reconcileNotifications(undefined)).toBeNull();
+    expect(reconcileNotifications('no' as unknown as boolean)).toBeNull();
+  });
+});
+
 describe('patch builders', () => {
+  it('notificationsPatch carries the boolean as notifications', () => {
+    expect(notificationsPatch(true)).toEqual({ notifications: true });
+    expect(notificationsPatch(false)).toEqual({ notifications: false });
+  });
+
   it('hideMarksPatch carries the boolean as hide_marks', () => {
     expect(hideMarksPatch(true)).toEqual({ hide_marks: true });
     expect(hideMarksPatch(false)).toEqual({ hide_marks: false });

@@ -69,6 +69,16 @@ export function suggestPromptsPatch(on: boolean): UiStatePatch {
   return { suggest_prompts: on };
 }
 
+/** The notifications setting from the file, or null when the file has no boolean for it (on then applies). Nothing is migrated. */
+export function reconcileNotifications(remote: boolean | null | undefined): boolean | null {
+  return typeof remote === 'boolean' ? remote : null;
+}
+
+/** The patch that saves the notifications setting. */
+export function notificationsPatch(on: boolean): UiStatePatch {
+  return { notifications: on };
+}
+
 /** The patch that saves a panel layout. */
 export function panelPatch(layout: PanelLayout): UiStatePatch {
   return { panel: { dock: layout.dock, sizes: { ...layout.sizes }, open: layout.open } };

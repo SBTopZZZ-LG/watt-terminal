@@ -82,6 +82,11 @@ describe('api side commands', () => {
     expect(invoke).toHaveBeenCalledWith('suggest_prompts', { sessionId: 'main' });
   });
 
+  it('focusMainWindow takes no arguments and asks the backend to bring the window forward', () => {
+    void api.focusMainWindow();
+    expect(invoke).toHaveBeenCalledWith('focus_main_window', undefined);
+  });
+
   it('compactConversation takes no arguments', () => {
     void api.compactConversation();
     expect(invoke).toHaveBeenCalledWith('compact_conversation', { sessionId: 'main' });

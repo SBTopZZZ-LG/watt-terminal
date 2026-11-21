@@ -1515,6 +1515,16 @@ fn migrate_app_folder() {
     }
 }
 
+/// Brings the main window forward. The frontend calls it when a notification is clicked; the window may be hidden,
+/// minimized or behind other apps.
+#[tauri::command]
+fn focus_main_window(app: tauri::AppHandle) -> Result<(), String> {
+    let window = app.get_webview_window("main").ok_or_else(|| "the main window is gone".to_string())?;
+    window.show().map_err(|e| e.to_string())?;
+    window.unminimize().map_err(|e| e.to_string())?;
+    window.set_focus().map_err(|e| e.to_string())
+}
+
 pub fn run() {
     #[cfg(target_os = "macos")]
     migrate_app_folder();
@@ -1528,6 +1538,8 @@ pub fn run() {
                 let _ = window.set_focus();
             }
         }))
+        // Desktop notifications (the frontend sends them and handles clicks). Registered after single-instance.
+        .plugin(tauri_plugin_notification::init())
         // Saves the window's size, position and maximized state on exit and restores them at launch.
         // Visibility, decorations and fullscreen are not tracked: Tauri shows the window itself.
         .plugin(
@@ -1557,6 +1569,7 @@ pub fn run() {
             ask_btw,
             suggest_name,
             suggest_prompts,
+            focus_main_window,
             compact_conversation,
             fork_conversation,
             export_conversation,

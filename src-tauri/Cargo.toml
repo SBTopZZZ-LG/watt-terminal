@@ -46,6 +46,9 @@ tauri-plugin-single-instance = "=2.5.5"
 # Saves the window's size, position and maximized state on exit and restores them at launch (lib.rs run).
 # Latest 2.x release (tauri ^2.12). The 3.x line requires tauri 3.
 tauri-plugin-window-state = "=2.5.0"
+# Desktop notifications for the agent going idle or asking something while the window is in the background (lib.rs run).
+# Latest release for tauri ^2.12 (MSRV 1.90).
+tauri-plugin-notification = "=2.8.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }

@@ -32,6 +32,8 @@ const QUEUE_MODES: [&str; 2] = ["all", "one"];
 const FONT_SIZES: RangeInclusive<u32> = 8..=32;
 /// The separators and agent labels are hidden unless the file says otherwise.
 const HIDE_MARKS_DEFAULT: bool = true;
+/// Desktop notifications (agent done, or asking something, while Watt is in the background) are on unless the file says otherwise.
+const NOTIFICATIONS_DEFAULT: bool = true;
 /// Largest accepted panel size, in pixels.
 const MAX_PANEL_SIZE: f64 = 20_000.0;
 
@@ -70,10 +72,18 @@ pub struct UiState {
     /// reply, so it is off unless the file says otherwise. Missing or invalid reads as `false`.
     #[serde(default)]
     pub suggest_prompts: bool,
+    /// System notification when the agent is done or asks something while Watt is in the background. Missing or invalid
+    /// in the file reads as the default, `true`.
+    #[serde(default = "notifications_default")]
+    pub notifications: bool,
 }
 
 fn hide_marks_default() -> bool {
     HIDE_MARKS_DEFAULT
+}
+
+fn notifications_default() -> bool {
+    NOTIFICATIONS_DEFAULT
 }
 
 impl Default for UiState {
@@ -87,6 +97,7 @@ impl Default for UiState {
             queue_mode: None,
             hide_marks: HIDE_MARKS_DEFAULT,
             suggest_prompts: false,
+            notifications: NOTIFICATIONS_DEFAULT,
         }
     }
 }
@@ -109,6 +120,8 @@ pub struct UiStatePatch {
     pub hide_marks: Option<bool>,
     /// As `hide_marks`: a boolean, so `null` leaves it alone.
     pub suggest_prompts: Option<bool>,
+    /// As `hide_marks`: a boolean, so `null` leaves it alone.
+    pub notifications: Option<bool>,
 }
 
 /// Distinguishes an absent field (outer `None`, via `default`) from `null` (`Some(None)`).
@@ -165,6 +178,9 @@ impl UiStateStore {
         }
         if let Some(suggest) = patch.suggest_prompts {
             state.suggest_prompts = suggest;
+        }
+        if let Some(notify) = patch.notifications {
+            state.notifications = notify;
         }
         state.version = UI_STATE_VERSION;
         self.write(&state)?;
@@ -241,6 +257,7 @@ fn tolerant(value: &Value) -> UiState {
             .map(str::to_string),
         hide_marks: obj.get("hide_marks").and_then(Value::as_bool).unwrap_or(HIDE_MARKS_DEFAULT),
         suggest_prompts: obj.get("suggest_prompts").and_then(Value::as_bool).unwrap_or(false),
+        notifications: obj.get("notifications").and_then(Value::as_bool).unwrap_or(NOTIFICATIONS_DEFAULT),
     }
 }
 
@@ -363,6 +380,7 @@ mod tests {
             queue_mode: Some(Some("one".into())),
             hide_marks: Some(false),
             suggest_prompts: Some(true),
+            notifications: Some(false),
         };
         let written = s.patch(patch).unwrap();
         assert_eq!(s.load().unwrap(), written);
@@ -373,6 +391,7 @@ mod tests {
         assert_eq!(written.queue_mode.as_deref(), Some("one"));
         assert!(!written.hide_marks);
         assert!(written.suggest_prompts);
+        assert!(!written.notifications);
     }
 
     #[test]
@@ -691,6 +710,38 @@ mod tests {
         let off = s.patch(patch_from(json!({"suggest_prompts": false}))).unwrap();
         assert!(!off.suggest_prompts);
         assert_eq!(patch_from(json!({})).suggest_prompts, None);
+    }
+
+    #[test]
+    fn notifications_are_on_by_default_and_a_boolean_only() {
+        let tmp = TempDir::new();
+        assert!(store(&tmp).load().unwrap().notifications, "no file");
+        assert!(UiState::default().notifications);
+        assert!(read_text(&tmp, r#"{"font_size": 12}"#).notifications, "an old file has none");
+        assert!(!read_text(&tmp, r#"{"notifications": false}"#).notifications);
+        assert!(read_text(&tmp, r#"{"notifications": "no"}"#).notifications);
+        assert!(read_text(&tmp, r#"{"notifications": 0}"#).notifications);
+        assert!(read_text(&tmp, r#"{"notifications": null}"#).notifications);
+    }
+
+    #[test]
+    fn notifications_patch_sets_persists_and_null_or_absent_leaves_it_alone() {
+        let tmp = TempDir::new();
+        let s = store(&tmp);
+        let off = s.patch(patch_from(json!({"notifications": false}))).unwrap();
+        assert!(!off.notifications);
+        assert!(!s.load().unwrap().notifications, "written to the file");
+
+        let untouched = s.patch(patch_from(json!({"font_size": 13}))).unwrap();
+        assert!(!untouched.notifications, "an absent field leaves it alone");
+
+        let null = s.patch(patch_from(json!({"notifications": null}))).unwrap();
+        assert!(!null.notifications, "null leaves it alone too");
+
+        let on = s.patch(patch_from(json!({"notifications": true}))).unwrap();
+        assert!(on.notifications);
+        assert!(s.load().unwrap().notifications);
+        assert_eq!(patch_from(json!({})).notifications, None);
     }
 
     #[test]

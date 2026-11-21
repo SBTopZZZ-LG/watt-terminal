@@ -31,6 +31,7 @@ import { SettingsTabs } from './SettingsTabs';
 import type { TabDef } from './SettingsTabs';
 import { TerminalSection } from './TerminalSection';
 import { QueueSection } from './QueueSection';
+import { NotifySection } from './NotifySection';
 import { SuggestSection } from './SuggestSection';
 import { secretStoreName } from '../lib/platform';
 
@@ -480,6 +481,9 @@ export interface SettingsDialogProps {
   /** Whether the agent suggests follow-up prompts after each reply. Owned by the caller (UI state). */
   suggestPrompts: boolean;
   onSuggestPromptsChange(on: boolean): void;
+  /** Whether Watt notifies the user when the agent is done or needs them in the background. Owned by the caller (UI state). */
+  notifications: boolean;
+  onNotificationsChange(on: boolean): void;
 }
 
 /**
@@ -489,7 +493,7 @@ export interface SettingsDialogProps {
  * and goes back to where it was on close. Esc closes; a click on the backdrop closes. Unsaved changes are asked about
  * before they are dropped.
  */
-export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded, hideMarks, onHideMarksChange, queueMode, onQueueModeChange, suggestPrompts, onSuggestPromptsChange }: SettingsDialogProps) {
+export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded, hideMarks, onHideMarksChange, queueMode, onQueueModeChange, suggestPrompts, onSuggestPromptsChange, notifications, onNotificationsChange }: SettingsDialogProps) {
   const titleId = useId();
   const dialogRef = useRef<HTMLDivElement>(null);
   const backdropPressed = useRef(false);
@@ -1126,6 +1130,7 @@ export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded, h
       <TerminalSection hideMarks={hideMarks} onHideMarksChange={onHideMarksChange} />
       <QueueSection queueMode={queueMode} onQueueModeChange={onQueueModeChange} />
       <SuggestSection suggestPrompts={suggestPrompts} onSuggestPromptsChange={onSuggestPromptsChange} />
+      <NotifySection notifications={notifications} onNotificationsChange={onNotificationsChange} />
     </>
   );
 

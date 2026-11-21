@@ -133,6 +133,10 @@ export const api = {
   suggestPrompts() {
     return invoke<string[]>('suggest_prompts', { sessionId: SESSION_ID });
   },
+  /** Brings the main window forward, for a clicked notification. Errors reject; the caller ignores them. */
+  focusMainWindow() {
+    return invoke<void>('focus_main_window');
+  },
   /** Summarizes the live conversation into a new conversation and switches to it. The old one stays in history. */
   compactConversation() {
     return invoke<LoadedConversation>('compact_conversation', { sessionId: SESSION_ID });

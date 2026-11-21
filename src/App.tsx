@@ -37,7 +37,10 @@ import { itemsFromMessages } from './lib/historyView';
 import { agentActivityText } from './lib/agentActivity';
 import { userAttachments } from './lib/attachments';
 import { defaultModelVision } from './lib/modelVision';
-import { createPatchSaver, fontPatch, hideMarksPatch, panelPatch, queueModePatch, reconcileFont, reconcileGroupBy, reconcileHideMarks, reconcilePanel, reconcileQueueMode, reconcileSuggestPrompts, shouldRestoreLast, suggestPromptsPatch } from './lib/uiState';
+import { createPatchSaver, fontPatch, hideMarksPatch, notificationsPatch, panelPatch, queueModePatch, reconcileFont, reconcileGroupBy, reconcileHideMarks, reconcileNotifications, reconcilePanel, reconcileQueueMode, reconcileSuggestPrompts, shouldRestoreLast, suggestPromptsPatch } from './lib/uiState';
+import { decideAttention } from './lib/attention';
+import type { AttentionEvent } from './lib/attention';
+import { onNotificationClick, sendAttention, watchWindowFocus } from './lib/attentionClient';
 import { acceptSuggestions, endsWithAgentText, shouldSuggest } from './lib/suggestions';
 import { drainBatch, enqueue, QUEUE_SLOT_POLL_MS, QUEUE_SLOT_WAIT_MS, removeQueued, shouldDrain } from './lib/messageQueue';
 import type { QueuedMessage } from './lib/messageQueue';
@@ -162,6 +165,12 @@ export default function App() {
   const suggestGen = useRef(0);
   const suggesting = useRef(false);
   const suggestAgain = useRef(false);
+  // Desktop notifications when the agent is done or needs the user while Watt is in the background (see attention.ts). On
+  // until the file says otherwise. `windowFocused` is the native focus state, kept by a listener; it starts true, so nothing
+  // is sent before the state is known. `attentionKey` is the last question or approval already handled, so each shows once.
+  const [notifications, setNotifications] = useState(true);
+  const windowFocused = useRef(true);
+  const attentionKey = useRef<string | null>(null);
   // The UI state file, read at startup. Nothing is written to it until that read has been reconciled (see uiReady).
   const uiLoaded = useRef<Promise<UiState | null> | null>(null);
   const uiReady = useRef(false);
@@ -412,6 +421,10 @@ export default function App() {
       const suggest = reconcileSuggestPrompts(remote.suggest_prompts);
       if (suggest !== null) {
         setSuggestPrompts(suggest);
+      }
+      const notify = reconcileNotifications(remote.notifications);
+      if (notify !== null) {
+        setNotifications(notify);
       }
     });
     const unsubscribeFont = onFontSizeChange((size) => persist(fontPatch(size)));
@@ -820,6 +833,12 @@ export default function App() {
     dropSuggestions();
     setSuggestPrompts(on);
     persist(suggestPromptsPatch(on));
+  };
+
+  /** The notifications setting is applied at once and saved with the UI state. */
+  const setNotificationsSetting = (on: boolean) => {
+    setNotifications(on);
+    persist(notificationsPatch(on));
   };
 
   // Clears the agent's conversation. The backend refuses while the agent is busy; the button is also disabled then. On
@@ -1304,6 +1323,77 @@ export default function App() {
       void requestSuggestions();
     }
   }, [active]);
+  // Desktop notifications (see attention.ts): sent with the current setting and focus. Failures are handled in attentionClient.
+  const notifyAttention = (event: AttentionEvent) => {
+    const decision = decideAttention(event, {
+      enabled: notifications,
+      focused: windowFocused.current,
+      queueLength: queueRef.current.length,
+    });
+    if (decision !== null) {
+      void sendAttention(decision);
+    }
+  };
+  /** True the first time a key is seen, so each question or approval is notified once. */
+  const firstAttention = (key: string): boolean => {
+    if (attentionKey.current === key) {
+      return false;
+    }
+    attentionKey.current = key;
+    return true;
+  };
+  // The window's focus, and a click on a notification (it brings the window forward). Registered once. When a listener
+  // cannot be set up, the defaults stay: focused, and a click does nothing.
+  useEffect(() => {
+    const stops: Array<() => void> = [];
+    let gone = false;
+    const keep = (stop: () => void) => {
+      if (gone) {
+        stop();
+      } else {
+        stops.push(stop);
+      }
+    };
+    watchWindowFocus((focused) => {
+      windowFocused.current = focused;
+    }).then(keep, () => undefined);
+    onNotificationClick(() => {
+      api.focusMainWindow().catch(() => undefined);
+    }).then(keep, () => undefined);
+    return () => {
+      gone = true;
+      stops.forEach((stop) => stop());
+    };
+  }, []);
+  // The turn ended (the busy edge). Not for a side command. A queued message is about to be sent, so it is not idle.
+  const wasBusy = useRef(busy);
+  useEffect(() => {
+    const prev = wasBusy.current;
+    wasBusy.current = busy;
+    if (prev && !busy) {
+      const last = transcript.items[transcript.items.length - 1];
+      notifyAttention({ type: 'turn_idle', lastText: last !== undefined && last.kind === 'agent' ? last.text : null });
+    }
+  }, [busy]);
+  // A question or an approval waiting for the user. Each card notifies once, keyed by its call id.
+  const pendingQuestionItem =
+    transcript.items.find(
+      (i): i is Extract<TranscriptItem, { kind: 'question' }> => i.kind === 'question' && i.state === 'pending',
+    ) ?? null;
+  useEffect(() => {
+    if (pendingQuestionItem === null || !firstAttention(`question:${pendingQuestionItem.callId}`)) {
+      return;
+    }
+    notifyAttention({ type: 'question', text: pendingQuestionItem.questions[0]?.question ?? '' });
+  }, [pendingQuestionItem?.callId]);
+  useEffect(() => {
+    if (pendingApprovalItem === null || !firstAttention(`approval:${pendingApprovalItem.callId}`)) {
+      return;
+    }
+    const text =
+      pendingApprovalItem.name === 'send_keys' ? (pendingApprovalItem.display ?? pendingApprovalItem.text) : pendingApprovalItem.text;
+    notifyAttention({ type: 'approval', text });
+  }, [pendingApprovalItem?.callId]);
   // Same busy as the input bar's loader (busy || sideBusy). An exited shell takes the border off even if a turn is still open.
   const border: BorderLevel = borderLevel(agentControl, (busy || sideBusy) && effective !== 'exited');
   const borderClass: Record<BorderLevel, string> = {
@@ -1590,6 +1680,8 @@ export default function App() {
           onQueueModeChange={setQueueModeSetting}
           suggestPrompts={suggestPrompts}
           onSuggestPromptsChange={setSuggestPromptsSetting}
+          notifications={notifications}
+          onNotificationsChange={setNotificationsSetting}
         />
       )}
       {helpOpen && <HelpDialog load={helpState} onRetry={loadHelp} onClose={closeHelp} />}
