@@ -4,6 +4,7 @@
 
 import { capDisplay, sendKeysDisplay } from './keysDisplay';
 import { visibleEscapes } from './visibleEscapes';
+import type { ToolStatus } from './transcript';
 
 /** A caption keeps at most this many words; the cut is marked with an ellipsis. */
 export const MAX_CAPTION_WORDS = 10;
@@ -78,4 +79,47 @@ export interface ToolRowHead {
 
 export function toolRowHead(name: string, args: unknown): ToolRowHead {
   return { label: visibleEscapes(name), caption: toolCaption(args), detail: toolPreview(name, args) };
+}
+
+/** The backend's default and largest `wait` seconds (core/tools DEFAULT_WAIT_SECONDS, MAX_WAIT_SECONDS). */
+const DEFAULT_WAIT_SECONDS = 10;
+const MAX_WAIT_SECONDS = 120;
+
+/** The seconds a wait was asked for, as the backend clamps them: the default when absent or not an integer. */
+function requestedWaitSeconds(args: unknown): number {
+  const seconds = typeof args === 'object' && args !== null ? (args as { seconds?: unknown }).seconds : undefined;
+  if (typeof seconds !== 'number' || !Number.isInteger(seconds)) {
+    return DEFAULT_WAIT_SECONDS;
+  }
+  return Math.min(Math.max(seconds, 1), MAX_WAIT_SECONDS);
+}
+
+/** The time a wait took: from `waited_ms` of a live result, or from the text the model saw (`waited 4.9s: ...`). */
+function waitedSeconds(result: unknown): string | null {
+  if (typeof result === 'string') {
+    const m = /^waited (\d+(?:\.\d+)?)s:/.exec(result);
+    return m ? m[1] : null;
+  }
+  if (typeof result === 'object' && result !== null) {
+    const ms = (result as { waited_ms?: unknown }).waited_ms;
+    if (typeof ms === 'number' && Number.isFinite(ms) && ms >= 0) {
+      return (ms / 1000).toFixed(1);
+    }
+  }
+  return null;
+}
+
+/**
+ * The duration a `wait` row shows in place of its bare status: `waiting 5s` while it runs (the requested seconds), then
+ * `waited 4.9s` once it ends (the time it took, or the requested seconds when the result has no time). Null for other tools,
+ * and for a failed wait (its status word stays).
+ */
+export function waitDuration(name: string, args: unknown, result: unknown, status: ToolStatus): string | null {
+  if (name !== 'wait' || status === 'failed') {
+    return null;
+  }
+  if (status === 'running') {
+    return `waiting ${requestedWaitSeconds(args)}s`;
+  }
+  return `waited ${waitedSeconds(result) ?? String(requestedWaitSeconds(args))}s`;
 }

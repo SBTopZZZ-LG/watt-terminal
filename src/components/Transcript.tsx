@@ -1,7 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { MouseEvent, ReactNode, UIEvent, WheelEvent } from 'react';
 import { copyText } from '../lib/clipboard';
-import { previewJson } from '../lib/format';
 import { isAtBottom, shouldFollowAfterSend } from '../lib/stickScroll';
 import { approvalTitle } from '../lib/transcript';
 import type { TranscriptItem, UserAttachment } from '../lib/transcript';
@@ -10,16 +9,15 @@ import { draftsFromAnswers, enterIntent, firstUnsettled, isComplete, newDrafts, 
 import type { EnterIntent, QuestionDraft } from '../lib/questions';
 import { formatSize } from '../lib/attachments';
 import { safeText } from '../lib/historyView';
-import { askedBecause, decisionLabel, decisionTooltip } from '../lib/approvalReasons';
+import { askedBecause } from '../lib/approvalReasons';
 import { displayText } from '../lib/keysDisplay';
-import { toolRowHead } from '../lib/toolDisplay';
 import { interactiveHeader } from '../lib/interactive';
-import { isDeclinedIntegration } from '../lib/integrate';
 import { groupTranscript, toolGroupSummary } from '../lib/toolGroups';
 import type { GroupItem, InteractiveGroup, TranscriptEntry } from '../lib/toolGroups';
 import { visibleEscapes } from '../lib/visibleEscapes';
 import { Markdown } from './Markdown';
 import { ApprovalCountdown } from './ApprovalCountdown';
+import { ToolRow } from './ToolRow';
 import { chatBodyShown } from '../lib/panelLayout';
 import { settleTight } from '../lib/panelTight';
 import type { Dock } from '../lib/panelLayout';
@@ -384,35 +382,8 @@ function Entry({ item, onApprove, onAnswerQuestions }: { item: TranscriptItem; o
     // Closes an interactive group (see renderEntries); with no group open there is nothing to show.
     case 'record_end':
       return null;
-    case 'tool': {
-      // A declined integration request is its own status, not a failure: the user chose it.
-      const declined = isDeclinedIntegration(item.name, item.decision);
-      const status = declined ? 'declined' : item.status === 'running' ? 'running' : item.status === 'ok' ? 'ok' : 'failed';
-      const head = toolRowHead(item.name, item.args);
-      return (
-        <details className={`tool tool-${status}`}>
-          <summary>
-            <span className="tool-summary">
-              <span className="tool-line">
-                {head.label}
-                {head.caption !== null && <span className="tool-caption">{` · ${head.caption}`}</span>}
-                {item.decision !== null && !declined && (
-                  <span
-                    className={`decision decision-${item.decision}`}
-                    title={decisionTooltip(item.decision, item.reason) ?? undefined}
-                  >
-                    {` ${decisionLabel(item.decision, item.reason)}`}
-                  </span>
-                )}
-                {`: ${status}`}
-              </span>
-              {head.detail !== null && <span className="tool-detail">{head.detail}</span>}
-            </span>
-          </summary>
-          <pre>{previewJson({ args: item.args, result: item.result })}</pre>
-        </details>
-      );
-    }
+    case 'tool':
+      return <ToolRow item={item} />;
     case 'approval': {
       const why = askedBecause(item.reason);
       return (
