@@ -247,9 +247,46 @@ describe('InputBar: the approval row', () => {
     expect(html.indexOf('bar-approval')).toBeLessThan(html.indexOf('bar-field'));
   });
 
-  it('is not shown in the exited or collapsed modes', () => {
+  it('is not shown in the exited or collapsed modes while bypass is off', () => {
     expect(render({ mode: 'exited' })).not.toContain('bar-approval');
     expect(render({ mode: 'collapsed' })).not.toContain('bar-approval');
+  });
+
+  it('collapsed: shows the bypass chip, orange, with the bypass tip, when bypass is on here', () => {
+    const html = render({ mode: 'collapsed', autoApprove: true });
+    expect(html).toContain('class="bar-approval is-inline"');
+    const tag = tagHolding(html, 'button', 'bar-approval-toggle');
+    expect(tag).toContain('is-bypass');
+    expect(tag).toContain('aria-pressed="true"');
+    expect(tag).toContain('data-tip="Bypass is ON:');
+    expect(html).toContain('>bypass</button>');
+    expect(html).not.toContain('bar-field');
+    expect(html).not.toContain('<textarea');
+  });
+
+  it('collapsed: no chip when bypass is off or only suspended in another shell', () => {
+    expect(render({ mode: 'collapsed', autoApprove: false })).not.toContain('bar-approval');
+    expect(render({ mode: 'collapsed', autoApprove: true, autoSuspended: true })).not.toContain('bar-approval');
+  });
+
+  it('exited: shows the bypass chip, orange, when bypass is on here, beside the restart button', () => {
+    const html = render({ mode: 'exited', autoApprove: true });
+    const tag = tagHolding(html, 'button', 'bar-approval-toggle');
+    expect(tag).toContain('is-bypass');
+    expect(tag).toContain('aria-pressed="true"');
+    expect(html).toContain('>bypass</button>');
+    expect(html.indexOf('bar-approval')).toBeLessThan(html.indexOf('bar-restart'));
+    expect(html).toContain('Start new session');
+  });
+
+  it('exited: no chip when bypass is off or only suspended', () => {
+    expect(render({ mode: 'exited', autoApprove: false })).not.toContain('bar-approval');
+    expect(render({ mode: 'exited', autoApprove: true, autoSuspended: true })).not.toContain('bar-approval');
+  });
+
+  it('the collapsed and exited chips are disabled while locked', () => {
+    expect(tagHolding(render({ mode: 'exited', autoApprove: true, locked: true }), 'button', 'bar-approval-toggle')).toContain('disabled=""');
+    expect(tagHolding(render({ mode: 'collapsed', autoApprove: true, locked: true }), 'button', 'bar-approval-toggle')).toContain('disabled=""');
   });
 });
 

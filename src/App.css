@@ -2715,6 +2715,16 @@ input {
   font-size: 11px;
 }
 
+/* In the collapsed and exited bars the chip shares the row: it takes its own width, and sits at the end in the exited bar. */
+.bar-approval.is-inline {
+  flex-basis: auto;
+  white-space: nowrap;
+}
+
+.bar-exited .bar-approval.is-inline {
+  margin-left: auto;
+}
+
 .bar-approval-label {
   color: var(--muted);
 }

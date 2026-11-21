@@ -284,10 +284,42 @@ export function InputBar(props: Props) {
     }
   }, [props.locked]);
 
+  // Bypass is on in this shell only when it was switched on here: a suspended one reads manual for the shell on top.
+  const bypassOn = props.autoApprove && !props.autoSuspended;
+  const bypassSuspended = props.autoApprove && props.autoSuspended === true;
+  const approvalTip = bypassOn
+    ? 'Bypass is ON: the agent runs every command without asking, even ones your deny rules or the built-in checks would block. It resets when Watt restarts. Click to turn off.'
+    : bypassSuspended
+      ? 'Bypass was turned on in another shell, so it is off in this one: every command here asks for your approval. Click to turn it on here.'
+      : 'manual: each command asks for approval. Click (or Shift+Tab) to bypass approval for this session.';
+  const toggleClass = bypassOn ? 'bar-approval-toggle is-bypass' : bypassSuspended ? 'bar-approval-toggle is-suspended' : 'bar-approval-toggle';
+
+  /**
+   * The approval chip. The chat bar always shows it. The collapsed and exited bars show it only while bypass is on here
+   * (`inline`: one row with the rest of the bar), so a bypass left on can still be seen and turned off.
+   */
+  const approvalChip = (inline: boolean) => (
+    <div className={inline ? 'bar-approval is-inline' : 'bar-approval'} data-tip={approvalTip}>
+      <span className="bar-approval-label">approval:</span>{' '}
+      <button
+        type="button"
+        className={toggleClass}
+        aria-pressed={bypassOn}
+        data-tip={approvalTip}
+        disabled={props.locked}
+        onMouseDown={(e) => e.preventDefault()}
+        onClick={props.onToggleAutoApprove}
+      >
+        {bypassOn ? BYPASS_LABEL : 'manual'}
+      </button>
+    </div>
+  );
+
   if (mode === 'exited') {
     return (
       <div className="bar bar-exited">
         <span className="bar-notice">{hint}</span>
+        {bypassOn && approvalChip(true)}
         <button ref={restartRef} type="button" className="bar-restart" disabled={props.restarting} onClick={props.onRestart}>
           Start new session
         </button>
@@ -299,6 +331,7 @@ export function InputBar(props: Props) {
     return (
       <div className="bar bar-collapsed" title={`${shortcutLabel('agent')} to message the agent`}>
         <span className="bar-hint">{hint}</span>
+        {bypassOn && approvalChip(true)}
       </div>
     );
   }
@@ -447,15 +480,6 @@ export function InputBar(props: Props) {
   const readyCount = drafts.filter((d) => d.input !== null).length;
   const processing = drafts.some((d) => d.input === null);
   const send = sendButtonFor(busy, text, props.locked, { ready: readyCount, processing });
-  // Bypass is on in this shell only when it was switched on here: a suspended one reads manual for the shell on top.
-  const bypassOn = props.autoApprove && !props.autoSuspended;
-  const bypassSuspended = props.autoApprove && props.autoSuspended === true;
-  const approvalTip = bypassOn
-    ? 'Bypass is ON: the agent runs every command without asking, even ones your deny rules or the built-in checks would block. It resets when Watt restarts. Click to turn off.'
-    : bypassSuspended
-      ? 'Bypass was turned on in another shell, so it is off in this one: every command here asks for your approval. Click to turn it on here.'
-      : 'manual: each command asks for approval. Click (or Shift+Tab) to bypass approval for this session.';
-  const toggleClass = bypassOn ? 'bar-approval-toggle is-bypass' : bypassSuspended ? 'bar-approval-toggle is-suspended' : 'bar-approval-toggle';
 
   /** The send button: Stop while busy, otherwise the same as Enter. Focus stays in the input either way. */
   function onSendClick() {
@@ -641,22 +665,7 @@ export function InputBar(props: Props) {
       onDragLeave={onDragLeave}
       onDrop={onDrop}
     >
-      {mode === 'chat' && (
-        <div className="bar-approval" data-tip={approvalTip}>
-          <span className="bar-approval-label">approval:</span>{' '}
-          <button
-            type="button"
-            className={toggleClass}
-            aria-pressed={bypassOn}
-            data-tip={approvalTip}
-            disabled={props.locked}
-            onMouseDown={(e) => e.preventDefault()}
-            onClick={props.onToggleAutoApprove}
-          >
-            {bypassOn ? BYPASS_LABEL : 'manual'}
-          </button>
-        </div>
-      )}
+      {mode === 'chat' && approvalChip(false)}
       {mode === 'chat' && props.queue.length > 0 && (
         <div className="bar-queue">
           <span className="bar-queue-head">{queueHeader(props.queueMode)}</span>
