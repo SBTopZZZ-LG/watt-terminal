@@ -37,7 +37,7 @@ import { itemsFromMessages } from './lib/historyView';
 import { agentActivityText } from './lib/agentActivity';
 import { userAttachments } from './lib/attachments';
 import { defaultModelVision } from './lib/modelVision';
-import { createPatchSaver, fontPatch, panelPatch, reconcileFont, reconcileGroupBy, reconcilePanel, shouldRestoreLast } from './lib/uiState';
+import { createPatchSaver, fontPatch, hideMarksPatch, panelPatch, reconcileFont, reconcileGroupBy, reconcileHideMarks, reconcilePanel, shouldRestoreLast } from './lib/uiState';
 import type { AttachmentInput, Cwd, HistoryGroupBy, InputState, IntegrationStatus, LevelInfo, LlmStatus, LoadedConversation, ObserverStatus, QuestionAnswerInput, SettingsStateView, Status, UiState, UiStatePatch, WireEvent } from './lib/types';
 import { recoveryKind } from './lib/settingsRecovery';
 import { TerminalView } from './components/TerminalView';
@@ -136,6 +136,11 @@ export default function App() {
   // Bumped when the live conversation is renamed, so an open HistoryView remounts and refetches its rows.
   const [historyKey, setHistoryKey] = useState(0);
   const [historyGroupBy, setHistoryGroupBy] = useState<HistoryGroupBy>('date');
+  // Hides the terminal's separators and agent labels (CSS on the root element, see App.css). Hidden until the file says otherwise.
+  const [hideMarks, setHideMarks] = useState(true);
+  useEffect(() => {
+    document.documentElement.dataset.hideMarks = String(hideMarks);
+  }, [hideMarks]);
   // The UI state file, read at startup. Nothing is written to it until that read has been reconciled (see uiReady).
   const uiLoaded = useRef<Promise<UiState | null> | null>(null);
   const uiReady = useRef(false);
@@ -374,6 +379,10 @@ export default function App() {
       const group = reconcileGroupBy(remote.history_group_by);
       if (group !== null) {
         setHistoryGroupBy(group);
+      }
+      const marks = reconcileHideMarks(remote.hide_marks);
+      if (marks !== null) {
+        setHideMarks(marks);
       }
     });
     const unsubscribeFont = onFontSizeChange((size) => persist(fontPatch(size)));
@@ -1042,6 +1051,11 @@ export default function App() {
     persist({ history_group_by: groupBy });
   };
 
+  const setMarksHidden = (hide: boolean) => {
+    setHideMarks(hide);
+    persist(hideMarksPatch(hide));
+  };
+
   const answer = (callId: string, approve: boolean) => {
     dispatchTranscript({ type: 'approval_answering', callId, approve });
     api.approveTool(callId, approve).catch((e) => {
@@ -1351,7 +1365,16 @@ export default function App() {
       {pendingApprovalItem !== null && !chatBodyShown(panel.open, panelBody) && (
         <ApprovalToast approval={pendingApprovalItem} dock={panel.dock} onApprove={answer} onOpen={showChat} />
       )}
-      {settingsOpen && <SettingsDialog focusModel={settingsFocusModel} onClose={closeSettings} onChanged={refreshStatus} onViewLoaded={refreshSettingsState} />}
+      {settingsOpen && (
+        <SettingsDialog
+          focusModel={settingsFocusModel}
+          onClose={closeSettings}
+          onChanged={refreshStatus}
+          onViewLoaded={refreshSettingsState}
+          hideMarks={hideMarks}
+          onHideMarksChange={setMarksHidden}
+        />
+      )}
       {helpOpen && <HelpDialog load={helpState} onRetry={loadHelp} onClose={closeHelp} />}
       {agentPhase !== null ? (
         <IntegrateDialog key="agent" phase={agentPhase} agent={{ onDecline: declineAgent }} onStart={acceptAgent} onClose={closeAgent} local={localShell} />

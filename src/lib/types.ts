@@ -330,6 +330,8 @@ export interface UiState {
   font_size: number | null;
   last_conversation_id: string | null;
   history_group_by: HistoryGroupBy | null;
+  /** Hides the terminal's command separators and agent labels. Always a boolean: true when the file has no value. */
+  hide_marks: boolean;
 }
 
 /** A change to the UI state. An absent field is left alone, `null` clears it, a value sets it. */
@@ -338,6 +340,8 @@ export interface UiStatePatch {
   font_size?: number | null;
   last_conversation_id?: string | null;
   history_group_by?: HistoryGroupBy | null;
+  /** A boolean cannot be cleared: the backend ignores `null`, like an absent field. */
+  hide_marks?: boolean;
 }
 
 // AI provider settings (src-tauri/src/core/settings). Secrets are never in these types: they are only written, as

@@ -39,6 +39,16 @@ export function reconcileGroupBy(remote: string | null | undefined): 'date' | 'w
   return remote === 'date' || remote === 'workspace' ? remote : null;
 }
 
+/** The marks setting from the file, or null when the file has no boolean for it (the default then applies). Nothing is migrated. */
+export function reconcileHideMarks(remote: boolean | null | undefined): boolean | null {
+  return typeof remote === 'boolean' ? remote : null;
+}
+
+/** The patch that saves the marks setting. */
+export function hideMarksPatch(hide: boolean): UiStatePatch {
+  return { hide_marks: hide };
+}
+
 /** The patch that saves a panel layout. */
 export function panelPatch(layout: PanelLayout): UiStatePatch {
   return { panel: { dock: layout.dock, sizes: { ...layout.sizes }, open: layout.open } };

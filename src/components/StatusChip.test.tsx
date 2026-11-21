@@ -315,3 +315,45 @@ describe('StatusChip: the agent integrates quietly (auto mode)', () => {
     expect(out).toMatch(/<span class="chip chip-integrating"[^>]*>Integrating…<\/span>/);
   });
 });
+
+describe('StatusChip: the provider chip sits just left of the model chip', () => {
+  function providerChip(out: string): string {
+    return out.match(/<span class="chip chip-provider"[^>]*>[^<]*<\/span>/)?.[0] ?? '';
+  }
+
+  it('shows the saved provider name, with the full name in the title', () => {
+    const out = chip(LLM_ON, OK);
+    expect(providerChip(out)).toBe('<span class="chip chip-provider" title="Acme">provider: Acme</span>');
+  });
+
+  it('is before the model chip in the markup', () => {
+    const out = chip(LLM_ON, OK);
+    expect(out.indexOf('chip-provider')).toBeGreaterThan(-1);
+    expect(out.indexOf('chip-provider')).toBeLessThan(out.indexOf('chip-model'));
+    // Nothing but the grid chip sits between them in this strip.
+    expect(out.slice(out.indexOf('chip-provider'), out.indexOf('chip-model'))).not.toContain('chip-cwd');
+  });
+
+  it('the model chip keeps its label and its title', () => {
+    expect(modelChip(chip(LLM_ON, OK))).toContain('model: big');
+    expect(modelChip(chip(LLM_ON, OK))).toContain('title="Acme · model: big"');
+  });
+
+  it('a long provider name is cut with an ellipsis (CSS) and the title keeps the full name', () => {
+    const long = 'A very long provider name for the status strip';
+    const out = chip({ ...LLM_ON, provider: long }, OK);
+    expect(out).toContain(`<span class="chip chip-provider" title="${long}">provider: ${long}</span>`);
+  });
+
+  it('hidden without a provider: the mock agent and the environment settings', () => {
+    expect(chip(LLM_OFF, OK)).not.toContain('chip-provider');
+    expect(chip({ enabled: true, model: 'env-model', provider: null }, OK)).not.toContain('chip-provider');
+    expect(chip(LLM_ON, null)).toContain('chip-provider');
+  });
+
+  it('hidden in the broken and last-good states, where the model chip says so instead', () => {
+    expect(chip(LLM_OFF, BROKEN)).not.toContain('chip-provider');
+    expect(chip(LLM_ON, LAST_GOOD)).not.toContain('chip-provider');
+    expect(modelChip(chip(LLM_ON, LAST_GOOD))).toContain('last good');
+  });
+});

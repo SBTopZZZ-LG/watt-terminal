@@ -66,6 +66,8 @@ export function StatusChip(props: Props) {
   const modelLabel = chipLabel(settingsState, llm);
   const broken = recoveryKind(settingsState) !== 'ok';
   const modelTitle = chipBrokenTitle(settingsState) ?? `${llm.provider ? `${llm.provider} · ` : ''}${modelLabel}`;
+  // The provider's name is shown only while the model label shows the model: a broken or last-good state says so instead.
+  const providerName = !broken && llm.provider ? llm.provider : null;
   return (
     <div className="status-chip" role="status">
       {/* Shown only when there is something to fix: a live integration and an ok observer are the normal case. */}
@@ -84,6 +86,11 @@ export function StatusChip(props: Props) {
         </span>
       )}
       <GridChip />
+      {providerName !== null && (
+        <span className="chip chip-provider" title={providerName}>
+          {`provider: ${providerName}`}
+        </span>
+      )}
       <span className={`chip chip-model${broken ? ' chip-warn' : ''}`} title={modelTitle}>
         {modelLabel}
       </span>

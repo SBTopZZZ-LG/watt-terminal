@@ -29,6 +29,7 @@ import { ProviderEditor } from './ProviderEditor';
 import type { TestState } from './ProviderEditor';
 import { SettingsTabs } from './SettingsTabs';
 import type { TabDef } from './SettingsTabs';
+import { TerminalSection } from './TerminalSection';
 import { secretStoreName } from '../lib/platform';
 
 /** The recovery actions in flight or waiting for their confirm step. `busy` names the action that is running. */
@@ -63,13 +64,14 @@ export interface EditorState {
 
 /**
  * The tabs of the AI settings, in order. Models holds the default model, the context limit, the providers and the editor;
- * Approvals holds the approval rules; Limits holds the per-turn caps; About shows the app's name and version. A new tab is one
- * entry here and one panel in the dialog's render.
+ * Approvals holds the approval rules; Limits holds the per-turn caps; Terminal holds the terminal's display preferences; About
+ * shows the app's name and version. A new tab is one entry here and one panel in the dialog's render.
  */
 export const SETTINGS_TABS: readonly TabDef[] = [
   { id: 'models', label: 'Models' },
   { id: 'approvals', label: 'Approvals' },
   { id: 'limits', label: 'Limits' },
+  { id: 'terminal', label: 'Terminal' },
   { id: 'about', label: 'About' },
 ];
 
@@ -467,6 +469,9 @@ export interface SettingsDialogProps {
   onChanged(): void;
   /** The settings were loaded (on open, Retry or Check again): the caller reads the settings state again. */
   onViewLoaded?(): void;
+  /** The Terminal tab's setting: true hides the command separators and agent labels. Owned by the caller (UI state). */
+  hideMarks: boolean;
+  onHideMarksChange(hide: boolean): void;
 }
 
 /**
@@ -476,7 +481,7 @@ export interface SettingsDialogProps {
  * and goes back to where it was on close. Esc closes; a click on the backdrop closes. Unsaved changes are asked about
  * before they are dropped.
  */
-export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded }: SettingsDialogProps) {
+export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded, hideMarks, onHideMarksChange }: SettingsDialogProps) {
   const titleId = useId();
   const dialogRef = useRef<HTMLDivElement>(null);
   const backdropPressed = useRef(false);
@@ -1108,6 +1113,8 @@ export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded }:
       />
     ) : null;
 
+  const terminalPanel = <TerminalSection hideMarks={hideMarks} onHideMarksChange={onHideMarksChange} />;
+
   const aboutPanel = <AboutSection />;
 
   return (
@@ -1155,7 +1162,15 @@ export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded }:
           dirty={dirtyTabs}
           onSelect={setTab}
           panel={(id) =>
-            id === 'approvals' ? approvalsPanel : id === 'limits' ? limitsPanel : id === 'about' ? aboutPanel : modelsPanel
+            id === 'approvals'
+              ? approvalsPanel
+              : id === 'limits'
+                ? limitsPanel
+                : id === 'terminal'
+                  ? terminalPanel
+                  : id === 'about'
+                    ? aboutPanel
+                    : modelsPanel
           }
         />
         <footer className="settings-foot">

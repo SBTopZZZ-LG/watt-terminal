@@ -232,6 +232,19 @@ input {
 }
 
 /*
+ * The "hide command separators and agent labels" setting (ui_state hide_marks, on by default). The root attribute is set
+ * from App.tsx. It hides the separator lines (and their badges, which are inside them) and the agent badge on each stripe.
+ * The exit-coloured stripe bars stay. StripeLayer is not unmounted, so the marks come back at once when the setting is off.
+ */
+:root[data-hide-marks="true"] .separator {
+  display: none;
+}
+
+:root[data-hide-marks="true"] .stripe[data-agent="true"]::after {
+  content: none;
+}
+
+/*
  * Find bar: a small overlay at the top right of the terminal area. It sits above the stripes (6) and the agent control (5).
  * The status strip is outside .terminal-area, so the bar never covers it.
  */
@@ -434,6 +447,18 @@ input {
    auto, basis auto; no flex-grow, so it stays snug around its text instead of filling empty space). No max-width cap:
    long model/variant labels use free strip space. The full text stays in the title attribute. */
 .chip-model {
+  font-family: var(--mono);
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+/* The provider's name, just left of the model chip. Same look and ellipsis as the model chip; its full name is in the title. */
+.chip-provider {
   font-family: var(--mono);
   flex: 0 1 auto;
   min-width: 0;

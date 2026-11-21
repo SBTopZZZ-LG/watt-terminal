@@ -4,8 +4,10 @@ import {
   fontPatch,
   panelPatch,
   PATCH_DELAY_MS,
+  hideMarksPatch,
   reconcileFont,
   reconcileGroupBy,
+  reconcileHideMarks,
   reconcilePanel,
   shouldRestoreLast,
 } from './uiState';
@@ -73,7 +75,22 @@ describe('reconcileGroupBy', () => {
   });
 });
 
+describe('reconcileHideMarks', () => {
+  it('takes a boolean from the file, either way; anything else leaves the default to apply', () => {
+    expect(reconcileHideMarks(true)).toBe(true);
+    expect(reconcileHideMarks(false)).toBe(false);
+    expect(reconcileHideMarks(null)).toBeNull();
+    expect(reconcileHideMarks(undefined)).toBeNull();
+    expect(reconcileHideMarks('no' as unknown as boolean)).toBeNull();
+  });
+});
+
 describe('patch builders', () => {
+  it('hideMarksPatch carries the boolean as hide_marks', () => {
+    expect(hideMarksPatch(true)).toEqual({ hide_marks: true });
+    expect(hideMarksPatch(false)).toEqual({ hide_marks: false });
+  });
+
   it('panelPatch carries the snake_case panel shape, with its own copy of the sizes', () => {
     const layout = defaultLayout();
     const patch = panelPatch(layout);

@@ -1,5 +1,6 @@
 //! UI state in `<config_dir>/ui-state.json`: the agent panel's dock, size and open state, the font size, the last
-//! conversation used, and how the history list is grouped.
+//! conversation used, how the history list is grouped, and whether the terminal's command separators and agent labels
+//! are hidden.
 //!
 //! Reading is tolerant. Unknown fields are ignored, and each field that is missing or invalid becomes `None` on its
 //! own, so one bad value never loses the rest. A file that is not JSON at all reads as the default state, and it is
@@ -27,6 +28,8 @@ pub const UI_STATE_FILE: &str = "ui-state.json";
 const DOCKS: [&str; 4] = ["left", "top", "right", "bottom"];
 const HISTORY_GROUPS: [&str; 2] = ["date", "workspace"];
 const FONT_SIZES: RangeInclusive<u32> = 8..=32;
+/// The separators and agent labels are hidden unless the file says otherwise.
+const HIDE_MARKS_DEFAULT: bool = true;
 /// Largest accepted panel size, in pixels.
 const MAX_PANEL_SIZE: f64 = 20_000.0;
 
@@ -55,6 +58,14 @@ pub struct UiState {
     pub last_conversation_id: Option<String>,
     /// `date` or `workspace`.
     pub history_group_by: Option<String>,
+    /// Hides the terminal's command separators and agent labels (the exit-coloured stripes stay). Missing or invalid
+    /// in the file reads as the default, `true`.
+    #[serde(default = "hide_marks_default")]
+    pub hide_marks: bool,
+}
+
+fn hide_marks_default() -> bool {
+    HIDE_MARKS_DEFAULT
 }
 
 impl Default for UiState {
@@ -65,6 +76,7 @@ impl Default for UiState {
             font_size: None,
             last_conversation_id: None,
             history_group_by: None,
+            hide_marks: HIDE_MARKS_DEFAULT,
         }
     }
 }
@@ -81,6 +93,8 @@ pub struct UiStatePatch {
     pub last_conversation_id: Option<Option<String>>,
     #[serde(deserialize_with = "double_option")]
     pub history_group_by: Option<Option<String>>,
+    /// A boolean has no "clear", so `null` is the same as absent: the value is left alone.
+    pub hide_marks: Option<bool>,
 }
 
 /// Distinguishes an absent field (outer `None`, via `default`) from `null` (`Some(None)`).
@@ -128,6 +142,9 @@ impl UiStateStore {
         }
         if let Some(group) = patch.history_group_by {
             state.history_group_by = group;
+        }
+        if let Some(hide) = patch.hide_marks {
+            state.hide_marks = hide;
         }
         state.version = UI_STATE_VERSION;
         self.write(&state)?;
@@ -197,6 +214,7 @@ fn tolerant(value: &Value) -> UiState {
             .and_then(Value::as_str)
             .filter(|g| HISTORY_GROUPS.contains(g))
             .map(str::to_string),
+        hide_marks: obj.get("hide_marks").and_then(Value::as_bool).unwrap_or(HIDE_MARKS_DEFAULT),
     }
 }
 
@@ -311,6 +329,7 @@ mod tests {
             font_size: Some(Some(14)),
             last_conversation_id: Some(Some(id(1))),
             history_group_by: Some(Some("workspace".into())),
+            hide_marks: Some(false),
         };
         let written = s.patch(patch).unwrap();
         assert_eq!(s.load().unwrap(), written);
@@ -318,6 +337,7 @@ mod tests {
         assert_eq!(written.font_size, Some(14));
         assert_eq!(written.last_conversation_id, Some(id(1)));
         assert_eq!(written.history_group_by.as_deref(), Some("workspace"));
+        assert!(!written.hide_marks);
     }
 
     #[test]
@@ -532,6 +552,51 @@ mod tests {
         assert!(!s.path.parent().unwrap().exists());
         s.patch(patch_from(json!({"font_size": 11}))).unwrap();
         assert!(s.path.exists());
+    }
+
+    #[test]
+    fn hide_marks_defaults_to_true_and_an_old_file_without_it_loads_as_true() {
+        let tmp = TempDir::new();
+        assert!(store(&tmp).load().unwrap().hide_marks, "no file");
+        assert!(UiState::default().hide_marks);
+        // A file written before the setting existed has no hide_marks field.
+        let old = read_text(&tmp, r#"{"version": 1, "font_size": 12, "history_group_by": "date"}"#);
+        assert!(old.hide_marks);
+        assert_eq!(old.font_size, Some(12));
+    }
+
+    #[test]
+    fn hide_marks_must_be_a_boolean_or_it_reads_as_the_default() {
+        let tmp = TempDir::new();
+        assert!(read_text(&tmp, r#"{"hide_marks": "no"}"#).hide_marks);
+        assert!(read_text(&tmp, r#"{"hide_marks": 0}"#).hide_marks);
+        assert!(read_text(&tmp, r#"{"hide_marks": null}"#).hide_marks);
+        assert!(!read_text(&tmp, r#"{"hide_marks": false}"#).hide_marks);
+    }
+
+    #[test]
+    fn hide_marks_patch_sets_persists_and_null_leaves_it_alone() {
+        let tmp = TempDir::new();
+        let s = store(&tmp);
+        let off = s.patch(patch_from(json!({"hide_marks": false}))).unwrap();
+        assert!(!off.hide_marks);
+        assert!(!s.load().unwrap().hide_marks, "written to the file");
+
+        let untouched = s.patch(patch_from(json!({"font_size": 13}))).unwrap();
+        assert!(!untouched.hide_marks, "an absent field leaves it alone");
+
+        let null = s.patch(patch_from(json!({"hide_marks": null}))).unwrap();
+        assert!(!null.hide_marks, "null leaves it alone too");
+
+        let on = s.patch(patch_from(json!({"hide_marks": true}))).unwrap();
+        assert!(on.hide_marks);
+        assert!(s.load().unwrap().hide_marks);
+    }
+
+    #[test]
+    fn hide_marks_is_in_the_patch_default_as_absent() {
+        assert_eq!(UiStatePatch::default().hide_marks, None);
+        assert_eq!(patch_from(json!({"hide_marks": false})).hide_marks, Some(false));
     }
 
     #[test]
