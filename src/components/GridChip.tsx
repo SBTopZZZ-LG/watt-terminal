@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { gridInfo, term } from '../lib/terminal';
 import type { GridInfo } from '../lib/terminal';
+import { gridTip } from '../lib/gridTip';
 
 /** Shows xterm's grid as cols x rows. The tooltip has the numbers to report when the text looks clipped. */
 export function GridChip() {
@@ -16,13 +17,8 @@ export function GridChip() {
   if (info === null) {
     return <span className="chip chip-grid">--</span>;
   }
-  const title = [
-    `xterm cols ${info.cols}, rows ${info.rows}`,
-    `host ${info.hostWidth}px, grid ${info.screenWidth}px`,
-    `devicePixelRatio ${info.devicePixelRatio}`,
-  ].join('\n');
   return (
-    <span className="chip chip-grid" title={title}>
+    <span className="chip chip-grid" data-tip={gridTip(info)}>
       {`${info.cols}×${info.rows}`}
     </span>
   );

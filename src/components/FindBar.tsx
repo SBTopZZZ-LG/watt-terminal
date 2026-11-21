@@ -96,7 +96,7 @@ export function FindBar({ focusToken, onClose }: Props) {
         type="button"
         className="find-button"
         aria-label="Previous match"
-        title="Previous (Shift+Enter)"
+        data-tip="Previous (Shift+Enter)"
         onMouseDown={keepFocus}
         onClick={() => run(query, caseSensitive, 'prev', false)}
       >
@@ -106,7 +106,7 @@ export function FindBar({ focusToken, onClose }: Props) {
         type="button"
         className="find-button"
         aria-label="Next match"
-        title="Next (Enter)"
+        data-tip="Next (Enter)"
         onMouseDown={keepFocus}
         onClick={() => run(query, caseSensitive, 'next', false)}
       >
@@ -116,13 +116,14 @@ export function FindBar({ focusToken, onClose }: Props) {
         type="button"
         className={caseSensitive ? 'find-button is-on' : 'find-button'}
         aria-pressed={caseSensitive}
-        title="Match case"
+        aria-label="Match case"
+        data-tip="Match case"
         onMouseDown={keepFocus}
         onClick={toggleCase}
       >
         Aa
       </button>
-      <button type="button" className="find-button" aria-label="Close find" title="Close (Esc)" onMouseDown={keepFocus} onClick={onClose}>
+      <button type="button" className="find-button" aria-label="Close find" data-tip="Close (Esc)" onMouseDown={keepFocus} onClick={onClose}>
         ×
       </button>
     </div>

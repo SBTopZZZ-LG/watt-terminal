@@ -79,7 +79,8 @@ describe('StatusChip: the AI settings button', () => {
   it('is a button named "AI settings", with the shortcut in its title', () => {
     const tag = gearTag(chip(LLM_ON, OK));
     expect(tag).toContain('aria-label="AI settings"');
-    expect(tag).toContain('title="AI settings (Ctrl/Cmd+,)"');
+    expect(tag).toContain('data-tip="AI settings (Ctrl/Cmd+,)"');
+    expect(tag).not.toContain('title=');
     expect(tag).toContain('type="button"');
     expect(tag).not.toContain('chip-warn');
   });
@@ -211,6 +212,8 @@ describe('StatusChip: the location chip and the Integrate button', () => {
     expect(nestedStrip({ canIntegrate: false })).not.toContain('Integrate');
     const out = nestedStrip({ canIntegrate: true });
     expect(out).toMatch(/<button[^>]*chip-integrate[^>]*aria-label="Integrate this shell"[^>]*>Integrate<\/button>/);
+    expect(out).toContain('data-tip="Integrate this shell: the agent can then run commands in it. It asks first."');
+    expect(out).not.toContain('title=');
   });
 
   it('Integrate is in the right-hand group: just before the gear', () => {
@@ -313,6 +316,8 @@ describe('StatusChip: the agent integrates quietly (auto mode)', () => {
   it('is a label, not a button', () => {
     const out = strip({ integrating: true });
     expect(out).toMatch(/<span class="chip chip-integrating"[^>]*>Integrating…<\/span>/);
+    expect(out).toContain('data-tip="The agent is integrating this shell. It was allowed to do so without asking."');
+    expect(out).not.toContain('title=');
   });
 });
 

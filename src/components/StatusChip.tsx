@@ -98,7 +98,7 @@ export function StatusChip(props: Props) {
         {formatCwd(cwd)}
       </span>
       {integrating && (
-        <span className="chip chip-integrating" title="The agent is integrating this shell. It was allowed to do so without asking.">
+        <span className="chip chip-integrating" data-tip="The agent is integrating this shell. It was allowed to do so without asking.">
           Integrating…
         </span>
       )}
@@ -107,7 +107,7 @@ export function StatusChip(props: Props) {
           type="button"
           className="chip chip-integrate"
           aria-label="Integrate this shell"
-          title="Integrate this shell: the agent can then run commands in it. It asks first."
+          data-tip="Integrate this shell: the agent can then run commands in it. It asks first."
           onMouseDown={(e) => e.preventDefault()}
           onClick={onIntegrate}
         >
@@ -118,7 +118,7 @@ export function StatusChip(props: Props) {
         type="button"
         className={`chip chip-button chip-icon${broken ? ' chip-warn' : ''}`}
         aria-label={broken ? 'AI settings (needs attention)' : 'AI settings'}
-        title={`AI settings (${shortcutLabel('settings')})`}
+        data-tip={`AI settings (${shortcutLabel('settings')})`}
         onMouseDown={(e) => e.preventDefault()}
         onClick={onOpenSettings}
       >

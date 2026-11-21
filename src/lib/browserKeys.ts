@@ -1,7 +1,7 @@
 // Browser accelerators that would reload the page or open browser UI (Reload, Print, Save, View Source, Find Next, ...).
 // The guard only cancels the default action. It does not stop propagation, so the key still reaches the app and xterm:
 // xterm reads keydown on its textarea and does not check defaultPrevented (node_modules/@xterm/xterm/src/browser), so
-// Ctrl+R, Ctrl+S, Ctrl+U, Ctrl+P and Ctrl+G still reach the shell. Ctrl+F is not here: it is the find key (a later change).
+// Ctrl+R, Ctrl+S, Ctrl+U, Ctrl+P and Ctrl+G still reach the shell. Ctrl+F is not here because it is the find key (see appHotkeys.ts).
 
 import { IS_MAC } from './platform';
 
