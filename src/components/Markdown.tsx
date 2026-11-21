@@ -1,7 +1,10 @@
-import { memo } from 'react';
+import { memo, useEffect, useRef, useState } from 'react';
+import type { ComponentProps } from 'react';
 import ReactMarkdown from 'react-markdown';
 import type { Components, ExtraProps } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { copyText } from '../lib/clipboard';
+import { nodeText } from '../lib/codeText';
 
 /*
  * Agent replies, rendered as markdown.
@@ -42,12 +45,62 @@ function isDoneTask(node: ExtraProps['node']): boolean {
   return node?.children.some((child) => child.type === 'element' && child.tagName === 'input' && Boolean(child.properties.checked)) ?? false;
 }
 
+/** How long the copy result stays on screen. */
+const FEEDBACK_MS = 1500;
+
+/**
+ * A fenced block: the pre, and a copy button pinned to its top-right corner. The button sits beside the pre, not inside
+ * it, so it stays put when a wide line scrolls. It copies the raw text (see codeText.ts).
+ */
+function CodeBlock({ lang, children, ...pre }: ComponentProps<'pre'> & { lang: string }) {
+  return (
+    <div className="md-code">
+      <pre {...pre} data-lang={lang}>
+        {children}
+      </pre>
+      <CopyCodeButton text={nodeText(children)} />
+    </div>
+  );
+}
+
+type CopyState = 'idle' | 'copied' | 'failed';
+
+function CopyCodeButton({ text }: { text: string }) {
+  const [state, setState] = useState<CopyState>('idle');
+  const timer = useRef<number | undefined>(undefined);
+
+  useEffect(() => () => window.clearTimeout(timer.current), []);
+
+  const onClick = async () => {
+    const ok = await copyText(text, { clipboard: navigator.clipboard, document });
+    setState(ok ? 'copied' : 'failed');
+    window.clearTimeout(timer.current);
+    timer.current = window.setTimeout(() => setState('idle'), FEEDBACK_MS);
+  };
+
+  return (
+    <div className={`md-code-copy${state === 'idle' ? '' : ' shown'}`}>
+      {/* Its own live region, outside the button: a button's children are not announced. */}
+      <span className={`md-code-status${state === 'failed' ? ' failed' : ''}`} role="status" aria-live="polite">
+        {state === 'copied' ? 'Copied' : state === 'failed' ? 'Copy failed' : ''}
+      </span>
+      {/* Mouse-down keeps focus where it was, so the prompt keeps the focus it has (see inputFocus.ts). */}
+      <button type="button" className="md-code-button" aria-label="Copy code" onMouseDown={(e) => e.preventDefault()} onClick={onClick}>
+        <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="1.25" aria-hidden="true">
+          <rect x="5.5" y="5.5" width="8" height="8" rx="1" />
+          <path d="M10.5 5.5V3.5a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2" />
+        </svg>
+      </button>
+    </div>
+  );
+}
+
 const components: Components = {
   // Keep the link text. The URL is on hover, and nothing navigates.
   a: ({ href, children }) => <span className="md-link" title={href}>{children}</span>,
   // Never fetch an image. Show the alt text as plain text, and nothing when there is none.
   img: ({ alt }) => (alt ? <span className="md-img">{alt}</span> : null),
-  pre: ({ node, ...props }) => <pre {...props} data-lang={fenceLanguage(node)} />,
+  pre: ({ node, ...props }) => <CodeBlock {...props} lang={fenceLanguage(node)} />,
   // Wide tables scroll inside the panel instead of stretching it.
   table: ({ node, ...props }) => (
     <div className="md-table">

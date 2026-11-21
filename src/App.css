@@ -1543,6 +1543,80 @@ input {
   font-size: inherit;
 }
 
+/* A fenced block sits in a wrapper that holds the copy button, so the button does not scroll with a wide line. The
+   wrapper takes the pre's margin. The button shows on hover, on focus within, and while a copy result is shown. */
+.msg.agent .md .md-code {
+  position: relative;
+  margin: 0.9em 0;
+}
+
+.msg.agent .md .md-code > pre {
+  margin: 0;
+}
+
+.msg.agent .md .md-code-copy {
+  position: absolute;
+  top: 3px;
+  right: 4px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  opacity: 0;
+  transition: opacity 120ms ease;
+  user-select: none;
+}
+
+.msg.agent .md .md-code:hover .md-code-copy,
+.msg.agent .md .md-code:focus-within .md-code-copy,
+.msg.agent .md .md-code-copy.shown {
+  opacity: 1;
+}
+
+.msg.agent .md .md-code-status {
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ok);
+}
+
+.msg.agent .md .md-code-status.failed {
+  color: var(--warn);
+}
+
+.msg.agent .md .md-code-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 1px dashed var(--rule);
+  border-radius: 2px;
+  background: var(--code-bg);
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.msg.agent .md .md-code-button svg {
+  display: block;
+}
+
+.msg.agent .md .md-code-button:hover {
+  border-color: var(--rule-strong);
+  color: var(--accent);
+}
+
+.msg.agent .md .md-code-button:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .msg.agent .md .md-code-copy {
+    transition: none;
+  }
+}
+
 /* Wide tables scroll inside the wrapper, so they never stretch the panel. */
 .msg.agent .md .md-table {
   max-width: 100%;

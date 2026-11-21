@@ -62,6 +62,17 @@ describe('Markdown: rendering', () => {
     expect(html('Hello there.')).toBe('<div class="md"><p>Hello there.</p></div>');
   });
 
+  it('puts one copy button beside each fenced block and none on inline code', () => {
+    const out = html('Run `ls` first.\n\n```sh\nls -la\n```\n\n```\nplain\n```');
+    expect(out.match(/aria-label="Copy code"/g)).toHaveLength(2);
+    expect(out.match(/<button type="button" class="md-code-button" aria-label="Copy code"/g)).toHaveLength(2);
+    expect(out).toMatch(/<div class="md-code"><pre data-lang="sh">[\s\S]*?<\/pre><div class="md-code-copy">/);
+  });
+
+  it('puts no copy button in a message without a fenced block', () => {
+    expect(html('Use `ls`.')).not.toContain('Copy code');
+  });
+
   it('does not throw on an unclosed fence and keeps the partial text', () => {
     let out = '';
     expect(() => {
