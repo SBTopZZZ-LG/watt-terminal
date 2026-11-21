@@ -19,8 +19,8 @@ function copySelection(): void {
   });
 }
 
-/** Pastes the clipboard's text as typed text would be: through xterm, so bracketed paste applies. */
-async function pasteFromClipboard(): Promise<void> {
+/** Pastes the clipboard's text as typed text would be: through xterm, so bracketed paste applies. Ctrl+V and the context menu's Paste both use it. */
+export async function pasteFromClipboard(): Promise<void> {
   const text = await readClipboardText(navigator.clipboard);
   if (text === null) {
     reportError('Could not read the clipboard.');

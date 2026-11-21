@@ -85,6 +85,9 @@ export const term = new Terminal({
   fontFamily: terminalFontFamily(),
   fontSize: loadFontSize(defaultSizeStorage()),
   scrollback: 5000,
+  // A right click opens our context menu. xterm's default on macOS would first replace the selection with the word under
+  // the pointer, so the menu's Copy would lose the selection the user made.
+  rightClickSelectsWord: false,
   theme: THEME,
   // OSC 8 links never navigate: activation is ignored, matching the Markdown "nothing navigates" rule.
   // A future opener command can route links to the system browser from here.

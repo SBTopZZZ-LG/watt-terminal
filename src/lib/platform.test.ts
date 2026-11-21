@@ -49,6 +49,17 @@ describe('shortcutLabel', () => {
     expect(shortcutLabel('agent', false)).toBe('Ctrl+Shift+A');
     expect(shortcutLabel('settings', false)).toBe('Ctrl+,');
   });
+
+  it('names the context menu keys with Cmd on macOS and Ctrl elsewhere', () => {
+    expect(shortcutLabel('copy', true)).toBe('Cmd+C');
+    expect(shortcutLabel('copy', false)).toBe('Ctrl+C');
+    expect(shortcutLabel('copy-terminal', false)).toBe('Ctrl+Shift+C');
+    expect(shortcutLabel('paste', false)).toBe('Ctrl+V');
+    expect(shortcutLabel('find', true)).toBe('Cmd+F');
+    expect(shortcutLabel('find-terminal', false)).toBe('Ctrl+Shift+F');
+    expect(shortcutLabel('clear', true)).toBe('Cmd+K');
+    expect(shortcutLabel('clear', false)).toBe('Ctrl+Shift+K');
+  });
 });
 
 describe('terminalFontFamily', () => {

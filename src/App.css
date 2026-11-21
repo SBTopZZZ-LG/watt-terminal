@@ -4807,3 +4807,58 @@ a {
     animation: none;
   }
 }
+
+/*
+ * The context menu (src/components/ContextMenu.tsx): the tooltip's look, an inverted light card, so it reads as part of
+ * the same family. One fixed box, opened at the pointer or at the focused element. No animation.
+ */
+.context-menu {
+  position: fixed;
+  z-index: 61;
+  min-width: 170px;
+  max-width: 320px;
+  padding: 4px;
+  border: 1px solid var(--accent);
+  border-radius: 2px;
+  background: var(--tip-bg);
+  color: var(--tip-fg);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.4;
+  box-shadow: 3px 3px 0 var(--scrim), 0 0 14px rgba(111, 211, 255, 0.3);
+  outline: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.context-menu-item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 3px 8px;
+  border-radius: 2px;
+  cursor: default;
+  white-space: nowrap;
+}
+
+.context-menu-item.is-highlighted {
+  background: var(--tip-fg);
+  color: var(--tip-bg);
+}
+
+.context-menu-item.is-disabled {
+  opacity: 0.42;
+}
+
+.context-menu-shortcut {
+  opacity: 0.6;
+  font-size: 11px;
+}
+
+.context-menu-sep {
+  height: 0;
+  margin: 4px 2px;
+  border-top: 1px solid var(--tip-rule);
+  opacity: 0.35;
+}

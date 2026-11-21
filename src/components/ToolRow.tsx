@@ -97,9 +97,9 @@ export function ToolRow({ item }: { item: ToolItem }) {
         </div>
         <div role="tabpanel" id={`${uid}-panel-io`} aria-labelledby={`${uid}-tab-io`} hidden={tab !== 'io'} className="tool-panel">
           <div className="tool-io-label">Input</div>
-          <pre>{input === '' ? '(none)' : input}</pre>
+          <pre data-empty={input === '' ? '' : undefined}>{input === '' ? '(none)' : input}</pre>
           <div className="tool-io-label">Output</div>
-          <pre>{outputPlaceholder}</pre>
+          <pre data-empty={output === '' ? '' : undefined}>{outputPlaceholder}</pre>
         </div>
         <div role="tabpanel" id={`${uid}-panel-json`} aria-labelledby={`${uid}-tab-json`} hidden={tab !== 'json'} className="tool-panel">
           <pre>{toolJson(item.args, item.result)}</pre>

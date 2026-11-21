@@ -69,6 +69,7 @@ import { SettingsDialog } from './components/SettingsDialog';
 import { SettingsBanner } from './components/SettingsBanner';
 import { IntegrateDialog } from './components/IntegrateDialog';
 import { Tooltip } from './components/Tooltip';
+import { ContextMenu } from './components/ContextMenu';
 
 const CTRL_C = '\u0003';
 
@@ -740,6 +741,21 @@ export default function App() {
     if (origin instanceof HTMLElement && origin.isConnected) {
       origin.focus();
     }
+  };
+
+  // The context menu's find items: the same as Ctrl+Shift+F, and Ctrl+F in the agent panel (see the keydown listener).
+  const openTerminalFind = () => {
+    setFindOpen(true);
+    setFindToken((t) => t + 1);
+  };
+
+  const openChatFind = () => {
+    const active = document.activeElement;
+    if (!active?.closest('.chat-find')) {
+      chatFindOrigin.current = active;
+    }
+    setChatFindOpen(true);
+    setChatFindToken((t) => t + 1);
   };
 
   const sendRaw = (text: string) => {
@@ -1831,6 +1847,12 @@ export default function App() {
         integrate.kind !== 'closed' && <IntegrateDialog key="user" phase={integrate} onStart={startIntegrate} onClose={closeIntegrate} local={localShell} />
       )}
       <Tooltip />
+      <ContextMenu
+        terminal={{ state: effective, agentBusy: busy || sideBusy, pasteRoutesToPty: keyRoute.keys === 'pty' }}
+        onClearTerminal={() => clearTerminal(effectiveRef.current, handleTerminalInput)}
+        onFindTerminal={openTerminalFind}
+        onFindChat={openChatFind}
+      />
     </div>
   );
 }

@@ -75,7 +75,17 @@ describe('ToolRow: the panels', () => {
 
   it('a running row with no result yet says it is waiting for output', () => {
     const html = renderToStaticMarkup(<ToolRow item={row({ status: 'running', result: null, args: { command: 'sleep 9' } })} />);
-    expect(html).toContain('<pre>…waiting for output</pre>');
+    expect(html).toContain('<pre data-empty="">…waiting for output</pre>');
+  });
+
+  it('a placeholder pane is marked data-empty, and a pane with text is not', () => {
+    const empty = renderToStaticMarkup(<ToolRow item={row({ args: {}, result: {} })} />);
+    expect(empty).toContain('<pre data-empty="">(none)</pre>');
+    expect(empty).toContain('<pre data-empty="">(no output)</pre>');
+    const full = renderToStaticMarkup(<ToolRow item={row({ args: { command: 'ls' }, result: 'a.txt' })} />);
+    expect(full).toContain('<pre>ls</pre>');
+    expect(full).toContain('<pre>a.txt</pre>');
+    expect(full).not.toContain('data-empty=""');
   });
 
   it('a failed row shows its reason as the output', () => {
