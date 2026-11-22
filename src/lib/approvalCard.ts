@@ -3,6 +3,7 @@
 // with newlines as ⏎. Pure, so the choice is tested without the DOM.
 
 import type { ApprovalReasonCode } from './types';
+import { visibleEscapes, visiblePreviewEscapes } from './visibleEscapes';
 
 /** Whether `name` is a file write tool (core/fs_tools): its card shows the preview, in a block that keeps its lines. */
 export function isFileWrite(name: string): boolean {
@@ -12,4 +13,12 @@ export function isFileWrite(name: string): boolean {
 /** Whether the card shows its `display` instead of the command: send_keys, an external tool, or a file write. */
 export function showsDisplay(name: string, reason: ApprovalReasonCode | null): boolean {
   return name === 'send_keys' || reason === 'external_tool' || isFileWrite(name);
+}
+
+/**
+ * The card's text, escaped for `name`: a file write's preview keeps readable non-ASCII (visiblePreviewEscapes); every
+ * other card stays strict (visibleEscapes).
+ */
+export function previewText(name: string, text: string): string {
+  return isFileWrite(name) ? visiblePreviewEscapes(text) : visibleEscapes(text);
 }

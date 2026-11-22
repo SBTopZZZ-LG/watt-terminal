@@ -3,12 +3,11 @@
 // escaped preview the tool rows show (newlines as ⏎); a send_keys toast shows the decoded input instead, and a file write
 // shows its preview in a block that keeps the lines.
 
-import { isFileWrite, showsDisplay } from '../lib/approvalCard';
+import { isFileWrite, previewText, showsDisplay } from '../lib/approvalCard';
 import { capDisplay, displayText } from '../lib/keysDisplay';
 import type { Dock } from '../lib/panelLayout';
 import { MAX_COMMAND_PREVIEW_CHARS, MAX_SEND_KEYS_PREVIEW_CHARS } from '../lib/toolDisplay';
 import type { TranscriptItem } from '../lib/transcript';
-import { visibleEscapes } from '../lib/visibleEscapes';
 import { ApprovalCountdown } from './ApprovalCountdown';
 
 type ApprovalItem = Extract<TranscriptItem, { kind: 'approval' }>;
@@ -34,7 +33,7 @@ export function ApprovalToast({ approval, dock, onApprove, onOpen }: ApprovalToa
     <div className={`approval-toast dock-${dock}`} role="alertdialog" aria-label="Approval needed">
       <div className="approval-toast-title">Approval needed</div>
       {isFileWrite(approval.name) ? (
-        <pre className="approval-toast-preview">{visibleEscapes(preview)}</pre>
+        <pre className="approval-toast-preview">{previewText(approval.name, preview)}</pre>
       ) : (
         <code className="approval-toast-command" data-tip={displayText(preview)} data-tip-clip={[...preview].length > max ? undefined : ''}>
           {command}

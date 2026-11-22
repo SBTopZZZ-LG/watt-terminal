@@ -21,3 +21,24 @@ export function visibleEscapes(text: string): string {
   }
   return out;
 }
+
+// A letter, mark, number, punctuation or symbol. Everything else (controls, format characters, separators, private use,
+// unassigned, lone surrogates) is escaped.
+const READABLE_NON_ASCII = /^[\p{L}\p{M}\p{N}\p{P}\p{S}]$/u;
+
+/**
+ * For file-write previews, which are code and prose, not commands: tab and newline stay, and so does any readable
+ * non-ASCII character (é, —, →, emoji). Everything else is escaped as visibleEscapes escapes it. Iterates by code point.
+ */
+export function visiblePreviewEscapes(text: string): string {
+  let out = '';
+  for (const ch of text) {
+    const cp = ch.codePointAt(0) ?? 0;
+    if (cp === 0x09 || cp === 0x0a || (cp >= 0x20 && cp <= 0x7e) || (cp > 0x7e && READABLE_NON_ASCII.test(ch))) {
+      out += ch;
+    } else {
+      out += `\\u{${cp.toString(16).toUpperCase()}}`;
+    }
+  }
+  return out;
+}

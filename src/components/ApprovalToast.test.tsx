@@ -76,7 +76,7 @@ describe('ApprovalToast', () => {
   it('shows a file write as its preview in a block that keeps the lines', () => {
     const display = 'a.txt (new file, 2 lines)\nfirst\n\tsecond';
     const html = render({ ...RUN, name: 'write_file', text: display, display, reason: 'fs_write' });
-    expect(html).toContain('<pre class="approval-toast-preview">a.txt (new file, 2 lines)\nfirst\n\\u{9}second</pre>');
+    expect(html).toContain('<pre class="approval-toast-preview">a.txt (new file, 2 lines)\nfirst\n\tsecond</pre>');
     expect(html).not.toContain('approval-toast-command');
   });
 
