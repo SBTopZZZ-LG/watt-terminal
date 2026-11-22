@@ -94,6 +94,11 @@ impl Redactor {
         Redactor { secrets }
     }
 
+    /// This redactor's secrets plus `more`, with the same trimming and length rule as `new`.
+    pub fn with_secrets(&self, more: Vec<String>) -> Self {
+        Self::new(self.secrets.iter().cloned().chain(more).collect())
+    }
+
     /// Returns `text` with known secrets and credential-shaped text replaced. Applying it twice changes nothing more.
     pub fn redact(&self, text: &str) -> String {
         let mut out = text.to_string();
@@ -125,6 +130,12 @@ mod tests {
     fn known_secret_is_replaced_everywhere_it_appears() {
         let r = with(&["tok-value-123456"]);
         assert_eq!(r.redact("a tok-value-123456 b tok-value-123456"), "a [REDACTED] b [REDACTED]");
+    }
+
+    #[test]
+    fn with_secrets_keeps_the_old_secrets_and_adds_the_new_ones() {
+        let r = with(&["tok-value-123456"]).with_secrets(vec!["mcp-value-7890".into(), "abc".into()]);
+        assert_eq!(r.redact("tok-value-123456 mcp-value-7890 abc"), "[REDACTED] [REDACTED] abc");
     }
 
     #[test]

@@ -17,4 +17,5 @@ pub mod parse;
 pub mod result;
 pub mod runtime;
 pub mod secrets;
+pub mod service;
 pub mod tools;

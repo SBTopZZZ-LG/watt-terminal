@@ -492,6 +492,7 @@ describe('modelOptions and modelRefKey', () => {
     approval: { mode: 'manual', allow: [], deny: [], nested: 'ask' },
     integration: { agent_requests: 'ask' },
     limits: { max_model_calls: 50, model_calls_unlimited: false, max_poll_calls: 60, max_commands_per_turn: 30, max_wait_minutes: 30 },
+    mcp: { servers: [] },
   };
 
   it('lists every model of every provider in order, labelled "Provider · model"', () => {
@@ -557,6 +558,7 @@ describe('effectiveVariants and variantOptions', () => {
       approval: { mode: 'manual', allow: [], deny: [], nested: 'ask' },
       integration: { agent_requests: 'ask' },
       limits: { max_model_calls: 50, model_calls_unlimited: false, max_poll_calls: 60, max_commands_per_turn: 30, max_wait_minutes: 30 },
+      mcp: { servers: [] },
     };
     const ref = { provider_id: 'acme', model_id: 'big/one' };
     expect(variantOptions(settings, ref)).toEqual([

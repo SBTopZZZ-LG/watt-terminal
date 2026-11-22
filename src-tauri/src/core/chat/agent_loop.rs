@@ -529,6 +529,13 @@ impl LlmAgent {
         }
     }
 
+    /// Adds secret values this turn's output must never show, on top of the key and headers (MCP server values come this
+    /// way). Used by the turn's transcript, its checkpoints and its tool results.
+    pub fn with_extra_secrets(mut self, values: Vec<String>) -> Self {
+        self.redactor = self.redactor.with_secrets(values);
+        self
+    }
+
     /// The caps this turn runs under: the saved limits, read per user message. The default is the saved default.
     pub fn with_limits(mut self, limits: LimitsSettings) -> Self {
         self.limits = limits;

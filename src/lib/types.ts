@@ -476,6 +476,76 @@ export interface Settings {
   approval: ApprovalSettings;
   integration: IntegrationSettings;
   limits: LimitsSettings;
+  mcp: McpSettings;
+}
+
+/** The approval level of an MCP server or of one tool. `never` means the tool is not offered to the model. */
+export type McpLevel = 'ask' | 'auto' | 'never';
+
+/** How the app reaches an MCP server. `type` is the tag. Env and header values are never here, only their names. */
+export type McpTransport =
+  | { type: 'stdio'; command: string; args: string[]; cwd?: string; env: string[] }
+  | { type: 'http'; url: string; headers: string[] };
+
+/** One MCP server as saved. `tools` holds the per-tool overrides, keyed by the server's own tool name. */
+export interface McpServerConfig {
+  name: string;
+  enabled: boolean;
+  approval: McpLevel;
+  tools?: Record<string, McpLevel>;
+  timeout_secs?: number;
+  transport: McpTransport;
+}
+
+export interface McpSettings {
+  servers: McpServerConfig[];
+}
+
+/** A server's live state. `kind` is the tag. */
+export type McpStateView =
+  | { kind: 'disabled' }
+  | { kind: 'connecting' }
+  | { kind: 'connected'; tools: number }
+  | { kind: 'failed'; message: string }
+  | { kind: 'needs_auth'; message: string };
+
+export interface McpToolView {
+  name: string;
+  description: string;
+  /** The tool's own level, or null when it inherits the server's. */
+  override: McpLevel | null;
+  /** The level the model's calls to the tool are gated at. */
+  effective: McpLevel;
+}
+
+/** The names of the secrets stored for a server. Never their values. */
+export interface McpSecretsPresent {
+  env: string[];
+  headers: string[];
+}
+
+export interface McpServerView {
+  config: McpServerConfig;
+  state: McpStateView;
+  tools: McpToolView[];
+  secrets_present: McpSecretsPresent;
+}
+
+export interface McpView {
+  servers: McpServerView[];
+}
+
+export interface McpImportResult {
+  view: McpView;
+  added: string[];
+  warnings: string[];
+}
+
+/** One server as the settings UI saves it. Values are sent once and never returned. An absent name keeps its stored value. */
+export interface McpServerInput {
+  config: McpServerConfig;
+  env_values: Record<string, string>;
+  header_values: Record<string, string>;
 }
 
 /** Which secrets a provider has stored. Never their values. */

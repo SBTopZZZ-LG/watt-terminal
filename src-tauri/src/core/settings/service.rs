@@ -39,6 +39,7 @@ use super::{
     SettingsError, last_good_path, read_checked, save, settings_path, write_private_atomic,
 };
 use crate::core::chat::agent_loop::{LlmSettings, USER_AGENT, new_conversation_id};
+use crate::core::mcp::config::McpSettings;
 use crate::core::chat::redact::Redactor;
 use crate::core::llm::{self, ChatRequest, ProviderConfig, TurnCancel};
 use crate::core::persist::now_secs;
@@ -336,6 +337,31 @@ impl SettingsService {
         candidate.validate().map_err(|problems| problems.join("; "))?;
         self.commit(candidate)?;
         self.view()
+    }
+
+    /// Like `change_settings`, with `secrets` applied in the same save: when settings.json cannot be written, the secrets
+    /// go back. `change` may refuse; a refusal changes nothing. Returns no view (the caller builds its own).
+    pub fn change_settings_with_secrets(
+        &self,
+        change: impl FnOnce(&mut Settings) -> Result<(), String>,
+        secrets: impl FnOnce(&mut SecretMap),
+    ) -> Result<(), String> {
+        let _write = lock(&self.write);
+        let mut candidate = self.writable()?;
+        change(&mut candidate)?;
+        candidate.validate().map_err(|problems| problems.join("; "))?;
+        let before = self.change_secrets(secrets)?;
+        self.commit_with_secrets(candidate, before)
+    }
+
+    /// The MCP settings (core/mcp). Refused while settings.json is broken, like the other reads that run servers.
+    pub fn mcp_settings(&self) -> Result<McpSettings, String> {
+        Ok(self.usable()?.mcp)
+    }
+
+    /// The secret store this service reads and writes. The MCP service shares it, so both use one cache.
+    pub fn secrets(&self) -> Arc<Secrets> {
+        self.secrets.clone()
     }
 
     pub fn view(&self) -> Result<SettingsView, String> {

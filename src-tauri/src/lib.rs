@@ -57,6 +57,8 @@ use crate::core::settings::service::{
     test_model,
 };
 use crate::core::settings::{AgentRequests, ApprovalSettings, IntegrationSettings, LimitsSettings, ModelRef, Nested};
+use crate::core::mcp::config::McpLevel;
+use crate::core::mcp::service::{McpImportResult, McpServerInput, McpService, McpView, TurnMcp};
 use crate::core::tools::SessionTools;
 
 type Reg = Registry<Attached>;
@@ -245,6 +247,16 @@ const NO_SETTINGS: &str = "AI settings are unavailable: the app folders could no
 
 impl SettingsState {
     fn get(&self) -> Result<Arc<SettingsService>, String> {
+        self.0.clone().ok_or_else(|| NO_SETTINGS.to_string())
+    }
+}
+
+/// The MCP servers (core/mcp/service.rs). `None` when the app folders could not be found, as for `SettingsState`. Nothing
+/// starts here: the runtime starts on the first MCP command or model turn.
+struct McpState(Option<Arc<McpService>>);
+
+impl McpState {
+    fn get(&self) -> Result<Arc<McpService>, String> {
         self.0.clone().ok_or_else(|| NO_SETTINGS.to_string())
     }
 }
@@ -585,6 +597,9 @@ async fn agent_message(
         }
     }
     let store = persist.0.clone();
+    // The MCP tools of this turn (LLM turns only). Set below when the servers are available.
+    let mcp_service = app.state::<McpState>().0.clone();
+    let mut mcp_turn: Option<TurnMcp> = None;
     // Only the LLM agent writes history, so only its turns are saved. The mock agent never touches the history, and it
     // ignores attachments.
     let (mut llm, saved) = match chosen {
@@ -604,6 +619,18 @@ async fn agent_message(
                     context: att.conversation.last_usage(),
                 });
                 let checkpoint = checkpoint_saver(store.clone(), att.clone(), state.clone());
+                // The servers start on the first turn that needs them. If they cannot be read, this turn runs without MCP
+                // tools, and the user is told why.
+                if let Some(service) = mcp_service.clone() {
+                    match blocking(move || service.for_turn()).await {
+                        Ok(turn) => mcp_turn = Some(turn),
+                        Err(e) => {
+                            att.channels.send_json(&AgentEvent::Notice {
+                                text: format!("MCP tools are not available this turn: {e}"),
+                            });
+                        }
+                    }
+                }
                 let mut agent = LlmAgent::new(client, llm_settings, &conversation_id, history, todos, cancel.clone())
                     // The note is taken only by a turn that calls the model: a turn that fails to start keeps it.
                     .with_resume_note(att.conversation.take_resume_note())
@@ -613,7 +640,8 @@ async fn agent_message(
                     .with_no_vision(att.conversation.no_vision())
                     .with_calibration(att.conversation.calibration())
                     .with_learned_limits(att.conversation.learned_limits())
-                    .with_last_usage(att.conversation.last_usage());
+                    .with_last_usage(att.conversation.last_usage())
+                    .with_extra_secrets(mcp_turn.as_ref().map_or_else(Vec::new, |turn| turn.secret_values.clone()));
                 if let Some(persist) = store.as_ref() {
                     agent = agent.with_attachments(persist.conversations.attachments().clone());
                 }
@@ -627,6 +655,7 @@ async fn agent_message(
     };
     let message = UserMessage { text, attachments: prepared.attachments };
     let worker = att.clone();
+    let settle_cancel = cancel.clone();
     let spawned = thread::Builder::new().name("agent".into()).spawn(move || {
         // Runs on panic too, so a crashed turn cannot leave the agent busy or in control of the shell.
         let _end = OnDrop::new(|| worker.end_turn());
@@ -639,7 +668,15 @@ async fn agent_message(
             }
             channels.send_json(&ev);
         };
-        let ctx = AgentCtx::new(&tools, &worker.approvals, &emit).with_policy(policy.as_ref()).with_rules(rules);
+        // The turn that starts the servers waits for them to connect, so their tools are offered this turn.
+        if let Some(turn) = mcp_turn.as_ref() {
+            turn.settle(&settle_cancel);
+        }
+        let base = AgentCtx::new(&tools, &worker.approvals, &emit).with_policy(policy.as_ref()).with_rules(rules);
+        let ctx = match mcp_turn.as_ref() {
+            Some(turn) => base.with_external_tools(&*turn.manager, &settle_cancel),
+            None => base,
+        };
         match llm.as_mut() {
             Some(agent) => agent::run_turn(agent, &message, &ctx),
             None => agent::run_turn(&mut MockAgent, &message, &ctx),
@@ -1483,6 +1520,70 @@ async fn test_connection(
     Ok(test_model(client, &plan).await)
 }
 
+/// The MCP servers as saved, with their live state and tools. Starts the servers on first use. Holds no secret value.
+#[tauri::command]
+async fn get_mcp(mcp: State<'_, McpState>) -> Result<McpView, String> {
+    let service = mcp.get()?;
+    blocking(move || service.view()).await
+}
+
+/// Adds the servers of a pasted `mcpServers` list. Refused as a whole, naming the servers, when a name already exists.
+#[tauri::command]
+async fn mcp_import(text: String, mcp: State<'_, McpState>) -> Result<McpImportResult, String> {
+    let service = mcp.get()?;
+    blocking(move || service.import(&text)).await
+}
+
+/// Adds a server or replaces the one with its name. Secret values are kept in the secret store (see `McpService::save_server`).
+#[tauri::command]
+async fn mcp_save_server(input: McpServerInput, mcp: State<'_, McpState>) -> Result<McpView, String> {
+    let service = mcp.get()?;
+    blocking(move || service.save_server(input)).await
+}
+
+#[tauri::command]
+async fn mcp_remove_server(name: String, mcp: State<'_, McpState>) -> Result<McpView, String> {
+    let service = mcp.get()?;
+    blocking(move || service.remove_server(&name)).await
+}
+
+#[tauri::command]
+async fn mcp_set_enabled(name: String, enabled: bool, mcp: State<'_, McpState>) -> Result<McpView, String> {
+    let service = mcp.get()?;
+    blocking(move || service.set_enabled(&name, enabled)).await
+}
+
+#[tauri::command]
+async fn mcp_set_server_approval(name: String, level: McpLevel, mcp: State<'_, McpState>) -> Result<McpView, String> {
+    let service = mcp.get()?;
+    blocking(move || service.set_server_approval(&name, level)).await
+}
+
+/// Sets one tool's level, or clears its override with null (the tool then inherits the server's level).
+#[tauri::command]
+async fn mcp_set_tool_approval(
+    name: String,
+    tool: String,
+    level: Option<McpLevel>,
+    mcp: State<'_, McpState>,
+) -> Result<McpView, String> {
+    let service = mcp.get()?;
+    blocking(move || service.set_tool_approval(&name, &tool, level)).await
+}
+
+#[tauri::command]
+async fn mcp_restart(name: String, mcp: State<'_, McpState>) -> Result<McpView, String> {
+    let service = mcp.get()?;
+    blocking(move || service.restart(&name)).await
+}
+
+/// The last log lines of a server, oldest first.
+#[tauri::command]
+async fn mcp_logs(name: String, mcp: State<'_, McpState>) -> Result<Vec<String>, String> {
+    let service = mcp.get()?;
+    blocking(move || service.logs(&name)).await
+}
+
 /// The bundle identifier before the rename to Watt, and the current one (tauri.conf.json). On macOS the app's data
 /// folder is named after the identifier, so the old folder is copied to the new one once (`migrate_app_folder`).
 #[cfg(target_os = "macos")]
@@ -1554,6 +1655,7 @@ pub fn run() {
             // Loads settings.json only. The secret store is read on first use, so startup never touches the Keychain.
             let settings = resolve_config_dir(app.handle())
                 .map(|dir| Arc::new(SettingsService::new(&dir, Arc::new(Secrets::from_env(&dir)))));
+            app.manage(McpState(settings.as_ref().map(|s| Arc::new(McpService::new(s.clone())))));
             app.manage(SettingsState(settings));
             Ok(())
         })
@@ -1602,7 +1704,16 @@ pub fn run() {
             approval_builtin_deny,
             provider_presets,
             fetch_models,
-            test_connection
+            test_connection,
+            get_mcp,
+            mcp_import,
+            mcp_save_server,
+            mcp_remove_server,
+            mcp_set_enabled,
+            mcp_set_server_approval,
+            mcp_set_tool_approval,
+            mcp_restart,
+            mcp_logs
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
@@ -1611,6 +1722,10 @@ pub fn run() {
             // Kill every shell. Session::kill sends SIGKILL, so zsh does not rewrite the user's history.
             for att in app.state::<Reg>().take_all() {
                 att.session.kill();
+            }
+            // Stops the MCP servers, if they were started. Idempotent.
+            if let Ok(mcp) = app.state::<McpState>().get() {
+                mcp.shutdown();
             }
         }
     });
