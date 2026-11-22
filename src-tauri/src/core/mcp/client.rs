@@ -18,7 +18,9 @@ use tokio::process::ChildStderr;
 use tokio::sync::mpsc::UnboundedSender;
 
 #[cfg(windows)]
-use process_wrap::tokio::JobObject;
+use process_wrap::tokio::{CreationFlags, JobObject};
+#[cfg(windows)]
+use windows::Win32::System::Threading::{CREATE_NO_WINDOW, PROCESS_CREATION_FLAGS};
 #[cfg(unix)]
 use process_wrap::tokio::ProcessGroup;
 
@@ -120,6 +122,8 @@ fn spawn_stdio(
         c.envs(&env);
     });
     #[cfg(windows)]
+    wrapped.wrap(CreationFlags(stdio_creation_flags()));
+    #[cfg(windows)]
     wrapped.wrap(JobObject);
     #[cfg(unix)]
     wrapped.wrap(ProcessGroup::leader());
@@ -127,6 +131,13 @@ fn spawn_stdio(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("could not start the server process: {e}"))
+}
+
+/// The creation flags of a stdio server on Windows. CREATE_NO_WINDOW: a console program (such as `uvx`) gets no console
+/// window of its own. Set through `CreationFlags`, which JobObject keeps (a flag set on the Command would be lost).
+#[cfg(windows)]
+fn stdio_creation_flags() -> PROCESS_CREATION_FLAGS {
+    CREATE_NO_WINDOW
 }
 
 /// The most bytes of one stderr line that are kept. A longer line keeps its first bytes; the rest is read and dropped.
@@ -265,6 +276,13 @@ mod tests {
         let bad_value = vec![("X-Key".to_string(), "line\nbreak-secret".to_string())];
         let err = http_config("https://x.test/mcp", &bad_value).unwrap_err();
         assert!(err.contains("X-Key") && !err.contains("line"), "{err}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stdio_servers_start_with_the_no_window_creation_flag() {
+        const CREATE_NO_WINDOW_BIT: u32 = 0x0800_0000;
+        assert_ne!(stdio_creation_flags().0 & CREATE_NO_WINDOW_BIT, 0);
     }
 
     #[tokio::test]
