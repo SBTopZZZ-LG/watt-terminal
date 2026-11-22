@@ -335,7 +335,7 @@ export interface UiState {
   queue_mode: QueueMode | null;
   /** Hides the terminal's command separators and agent labels. Always a boolean: true when the file has no value. */
   hide_marks: boolean;
-  /** Suggests follow-up prompts after each reply (one extra model call per reply). Always a boolean: false when the file has no value. */
+  /** Suggests follow-up prompts after each reply (one extra model call per reply). Always a boolean: true when the file has no value. */
   suggest_prompts: boolean;
   /** Shows a system notification when the agent is done or asks something while Watt is in the background. Always a boolean: true when the file has no value. */
   notifications: boolean;
@@ -352,8 +352,7 @@ export interface UiStatePatch {
   hide_marks?: boolean;
   /** As `hide_marks`: a boolean, so `null` is ignored too. */
   suggest_prompts?: boolean;
-  /** As \hide_marks\: a boolean, so \
-ull\ is ignored too. */
+  /** As `hide_marks`: a boolean, so `null` is ignored too. */
   notifications?: boolean;
 }
 

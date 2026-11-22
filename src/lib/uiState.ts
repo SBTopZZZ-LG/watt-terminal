@@ -59,7 +59,7 @@ export function hideMarksPatch(hide: boolean): UiStatePatch {
   return { hide_marks: hide };
 }
 
-/** The suggest-prompts setting from the file, or null when the file has no boolean for it (off then applies). Nothing is migrated. */
+/** The suggest-prompts setting from the file, or null when the file has no boolean for it (on then applies). Nothing is migrated. */
 export function reconcileSuggestPrompts(remote: boolean | null | undefined): boolean | null {
   return typeof remote === 'boolean' ? remote : null;
 }

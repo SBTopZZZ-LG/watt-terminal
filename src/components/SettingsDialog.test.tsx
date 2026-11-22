@@ -505,7 +505,7 @@ describe('SettingsDialog: suggested prompts', () => {
       const on = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} hideMarks onHideMarksChange={NOOP} queueMode="all" onQueueModeChange={NOOP} suggestPrompts onSuggestPromptsChange={NOOP} notifications onNotificationsChange={NOOP} />);
       expect(on).toContain('Suggested prompts');
       expect(on).toMatch(/<input type="checkbox"[^>]*checked=""[^>]*\/>Suggest follow-up prompts after each reply/);
-      expect(on).toContain('Makes one extra model call per reply. Off by default.');
+      expect(on).toContain('Makes one extra model call per reply. On by default.');
       const off = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} hideMarks onHideMarksChange={NOOP} queueMode="all" onQueueModeChange={NOOP} suggestPrompts={false} onSuggestPromptsChange={NOOP} notifications onNotificationsChange={NOOP} />);
       expect(off).toMatch(/<input type="checkbox"[^>]*\/>Suggest follow-up prompts after each reply/);
       expect(off).not.toMatch(/<input type="checkbox"[^>]*checked=""[^>]*\/>Suggest follow-up/);

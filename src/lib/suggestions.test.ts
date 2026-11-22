@@ -10,7 +10,7 @@ describe('shouldSuggest', () => {
     expect(shouldSuggest(READY)).toBe(true);
   });
 
-  it('asks for nothing while the setting is off (it is off by default)', () => {
+  it('asks for nothing while the setting is off', () => {
     expect(shouldSuggest({ ...READY, enabled: false })).toBe(false);
   });
 

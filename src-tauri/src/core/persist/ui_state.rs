@@ -32,6 +32,8 @@ const QUEUE_MODES: [&str; 2] = ["all", "one"];
 const FONT_SIZES: RangeInclusive<u32> = 8..=32;
 /// The separators and agent labels are hidden unless the file says otherwise.
 const HIDE_MARKS_DEFAULT: bool = true;
+/// Suggested prompts are on unless the file says otherwise. An explicit `false` in the file is kept.
+const SUGGEST_PROMPTS_DEFAULT: bool = true;
 /// Desktop notifications (agent done, or asking something, while Watt is in the background) are on unless the file says otherwise.
 const NOTIFICATIONS_DEFAULT: bool = true;
 /// Largest accepted panel size, in pixels.
@@ -69,8 +71,8 @@ pub struct UiState {
     #[serde(default = "hide_marks_default")]
     pub hide_marks: bool,
     /// After each reply, asks the model for a few follow-up prompts shown under the input. One extra model call per
-    /// reply, so it is off unless the file says otherwise. Missing or invalid reads as `false`.
-    #[serde(default)]
+    /// reply. Missing or invalid in the file reads as the default, `true`.
+    #[serde(default = "suggest_prompts_default")]
     pub suggest_prompts: bool,
     /// System notification when the agent is done or asks something while Watt is in the background. Missing or invalid
     /// in the file reads as the default, `true`.
@@ -80,6 +82,10 @@ pub struct UiState {
 
 fn hide_marks_default() -> bool {
     HIDE_MARKS_DEFAULT
+}
+
+fn suggest_prompts_default() -> bool {
+    SUGGEST_PROMPTS_DEFAULT
 }
 
 fn notifications_default() -> bool {
@@ -96,7 +102,7 @@ impl Default for UiState {
             history_group_by: None,
             queue_mode: None,
             hide_marks: HIDE_MARKS_DEFAULT,
-            suggest_prompts: false,
+            suggest_prompts: SUGGEST_PROMPTS_DEFAULT,
             notifications: NOTIFICATIONS_DEFAULT,
         }
     }
@@ -256,7 +262,7 @@ fn tolerant(value: &Value) -> UiState {
             .filter(|m| QUEUE_MODES.contains(m))
             .map(str::to_string),
         hide_marks: obj.get("hide_marks").and_then(Value::as_bool).unwrap_or(HIDE_MARKS_DEFAULT),
-        suggest_prompts: obj.get("suggest_prompts").and_then(Value::as_bool).unwrap_or(false),
+        suggest_prompts: obj.get("suggest_prompts").and_then(Value::as_bool).unwrap_or(SUGGEST_PROMPTS_DEFAULT),
         notifications: obj.get("notifications").and_then(Value::as_bool).unwrap_or(NOTIFICATIONS_DEFAULT),
     }
 }
@@ -683,14 +689,15 @@ mod tests {
     }
 
     #[test]
-    fn suggest_prompts_is_off_by_default_and_a_boolean_only() {
+    fn suggest_prompts_is_on_by_default_and_a_boolean_only() {
         let tmp = TempDir::new();
-        assert!(!store(&tmp).load().unwrap().suggest_prompts, "no file");
-        assert!(!UiState::default().suggest_prompts);
-        assert!(!read_text(&tmp, r#"{"font_size": 12}"#).suggest_prompts, "an old file has none");
+        assert!(store(&tmp).load().unwrap().suggest_prompts, "no file");
+        assert!(UiState::default().suggest_prompts);
+        assert!(read_text(&tmp, r#"{"font_size": 12}"#).suggest_prompts, "an old file has none");
         assert!(read_text(&tmp, r#"{"suggest_prompts": true}"#).suggest_prompts);
-        assert!(!read_text(&tmp, r#"{"suggest_prompts": "yes"}"#).suggest_prompts);
-        assert!(!read_text(&tmp, r#"{"suggest_prompts": 1}"#).suggest_prompts);
+        assert!(!read_text(&tmp, r#"{"suggest_prompts": false}"#).suggest_prompts, "an explicit false is kept");
+        assert!(read_text(&tmp, r#"{"suggest_prompts": "yes"}"#).suggest_prompts, "non-boolean falls back to the default");
+        assert!(read_text(&tmp, r#"{"suggest_prompts": 1}"#).suggest_prompts, "non-boolean falls back to the default");
     }
 
     #[test]

@@ -9,7 +9,7 @@ export interface SuggestSectionProps {
 
 /**
  * The suggested-prompts section of the AI settings: whether the agent proposes a few follow-up prompts after each reply.
- * An immediate preference, like the Terminal section, so it has no Save and no draft. Off by default: it costs one extra
+ * An immediate preference, like the Terminal section, so it has no Save and no draft. On by default: it costs one extra
  * model call per reply.
  */
 export function SuggestSection({ suggestPrompts, onSuggestPromptsChange }: SuggestSectionProps) {
@@ -29,7 +29,7 @@ export function SuggestSection({ suggestPrompts, onSuggestPromptsChange }: Sugge
         Suggest follow-up prompts after each reply
       </label>
       <span className="settings-hint" id={`${uid}-suggest-help`}>
-        Makes one extra model call per reply. Off by default. Applies at once.
+        Makes one extra model call per reply. On by default. Applies at once.
       </span>
     </section>
   );
