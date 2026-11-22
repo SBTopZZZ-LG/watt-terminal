@@ -6,7 +6,7 @@ mod common;
 
 use std::sync::Mutex;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use watt_terminal_lib::core::agent::{AgentCtx, AgentEvent, ApprovalGate, DENIED, TurnRules};
 use watt_terminal_lib::core::foreground::ForegroundKind;
@@ -25,14 +25,111 @@ fn wait_foreground(s: &Session, kind: ForegroundKind) -> bool {
     wait_until(WAIT, || (s.foreground().map(|f| f.kind) == Some(kind)).then_some(())).is_some()
 }
 
+/// Waits until the screen of `s` has been still for `quiet`. False on timeout (WAIT).
+fn wait_screen_quiet(s: &Session, quiet: Duration) -> bool {
+    let end = Instant::now() + WAIT;
+    let mut seen = s.activity().screen_gen;
+    let mut still_since = Instant::now();
+    loop {
+        thread::sleep(Duration::from_millis(20));
+        let generation = s.activity().screen_gen;
+        if generation != seen {
+            seen = generation;
+            still_since = Instant::now();
+        }
+        if still_since.elapsed() >= quiet {
+            return true;
+        }
+        if Instant::now() >= end {
+            return false;
+        }
+    }
+}
+
 /// A session at a prompt with `zsh -f -i` running in the foreground, not yet integrated.
 fn nested_zsh_session() -> Harness {
     let s = start();
-    wait_prompt(&s);
-    s.submit(Source::User, NESTED_ZSH).expect("submit the nested shell");
-    assert!(wait_foreground(&s, ForegroundKind::Shell), "state {:?}", s.state());
-    assert!(wait_program_up(&s, NESTED_ZSH), "the nested shell never drew its prompt");
+    open_nested_zsh(&s);
     s
+}
+
+/// Starts `zsh -f -i` at the local prompt of `s`, and waits until it has drawn its prompt.
+fn open_nested_zsh(s: &Session) {
+    wait_prompt(s);
+    s.submit(Source::User, NESTED_ZSH).expect("submit the nested shell");
+    assert!(wait_foreground(s, ForegroundKind::Shell), "state {:?}", s.state());
+    assert!(wait_program_up(s, NESTED_ZSH), "the nested shell never drew its prompt");
+}
+
+/// Linux procfs: the `stat` and `wchan` of `pid`, and its direct children (pid and comm from `stat`).
+fn proc_lines(pid: u32) -> String {
+    let read = |f: &str| std::fs::read_to_string(format!("/proc/{pid}/{f}")).unwrap_or_default();
+    let stat = read("stat");
+    let mut out = format!("  pid={pid} stat={:?} wchan={:?}\n", stat.trim(), read("wchan").trim());
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return out;
+    };
+    for entry in dir.flatten() {
+        let Ok(child) = entry.file_name().to_string_lossy().parse::<u32>() else { continue };
+        let Ok(cstat) = std::fs::read_to_string(format!("/proc/{child}/stat")) else { continue };
+        // Fields after the last ')' are: state ppid ...; comm may itself contain spaces or ')'.
+        let Some(after) = cstat.rfind(')').map(|i| &cstat[i + 1..]) else { continue };
+        let mut fields = after.split_whitespace();
+        let _state = fields.next();
+        if fields.next().and_then(|p| p.parse::<u32>().ok()) == Some(pid) {
+            let wchan = std::fs::read_to_string(format!("/proc/{child}/wchan")).unwrap_or_default();
+            out.push_str(&format!("  child pid={child} stat={:?} wchan={:?}\n", cstat.trim(), wchan.trim()));
+        }
+    }
+    out
+}
+
+/// The `run_command` Err path of the nested-prompt test: panics with what the harness sees, so a flake names its cause. It first
+/// waits up to 10 s more for the prompt (state Prompt and a prompt count above `before`), and reports whether it came late.
+fn run_command_failure(s: &Session, raw: &Mutex<Vec<u8>>, before: u64, call_at: Instant, err: &str) -> ! {
+    let err_at = Instant::now();
+    let late = wait_until(Duration::from_secs(10), || {
+        (s.state() == InputState::Prompt && s.prompt_count() > before).then(Instant::now)
+    });
+    let late = match late {
+        Some(at) => format!(
+            "prompt ARRIVED late: {}ms after the Err, {}ms after the call",
+            at.duration_since(err_at).as_millis(),
+            at.duration_since(call_at).as_millis()
+        ),
+        None => format!("prompt did NOT arrive within 10s after the Err (prompt_count now {}, before the call {before})", s.prompt_count()),
+    };
+    let bytes = raw.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let tail = &bytes[bytes.len().saturating_sub(4096)..];
+    let snap = s.screen_snapshot();
+    let procs = s.shell_pid().map(proc_lines).unwrap_or_else(|| "  (no shell pid)\n".into());
+    panic!(
+        "run_command failed: {err}
+late prompt: {late}
+state={:?} prompt_count before-call={before} now={} user_writes={} typed_since_prompt={}
+levels={:?}
+foreground={:?}
+records={:?}
+shell_pid={:?} procfs (local shell and its children):
+{procs}screen size={:?} cursor={:?} alternate={}
+rows:
+{}
+raw bytes total={} tail(4096)={:?}",
+        s.state(),
+        s.prompt_count(),
+        s.user_writes(),
+        s.user_typed_since_prompt(),
+        s.levels(),
+        s.foreground(),
+        s.records(),
+        s.shell_pid(),
+        snap.size,
+        snap.cursor,
+        snap.alternate_screen,
+        snap.rows.iter().enumerate().map(|(i, r)| format!("  {i:2}|{r}")).collect::<Vec<_>>().join("\n"),
+        bytes.len(),
+        String::from_utf8_lossy(tail),
+    );
 }
 
 /// Leaves the nested shell the user opened, and waits for the local prompt again.
@@ -267,7 +364,8 @@ fn the_granted_result_is_text() {
 #[test]
 fn typed_text_at_a_nested_prompt_is_cleared_before_run_command() {
     let _g = serial();
-    let s = nested_zsh_session();
+    let (s, raw) = start_recording();
+    open_nested_zsh(&s);
     let tools = SessionTools::new(&s);
     let gate = ApprovalGate::with_timeout(Duration::from_secs(5));
     let emit = |_: AgentEvent| {};
@@ -276,11 +374,24 @@ fn typed_text_at_a_nested_prompt_is_cleared_before_run_command() {
     ctx.call_tool("request_integration", json!({})).expect("integrated");
     assert!(wait_state(&s, InputState::Prompt, WAIT), "state {:?}", s.state());
 
+    // Type only once the nested shell has settled. Bytes written right after its prompt start can be lost while zsh switches
+    // its line editor on, so the Ctrl-C that run_command sends after them is not acted on. Then wait for the echo.
+    assert!(wait_screen_quiet(&s, PROGRAM_QUIET), "the nested prompt never settled: {:?}", s.screen_snapshot().rows);
     s.write_user(b"echo user-typed").expect("the user types at the nested prompt");
     assert!(wait_until(WAIT, || s.user_typed_since_prompt().then_some(())).is_some(), "the typed text is not counted");
+    assert!(
+        wait_until(Duration::from_secs(5), || s.screen_snapshot().rows.iter().any(|r| r.contains("echo user-typed")).then_some(())).is_some(),
+        "the typed text was not echoed at the nested prompt: {:?}",
+        s.screen_snapshot().rows
+    );
 
-    let RunOutcome::Finished { record } = tools.run_command("echo nested-after-clear", DEFAULT_RUN_WAIT, None).expect("run_command")
-    else {
+    let before = s.prompt_count();
+    let call_at = Instant::now();
+    let outcome = match tools.run_command("echo nested-after-clear", DEFAULT_RUN_WAIT, None) {
+        Ok(outcome) => outcome,
+        Err(err) => run_command_failure(&s, &raw, before, call_at, &err),
+    };
+    let RunOutcome::Finished { record } = outcome else {
         panic!("the command did not finish: state {:?}", s.state());
     };
     assert_eq!(record.exit_code, Some(0), "output={:?}", record.output);
