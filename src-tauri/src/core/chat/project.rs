@@ -13,6 +13,7 @@ use crate::core::chat::{questions, todo};
 use crate::core::foreground::{Foreground, ForegroundKind};
 use crate::core::mcp::result::RESULT_LIMIT as MCP_RESULT_LIMIT;
 use crate::core::observer::{SCREEN_HISTORY_CAP, SHELL_EXITED_TEXT};
+use crate::core::skills::tool as skill_tool;
 use crate::core::tools::foreground_next_step;
 
 /// `run_command` output longer than this is cut to a head and tail. Output at or under it is sent whole.
@@ -56,6 +57,11 @@ pub fn project(name: &str, ok: bool, result: &Value, redactor: &Redactor) -> Str
             "request_integration" => result.as_str().unwrap_or_default().to_string(),
             "list_commands" => list_commands_text(result, redactor),
             "get_cwd" => cwd_text(Some(result)),
+            // A skill's instructions or file (core/skills/tool): plain text, cut at the skill cap.
+            skill_tool::TOOL_NAME => match result.as_str() {
+                Some(text) => skill_tool::cap_text(text, skill_tool::TEXT_LIMIT),
+                None => compact_json(result),
+            },
             // An MCP tool (core/mcp): its result is plain text, kept as it is up to the MCP cap (the runtime caps it too).
             _ if name.starts_with("mcp__") => match result.as_str() {
                 Some(text) => cap(text, MCP_RESULT_LIMIT),
@@ -859,6 +865,20 @@ mod tests {
         assert_eq!(shown, value.to_string(), "the maximum valid result is intact, not cut");
         let parsed: Value = serde_json::from_str(&shown).expect("the projected result parses");
         assert_eq!(parsed, value);
+    }
+
+    /// A skill's text is plain text, cut at the skill cap on a character boundary, and redacted like the rest.
+    #[test]
+    fn a_skill_result_is_plain_text_capped_and_redacted() {
+        let secret = "sk-or-v1-PROJECTTESTSECRET0123456789";
+        let body = format!("Use {secret} carefully. {}", "é".repeat(skill_tool::TEXT_LIMIT));
+        let shown = project(skill_tool::TOOL_NAME, true, &Value::String(body.clone()), &Redactor::new(vec![secret.to_string()]));
+        assert!(shown.len() <= skill_tool::TEXT_LIMIT, "{} bytes", shown.len());
+        assert!(shown.starts_with("Use "), "plain text, not JSON: {shown:?}");
+        assert!(!shown.contains(secret), "the secret is redacted");
+        assert!(shown.contains("[truncated "), "the cut is said");
+        let plain = project(skill_tool::TOOL_NAME, true, &Value::String("Step one.".into()), &none());
+        assert_eq!(plain, "Step one.");
     }
 
     #[test]

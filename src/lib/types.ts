@@ -649,6 +649,23 @@ export interface CommandCatalog {
   skipped?: string[];
 }
 
+/** One skill (core/skills): where it came from, and whether the model is offered it (false for disable-model-invocation). */
+export interface SkillView {
+  name: string;
+  description: string;
+  source: 'watt' | 'user' | 'project';
+  /** The skill's folder. */
+  path: string;
+  model_invocable: boolean;
+}
+
+/** The skills for the settings view: every skill found, the warnings for the ones skipped, and the folders scanned in order. */
+export interface SkillsView {
+  skills: SkillView[];
+  warnings: string[];
+  roots: string[];
+}
+
 /**
  * One attachment as agent_message takes it (src-tauri/src/core/chat/attachments.rs, AttachmentInput). An image is PNG or JPEG,
  * already re-encoded in the webview. A text document is its UTF-8 bytes. `thumb` is a PNG or JPEG data URL of at most 16 KB.

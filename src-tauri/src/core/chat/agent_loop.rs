@@ -45,6 +45,8 @@ use crate::core::llm::{self, AssistantReply, ChatRequest, Delta, LlmError, Provi
 use crate::core::observer::{InputState, IntegrationStatus, ObserverStatus, OpenAgentRecord};
 use crate::core::persist::attachments::AttachmentStore;
 use crate::core::settings::LimitsSettings;
+use crate::core::skills::{self, SkillIndex};
+use crate::core::skills::tool as skill_tool;
 use crate::core::tools::{age_text, foreground_next_step, SessionFacts, TopLevel};
 
 const SESSION_PLACEHOLDER: &str = "{session_id}";
@@ -474,6 +476,8 @@ pub struct LlmAgent {
     resume_note: Option<String>,
     /// The workspace root's AGENTS.md for this turn (see `with_project_rules`).
     project_rules: Option<String>,
+    /// The skills this turn can load (see `with_skills`). None: no skill is listed or loadable.
+    skills: Option<Arc<SkillIndex>>,
     /// Saves the conversation at each checkpoint (see `with_checkpoint`).
     checkpoint: Option<Checkpoint>,
     /// The caps this turn runs under (see `with_limits`).
@@ -518,6 +522,7 @@ impl LlmAgent {
             tools: prompt::tool_definitions(),
             resume_note: None,
             project_rules: None,
+            skills: None,
             checkpoint: None,
             limits: LimitsSettings::default(),
             attachments: None,
@@ -594,6 +599,13 @@ impl LlmAgent {
         self
     }
 
+    /// The skills of this turn (core/skills), built from the folders when the turn starts. They are listed in the system
+    /// message after the project rules, and the `skill` tool loads from them. Never stored in the history.
+    pub fn with_skills(mut self, index: Arc<SkillIndex>) -> Self {
+        self.skills = Some(index);
+        self
+    }
+
     /// Calls `save` at each checkpoint: once the user message is recorded, once a reply's tool calls are recorded
     /// but before they run, and after each completed round of tool calls. The history is paired at the first and last
     /// of those points; the middle one may hold calls without results yet (a restart then repairs them into closed
@@ -621,6 +633,9 @@ impl LlmAgent {
         let mut system = self.system.clone();
         if let Some(rules) = &self.project_rules {
             system = format!("{system}\n\n{}", instructions::note(rules));
+        }
+        if let Some(block) = self.skills.as_deref().and_then(skills::prompt_block) {
+            system = format!("{system}\n\n{block}");
         }
         let top = ctx.top_level();
         let facts = ctx.session_facts();
@@ -929,6 +944,8 @@ impl LlmAgent {
                 ctx.call_tool("run_command", args)
             }
             todo::TOOL_NAME => ctx.local_tool(name, &args, |args| self.write_todos(args, ctx)),
+            // Read-only like `todo_write`: the skill's text or file, from this turn's index (core/skills/tool).
+            skill_tool::TOOL_NAME => ctx.local_tool(name, &args, |args| self.run_skill(args)),
             // Chat-local like `todo_write`: answered by the user, never by the shell or an approval card. It counts
             // against neither the command cap nor the read names, and its result never stops the turn.
             questions::TOOL_NAME => ctx.ask_user(&args),
@@ -948,6 +965,13 @@ impl LlmAgent {
             Err(e) => project(name, false, &Value::String(e), &self.redactor),
         };
         (content, denied)
+    }
+
+    /// Runs a `skill` call against this turn's index. Without an index no skill exists, so any name is unknown.
+    fn run_skill(&self, args: &Value) -> Result<Value, String> {
+        let empty = SkillIndex::default();
+        let index = self.skills.as_deref().unwrap_or(&empty);
+        skill_tool::run(index, args).map(Value::String)
     }
 
     /// Validates a `todo_write` call and, when it is valid, replaces the conversation's list and reports it. A refused

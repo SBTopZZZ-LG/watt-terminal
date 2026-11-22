@@ -17,6 +17,7 @@ use watt_terminal_lib::core::chat::context::{self, ContextUsage};
 use watt_terminal_lib::core::chat::trim::{OLD_OUTPUT_NOTE, OMITTED_TURNS_NOTE, TRIM_NOTE};
 use watt_terminal_lib::core::persist::attachments::{sha256_hex, AttachmentStore};
 use watt_terminal_lib::core::settings::LimitsSettings;
+use watt_terminal_lib::core::skills::{self, Root};
 use watt_terminal_lib::core::chat::history::History;
 use watt_terminal_lib::core::chat::prompt;
 use watt_terminal_lib::core::chat::questions;
@@ -1141,6 +1142,69 @@ fn an_invalid_todo_write_changes_nothing_and_the_model_reads_why() {
     assert_paired(&msgs);
     let text = tool_content(&msgs, "call_bad");
     assert!(text.starts_with("error: ") && text.contains("exactly one in_progress"), "{text}");
+}
+
+/// One skill folder, `demo`, under a fresh root in the temp dir. The caller removes the root.
+fn skill_root(tag: &str) -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(format!("watt-terminal-test-{}-skills-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let demo = root.join("demo");
+    std::fs::create_dir_all(demo.join("scripts")).unwrap();
+    std::fs::write(demo.join("SKILL.md"), "---\nname: demo\ndescription: Demo skill\n---\nStep one.\n").unwrap();
+    std::fs::write(demo.join("scripts").join("check.sh"), "echo ok").unwrap();
+    root
+}
+
+/// The `skill` tool is a read: no card and no backend call. Its text reaches the model under its call id, a missing
+/// file or an unknown name is an error the model reads, and the system message names the skill only for a turn that
+/// has skills. The listing never enters the stored history.
+#[test]
+fn skill_tool_is_a_read_and_the_system_message_lists_the_skill() {
+    let root = skill_root("loads");
+    let index = skills::scan(&[Root { dir: root.clone(), source: skills::Source::Watt }]);
+    let provider = serve(vec![
+        Script::json(tool_reply(&[
+            ("call_s1", "skill", r#"{"name":"demo"}"#),
+            ("call_s2", "skill", r#"{"name":"demo","file":"scripts/check.sh"}"#),
+            ("call_s3", "skill", r#"{"name":"nope"}"#),
+        ])),
+        Script::json(text_reply("done")),
+    ]);
+    let conv = Conversation::new().unwrap();
+    let tools = FakeTools::default();
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new())).with_skills(Arc::new(index));
+    let events = turn(&mut agent, &tools, &no_gate(), "use the demo skill");
+
+    assert!(tools.reached().is_empty(), "skill reached the backend: {:?}", tools.reached());
+    assert!(!events.iter().any(|e| matches!(e, AgentEvent::ApprovalRequest { .. })), "no approval card");
+    assert_eq!(
+        decisions(&events),
+        [("skill".to_string(), "read", true), ("skill".to_string(), "read", true), ("skill".to_string(), "read", false)]
+    );
+
+    let requests = provider.requests();
+    assert!(body_of(&requests[0])["tools"].as_array().unwrap().iter().any(|t| t["function"]["name"] == "skill"));
+    let system = system_of(&requests[0]);
+    assert!(system.starts_with(&prompt::system_prompt()), "the base prompt comes first");
+    assert!(system.contains("- demo: Demo skill"), "{system}");
+
+    let msgs = stored(&conv.history());
+    assert_paired(&msgs);
+    let body = tool_content(&msgs, "call_s1");
+    assert!(body.starts_with("Step one.") && body.contains("Files: scripts/check.sh"), "{body}");
+    assert_eq!(tool_content(&msgs, "call_s2"), "echo ok");
+    assert!(tool_content(&msgs, "call_s3").starts_with("error: unknown skill 'nope'. Available: demo"));
+    assert!(!serde_json::to_string(&msgs).unwrap().contains("reusable instruction packs"), "the listing is never stored");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn a_turn_without_skills_has_the_plain_system_prompt() {
+    let provider = serve(vec![Script::json(text_reply("hi"))]);
+    let conv = Conversation::new().unwrap();
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
+    turn(&mut agent, &FakeTools::default(), &no_gate(), "hello");
+    assert_eq!(system_of(&provider.requests()[0]), prompt::system_prompt());
 }
 
 // ask_user clarification questions: the model asks, a test thread answers through the gate, the next model request

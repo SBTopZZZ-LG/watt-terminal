@@ -59,6 +59,7 @@ use crate::core::settings::service::{
 use crate::core::settings::{AgentRequests, ApprovalSettings, IntegrationSettings, LimitsSettings, ModelRef, Nested};
 use crate::core::mcp::config::McpLevel;
 use crate::core::mcp::service::{McpImportResult, McpServerInput, McpService, McpView, TurnMcp};
+use crate::core::skills::{self, Root, SkillsView};
 use crate::core::tools::SessionTools;
 
 type Reg = Registry<Attached>;
@@ -567,11 +568,9 @@ async fn agent_message(
     let att = session(&reg, &session_id)?;
     // The project instructions come from the session's live working directory, read once before the
     // turn starts. Anything unreadable just means no rules; it never fails the turn.
-    let project_rooted_rules = att
-        .session
-        .cwd()
-        .and_then(|cwd| workspace_root_for_cwd(&app, &cwd))
-        .and_then(|root| instructions::load(&root).map(|rules| (root, rules)));
+    let project_root = att.session.cwd().and_then(|cwd| workspace_root_for_cwd(&app, &cwd));
+    let project_rooted_rules =
+        project_root.as_ref().and_then(|root| instructions::load(root).map(|rules| (root.clone(), rules)));
     let project_rules = project_rooted_rules.as_ref().map(|(_, rules)| rules.clone());
     let prepared = prepare(&attachments.unwrap_or_default())?;
     // Reading a saved model touches the Keychain, so it runs on the blocking pool.
@@ -631,10 +630,14 @@ async fn agent_message(
                         }
                     }
                 }
+                // The skill folders of this turn (core/skills), scanned on the blocking pool. A scan never fails the turn.
+                let skill_folders = skill_roots(&app, project_root);
+                let skill_index = blocking(move || Ok(skills::scan(&skill_folders))).await.unwrap_or_default();
                 let mut agent = LlmAgent::new(client, llm_settings, &conversation_id, history, todos, cancel.clone())
                     // The note is taken only by a turn that calls the model: a turn that fails to start keeps it.
                     .with_resume_note(att.conversation.take_resume_note())
                     .with_project_rules(project_rules)
+                    .with_skills(Arc::new(skill_index))
                     .with_checkpoint(checkpoint)
                     .with_limits(limits)
                     .with_no_vision(att.conversation.no_vision())
@@ -894,6 +897,25 @@ fn workspace_root_for_cwd(app: &tauri::AppHandle, cwd: &Cwd) -> Option<PathBuf> 
         return None;
     }
     Some(PathBuf::from(workspace.root))
+}
+
+/// The skill folders (core/skills) in priority order: the Watt config folder, the user's folders in the home directory,
+/// then the workspace's folders when there is a workspace root.
+fn skill_roots(app: &tauri::AppHandle, project_root: Option<PathBuf>) -> Vec<Root> {
+    let config = resolve_config_dir(app);
+    skills::roots(config.as_deref(), home_dir().as_deref(), project_root.as_deref())
+}
+
+/// The skills for the settings view (core/skills): the folders of the shell's working directory (when given) and the
+/// user's, with the scan's warnings. Read on the blocking pool; a missing folder is not an error.
+#[tauri::command]
+async fn list_skills(cwd: Option<String>, app: tauri::AppHandle) -> Result<SkillsView, String> {
+    blocking(move || {
+        let project_root = cwd.and_then(|path| workspace_root_for_cwd(&app, &Cwd { host: local_host().to_string(), path }));
+        let folders = skill_roots(&app, project_root);
+        Ok(skills::scan(&folders).view())
+    })
+    .await
 }
 
 /// The project's command directory for a shell working directory: `<workspace root>/.watt/commands`.
@@ -1713,7 +1735,8 @@ pub fn run() {
             mcp_set_server_approval,
             mcp_set_tool_approval,
             mcp_restart,
-            mcp_logs
+            mcp_logs,
+            list_skills
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

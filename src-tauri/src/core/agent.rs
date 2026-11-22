@@ -371,10 +371,10 @@ fn new_call_id() -> String {
 /// Tools that never change the shell. `read_tool` accepts only these. Must match `READ_NAMES` in core/chat/agent_loop.rs.
 const READ_TOOLS: [&str; 5] = ["list_commands", "get_command", "get_screen", "get_cwd", "wait"];
 
-/// Built-in tools that may run without a gate decision: the read tools, `todo_write` and `ask_user`. Neither of the last two
-/// touches the shell. Any other name needs a gate decision: a gated built-in, or a host tool (core/external_tools). Must match
-/// the names routed in core/chat/agent_loop.rs (`run_call`).
-const BUILTIN_UNGATED: [&str; 7] = ["list_commands", "get_command", "get_screen", "get_cwd", "wait", "todo_write", "ask_user"];
+/// Built-in tools that may run without a gate decision: the read tools, `todo_write`, `ask_user` and `skill`. None of the
+/// last three touches the shell. Any other name needs a gate decision: a gated built-in, or a host tool (core/external_tools).
+/// Must match the names routed in core/chat/agent_loop.rs (`run_call`).
+const BUILTIN_UNGATED: [&str; 8] = ["list_commands", "get_command", "get_screen", "get_cwd", "wait", "todo_write", "ask_user", "skill"];
 
 /// What a turn reads from the saved settings when it decides. lib.rs builds one per user message. The defaults are the
 /// cautious ones: a nested shell is approved as before (its allow rules ask), and `request_integration` asks the user.

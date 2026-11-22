@@ -147,3 +147,14 @@ describe('api MCP commands', () => {
     expect(invoke).toHaveBeenLastCalledWith('mcp_logs', { name: 'fetch' });
   });
 });
+
+describe('api skills commands', () => {
+  beforeEach(() => invoke.mockClear());
+
+  it('listSkills sends the working directory as cwd, or null when there is none', () => {
+    void api.listSkills('/work/app');
+    expect(invoke).toHaveBeenLastCalledWith('list_skills', { cwd: '/work/app' });
+    void api.listSkills();
+    expect(invoke).toHaveBeenLastCalledWith('list_skills', { cwd: null });
+  });
+});
