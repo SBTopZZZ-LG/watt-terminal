@@ -130,7 +130,19 @@ fn spawn_stdio(
     TokioChildProcess::builder(wrapped)
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("could not start the server process: {e}"))
+        .map_err(|e| spawn_failure(command, &e))
+}
+
+/// The message for a server that did not start. A NotFound names the command as configured and where it was searched:
+/// Watt's PATH is fixed when Watt starts, so a Node installed later needs a restart.
+fn spawn_failure(command: &str, e: &std::io::Error) -> String {
+    let mut message = format!("could not start the server process: {e}");
+    if e.kind() == std::io::ErrorKind::NotFound {
+        message.push_str(&format!(
+            " (\"{command}\" was searched on Watt's PATH. Watt's PATH may be older than your shell's; restart Watt after installing Node)"
+        ));
+    }
+    message
 }
 
 /// The creation flags of a stdio server on Windows. CREATE_NO_WINDOW: a console program (such as `uvx`) gets no console
