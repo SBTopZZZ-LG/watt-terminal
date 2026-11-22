@@ -299,6 +299,25 @@ fn a_process_that_exits_while_connected_is_marked_failed_without_a_call() {
 }
 
 #[test]
+fn a_lost_server_is_rebuilt_on_its_own_once_the_cooldown_has_passed() {
+    require_node!();
+    // The app waits 30 s between automatic reconnects; this manager uses a short one.
+    let manager = McpManager::start_with_cooldown(Duration::from_millis(100)).expect("start");
+    manager.apply(&settings(vec![fixture_server("fixture", &[])]), &BTreeMap::new()).expect("apply");
+    wait_connected(&manager, "fixture");
+    let before = pid_of(&manager, "fixture");
+
+    // The `exit` tool ends the server's process without an answer, so the connection is lost.
+    assert!(call(&manager, "mcp__fixture__exit", json!({})).is_err());
+    wait_for(&manager, "fixture", |s| matches!(s, ServerState::Failed { .. }));
+
+    // One second after the loss the runtime rebuilds the client, with no call and no restart.
+    wait_connected(&manager, "fixture");
+    assert_ne!(pid_of(&manager, "fixture"), before, "the client came back on the same process");
+    manager.shutdown();
+}
+
+#[test]
 fn apply_restarts_only_what_changed_and_closes_what_was_removed() {
     require_node!();
     let manager = McpManager::start().expect("start");

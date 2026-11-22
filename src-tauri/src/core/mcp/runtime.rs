@@ -119,8 +119,8 @@ impl Server {
         self.names = NameTable::build(server, &originals);
     }
 
-    fn cooldown_elapsed(&self) -> bool {
-        self.last_attempt.is_none_or(|at| at.elapsed() >= RECONNECT_COOLDOWN)
+    fn cooldown_elapsed(&self, cooldown: Duration) -> bool {
+        self.last_attempt.is_none_or(|at| at.elapsed() >= cooldown)
     }
 }
 
@@ -135,6 +135,8 @@ pub struct Runtime {
     calls: Vec<JoinHandle<()>>,
     /// Whether the tool-count warning was already logged, so it is logged once per crossing.
     over_limit: bool,
+    /// The least time between two connect attempts that are not explicit. `RECONNECT_COOLDOWN` in the app.
+    cooldown: Duration,
 }
 
 impl Runtime {
@@ -146,7 +148,14 @@ impl Runtime {
             reapers: Vec::new(),
             calls: Vec::new(),
             over_limit: false,
+            cooldown: RECONNECT_COOLDOWN,
         }
+    }
+
+    /// The same runtime with another reconnect cooldown. Only the tests use it (see `McpManager::start_with_cooldown`).
+    pub fn with_cooldown(mut self, cooldown: Duration) -> Runtime {
+        self.cooldown = cooldown;
+        self
     }
 
     /// Serves messages until `Shutdown`, then closes every client and returns. Runs on the runtime thread.
@@ -411,7 +420,7 @@ impl Runtime {
             Status::Failed(error) => format!("failed: {error}"),
             Status::NeedsAuth(message) => format!("needs authentication: {message}"),
         };
-        let retry = matches!(s.status, Status::Failed(_)) && s.cooldown_elapsed() && s.config.enabled;
+        let retry = matches!(s.status, Status::Failed(_)) && s.cooldown_elapsed(self.cooldown) && s.config.enabled;
         if retry {
             let _ = self.try_start(server);
             return format!("MCP server '{server}' is not connected ({state}); reconnecting, try again shortly");
@@ -472,10 +481,11 @@ impl Runtime {
     }
 
     fn reconnect(&mut self, name: &str) {
+        let cooldown = self.cooldown;
         let due = self
             .servers
             .get(name)
-            .is_some_and(|s| matches!(s.status, Status::Failed(_)) && s.cooldown_elapsed() && s.config.enabled);
+            .is_some_and(|s| matches!(s.status, Status::Failed(_)) && s.cooldown_elapsed(cooldown) && s.config.enabled);
         if due {
             let _ = self.try_start(name);
         }
