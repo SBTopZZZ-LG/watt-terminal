@@ -2,6 +2,7 @@
 //! names of env variables and headers, and the values live in the secret store (see `secrets.rs`).
 
 use std::collections::{BTreeMap, HashSet};
+use std::net::IpAddr;
 use std::time::Duration;
 
 use reqwest::Url;
@@ -180,8 +181,8 @@ pub fn is_token_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
 }
 
-/// The URL must parse, use http or https and have a host. The URL is not put in the problem text: it may carry a key
-/// in its query.
+/// The URL must parse, use http or https and have a host. Plain http is allowed only for a loopback host. The URL is
+/// not put in the problem text: it may carry a key in its query.
 fn validate_mcp_url(label: &str, url: &str, problems: &mut Vec<String>) {
     if url.trim().is_empty() {
         problems.push(format!("{label}: url must not be empty"));
@@ -192,10 +193,26 @@ fn validate_mcp_url(label: &str, url: &str, problems: &mut Vec<String>) {
         return;
     }
     match Url::parse(url) {
-        Ok(parsed) if matches!(parsed.scheme(), "http" | "https") && parsed.host_str().is_some_and(|h| !h.is_empty()) => {}
+        Ok(parsed) if parsed.scheme() == "https" && parsed.host_str().is_some_and(|h| !h.is_empty()) => {}
+        Ok(parsed) if parsed.scheme() == "http" && parsed.host_str().is_some_and(|h| !h.is_empty()) => {
+            if !is_loopback_host(&parsed) {
+                problems.push(format!("{label}: url must use https unless the host is localhost"));
+            }
+        }
         Ok(_) => problems.push(format!("{label}: url must be an http or https URL with a host")),
         Err(_) => problems.push(format!("{label}: url is not a valid URL")),
     }
+}
+
+/// `localhost`, `*.localhost`, or a loopback IP address (127.0.0.0/8, ::1).
+fn is_loopback_host(url: &Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if host == "localhost" || host.ends_with(".localhost") {
+        return true;
+    }
+    host.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 #[cfg(test)]
@@ -373,6 +390,28 @@ mod tests {
         assert!(http_url_problem("ftp://example.com/mcp").iter().any(|p| p.contains("http or https")));
         assert!(http_url_problem("not a url").iter().any(|p| p.contains("whitespace")));
         assert!(http_url_problem("https://").iter().any(|p| p.contains("not a valid URL")));
+    }
+
+    #[test]
+    fn plain_http_is_allowed_only_for_loopback_hosts() {
+        for ok_url in [
+            "http://localhost:3000/mcp",
+            "http://api.localhost/mcp",
+            "http://127.0.0.1/mcp",
+            "http://127.5.6.7:8080/mcp",
+            "http://[::1]/mcp",
+            "https://example.com/mcp",
+        ] {
+            assert!(http_url_problem(ok_url).is_empty(), "{ok_url}: {:?}", http_url_problem(ok_url));
+        }
+        for bad_url in ["http://example.com/mcp", "http://192.168.1.5/mcp", "http://localhost.example.com/mcp"] {
+            let problems = http_url_problem(bad_url);
+            assert!(
+                problems.iter().any(|p| p.contains("url must use https unless the host is localhost")),
+                "{bad_url}: {problems:?}"
+            );
+            assert!(problems.iter().all(|p| !p.contains("example.com") && !p.contains("192.168")), "{problems:?}");
+        }
     }
 
     #[test]

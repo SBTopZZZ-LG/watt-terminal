@@ -212,7 +212,7 @@ fn parse_stdio(
 ) -> (Option<McpTransport>, SecretValues) {
     let mut values = SecretValues::default();
     let command = string_field(fields, "command", label, errors);
-    let args = match fields.get("args") {
+    let mut args = match fields.get("args") {
         None => Vec::new(),
         Some(Value::Array(items)) => items
             .iter()
@@ -250,6 +250,7 @@ fn parse_stdio(
         }
         Some(_) => errors.push(format!("{label}: env must be an object")),
     }
+    extract_arg_secrets(label, &mut args, &mut env_names, &mut values, warnings);
 
     let cwd = match (fields.get("cwd"), fields.get("working_directory")) {
         (Some(_), Some(_)) => {
@@ -264,6 +265,91 @@ fn parse_stdio(
     note_unknown_fields(label, fields, STDIO_FIELDS, warnings);
     let transport = command.map(|command| McpTransport::Stdio { command, args, cwd, env: env_names });
     (transport, values)
+}
+
+/// Flag-name words that mark the value after the flag as a secret. Matched against flag names only, never values.
+const SECRET_FLAG_WORDS: &[&str] =
+    &["api_key", "apikey", "token", "secret", "password", "passwd", "bearer", "auth", "credential"];
+
+/// Moves the values of key-like flags out of stdio `args` (`--api-key KEY`, `--api-key=KEY`) into env variables, so
+/// they stay out of settings.json. The arg becomes `${ENV}`, which `resolve_transport` expands at launch. A value that
+/// is already a `${...}` reference is left as it is. Warnings name the flag and the env name, never the value.
+fn extract_arg_secrets(
+    label: &str,
+    args: &mut [String],
+    env_names: &mut Vec<String>,
+    values: &mut SecretValues,
+    warnings: &mut Vec<String>,
+) {
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].clone();
+        if !arg.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        if let Some((flag, value)) = arg.split_once('=') {
+            if is_secret_flag(flag) && !value.is_empty() && !is_reference(value) {
+                let env = move_to_env(label, flag, value, env_names, values, warnings);
+                args[index] = format!("{flag}=${{{env}}}");
+            }
+            index += 1;
+        } else if is_secret_flag(&arg) && index + 1 < args.len() && !args[index + 1].starts_with('-') {
+            let value = args[index + 1].clone();
+            if !value.is_empty() && !is_reference(&value) {
+                let env = move_to_env(label, &arg, &value, env_names, values, warnings);
+                args[index + 1] = format!("${{{env}}}");
+            }
+            index += 2;
+        } else {
+            index += 1;
+        }
+    }
+}
+
+fn is_secret_flag(token: &str) -> bool {
+    let name = token.trim_start_matches('-').to_ascii_lowercase().replace('-', "_");
+    SECRET_FLAG_WORDS.iter().any(|word| name.contains(word))
+}
+
+/// A value that is only `${NAME}` or `${NAME:-default}`: no literal value to move.
+fn is_reference(value: &str) -> bool {
+    let Some(inner) = value.strip_prefix("${").and_then(|rest| rest.strip_suffix('}')) else {
+        return false;
+    };
+    let name = inner.split_once(":-").map_or(inner, |(name, _)| name);
+    valid_env_name(name) && !inner.contains('}') && !inner.contains("${")
+}
+
+/// Stores `value` as env variable `ENV` for the flag and returns `ENV`. `ENV` is the flag name in upper case with
+/// every other character as '_', and gets `_2`, `_3`... when taken.
+fn move_to_env(
+    label: &str,
+    flag: &str,
+    value: &str,
+    env_names: &mut Vec<String>,
+    values: &mut SecretValues,
+    warnings: &mut Vec<String>,
+) -> String {
+    let base: String = flag
+        .trim_start_matches('-')
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+        .collect();
+    let base = if valid_env_name(&base) { base } else { format!("_{base}") };
+    let mut env = base.clone();
+    let mut suffix = 2;
+    while env_names.contains(&env) {
+        env = format!("{base}_{suffix}");
+        suffix += 1;
+    }
+    env_names.push(env.clone());
+    values.env_values.insert(env.clone(), value.to_string());
+    warnings.push(format!(
+        "{label}: {flag} holds a secret, moved to env variable {env}; the value is still passed on the command line \
+         when the server starts"
+    ));
+    env
 }
 
 fn parse_http(
@@ -317,6 +403,7 @@ fn note_unknown_fields(label: &str, fields: &Map<String, Value>, known: &[&str],
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::mcp::expand::{ResolvedTransport, resolve_transport};
 
     fn ok(text: &str) -> ParsedImport {
         match parse_pasted(text) {
@@ -382,19 +469,115 @@ mod tests {
         assert_eq!(parsed.secrets["context7"].header_values["CONTEXT7_API_KEY"], "ctx7-remote-secret-42");
     }
 
+    fn no_process(_: &str) -> Option<String> {
+        None
+    }
+
     #[test]
-    fn context7_local_form_keeps_its_arguments_as_pasted() {
-        // The key is an argument here, so it stays in the args. See the report: this needs a decision.
+    fn context7_local_form_moves_the_key_out_of_args_and_resolves_back() {
+        let secret = "ctx7-local-arg-7";
+        let original = vec!["-y".to_string(), "@upstash/context7-mcp".into(), "--api-key".into(), secret.into()];
         let parsed = ok(r#"{"mcpServers":{"context7":{"command":"npx","args":["-y","@upstash/context7-mcp","--api-key","ctx7-local-arg-7"]}}}"#);
+        let ctx = server(&parsed, "context7");
         assert_eq!(
-            server(&parsed, "context7").transport,
+            ctx.transport,
             McpTransport::Stdio {
                 command: "npx".into(),
-                args: vec!["-y".into(), "@upstash/context7-mcp".into(), "--api-key".into(), "ctx7-local-arg-7".into()],
+                args: vec!["-y".into(), "@upstash/context7-mcp".into(), "--api-key".into(), "${API_KEY}".into()],
                 cwd: None,
-                env: vec![],
+                env: vec!["API_KEY".into()],
             }
         );
+        assert_eq!(parsed.secrets["context7"].env_values["API_KEY"], secret);
+        assert_eq!(parsed.warnings.len(), 1, "{:?}", parsed.warnings);
+        assert!(parsed.warnings[0].contains("--api-key") && parsed.warnings[0].contains("API_KEY"));
+        assert!(parsed.warnings.iter().all(|w| !w.contains(secret)), "{:?}", parsed.warnings);
+        assert!(!format!("{parsed:?}").contains(secret));
+        match resolve_transport(&ctx.transport, &parsed.secrets["context7"], &no_process).unwrap() {
+            ResolvedTransport::Stdio { command, args, .. } => {
+                assert_eq!(command, "npx");
+                assert_eq!(args, original);
+            }
+            other => panic!("expected stdio, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn key_flag_with_an_equals_value_moves_to_env() {
+        let parsed = ok(r#"{"mcpServers":{"c":{"command":"x","args":["--api-key=eq-secret-1"]}}}"#);
+        assert_eq!(args_of(&parsed, "c"), vec!["--api-key=${API_KEY}"]);
+        assert_eq!(parsed.secrets["c"].env_values["API_KEY"], "eq-secret-1");
+    }
+
+    #[test]
+    fn key_flag_with_a_separate_value_moves_to_env() {
+        let parsed = ok(r#"{"mcpServers":{"c":{"command":"x","args":["--token","tok-secret-2"]}}}"#);
+        assert_eq!(args_of(&parsed, "c"), vec!["--token", "${TOKEN}"]);
+        assert_eq!(parsed.secrets["c"].env_values["TOKEN"], "tok-secret-2");
+    }
+
+    #[test]
+    fn key_flag_without_a_value_is_left_alone() {
+        let at_end = ok(r#"{"mcpServers":{"c":{"command":"x","args":["--token"]}}}"#);
+        assert_eq!(args_of(&at_end, "c"), vec!["--token"]);
+        let before_flag = ok(r#"{"mcpServers":{"c":{"command":"x","args":["--token","--port","8080"]}}}"#);
+        assert_eq!(args_of(&before_flag, "c"), vec!["--token", "--port", "8080"]);
+        assert!(before_flag.secrets.is_empty() && before_flag.warnings.is_empty());
+    }
+
+    #[test]
+    fn a_reference_value_is_left_alone() {
+        let parsed = ok(r#"{"mcpServers":{"c":{"command":"x","args":["--token","${MY_TOKEN}","--api-key=${MY_KEY:-dflt}"]}}}"#);
+        assert_eq!(args_of(&parsed, "c"), vec!["--token", "${MY_TOKEN}", "--api-key=${MY_KEY:-dflt}"]);
+        assert!(parsed.secrets.is_empty() && parsed.warnings.is_empty());
+    }
+
+    #[test]
+    fn two_key_flags_get_two_env_names() {
+        let parsed = ok(r#"{"mcpServers":{"c":{"command":"x","args":["--api-key","k-one-1","--token","k-two-2"]}}}"#);
+        assert_eq!(args_of(&parsed, "c"), vec!["--api-key", "${API_KEY}", "--token", "${TOKEN}"]);
+        assert_eq!(parsed.secrets["c"].env_values["API_KEY"], "k-one-1");
+        assert_eq!(parsed.secrets["c"].env_values["TOKEN"], "k-two-2");
+        assert_eq!(parsed.warnings.len(), 2);
+    }
+
+    #[test]
+    fn env_name_collisions_get_a_numeric_suffix() {
+        let existing = ok(r#"{"mcpServers":{"c":{"command":"x","env":{"API_KEY":"env-value-3"},"args":["--api-key","arg-value-4"]}}}"#);
+        assert_eq!(args_of(&existing, "c"), vec!["--api-key", "${API_KEY_2}"]);
+        assert_eq!(existing.secrets["c"].env_values["API_KEY"], "env-value-3");
+        assert_eq!(existing.secrets["c"].env_values["API_KEY_2"], "arg-value-4");
+        match &existing.servers[0].transport {
+            McpTransport::Stdio { env, .. } => assert_eq!(env, &vec!["API_KEY".to_string(), "API_KEY_2".to_string()]),
+            other => panic!("expected stdio, got {other:?}"),
+        }
+
+        let earlier = ok(r#"{"mcpServers":{"c":{"command":"x","args":["--api-key","a-value-5","--api_key","b-value-6"]}}}"#);
+        assert_eq!(args_of(&earlier, "c"), vec!["--api-key", "${API_KEY}", "--api_key", "${API_KEY_2}"]);
+    }
+
+    #[test]
+    fn non_key_flags_and_values_are_untouched() {
+        let parsed = ok(r#"{"mcpServers":{"c":{"command":"x","args":["--port","8080","--read-only","--mode","auth-only","--name","author-bot"]}}}"#);
+        assert_eq!(
+            args_of(&parsed, "c"),
+            vec!["--port", "8080", "--read-only", "--mode", "auth-only", "--name", "author-bot"]
+        );
+        assert!(parsed.secrets.is_empty() && parsed.warnings.is_empty());
+    }
+
+    fn args_of(parsed: &ParsedImport, name: &str) -> Vec<String> {
+        match &server(parsed, name).transport {
+            McpTransport::Stdio { args, .. } => args.clone(),
+            other => panic!("expected stdio, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remote_plain_http_is_refused_without_echoing_the_url() {
+        let problems = errors(r#"{"mcpServers":{"s":{"url":"http://example.com/mcp?key=url-secret-8"}}}"#);
+        assert!(problems.iter().any(|p| p.contains("url must use https unless the host is localhost")), "{problems:?}");
+        assert!(problems.iter().all(|p| !p.contains("example.com") && !p.contains("url-secret-8")), "{problems:?}");
     }
 
     #[test]
