@@ -513,6 +513,75 @@ impl<'a> AgentCtx<'a> {
         self.run(name, args, true)
     }
 
+    /// Calls a write tool (`write_file`, `edit_file`; core/fs_tools). It always goes through the gate: approve-all runs it
+    /// without a card, otherwise the user is asked, and the card shows `preview`. `preview` checks the write against the file
+    /// as it is now; a refusal there is the tool error, and nobody is asked. `apply` checks it again and writes, after the
+    /// approval, so a file that changed while the card was open is checked again.
+    pub fn call_fs_write(
+        &self,
+        name: &str,
+        args: &Value,
+        preview: impl FnOnce() -> Result<String, String>,
+        apply: impl FnOnce() -> Result<String, String>,
+    ) -> Result<Value, String> {
+        let call_id = new_call_id();
+        self.emit(AgentEvent::ToolCall { call_id: call_id.clone(), name: name.to_string(), args: args.clone() });
+        let (decision, reason, result) = self.gate_fs_write(&call_id, name, args, preview, apply);
+        let (ok, value) = match &result {
+            Ok(v) => (true, v.clone()),
+            Err(e) => (false, json!({"error": e})),
+        };
+        self.emit(AgentEvent::ToolResult { call_id, name: name.to_string(), ok, decision, reason, result: value });
+        result
+    }
+
+    /// Applies the gate to one write call (see `call_fs_write`). The policy decides when approve-all is off; it asks for every
+    /// write (`Reason::FsWrite`).
+    fn gate_fs_write(
+        &self,
+        call_id: &str,
+        name: &str,
+        args: &Value,
+        preview: impl FnOnce() -> Result<String, String>,
+        apply: impl FnOnce() -> Result<String, String>,
+    ) -> (&'static str, Option<&'static str>, Result<Value, String>) {
+        let top = self.tools.top_level();
+        let verdict = match self.approvals.auto_state_across(top.key, self.rules.follow_local_in_nested) {
+            AutoState::On => Verdict::Auto(Reason::ApproveAll),
+            AutoState::Suspended => Verdict::Ask(Reason::ApproveAllSuspended),
+            AutoState::Off => self.policy.decide(name, args, self.policy_nested(&top)),
+        };
+        match verdict {
+            Verdict::Auto(reason) => {
+                let result = apply().map(Value::String);
+                (if result.is_ok() { "auto" } else { "refused" }, Some(reason.code()), result)
+            }
+            Verdict::Ask(reason) => {
+                let display = match preview() {
+                    Ok(display) => display,
+                    Err(refusal) => return ("refused", None, Err(refusal)),
+                };
+                let approved = self.approvals.ask(call_id, || {
+                    self.emit(AgentEvent::ApprovalRequest {
+                        call_id: call_id.to_string(),
+                        name: name.to_string(),
+                        text: display.clone(),
+                        display: Some(display.clone()),
+                        reason: Some(reason.code()),
+                        level: top.key,
+                        location: top.location.clone(),
+                    })
+                });
+                if !approved {
+                    let err = format!("{DENIED}: the user did not approve this call (denied, cancelled, or timed out)");
+                    return ("denied", Some(reason.code()), Err(err));
+                }
+                // The user approved, so the decision stays "manual" even if the write then refuses.
+                ("manual", Some(reason.code()), apply().map(Value::String))
+            }
+        }
+    }
+
     /// Runs a tool the agent loop handles itself (`todo_write`): no approval, no shell, no backend. It reports the call
     /// and its result like any tool, with the "read" decision, since no approval was asked.
     pub fn local_tool(
@@ -2722,6 +2791,74 @@ mod tests {
         assert_eq!(reasons(&log), [("ext_tool".to_string(), "auto", Some("approve_all"))]);
         assert!(cards(&log).is_empty());
         assert_eq!(host.reached(), ["ext_tool"]);
+    }
+
+    #[test]
+    fn a_file_write_asks_with_its_preview_and_a_timeout_is_a_denial() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        let args = json!({"path": "a.txt", "content": "x"});
+        let applied = std::cell::Cell::new(false);
+        let err = ctx
+            .call_fs_write(
+                "write_file",
+                &args,
+                || Ok("a.txt (new file, 1 lines)\nx".to_string()),
+                || {
+                    applied.set(true);
+                    Ok("wrote a.txt".to_string())
+                },
+            )
+            .expect_err("nobody answers");
+        assert!(err.starts_with(DENIED), "{err}");
+        assert!(!applied.get(), "a denied write is not applied");
+        assert_eq!(decisions(&log), [named("write_file", "denied", false)]);
+        let shown = log.lock().unwrap().iter().any(|ev| {
+            matches!(ev, AgentEvent::ApprovalRequest { name, display: Some(d), reason: Some("fs_write"), .. }
+                if name.as_str() == "write_file" && d.starts_with("a.txt (new file"))
+        });
+        assert!(shown, "the card carries the preview with reason fs_write");
+    }
+
+    #[test]
+    fn a_file_write_that_the_preview_refuses_asks_nobody() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        let args = json!({"path": "a.txt", "edits": []});
+        let err = ctx
+            .call_fs_write(
+                "edit_file",
+                &args,
+                || Err("old_string not found (edit #1). Nothing was written.".to_string()),
+                || panic!("a refused write is never applied"),
+            )
+            .expect_err("refused");
+        assert!(err.starts_with("old_string not found"), "{err}");
+        assert_eq!(decisions(&log), [named("edit_file", "refused", false)]);
+        assert!(cards(&log).is_empty());
+    }
+
+    #[test]
+    fn approve_all_writes_inside_the_root_without_a_card() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        gate.set_auto_approve(true, 0);
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        let args = json!({"path": "a.txt", "content": "x"});
+        let done = ctx
+            .call_fs_write("write_file", &args, || panic!("approve-all shows no card"), || Ok("wrote a.txt".to_string()))
+            .expect("approve-all runs it");
+        assert_eq!(done, json!("wrote a.txt"));
+        assert_eq!(reasons(&log), [("write_file".to_string(), "auto", Some("approve_all"))]);
+        assert!(cards(&log).is_empty());
     }
 
     #[test]

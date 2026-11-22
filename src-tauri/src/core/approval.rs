@@ -103,6 +103,8 @@ pub enum Reason {
     ApproveAllSuspended,
     /// A tool the app does not own (core/external_tools). The host's approval for it asks or runs it without a card.
     ExternalTool,
+    /// `write_file` or `edit_file` (core/fs_tools): every write asks, unless approve-all covers it.
+    FsWrite,
 }
 
 impl Reason {
@@ -124,6 +126,7 @@ impl Reason {
             Reason::NestedLevel => "nested_level",
             Reason::ApproveAllSuspended => "approve_all_suspended",
             Reason::ExternalTool => "external_tool",
+            Reason::FsWrite => "fs_write",
         }
     }
 }
@@ -159,7 +162,11 @@ pub struct ManualPolicy;
 
 impl ApprovalPolicy for ManualPolicy {
     fn decide(&self, tool: &str, _args: &Value, _nested: bool) -> Verdict {
-        if tool == "run_command" { Verdict::Ask(Reason::ManualMode) } else { Verdict::Ask(Reason::SendKeys) }
+        match tool {
+            "run_command" => Verdict::Ask(Reason::ManualMode),
+            "write_file" | "edit_file" => Verdict::Ask(Reason::FsWrite),
+            _ => Verdict::Ask(Reason::SendKeys),
+        }
     }
 
     fn uses_rules(&self) -> bool {
@@ -329,6 +336,10 @@ impl RegexPolicy {
     /// The order of evaluation, first hit wins: not `run_command`; the hard gate; a deny rule; an allow rule (asks in a
     /// nested shell); else ask. Says `Auto` only for an allow rule. The turn's allowance is applied by `decide`.
     fn classify(&self, tool: &str, args: &Value, nested: bool) -> Verdict {
+        // The file writes have no saved rules in this phase: every one asks.
+        if matches!(tool, "write_file" | "edit_file") {
+            return Verdict::Ask(Reason::FsWrite);
+        }
         if tool != "run_command" {
             return Verdict::Ask(Reason::SendKeys);
         }
@@ -845,6 +856,18 @@ mod tests {
     }
 
     #[test]
+    fn the_file_writes_always_ask_under_every_policy() {
+        let args = json!({"path": "a.txt", "content": "x"});
+        let rules = regex_policy(&["write_file"], &[]);
+        for tool in ["write_file", "edit_file"] {
+            assert_eq!(ManualPolicy.decide(tool, &args, false), Verdict::Ask(Reason::FsWrite), "{tool}");
+            assert_eq!(rules.decide(tool, &args, false), Verdict::Ask(Reason::FsWrite), "{tool}: an allow rule does not apply");
+            assert_eq!(rules.decide(tool, &args, true), Verdict::Ask(Reason::FsWrite), "{tool}: nested");
+        }
+        assert_eq!(ManualPolicy.decide("read_file", &args, false), Verdict::Ask(Reason::SendKeys));
+    }
+
+    #[test]
     fn reason_codes_are_the_wire_strings() {
         let codes = [
             (Reason::ApproveAll, "approve_all"),
@@ -863,6 +886,7 @@ mod tests {
             (Reason::Latched, "latched"),
             (Reason::UnintegratedShell, "unintegrated_shell"),
             (Reason::ExternalTool, "external_tool"),
+            (Reason::FsWrite, "fs_write"),
         ];
         for (reason, code) in codes {
             assert_eq!(reason.code(), code);

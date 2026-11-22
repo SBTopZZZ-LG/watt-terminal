@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { MouseEvent, ReactNode, UIEvent, WheelEvent } from 'react';
+import { isFileWrite } from '../lib/approvalCard';
 import { copyText } from '../lib/clipboard';
 import { isAtBottom, shouldFollowAfterSend } from '../lib/stickScroll';
 import { approvalTitle } from '../lib/transcript';
@@ -429,6 +430,9 @@ function Entry({ item, onApprove, onAnswerQuestions }: { item: TranscriptItem; o
           {/* A send_keys card shows the decoded input (the text and the keys), escaped; the other cards show the command. */}
           {item.name === 'send_keys' ? (
             <code className="approval-text approval-keys">{displayText(item.display ?? item.text)}</code>
+          ) : isFileWrite(item.name) ? (
+            // A file write shows its preview (the path, then the changed lines), in a block that keeps the lines.
+            <pre className="approval-text approval-preview">{visibleEscapes(item.display ?? item.text)}</pre>
           ) : (
             <code className="approval-text">{visibleEscapes(item.text)}</code>
           )}

@@ -922,12 +922,12 @@ impl LlmAgent {
 
     /// Runs the tool calls of one reply in order and records each result. Returns why the turn must stop, if it must.
     /// The calls after a stop are not run; the caller closes them in the history.
-    fn run_calls(&self, calls: &[ToolCall], ctx: &AgentCtx<'_>, commands: &mut u32) -> Option<Stop> {
+    fn run_calls(&self, calls: &[ToolCall], ctx: &AgentCtx<'_>, commands: &mut u32, writes: &mut u32) -> Option<Stop> {
         for call in calls {
             if self.cancel.is_cancelled() {
                 return Some(Stop::Cancelled);
             }
-            let (content, denied) = self.run_call(call, ctx, commands);
+            let (content, denied) = self.run_call(call, ctx, commands, writes);
             lock(&self.history).push_tool_result(&call.id, &content);
             if self.cancel.is_cancelled() {
                 return Some(Stop::Cancelled);
@@ -940,7 +940,7 @@ impl LlmAgent {
     }
 
     /// Runs one call. Returns the model-facing text of its result and whether the user denied it.
-    fn run_call(&self, call: &ToolCall, ctx: &AgentCtx<'_>, commands: &mut u32) -> (String, bool) {
+    fn run_call(&self, call: &ToolCall, ctx: &AgentCtx<'_>, commands: &mut u32, writes: &mut u32) -> (String, bool) {
         let name = call.name.as_str();
         let failed = |message: &str| (project(name, false, &Value::String(message.to_string()), &self.redactor), false);
         let Ok(args) = serde_json::from_str::<Value>(&call.arguments) else {
@@ -957,6 +957,22 @@ impl LlmAgent {
             todo::TOOL_NAME => ctx.local_tool(name, &args, |args| self.write_todos(args, ctx)),
             // Read-only like `todo_write`: the skill's text or file, from this turn's index (core/skills/tool).
             skill_tool::TOOL_NAME => ctx.local_tool(name, &args, |args| self.run_skill(args)),
+            // The write tools (core/fs_tools): gated like run_command, with a preview on the card. Capped per turn.
+            _ if fs_tools::is_write(name) => {
+                if *writes >= fs_tools::FS_WRITES_PER_TURN {
+                    return failed(&format!(
+                        "the file write limit for this turn is reached ({} calls). Ask the user to continue.",
+                        fs_tools::FS_WRITES_PER_TURN
+                    ));
+                }
+                *writes += 1;
+                ctx.call_fs_write(
+                    name,
+                    &args,
+                    || fs_tools::preview_write(self.fs_place(ctx), name, &args),
+                    || fs_tools::run_write(self.fs_place(ctx), name, &args),
+                )
+            }
             // Read-only like `skill`: the file tools (core/fs_tools), on this machine only, inside this turn's folder.
             _ if fs_tools::is_tool(name) => ctx.local_tool(name, &args, |args| self.run_fs(name, args, ctx)),
             // Chat-local like `todo_write`: answered by the user, never by the shell or an approval card. It counts
@@ -983,13 +999,18 @@ impl LlmAgent {
     /// Runs a file tool call in the place the shell on top gives now: this turn's folder, or a refusal when the shell is nested
     /// (its folder is on another machine) or no folder is known. Read per call, so a shell opened mid-turn counts.
     fn run_fs(&self, name: &str, args: &Value, ctx: &AgentCtx<'_>) -> Result<Value, String> {
+        fs_tools::run(self.fs_place(ctx), name, args).map(Value::String)
+    }
+
+    /// The place the file tools act in now: this turn's folder, or a refusal when the shell on top is nested (its folder is on
+    /// another machine) or no folder is known. Read per call, so a shell opened mid-turn counts.
+    fn fs_place(&self, ctx: &AgentCtx<'_>) -> Place<'_> {
         let top = ctx.top_level();
-        let place = if top.is_nested() {
+        if top.is_nested() {
             Place::Remote { host: top.host.clone().unwrap_or_else(|| "another machine".to_string()) }
         } else {
             self.fs_scope.as_ref().map_or(Place::Unknown, Place::Local)
-        };
-        fs_tools::run(place, name, args).map(Value::String)
+        }
     }
 
     /// Runs a `skill` call against this turn's index. Without an index no skill exists, so any name is unknown.
@@ -1018,6 +1039,7 @@ impl Agent for LlmAgent {
         // The finished note is for this turn's first model call only: it says what finished since the last turn.
         let mut finished = finished_since_last_turn(&lock(&self.history).snapshot(), ctx);
         let mut commands = 0;
+        let mut writes = 0;
         let (mut general, mut polls) = (0, 0);
         loop {
             if self.cancel.is_cancelled() {
@@ -1040,7 +1062,7 @@ impl Agent for LlmAgent {
                 ctx.say(cap.notice());
                 return;
             }
-            if let Some(stop) = self.run_calls(&reply.tool_calls, ctx, &mut commands) {
+            if let Some(stop) = self.run_calls(&reply.tool_calls, ctx, &mut commands, &mut writes) {
                 lock(&self.history).close_pending(stop.reason());
                 if stop == Stop::Denied {
                     ctx.say(DENIED_NOTICE);

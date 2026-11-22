@@ -1,5 +1,7 @@
 //! The file tools as the model sees them: the JSON schemas, the argument checks, and the dispatch to a backend. The agent loop
-//! decides the place (this machine, a nested shell, or unknown) and passes it in. This module only refuses or runs.
+//! decides the place (this machine, a nested shell, or unknown) and passes it in. This module only refuses or runs. The
+//! write tools (`write_file`, `edit_file`) are not run here: the gate asks first (core/agent), and only `preview_write` and
+//! `run_write` touch them.
 
 use std::ops::RangeInclusive;
 
@@ -8,14 +10,21 @@ use serde_json::{Value, json};
 use super::backend::{FsBackend, GlobRequest, GrepRequest, ListRequest, ReadRequest};
 use super::local::LocalBackend;
 use super::scope::{Scope, echo};
+use super::write::{self, EditFileArgs, EditSpec, WriteFileArgs, WritePlan};
 use crate::core::tools::ToolSchema;
 
 pub const READ_FILE: &str = "read_file";
 pub const LIST_DIR: &str = "list_dir";
 pub const GLOB: &str = "glob";
 pub const GREP: &str = "grep";
-/// The file tools' names, in the order they are offered.
+/// The read-only file tools' names, in the order they are offered.
 pub const TOOL_NAMES: [&str; 4] = [READ_FILE, LIST_DIR, GLOB, GREP];
+pub const WRITE_FILE: &str = "write_file";
+pub const EDIT_FILE: &str = "edit_file";
+/// The write tools' names. Each call needs approval (core/agent).
+pub const WRITE_TOOL_NAMES: [&str; 2] = [WRITE_FILE, EDIT_FILE];
+/// The most write calls (`write_file` and `edit_file` together) one turn may make.
+pub const FS_WRITES_PER_TURN: u32 = 60;
 
 /// Lines `read_file` shows when no limit is given.
 const DEFAULT_LINES: usize = 2000;
@@ -35,14 +44,64 @@ pub enum Place<'a> {
     Unknown,
 }
 
-/// Whether `name` is one of the file tools.
+/// Whether `name` is one of the file tools, read or write.
 pub fn is_tool(name: &str) -> bool {
-    TOOL_NAMES.contains(&name)
+    TOOL_NAMES.contains(&name) || is_write(name)
+}
+
+/// Whether `name` is a write tool: it needs approval, and goes through `preview_write` and `run_write`.
+pub fn is_write(name: &str) -> bool {
+    WRITE_TOOL_NAMES.contains(&name)
 }
 
 /// The schemas of the file tools.
 pub fn schemas() -> Vec<ToolSchema> {
     vec![
+        ToolSchema {
+            name: WRITE_FILE,
+            description: "Create or overwrite a whole text file on this machine (UTF-8). Use this instead of heredocs, printf or \
+                tee through run_command. Each call needs the user's approval; the card shows what will change. It works only \
+                inside the project folder and never writes .git, .env, key or secret files, or Watt's own settings. The parent \
+                folder must exist unless create_dirs is true. Up to 2 MiB per call. For a small change to an existing file, \
+                use edit_file instead.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "The file: relative to the project folder, or absolute inside it."},
+                    "content": {"type": "string", "description": "The whole new content of the file, exactly as it should be saved."},
+                    "create_dirs": {"type": "boolean", "description": "Create the missing folders of the path. Default false."}
+                },
+                "required": ["path", "content"]
+            }),
+        },
+        ToolSchema {
+            name: EDIT_FILE,
+            description: "Change an existing text file on this machine by exact string replacement. Use this instead of sed -i or \
+                other edits through run_command. Each call needs the user's approval; the card shows the change. `edits` run in \
+                order and all succeed or none does: old_string must match the file exactly (including indentation), once, unless \
+                replace_all is true. Put several edits in one call. Line endings and a BOM are kept. It works only inside the \
+                project folder and never on .git, .env, key or secret files, or Watt's own settings.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "The file: relative to the project folder, or absolute inside it."},
+                    "edits": {
+                        "type": "array",
+                        "description": "The replacements, applied in order. Each edit sees the result of the ones before it.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old_string": {"type": "string", "description": "The exact text to replace. Not empty."},
+                                "new_string": {"type": "string", "description": "The text to put in its place. May be empty."},
+                                "replace_all": {"type": "boolean", "description": "Replace every match, not only a single one. Default false."}
+                            },
+                            "required": ["old_string", "new_string"]
+                        }
+                    }
+                },
+                "required": ["path", "edits"]
+            }),
+        },
         ToolSchema {
             name: READ_FILE,
             description: "Read a text file on this machine, with line numbers. Use this instead of cat through run_command. \
@@ -108,17 +167,7 @@ pub fn schemas() -> Vec<ToolSchema> {
 /// Runs one file tool call and returns the text the model reads. A refusal is the error text. The place is checked before
 /// the arguments: a remote or unknown place touches no file.
 pub fn run(place: Place<'_>, name: &str, args: &Value) -> Result<String, String> {
-    let scope = match place {
-        Place::Local(scope) => scope,
-        Place::Remote { host } => {
-            return Err(format!(
-                "File tools work on the local machine only for now; this session is on {host}. Use run_command."
-            ));
-        }
-        Place::Unknown => {
-            return Err("File tools need this session's local folder, and none is known right now. Use run_command.".to_string());
-        }
-    };
+    let scope = local_scope(place)?;
     let backend = LocalBackend::new(scope);
     match name {
         READ_FILE => backend.read_file(&read_request(args)?),
@@ -127,6 +176,70 @@ pub fn run(place: Place<'_>, name: &str, args: &Value) -> Result<String, String>
         GREP => backend.grep(&grep_request(args)?),
         _ => Err(format!("unknown file tool `{}`", echo(name))),
     }
+}
+
+/// The write as the gate shows it: the card text, after the checks against the file as it is now. Nothing is written. A
+/// refusal here is the tool error, and the user is not asked.
+pub fn preview_write(place: Place<'_>, name: &str, args: &Value) -> Result<String, String> {
+    Ok(write_plan(place, name, args)?.display().to_string())
+}
+
+/// Runs an approved write: the checks again against the file as it is now, then the atomic write. Returns the result text.
+pub fn run_write(place: Place<'_>, name: &str, args: &Value) -> Result<String, String> {
+    write_plan(place, name, args)?.commit()
+}
+
+fn write_plan(place: Place<'_>, name: &str, args: &Value) -> Result<WritePlan, String> {
+    let scope = local_scope(place)?;
+    match name {
+        WRITE_FILE => write::plan_write_file(scope, &write_file_args(args)?),
+        EDIT_FILE => write::plan_edit_file(scope, &edit_file_args(args)?),
+        _ => Err(format!("unknown file tool `{}`", echo(name))),
+    }
+}
+
+/// The scope of a local place. A remote or unknown place is refused here, before any argument is read.
+fn local_scope(place: Place<'_>) -> Result<&Scope, String> {
+    match place {
+        Place::Local(scope) => Ok(scope),
+        Place::Remote { host } => Err(format!(
+            "File tools work on the local machine only for now; this session is on {host}. Use run_command."
+        )),
+        Place::Unknown => Err("File tools need this session's local folder, and none is known right now. Use run_command.".to_string()),
+    }
+}
+
+fn write_file_args(args: &Value) -> Result<WriteFileArgs, String> {
+    let content = match args.get("content") {
+        Some(Value::String(content)) => content.clone(),
+        None | Some(Value::Null) => return Err(format!("the {WRITE_FILE} tool needs `content`")),
+        Some(_) => return Err("`content` must be a string".to_string()),
+    };
+    Ok(WriteFileArgs { path: required_text(args, WRITE_FILE, "path")?, content, create_dirs: flag_arg(args, "create_dirs")? })
+}
+
+fn edit_file_args(args: &Value) -> Result<EditFileArgs, String> {
+    let path = required_text(args, EDIT_FILE, "path")?;
+    let list = match args.get("edits") {
+        Some(Value::Array(list)) if !list.is_empty() => list,
+        _ => return Err("`edits` must be a non-empty list of objects with old_string and new_string".to_string()),
+    };
+    let edits = list
+        .iter()
+        .enumerate()
+        .map(|(i, edit)| -> Result<EditSpec, String> {
+            let n = i + 1;
+            let text = |key: &str| {
+                edit.get(key).and_then(Value::as_str).map(str::to_string).ok_or_else(|| format!("edit #{n} needs `{key}` (text)"))
+            };
+            Ok(EditSpec {
+                old: text("old_string")?,
+                new: text("new_string")?,
+                replace_all: flag_arg(edit, "replace_all").map_err(|e| format!("edit #{n}: {e}"))?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(EditFileArgs { path, edits })
 }
 
 fn read_request(args: &Value) -> Result<ReadRequest, String> {
@@ -200,7 +313,7 @@ mod tests {
         let root = tmp.path().join("proj");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("a.txt"), "hello\n").unwrap();
-        Scope::new(root.clone(), root, None)
+        Scope::new(root.clone(), root, Vec::new())
     }
 
     #[test]
@@ -249,13 +362,80 @@ mod tests {
 
     #[test]
     fn the_schemas_name_exactly_the_file_tools() {
-        let names: Vec<&str> = schemas().iter().map(|s| s.name).collect();
-        assert_eq!(names, TOOL_NAMES);
+        let mut expected: Vec<&str> = TOOL_NAMES.to_vec();
+        expected.extend(WRITE_TOOL_NAMES);
+        let mut names: Vec<&str> = schemas().iter().map(|s| s.name).collect();
+        names.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(names, expected);
         for schema in schemas() {
             assert!(is_tool(schema.name));
             assert_eq!(schema.parameters["type"], "object", "{}", schema.name);
             assert!(!schema.description.is_empty(), "{}", schema.name);
         }
-        assert!(!is_tool("skill") && !is_tool("run_command"));
+        assert!(is_write("write_file") && is_write("edit_file") && !is_write("read_file"));
+        assert!(!is_tool("skill") && !is_tool("run_command") && !is_tool("send_keys"));
+    }
+
+    #[test]
+    fn a_write_call_with_bad_arguments_is_refused_before_any_file_is_touched() {
+        let tmp = TempDir::new();
+        let scope = local_scope(&tmp);
+        let local = || Place::Local(&scope);
+        assert_eq!(preview_write(local(), WRITE_FILE, &json!({"path": "n.txt"})).unwrap_err(), "the write_file tool needs `content`");
+        assert_eq!(preview_write(local(), WRITE_FILE, &json!({"content": "x"})).unwrap_err(), "the write_file tool needs `path`");
+        assert!(preview_write(local(), WRITE_FILE, &json!({"path": "n.txt", "content": 3})).unwrap_err().contains("must be a string"));
+        assert!(preview_write(local(), EDIT_FILE, &json!({"path": "a.txt", "edits": []})).unwrap_err().contains("non-empty list"));
+        let missing_new = preview_write(local(), EDIT_FILE, &json!({"path": "a.txt", "edits": [{"old_string": "a"}]})).unwrap_err();
+        assert_eq!(missing_new, "edit #1 needs `new_string` (text)");
+        let bad_flag = preview_write(local(), EDIT_FILE, &json!({"path": "a.txt", "edits": [{"old_string": "a", "new_string": "b", "replace_all": "yes"}]}));
+        assert!(bad_flag.unwrap_err().starts_with("edit #1: `replace_all` must be true or false"));
+        assert!(!tmp.path().join("proj").join("n.txt").exists());
+    }
+
+    #[test]
+    fn a_write_in_a_remote_or_unknown_place_is_refused_without_a_card() {
+        let args = json!({"path": "n.txt", "content": "x"});
+        let remote = Place::Remote { host: "pi@box".to_string() };
+        assert!(preview_write(remote, WRITE_FILE, &args).unwrap_err().starts_with("File tools work on the local machine only"));
+        assert!(preview_write(Place::Unknown, EDIT_FILE, &json!({"path": "a", "edits": []})).unwrap_err().starts_with("File tools need"));
+    }
+
+    /// The acceptance case: a long script full of the characters that make run_command refuse or ask. It is written as an
+    /// argument, read back byte for byte, and two places are edited in one call. A variant without a final newline too.
+    #[test]
+    fn an_acceptance_script_round_trips_byte_for_byte_and_takes_two_edits() {
+        let tmp = TempDir::new();
+        let scope = local_scope(&tmp);
+        let place = || Place::Local(&scope);
+        let mut script = String::from("#!/bin/bash\n");
+        for i in 0..96 {
+            script.push_str(&format!(
+                "printf '%s\\n' \"item {i}: \\$HOME \\`whoami\\` \\\\ tab\there 'single' caf\u{e9} \u{2014} \u{2713}\"\n"
+            ));
+        }
+        script.push_str("cat <<'EOF'\nhello 'world' $NOT_EXPANDED \\n\nEOF\n");
+        let root = tmp.path().join("proj");
+        let write_new = |name: &str, content: &str| {
+            let args = json!({"path": name, "content": content});
+            let plan = write_plan(place(), WRITE_FILE, &args).unwrap();
+            assert!(plan.display().starts_with(&format!("{name} (new file,")), "{}", plan.display());
+            assert!(plan.commit().unwrap().starts_with(&format!("wrote {name}:")));
+        };
+        write_new("run.sh", &script);
+        write_new("bare.sh", script.trim_end_matches('\n'));
+        assert_eq!(fs::read(root.join("run.sh")).unwrap(), script.as_bytes());
+        assert_eq!(fs::read(root.join("bare.sh")).unwrap(), script.trim_end_matches('\n').as_bytes());
+        assert!(run_write(place(), READ_FILE, &json!({"path": "run.sh"})).is_err(), "a read tool is not a write");
+
+        let args = json!({"path": "run.sh", "edits": [
+            {"old_string": "item 7:", "new_string": "item seven:"},
+            {"old_string": "item 80:", "new_string": "item eighty:"}
+        ]});
+        assert_eq!(run_write(place(), EDIT_FILE, &args).unwrap(), "edited run.sh: 2 replacements in 2 edits (100 lines)");
+        let expected = script.replacen("item 7:", "item seven:", 1).replacen("item 80:", "item eighty:", 1);
+        assert_eq!(fs::read(root.join("run.sh")).unwrap(), expected.as_bytes());
+        let shown = run(place(), READ_FILE, &json!({"path": "run.sh", "offset": 9, "limit": 1})).unwrap();
+        assert!(shown.contains("item seven:"), "{shown}");
     }
 }

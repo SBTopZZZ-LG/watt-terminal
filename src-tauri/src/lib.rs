@@ -52,7 +52,7 @@ use crate::core::registry::Registry;
 use crate::core::session::{IntegrateOutcome, Session, SessionStats, SpawnConfig};
 use crate::core::settings::models::fetch_models as fetch_model_list;
 use crate::core::settings::presets::{self, ProviderPreset};
-use crate::core::settings::secrets::Secrets;
+use crate::core::settings::secrets::{Secrets, secrets_file_path};
 use crate::core::settings::service::{
     FetchOutcome, RecoverAction, SaveProviderInput, SettingsService, SettingsStateView, SettingsView, TestResult,
     test_model,
@@ -227,7 +227,7 @@ fn resolve_config_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
 /// their folders on write.
 fn resolve_persist(app: &tauri::AppHandle) -> Option<Persist> {
     let config = resolve_config_dir(app);
-    let data = dir_override("WATT_DATA_DIR", "AGENT_TERM_DATA_DIR").or_else(|| app.path().app_data_dir().ok());
+    let data = resolve_data_dir(app);
     match (config, data) {
         (Some(config), Some(data)) => Some(Persist::new(&config, &data)),
         _ => {
@@ -235,6 +235,11 @@ fn resolve_persist(app: &tauri::AppHandle) -> Option<Persist> {
             None
         }
     }
+}
+
+/// Watt's data folder (conversations): WATT_DATA_DIR (or the old AGENT_TERM_DATA_DIR) when set, else the app data folder.
+fn resolve_data_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
+    dir_override("WATT_DATA_DIR", "AGENT_TERM_DATA_DIR").or_else(|| app.path().app_data_dir().ok())
 }
 
 fn dir_override(name: &str, legacy: &str) -> Option<PathBuf> {
@@ -927,7 +932,9 @@ fn fs_scope_for(app: &tauri::AppHandle, att: &Attached, project_root: Option<Pat
     let cwd = att.session.local_cwd().filter(is_local_cwd)?;
     let local = PathBuf::from(&cwd.path);
     let root = project_root.unwrap_or_else(|| local.clone());
-    Some(Scope::new(root, local, resolve_config_dir(app)))
+    // Watt's own folders and the secrets file: the file tools never read or write them, whatever the paths are.
+    let guarded = [resolve_config_dir(app), resolve_data_dir(app), secrets_file_path()].into_iter().flatten().collect();
+    Some(Scope::new(root, local, guarded))
 }
 
 /// The skills for the settings view (core/skills): the user's folders, plus the session's project folders when its local

@@ -537,6 +537,11 @@ describe('transcriptReducer: clarification questions', () => {
 });
 
 describe('approvalTitle', () => {
+  it('names the file writes', () => {
+    expect(approvalTitle('write_file', 'fs_write')).toBe('The agent wants to write a file');
+    expect(approvalTitle('edit_file', 'fs_write')).toBe('The agent wants to edit a file');
+  });
+
   it('names run_command and send_keys', () => {
     expect(approvalTitle('run_command')).toBe('The agent wants to run a command');
     expect(approvalTitle('send_keys')).toBe('The agent wants to type into a running command');
