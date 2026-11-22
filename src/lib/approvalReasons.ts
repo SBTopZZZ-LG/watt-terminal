@@ -30,6 +30,7 @@ const ASK_CLAUSE: Record<Exclude<AskReasonCode, 'unintegrated_shell'>, string> =
   auto_cap: `this turn has already used its ${AUTO_PER_TURN} automatic approvals.`,
   nested_level: 'this is a nested shell, so every command in it needs your approval.',
   approve_all_suspended: `${BYPASS_LABEL} is off in this shell, because it was turned on in another shell.`,
+  external_tool: 'this tool is not part of the terminal, so it needs your approval before it runs.',
 };
 
 /** Reasons that are a whole sentence on their own, so the card shows them as they are (no "Asked because"). */

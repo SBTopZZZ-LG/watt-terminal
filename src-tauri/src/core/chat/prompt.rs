@@ -91,6 +91,29 @@ pub fn tool_definitions() -> Vec<Value> {
 mod tests {
     use super::*;
 
+    /// The built-in tool names in the order they are offered. A new built-in must be added here on purpose: it is then
+    /// one more name the gate must classify (core/agent `BUILTIN_UNGATED`, or the gated set).
+    #[test]
+    fn builtin_tool_names_are_the_known_set() {
+        let defs = tool_definitions();
+        let names: Vec<&str> = defs.iter().filter_map(|d| d["function"]["name"].as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "list_commands",
+                "get_command",
+                "get_screen",
+                "get_cwd",
+                "wait",
+                "run_command",
+                "request_integration",
+                "send_keys",
+                "todo_write",
+                "ask_user",
+            ]
+        );
+    }
+
     #[test]
     fn send_keys_is_advertised_once() {
         let defs = tool_definitions();

@@ -7,6 +7,7 @@ pub mod agent;
 pub mod approval;
 pub mod chat;
 pub mod env;
+pub mod external_tools;
 pub mod foreground;
 pub mod inject;
 pub mod keys;

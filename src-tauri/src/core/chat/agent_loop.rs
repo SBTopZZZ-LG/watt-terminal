@@ -29,6 +29,7 @@ use serde_json::{Value, json};
 
 use crate::core::agent::{Agent, AgentCtx, AgentEvent, RunApproval, DENIED, UserMessage};
 use crate::core::env::env_setting;
+use crate::core::external_tools::{ExternalApproval, ExternalToolHost};
 use crate::core::foreground::{Foreground, ForegroundKind};
 use crate::core::chat::attachments::{Resolver, user_content};
 use crate::core::chat::context::{self, Calibrator, ContextUsage};
@@ -676,10 +677,12 @@ impl LlmAgent {
             } else {
                 Resolver::without_images()
             };
-            let request = self.fit_or_say(ctx, limit, &system, &mut resolver)?;
+            // Built per request, so an external host's tools are the ones it offers now.
+            let tools = request_tools(&self.tools, ctx.external_tools());
+            let request = self.fit_or_say(ctx, &tools, limit, &system, &mut resolver)?;
             let sent_images = has_image_part(&request.messages);
-            let estimate = self.estimate(&request);
-            let (result, streamed) = self.send(ctx, request);
+            let estimate = self.estimate(&request, &tools);
+            let (result, streamed) = self.send(ctx, request, &tools);
             match result {
                 Ok(reply) => {
                     if image_refused {
@@ -734,8 +737,8 @@ impl LlmAgent {
     }
 
     /// The calibrated estimate of one request, as the usage event reports it.
-    fn estimate(&self, request: &WireRequest) -> u32 {
-        let breakdown = context::breakdown(&request.system, &self.tools, &request.messages);
+    fn estimate(&self, request: &WireRequest, tools: &[Value]) -> u32 {
+        let breakdown = context::breakdown(&request.system, tools, &request.messages);
         context::usage(&breakdown, &lock_calibration(&self.calibration), None, None).used
     }
 
@@ -757,7 +760,7 @@ impl LlmAgent {
     /// The request to send for `system` under `limit`: the stored history as wire messages, trimmed (see core/chat/trim)
     /// when the limit is known and the untrimmed request is over the budget. Nothing is trimmed without a known limit.
     /// Err when even the smallest request does not fit; the stored history is never changed.
-    fn fit(&self, limit: Option<u32>, system: &str, resolver: &mut Resolver<'_>) -> Result<WireRequest, TooLarge> {
+    fn fit(&self, limit: Option<u32>, system: &str, tools: &[Value], resolver: &mut Resolver<'_>) -> Result<WireRequest, TooLarge> {
         let Some(limit) = limit else {
             return Ok(self.request(system, &TrimPlan::none(), resolver));
         };
@@ -767,7 +770,7 @@ impl LlmAgent {
         let max_drop = lock(&self.history).turn_count().saturating_sub(1);
         let chosen = trim::select(budget, max_drop, |plan| {
             let request = self.request(system, plan, resolver);
-            let breakdown = context::breakdown(&request.system, &self.tools, &request.messages);
+            let breakdown = context::breakdown(&request.system, tools, &request.messages);
             context::usage(&breakdown, &calibrator, Some(limit), self.max_tokens).used
         });
         match chosen {
@@ -777,8 +780,15 @@ impl LlmAgent {
     }
 
     /// `fit`, and when the request does not fit at all, its notice is shown and no request is made.
-    fn fit_or_say(&self, ctx: &AgentCtx<'_>, limit: Option<u32>, system: &str, resolver: &mut Resolver<'_>) -> Option<WireRequest> {
-        match self.fit(limit, system, resolver) {
+    fn fit_or_say(
+        &self,
+        ctx: &AgentCtx<'_>,
+        tools: &[Value],
+        limit: Option<u32>,
+        system: &str,
+        resolver: &mut Resolver<'_>,
+    ) -> Option<WireRequest> {
+        match self.fit(limit, system, tools, resolver) {
             Ok(request) => Some(request),
             Err(too_large) => {
                 ctx.say(self.redactor.redact(&too_large.text()));
@@ -798,13 +808,13 @@ impl LlmAgent {
     /// text was streamed to the user during the call. The context usage of the request is emitted before it is sent, and
     /// again with the provider's count if the reply reports one (see core/chat/context). The usage says whether older
     /// content was left out.
-    fn send(&self, ctx: &AgentCtx<'_>, request: WireRequest) -> (Result<AssistantReply, LlmError>, bool) {
+    fn send(&self, ctx: &AgentCtx<'_>, request: WireRequest, tools: &[Value]) -> (Result<AssistantReply, LlmError>, bool) {
         let WireRequest { system, messages, trimmed } = request;
-        let breakdown = context::breakdown(&system, &self.tools, &messages);
+        let breakdown = context::breakdown(&system, tools, &messages);
         let req = ChatRequest {
             model: self.model.clone(),
             messages,
-            tools: Some(self.tools.clone()),
+            tools: Some(tools.to_vec()),
             max_tokens: self.max_tokens,
             extra: self.extra.clone(),
         };
@@ -918,6 +928,8 @@ impl LlmAgent {
             _ if READ_NAMES.contains(&name) => ctx.read_tool(name, args),
             "request_integration" => ctx.call_tool("request_integration", args),
             "send_keys" => ctx.call_tool("send_keys", args),
+            // A tool an attached host owns goes through the gate, which asks, runs or refuses it (core/agent).
+            _ if ctx.owns_external_tool(name) => ctx.call_tool(name, args),
             _ => {
                 let shown: String = name.chars().take(NAME_LIMIT).collect();
                 return failed(&format!("unknown tool `{shown}`"));
@@ -996,6 +1008,29 @@ impl LlmAgent {
         *general += 1;
         self.limits.model_call_cap().filter(|&cap| *general > cap).map(Cap::Model)
     }
+}
+
+/// The tools offered in one model request: the built-in ones (`builtins`), then the attached host's (core/external_tools),
+/// except the ones the host disables and the ones whose name is already taken. The first name wins, so a built-in always
+/// wins over a host tool, and a host tool is listed once. Rebuilt for each request, so the host's list may change between
+/// requests.
+fn request_tools(builtins: &[Value], host: Option<&dyn ExternalToolHost>) -> Vec<Value> {
+    let mut tools = builtins.to_vec();
+    let Some(host) = host else {
+        return tools;
+    };
+    let mut names: HashSet<String> =
+        tools.iter().filter_map(|t| t["function"]["name"].as_str().map(str::to_string)).collect();
+    for schema in host.schemas() {
+        if host.approval(&schema.name) == ExternalApproval::Never || !names.insert(schema.name.clone()) {
+            continue;
+        }
+        tools.push(json!({
+            "type": "function",
+            "function": {"name": schema.name, "description": schema.description, "parameters": schema.parameters},
+        }));
+    }
+    tools
 }
 
 /// True when a reply counts as polling: an agent-started command is still running, and every call in the reply is one that
@@ -1951,5 +1986,61 @@ mod tests {
         let debug = format!("{plain:?}");
         assert!(debug.contains("extra_keys"), "{debug}");
         assert!(!debug.contains("DUMMY"), "{debug}");
+    }
+
+    /// The tool list of a model request when a host of external tools is attached (core/external_tools).
+    mod external_tool_list {
+        use super::super::*;
+        use crate::core::external_tools::ExternalApproval;
+        use crate::core::external_tools::testing::FakeHost;
+
+        fn builtins() -> Vec<Value> {
+            ["get_cwd", "run_command"].iter().map(|n| json!({"type": "function", "function": {"name": n}})).collect()
+        }
+
+        fn names(tools: &[Value]) -> Vec<String> {
+            tools.iter().map(|t| t["function"]["name"].as_str().unwrap_or_default().to_string()).collect()
+        }
+
+        #[test]
+        fn without_a_host_the_request_has_only_the_builtins() {
+            assert_eq!(names(&request_tools(&builtins(), None)), ["get_cwd", "run_command"]);
+        }
+
+        #[test]
+        fn a_host_adds_its_tools_but_not_the_disabled_ones_or_the_ones_a_builtin_has() {
+            let host = FakeHost::new(
+                &[
+                    ("ext_a", ExternalApproval::Ask),
+                    ("ext_off", ExternalApproval::Never),
+                    ("run_command", ExternalApproval::Auto),
+                    ("get_cwd", ExternalApproval::Auto),
+                ],
+                "x",
+            );
+            let tools = request_tools(&builtins(), Some(&host));
+            assert_eq!(names(&tools), ["get_cwd", "run_command", "ext_a"]);
+            assert_eq!(tools[2]["type"], "function");
+            assert_eq!(tools[2]["function"]["description"], "fake ext_a");
+        }
+
+        #[test]
+        fn the_list_is_rebuilt_for_each_request() {
+            let host = FakeHost::new(&[("ext_a", ExternalApproval::Ask)], "x");
+            assert_eq!(names(&request_tools(&builtins(), Some(&host))), ["get_cwd", "run_command", "ext_a"]);
+            *host.tools.lock().unwrap() = vec![("ext_b".to_string(), ExternalApproval::Auto)];
+            assert_eq!(names(&request_tools(&builtins(), Some(&host))), ["get_cwd", "run_command", "ext_b"]);
+        }
+
+        /// A host result is projected like any other tool result: redacted, and capped.
+        #[test]
+        fn a_host_result_is_redacted_and_capped() {
+            let secret = "hunter2-secret-key";
+            let redactor = Redactor::new(vec![secret.to_string()]);
+            let shown = project("ext_a", true, &Value::String(format!("token {secret}")), &redactor);
+            assert!(shown.contains("[REDACTED]") && !shown.contains(secret), "{shown}");
+            let long = project("ext_a", true, &Value::String("y".repeat(10_000)), &redactor);
+            assert!(long.len() < 10_000, "a long host result is capped: {} bytes", long.len());
+        }
     }
 }

@@ -13,6 +13,7 @@ const ASK_CODES: ApprovalReasonCode[] = [
   'auto_cap',
   'nested_level',
   'approve_all_suspended',
+  'external_tool',
 ];
 
 describe('askedBecause', () => {

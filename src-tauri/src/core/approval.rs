@@ -101,6 +101,8 @@ pub enum Reason {
     NestedLevel,
     /// Approve-all was switched on in another shell level, so it does not apply to this one.
     ApproveAllSuspended,
+    /// A tool the app does not own (core/external_tools). The host's approval for it asks or runs it without a card.
+    ExternalTool,
 }
 
 impl Reason {
@@ -121,6 +123,7 @@ impl Reason {
             Reason::AutoCap => "auto_cap",
             Reason::NestedLevel => "nested_level",
             Reason::ApproveAllSuspended => "approve_all_suspended",
+            Reason::ExternalTool => "external_tool",
         }
     }
 }
@@ -859,6 +862,7 @@ mod tests {
             (Reason::Interrupt, "interrupt"),
             (Reason::Latched, "latched"),
             (Reason::UnintegratedShell, "unintegrated_shell"),
+            (Reason::ExternalTool, "external_tool"),
         ];
         for (reason, code) in codes {
             assert_eq!(reason.code(), code);
