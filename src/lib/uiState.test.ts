@@ -15,6 +15,8 @@ import {
   suggestPromptsPatch,
   notificationsPatch,
   reconcileNotifications,
+  devtoolsPatch,
+  reconcileDevtools,
   shouldRestoreLast,
 } from './uiState';
 import type { Timers } from './uiState';
@@ -125,10 +127,25 @@ describe('reconcileNotifications', () => {
   });
 });
 
+describe('reconcileDevtools', () => {
+  it('takes a boolean from the file, either way; anything else leaves the default (off) to apply', () => {
+    expect(reconcileDevtools(true)).toBe(true);
+    expect(reconcileDevtools(false)).toBe(false);
+    expect(reconcileDevtools(null)).toBeNull();
+    expect(reconcileDevtools(undefined)).toBeNull();
+    expect(reconcileDevtools('yes' as unknown as boolean)).toBeNull();
+  });
+});
+
 describe('patch builders', () => {
   it('notificationsPatch carries the boolean as notifications', () => {
     expect(notificationsPatch(true)).toEqual({ notifications: true });
     expect(notificationsPatch(false)).toEqual({ notifications: false });
+  });
+
+  it('devtoolsPatch carries the boolean as devtools', () => {
+    expect(devtoolsPatch(true)).toEqual({ devtools: true });
+    expect(devtoolsPatch(false)).toEqual({ devtools: false });
   });
 
   it('hideMarksPatch carries the boolean as hide_marks', () => {

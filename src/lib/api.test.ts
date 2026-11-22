@@ -87,6 +87,11 @@ describe('api side commands', () => {
     expect(invoke).toHaveBeenCalledWith('focus_main_window', undefined);
   });
 
+  it('openDevtools takes no arguments and asks the backend to open DevTools', () => {
+    void api.openDevtools();
+    expect(invoke).toHaveBeenCalledWith('open_devtools', undefined);
+  });
+
   it('compactConversation takes no arguments', () => {
     void api.compactConversation();
     expect(invoke).toHaveBeenCalledWith('compact_conversation', { sessionId: 'main' });

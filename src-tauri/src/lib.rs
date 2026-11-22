@@ -1655,6 +1655,23 @@ fn focus_main_window(app: tauri::AppHandle) -> Result<(), String> {
     window.set_focus().map_err(|e| e.to_string())
 }
 
+/// The layout inspector's gate: the command opens DevTools only when the developer setting is on. The frontend hides the
+/// menu item too, but this check is the one that counts.
+fn devtools_gate(enabled: bool) -> Result<(), String> {
+    if enabled { Ok(()) } else { Err("developer tools are disabled in Settings".to_string()) }
+}
+
+/// Opens WebView2 DevTools (the layout inspector) for the main window. Refused unless the developer setting is on.
+#[tauri::command]
+async fn open_devtools(app: tauri::AppHandle, persist: State<'_, PersistState>) -> Result<(), String> {
+    let store = persist.get()?;
+    let enabled = blocking(move || store.ui.load().map(|s| s.devtools).map_err(|e| e.to_string())).await?;
+    devtools_gate(enabled)?;
+    let window = app.get_webview_window("main").ok_or_else(|| "the main window is gone".to_string())?;
+    window.open_devtools();
+    Ok(())
+}
+
 pub fn run() {
     #[cfg(target_os = "macos")]
     migrate_app_folder();
@@ -1701,6 +1718,7 @@ pub fn run() {
             suggest_name,
             suggest_prompts,
             focus_main_window,
+            open_devtools,
             compact_conversation,
             fork_conversation,
             export_conversation,
@@ -1790,6 +1808,12 @@ mod tests {
             *swapped_at_reset.lock().unwrap() = Some(lock(&probe.data).is_some());
         });
         assert_eq!(*swapped_at_reset.lock().unwrap(), Some(true), "reset runs after the channel swap");
+    }
+
+    #[test]
+    fn devtools_opens_only_when_the_setting_is_on() {
+        assert!(devtools_gate(true).is_ok());
+        assert_eq!(devtools_gate(false).unwrap_err(), "developer tools are disabled in Settings");
     }
 
     /// The terminal's Ctrl-C cancels the agent's turn only when it belongs to the agent (see

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { edgeIndex, emptyContext, enabledIndices, menuFor, menuKey, menuPlacement, stepIndex, typeaheadIndex } from './contextMenu';
+import { edgeIndex, emptyContext, enabledIndices, menuFor, menuKey, menuPlacement, stepIndex, typeaheadIndex, withLayoutInspector } from './contextMenu';
 import type { MenuContext, MenuItem, MenuRegion } from './contextMenu';
 import type { InputState } from './types';
 
@@ -250,6 +250,26 @@ describe('menuKey', () => {
     expect(menuKey('Tab', none)).toBeNull();
     expect(menuKey('ArrowDown', { ...none, shift: true })).toBeNull();
     expect(menuKey('Enter', { ...none, meta: true })).toBeNull();
+  });
+});
+
+describe('withLayoutInspector', () => {
+  const base = menuFor(ctx('field', { writable: true, hasSelection: true }));
+
+  it('adds the inspector after its own separator while the developer setting is on', () => {
+    const items = withLayoutInspector(base, true);
+    expect(summary(items).slice(-2)).toEqual(['---', 'Open layout inspector']);
+    expect(items[items.length - 1].id).toBe('open-layout-inspector');
+    expect(items.slice(0, base.length)).toEqual(base);
+  });
+
+  it('adds nothing while the setting is off', () => {
+    expect(withLayoutInspector(base, false)).toEqual(base);
+  });
+
+  it('adds nothing to an empty menu, so a region with no items still opens no menu', () => {
+    expect(withLayoutInspector([], true)).toEqual([]);
+    expect(withLayoutInspector(menuFor(ctx('none')), true)).toEqual([]);
   });
 });
 

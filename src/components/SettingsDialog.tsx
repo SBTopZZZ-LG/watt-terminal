@@ -32,6 +32,7 @@ import type { TabDef } from './SettingsTabs';
 import { TerminalSection } from './TerminalSection';
 import { QueueSection } from './QueueSection';
 import { NotifySection } from './NotifySection';
+import { DevtoolsSection } from './DevtoolsSection';
 import { McpTab } from './McpSection';
 import { SkillsTab } from './SkillsSection';
 import { SuggestSection } from './SuggestSection';
@@ -489,6 +490,9 @@ export interface SettingsDialogProps {
   /** Whether Watt notifies the user when the agent is done or needs them in the background. Owned by the caller (UI state). */
   notifications: boolean;
   onNotificationsChange(on: boolean): void;
+  /** Whether the right-click menu offers the layout inspector. Owned by the caller (UI state). */
+  devtools: boolean;
+  onDevtoolsChange(on: boolean): void;
 }
 
 /**
@@ -498,7 +502,7 @@ export interface SettingsDialogProps {
  * and goes back to where it was on close. Esc closes; a click on the backdrop closes. Unsaved changes are asked about
  * before they are dropped.
  */
-export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded, hideMarks, onHideMarksChange, queueMode, onQueueModeChange, suggestPrompts, onSuggestPromptsChange, notifications, onNotificationsChange }: SettingsDialogProps) {
+export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded, hideMarks, onHideMarksChange, queueMode, onQueueModeChange, suggestPrompts, onSuggestPromptsChange, notifications, onNotificationsChange, devtools, onDevtoolsChange }: SettingsDialogProps) {
   const titleId = useId();
   const dialogRef = useRef<HTMLDivElement>(null);
   const backdropPressed = useRef(false);
@@ -1136,6 +1140,7 @@ export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded, h
       <QueueSection queueMode={queueMode} onQueueModeChange={onQueueModeChange} />
       <SuggestSection suggestPrompts={suggestPrompts} onSuggestPromptsChange={onSuggestPromptsChange} />
       <NotifySection notifications={notifications} onNotificationsChange={onNotificationsChange} />
+      <DevtoolsSection devtools={devtools} onDevtoolsChange={onDevtoolsChange} />
     </>
   );
 

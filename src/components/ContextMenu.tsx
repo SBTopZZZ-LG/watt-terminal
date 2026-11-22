@@ -1,8 +1,9 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { flushSync } from 'react-dom';
 import type { Ref } from 'react';
+import { api } from '../lib/api';
 import { copyText, readClipboardText } from '../lib/clipboard';
-import { edgeIndex, menuFor, menuKey, menuPlacement, stepIndex, typeaheadIndex } from '../lib/contextMenu';
+import { edgeIndex, menuFor, menuKey, menuPlacement, stepIndex, typeaheadIndex, withLayoutInspector } from '../lib/contextMenu';
 import type { MenuItem } from '../lib/contextMenu';
 import { fieldSelectedText, resolveMenu } from '../lib/contextMenuDom';
 import type { MenuSnapshot, TerminalFacts, TextField } from '../lib/contextMenuDom';
@@ -30,6 +31,8 @@ export interface ContextMenuProps {
   onFindTerminal: () => void;
   /** Opens the chat find, as Ctrl+F does in the agent panel. */
   onFindChat: () => void;
+  /** The developer setting: true adds "Open layout inspector" to every menu the app opens. Read when a menu opens. */
+  devtools: boolean;
 }
 
 interface OpenMenu {
@@ -172,6 +175,9 @@ async function runAction(id: MenuItem['id'], snap: MenuSnapshot, props: ContextM
       return copyOrReport(texts.link);
     case 'copy-chip':
       return copyOrReport(texts.chip);
+    case 'open-layout-inspector':
+      // The backend refuses unless the setting is on; a refusal is reported like any other failed action.
+      return api.openDevtools();
     case 'separator':
       return;
   }
@@ -198,7 +204,8 @@ export function ContextMenu(props: ContextMenuProps) {
   };
 
   const show = (snap: MenuSnapshot, point: { x: number; y: number }, keyboard: boolean) => {
-    const items = menuFor(snap.ctx);
+    // Read from latest: show runs from listeners registered once, so the props of the first render would stay.
+    const items = withLayoutInspector(menuFor(snap.ctx), latest.current.devtools);
     if (items.length === 0) {
       return;
     }
