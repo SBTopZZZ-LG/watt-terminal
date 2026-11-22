@@ -5166,6 +5166,7 @@ dependencies = [
  "tauri-plugin-window-state",
  "tokio",
  "vt100",
+ "windows",
 ]
 
 [[package]]

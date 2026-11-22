@@ -56,6 +56,11 @@ tauri-plugin-window-state = "=2.5.0"
 # Latest release for tauri ^2.12 (MSRV 1.90).
 tauri-plugin-notification = "=2.8.1"
 
+[target.'cfg(windows)'.dependencies]
+# Process creation flags for MCP stdio servers (core/mcp/client.rs): CREATE_NO_WINDOW keeps a console app from opening a
+# console window. Same 0.62 as process-wrap's own windows dependency, so no second copy is built.
+windows = { version = "0.62", default-features = false, features = ["Win32_System_Threading"] }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
 

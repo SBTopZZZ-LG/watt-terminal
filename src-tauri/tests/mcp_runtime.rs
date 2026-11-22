@@ -93,7 +93,14 @@ fn process_alive(pid: u32) -> bool {
             .output()
             .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(&format!(" {pid} ")))
     } else {
-        Command::new("kill").args(["-0", &pid.to_string()]).status().is_ok_and(|s| s.success())
+        let signalable = Command::new("kill").args(["-0", &pid.to_string()]).status().is_ok_and(|s| s.success());
+        // kill -0 also succeeds on a zombie (exited, not yet reaped), so the process state decides too.
+        let state = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        signalable && !state.is_empty() && !state.starts_with('Z')
     }
 }
 
