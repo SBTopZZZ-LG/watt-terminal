@@ -23,6 +23,7 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "test": "vitest run",
+    "test:all": "node scripts/test-all.mjs",
     "preview": "vite preview",
     "tauri": "tauri",
     "app:build": "bash scripts/app-build.sh",

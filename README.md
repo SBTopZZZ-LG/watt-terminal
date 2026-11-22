@@ -143,6 +143,10 @@ cd src-tauri && cargo test                      # backend
 
 The Rust integration tests spawn real `zsh -l` sessions through your own startup files (`~/.zshenv`, `~/.zprofile`, `~/.zshrc`, `~/.zlogin`), one at a time, with a temporary `HISTFILE`. Expect them to take a few minutes. The SSH end-to-end tests need Docker and are ignored by default. On Windows, `src-tauri/tests/windows_*.rs` run PowerShell sessions instead.
 
+`npm run test:all` runs the frontend checks and `cargo clippy` and `cargo test` on your machine, prints a pass/fail summary, and exits non-zero if any step failed. `npm run test:all -- --docker` also runs clippy and the Rust tests in `ci/linux/Dockerfile` (Debian bookworm, zsh 5.9), using the named volumes `watt-ci-cargo` and `watt-ci-target`. `--only=<step,...>` runs a subset (`tsc`, `test`, `build`, `clippy`, `cargo-test`, `docker-build`, `docker-test`).
+
+CI (`.github/workflows/ci.yml`) runs the frontend checks and the Rust clippy and tests on macOS, Windows and Ubuntu, plus the Docker Linux run. Platform UI (the WebView, native menu, installers, Keychain) is not covered by CI and stays manual.
+
 ## Known limitations
 
 - The local shell is `zsh -l` on macOS. On Windows it is PowerShell: `pwsh.exe` from the first absolute PATH entry that has it, else Windows PowerShell (`powershell.exe` under `%SystemRoot%`).
