@@ -266,9 +266,9 @@ export const api = {
   mcpSetToolApproval(name: string, tool: string, level: McpLevel | null) {
     return invoke<McpView>('mcp_set_tool_approval', { name, tool, level });
   },
-  /** The skills found in the user's folders and, with a working directory, the workspace's. Missing folders are fine. */
-  listSkills(cwd: string | null = null) {
-    return invoke<SkillsView>('list_skills', { cwd });
+  /** The skills in the user's folders and, when the session's local shell is on top, its project's. Missing folders are fine. */
+  listSkills() {
+    return invoke<SkillsView>('list_skills', { sessionId: SESSION_ID });
   },
   mcpRestart(name: string) {
     return invoke<McpView>('mcp_restart', { name });

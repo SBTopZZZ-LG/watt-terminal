@@ -624,6 +624,11 @@ impl Session {
         self.shared.lock().cwd()
     }
 
+    /// The directory of the local shell, None while a nested shell is on top (see `Core::local_cwd`).
+    pub fn local_cwd(&self) -> Option<Cwd> {
+        self.shared.lock().local_cwd()
+    }
+
     /// The shell's pid, from the spawn. Used for teardown.
     pub fn shell_pid(&self) -> Option<u32> {
         self.shell_pid

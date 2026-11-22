@@ -36,6 +36,7 @@ export function SkillsSection({ view, loadError, loading, onRefresh }: SkillsSec
         skill tool when it fits the task.
       </p>
       <p className="settings-hint">Put a folder with a SKILL.md in one of the folders below, then press Refresh.</p>
+      <p className="settings-hint">Project skills come from the folder of the current terminal session.</p>
 
       {view !== null && view.roots.length > 0 && (
         <div className="settings-mcp-roots">
@@ -114,7 +115,7 @@ export function SkillsTab({ active }: { active: boolean }) {
   const read = () => {
     const my = ++seq.current;
     setLoading(true);
-    api.listSkills(null).then(
+    api.listSkills().then(
       (v) => {
         if (my > applied.current) {
           applied.current = my;

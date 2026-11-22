@@ -151,10 +151,8 @@ describe('api MCP commands', () => {
 describe('api skills commands', () => {
   beforeEach(() => invoke.mockClear());
 
-  it('listSkills sends the working directory as cwd, or null when there is none', () => {
-    void api.listSkills('/work/app');
-    expect(invoke).toHaveBeenLastCalledWith('list_skills', { cwd: '/work/app' });
+  it('listSkills passes the session id; the backend picks the project folders from the session', () => {
     void api.listSkills();
-    expect(invoke).toHaveBeenLastCalledWith('list_skills', { cwd: null });
+    expect(invoke).toHaveBeenLastCalledWith('list_skills', { sessionId: 'main' });
   });
 });

@@ -23,6 +23,7 @@ describe('SkillsSection', () => {
   it('explains skills in two lines and names the folders it looks in', () => {
     const html = render();
     expect(html).toContain('A skill is a folder with a SKILL.md file');
+    expect(html).toContain('Project skills come from the folder of the current terminal session.');
     expect(html).toContain('Looked in');
     expect(html).toContain('C:/Users/me/.claude/skills');
     expect(html).toContain('C:/Users/me/AppData/Roaming/Watt/skills');

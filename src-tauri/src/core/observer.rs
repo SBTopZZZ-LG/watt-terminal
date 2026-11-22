@@ -1834,6 +1834,15 @@ impl Core {
         }
     }
 
+    /// The local shell's directory, only while the local shell is on top: a nested level's filesystem is not this one.
+    pub fn local_cwd(&self) -> Option<Cwd> {
+        if self.top_is_local() {
+            self.cwd.clone()
+        } else {
+            None
+        }
+    }
+
     pub fn shell_pid(&self) -> Option<u32> {
         self.shell_pid
     }
@@ -2870,6 +2879,20 @@ mod tests {
         let recs = c.records();
         assert_eq!(recs.len(), 2, "{recs:?}");
         assert!(recs.iter().all(|r| r.status == RecordStatus::Incomplete), "{recs:?}");
+    }
+
+    /// `local_cwd` is the local shell's directory only while the local shell is on top: a nested level's directory is never
+    /// offered as a local path, even one with an empty host.
+    #[test]
+    fn local_cwd_is_none_while_a_nested_shell_is_on_top() {
+        let mut c = core();
+        c.feed(&osc("7;file://mac.local/tmp/local"));
+        assert_eq!(c.local_cwd(), c.cwd());
+        assert!(c.local_cwd().is_some());
+        let mut nested = nested_at_prompt();
+        nested.feed(&tagged("633;Cwd", CHILD, ";/srv/app"));
+        assert!(nested.cwd().is_some());
+        assert_eq!(nested.local_cwd(), None);
     }
 
     /// A remote level reports its own cwd (tagged 633;Cwd), records take it, and untagged OSC 7 is ignored while it is on top.
