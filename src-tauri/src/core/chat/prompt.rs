@@ -3,6 +3,7 @@
 use serde_json::{Value, json};
 
 use crate::core::chat::{questions, todo};
+use crate::core::skills::tool as skill_tool;
 use crate::core::tools::{self, ToolSchema};
 
 /// Tools the model is never offered. None now: `send_keys` is offered, with its own approval (core/approval).
@@ -64,12 +65,13 @@ pub fn system_prompt_for(shell: &str) -> String {
     format!("{SYSTEM_PROMPT_OPENING}{session}{SYSTEM_PROMPT_REST} {APP_FEATURES}")
 }
 
-/// Every tool the model may be offered before the hidden ones are removed: the backend tools, then `todo_write` and
-/// `ask_user`, which the agent loop handles itself.
+/// Every tool the model may be offered before the hidden ones are removed: the backend tools, then `todo_write`,
+/// `ask_user` and `skill`, which the agent loop handles itself.
 fn all_schemas() -> Vec<ToolSchema> {
     let mut all = tools::schemas();
     all.push(todo::schema());
     all.push(questions::schema());
+    all.push(skill_tool::schema());
     all
 }
 
@@ -110,6 +112,7 @@ mod tests {
                 "send_keys",
                 "todo_write",
                 "ask_user",
+                "skill",
             ]
         );
     }

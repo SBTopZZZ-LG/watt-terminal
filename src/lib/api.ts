@@ -25,6 +25,7 @@ import type {
   RecoverAction,
   SaveProviderInput,
   SettingsView,
+  SkillsView,
   StartResult,
   Status,
   TestResult,
@@ -264,6 +265,10 @@ export const api = {
   /** Sets one tool's level, or clears its override with null (the tool then inherits the server's level). */
   mcpSetToolApproval(name: string, tool: string, level: McpLevel | null) {
     return invoke<McpView>('mcp_set_tool_approval', { name, tool, level });
+  },
+  /** The skills found in the user's folders and, with a working directory, the workspace's. Missing folders are fine. */
+  listSkills(cwd: string | null = null) {
+    return invoke<SkillsView>('list_skills', { cwd });
   },
   mcpRestart(name: string) {
     return invoke<McpView>('mcp_restart', { name });
