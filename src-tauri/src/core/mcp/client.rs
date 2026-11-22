@@ -132,8 +132,8 @@ fn spawn_stdio(
 /// The most bytes of one stderr line that are kept. A longer line keeps its first bytes; the rest is read and dropped.
 const STDERR_LINE_BYTES: u64 = 8 * 1024;
 
-/// Reads one stderr line into `buf`, keeping at most `STDERR_LINE_BYTES` of it. Past the cap the line is read and dropped
-/// up to its newline, so the pipe keeps draining and memory stays bounded. False at the end of the stream.
+/// Reads one stderr line into `buf`, keeping at most `STDERR_LINE_BYTES` of it. Past the cap the line is read and
+/// dropped up to its newline, so the pipe keeps draining and memory stays bounded. False at the end of the stream.
 async fn read_capped_line<R: AsyncBufRead + Unpin>(reader: &mut R, buf: &mut Vec<u8>) -> std::io::Result<bool> {
     buf.clear();
     let n = (&mut *reader).take(STDERR_LINE_BYTES).read_until(b'\n', buf).await?;
