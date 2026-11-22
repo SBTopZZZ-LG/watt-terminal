@@ -13,7 +13,7 @@ use rmcp::service::{ClientInitializeError, NotificationContext, Peer, RunningSer
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::{ClientHandler, RoleClient, ServiceExt};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::ChildStderr;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -129,20 +129,44 @@ fn spawn_stdio(
         .map_err(|e| format!("could not start the server process: {e}"))
 }
 
+/// The most bytes of one stderr line that are kept. A longer line keeps its first bytes; the rest is read and dropped.
+const STDERR_LINE_BYTES: u64 = 8 * 1024;
+
+/// Reads one stderr line into `buf`, keeping at most `STDERR_LINE_BYTES` of it. Past the cap the line is read and dropped
+/// up to its newline, so the pipe keeps draining and memory stays bounded. False at the end of the stream.
+async fn read_capped_line<R: AsyncBufRead + Unpin>(reader: &mut R, buf: &mut Vec<u8>) -> std::io::Result<bool> {
+    buf.clear();
+    let n = (&mut *reader).take(STDERR_LINE_BYTES).read_until(b'\n', buf).await?;
+    if n == 0 {
+        return Ok(false);
+    }
+    if !buf.ends_with(b"\n") && buf.len() as u64 == STDERR_LINE_BYTES {
+        let mut rest = Vec::new();
+        loop {
+            rest.clear();
+            let m = (&mut *reader).take(STDERR_LINE_BYTES).read_until(b'\n', &mut rest).await?;
+            if m == 0 || rest.ends_with(b"\n") {
+                break;
+            }
+        }
+    }
+    Ok(true)
+}
+
 /// Reads the server's stderr line by line for the rest of its life, even when nobody reads the log: an undrained pipe
-/// could block the server. A line that is not UTF-8 is kept with replacement characters.
+/// could block the server. A line that is not UTF-8 is kept with replacement characters, and a line longer than
+/// `STDERR_LINE_BYTES` is kept cut (see `read_capped_line`).
 fn drain_stderr(server: String, stderr: ChildStderr, events: UnboundedSender<Msg>) {
     tokio::spawn(async move {
         let mut reader = BufReader::new(stderr);
         let mut buf = Vec::new();
         loop {
-            buf.clear();
-            match reader.read_until(b'\n', &mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
+            match read_capped_line(&mut reader, &mut buf).await {
+                Ok(true) => {
                     let line = String::from_utf8_lossy(&buf).trim_end_matches(['\r', '\n']).to_string();
                     let _ = events.send(Msg::Log { server: server.clone(), line });
                 }
+                Ok(false) | Err(_) => break,
             }
         }
     });
@@ -246,5 +270,31 @@ mod tests {
         let bad_value = vec![("X-Key".to_string(), "line\nbreak-secret".to_string())];
         let err = http_config("https://x.test/mcp", &bad_value).unwrap_err();
         assert!(err.contains("X-Key") && !err.contains("line"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_over_long_stderr_line_is_kept_cut_and_the_next_line_is_read() {
+        let mut data = vec![b'a'; 1_100_000];
+        data.extend_from_slice(b"\nafter the long line\n");
+        let mut reader = BufReader::new(data.as_slice());
+        let mut buf = Vec::new();
+        assert!(read_capped_line(&mut reader, &mut buf).await.unwrap());
+        assert_eq!(buf.len() as u64, STDERR_LINE_BYTES);
+        assert!(buf.iter().all(|&b| b == b'a'));
+        assert!(read_capped_line(&mut reader, &mut buf).await.unwrap());
+        assert_eq!(buf, b"after the long line\n");
+        assert!(!read_capped_line(&mut reader, &mut buf).await.unwrap(), "end of stream");
+    }
+
+    #[tokio::test]
+    async fn a_stderr_line_within_the_cap_is_kept_whole() {
+        let data = b"short\r\nlast line with no newline";
+        let mut reader = BufReader::new(&data[..]);
+        let mut buf = Vec::new();
+        assert!(read_capped_line(&mut reader, &mut buf).await.unwrap());
+        assert_eq!(buf, b"short\r\n");
+        assert!(read_capped_line(&mut reader, &mut buf).await.unwrap());
+        assert_eq!(buf, b"last line with no newline");
+        assert!(!read_capped_line(&mut reader, &mut buf).await.unwrap());
     }
 }

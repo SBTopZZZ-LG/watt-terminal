@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use watt_terminal_lib::core::external_tools::{ExternalApproval, ExternalToolHost};
 use watt_terminal_lib::core::llm::TurnCancel;
 use watt_terminal_lib::core::mcp::config::{McpLevel, McpServerConfig, McpSettings, McpTransport};
+use watt_terminal_lib::core::mcp::logs::LOG_LINE_CHARS;
 use watt_terminal_lib::core::mcp::manager::{McpManager, ServerState};
 use watt_terminal_lib::core::mcp::secrets::SecretValues;
 
@@ -386,6 +387,28 @@ fn secret_values_are_redacted_in_the_log_and_in_results() {
     assert!(joined.contains("fixture started FIXTURE_SECRET=[REDACTED]"), "{joined}");
     assert!(!joined.contains(FIXTURE_SECRET_VALUE), "{joined}");
     assert!(manager.logs("no-such-server").is_none());
+    manager.shutdown();
+}
+
+#[test]
+fn a_stderr_line_over_a_megabyte_is_cut_and_the_lines_after_it_are_still_logged() {
+    require_node!();
+    let manager = McpManager::start().expect("start");
+    let noisy = fixture_server("noisy", &["long-stderr"]);
+    manager.apply(&settings(vec![noisy]), &BTreeMap::new()).expect("apply");
+    wait_connected(&manager, "noisy");
+
+    let deadline = Instant::now() + WAIT;
+    let logs = loop {
+        let lines = manager.logs("noisy").unwrap_or_default();
+        if lines.iter().any(|l| l == "after the long line") || Instant::now() > deadline {
+            break lines;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(logs.iter().any(|l| l == "after the long line"), "the line after the long one was not logged");
+    let longest = logs.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    assert!(longest <= LOG_LINE_CHARS, "a kept line is {longest} characters");
     manager.shutdown();
 }
 
