@@ -3,6 +3,9 @@
 //! and parses everything the shell printed with the scanner. The blob's nonce is added as level 1, so events name
 //! their level. The bash cases skip with a note when no bash >= 4.4 is installed. The docker case is #[ignore].
 
+// Spawns zsh and /bin/bash: neither is available on Windows.
+#![cfg(unix)]
+
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};

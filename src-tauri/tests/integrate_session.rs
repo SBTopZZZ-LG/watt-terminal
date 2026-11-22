@@ -10,12 +10,19 @@ use std::thread;
 use std::time::Duration;
 
 use watt_terminal_lib::core::foreground::ForegroundKind;
-use watt_terminal_lib::core::observer::{InjectRefusal, InputState};
-use watt_terminal_lib::core::record::{Record, RecordStatus, RecordSummary, Source};
+use watt_terminal_lib::core::observer::InputState;
+#[cfg(unix)]
+use watt_terminal_lib::core::observer::InjectRefusal;
+use watt_terminal_lib::core::record::{RecordSummary, Source};
+#[cfg(unix)]
+use watt_terminal_lib::core::record::Record;
+#[cfg(unix)]
+use watt_terminal_lib::core::record::RecordStatus;
 use watt_terminal_lib::core::session::{IntegrateOutcome, Session, SubmitError};
 use common::*;
 
 const WAIT: Duration = Duration::from_secs(20);
+#[cfg(unix)]
 const NESTED_ZSH: &str = "zsh -f -i";
 
 /// Waits until `s` runs `kind` in the foreground. False on timeout.
@@ -32,6 +39,7 @@ fn integrate_ok(s: &Session) -> (u64, String) {
 }
 
 /// The record of `command` at `level` that has finished, once it has finished (the caller checks the state separately).
+#[cfg(unix)]
 fn finished(s: &Session, command: &str, level: u64) -> Record {
     let id = wait_until(WAIT, || {
         s.records().iter().find(|r| r.command == command && r.level == level && r.exit_code.is_some()).map(|r| r.id)
@@ -60,6 +68,8 @@ fn old_bash_at(path: &str) -> Option<(u32, u32)> {
 
 /// zsh inside zsh: integrated as level 1, its commands are attributed to that level and its location, a `zsh -f -i`
 /// parent record is kept, and `exit` pops back to the local shell.
+// Runs zsh through common/mod.rs: no zsh on Windows, so this test is unix-only.
+#[cfg(unix)]
 #[test]
 fn zsh_inside_zsh_is_integrated_and_its_commands_are_attributed() {
     let _g = serial();
@@ -110,6 +120,7 @@ fn zsh_inside_zsh_is_integrated_and_its_commands_are_attributed() {
 }
 
 /// A plain `sleep` is not a shell: refused as NoShellProgram. At a prompt there is no command at all: NotRunning.
+#[cfg(unix)]
 #[test]
 fn integrate_is_refused_at_a_prompt_and_for_a_program_that_is_not_a_shell() {
     let _g = serial();
@@ -128,6 +139,7 @@ fn integrate_is_refused_at_a_prompt_and_for_a_program_that_is_not_a_shell() {
 /// A shell that has printed nothing since its command began is still starting, and the Ctrl-C an integration types would
 /// stop it. Here the command sleeps before it execs zsh, so integrating at once is refused as still starting, and nothing
 /// is typed: the command is still running afterwards. Once zsh has drawn its prompt, the same session integrates.
+#[cfg(unix)]
 #[test]
 fn integrate_waits_while_a_shell_is_still_starting() {
     let _g = serial();
@@ -176,6 +188,7 @@ fn bash_32_is_refused_as_unsupported_and_the_session_goes_on() {
 }
 
 /// While a nested level is on top, a 133;A with a wrong nonce is forged: counted, and it changes nothing.
+#[cfg(unix)]
 #[test]
 fn a_forged_prompt_while_a_level_is_on_top_only_counts() {
     let _g = serial();

@@ -5,11 +5,17 @@ mod common;
 use std::fs;
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Barrier, Mutex};
+use std::sync::{mpsc, Arc, Barrier};
+#[cfg(unix)]
+use std::sync::Mutex;
 use std::thread;
+#[cfg(unix)]
 use std::time::Duration;
 
-use watt_terminal_lib::core::observer::{EventSink, InputState, IntegrationStatus, SessionEvent};
+#[cfg(unix)]
+use watt_terminal_lib::core::observer::{EventSink, SessionEvent};
+#[cfg(unix)]
+use watt_terminal_lib::core::observer::{InputState, IntegrationStatus};
 use watt_terminal_lib::core::registry::Registry;
 use watt_terminal_lib::core::session::{Session, SpawnConfig};
 
@@ -24,6 +30,8 @@ fn spawn_session(home: &std::path::Path) -> io::Result<Session> {
     Session::spawn(ID, cfg, Box::new(ChanSink(tx)))
 }
 
+// Runs zsh through common/mod.rs: no zsh on Windows, so this test is unix-only.
+#[cfg(unix)]
 #[test]
 fn attaching_the_same_id_twice_spawns_one_pty() {
     let _g = serial();
@@ -49,6 +57,7 @@ fn attaching_the_same_id_twice_spawns_one_pty() {
     let _ = fs::remove_dir_all(&home);
 }
 
+#[cfg(unix)]
 #[test]
 fn nonce_is_stable_across_attach_and_accepted_by_the_shell() {
     let _g = serial();
@@ -101,14 +110,17 @@ fn concurrent_attaches_spawn_one_pty() {
     let _ = fs::remove_dir_all(&home);
 }
 
+#[cfg(unix)]
 struct Collect(Mutex<Vec<SessionEvent>>);
 
+#[cfg(unix)]
 impl EventSink for Collect {
     fn event(&self, ev: SessionEvent) {
         self.0.lock().unwrap().push(ev);
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn listeners_get_state_integration_and_record_events() {
     let _g = serial();
@@ -137,6 +149,7 @@ fn listeners_get_state_integration_and_record_events() {
     assert_eq!(exit, Some(Some(0)));
 }
 
+#[cfg(unix)]
 #[test]
 fn user_typed_command_is_reported_with_user_source() {
     let _g = serial();

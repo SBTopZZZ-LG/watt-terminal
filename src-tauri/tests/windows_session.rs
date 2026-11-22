@@ -85,8 +85,13 @@ fn start_capturing(id: &str, cols: u16) -> (Arc<Session>, Arc<Mutex<Vec<u8>>>) {
     (session, log)
 }
 
-fn wait_until<T>(mut f: impl FnMut() -> Option<T>) -> Option<T> {
-    let end = Instant::now() + WAIT;
+fn wait_until<T>(f: impl FnMut() -> Option<T>) -> Option<T> {
+    wait_until_within(WAIT, f)
+}
+
+/// Like `wait_until`, with the given limit instead of WAIT.
+fn wait_until_within<T>(limit: Duration, mut f: impl FnMut() -> Option<T>) -> Option<T> {
+    let end = Instant::now() + limit;
     loop {
         if let Some(v) = f() {
             return Some(v);
@@ -165,10 +170,11 @@ fn wait_finished(s: &Session, command: &str) -> u64 {
 /// Waits for a continuation prompt and gives PSReadLine time to read input again. The 133;P is sent from the Enter
 /// handler, before ValidateAndAcceptLine returns, so the observer can say Continuation while the handler is still
 /// running. Keys written then can be lost. The row check waits for the continuation prompt on screen, the sleep
-/// lets the handler return.
+/// lets the handler return. The row is `>` or `>>`: PSReadLine's default ContinuationPrompt is `>> ` (pwsh 7 and
+/// Windows PowerShell 5.1), so `>` alone is not the only form.
 fn wait_continuation(s: &Session) {
     wait_state(s, InputState::Continuation);
-    let ok = wait_until(|| s.screen_snapshot().rows.iter().any(|r| r.trim_end() == ">").then_some(())).is_some();
+    let ok = wait_until(|| s.screen_snapshot().rows.iter().any(|r| matches!(r.trim_end(), ">" | ">>")).then_some(())).is_some();
     assert!(ok, "no continuation row on screen within {WAIT:?}; screen={:?}", s.screen_snapshot().rows);
     thread::sleep(Duration::from_millis(200));
 }
@@ -186,6 +192,23 @@ fn run(s: &Session, cmd: &str) -> Record {
 /// Forward slashes, no trailing slash, lower case: the form to compare two Windows paths in.
 fn norm(p: &str) -> String {
     p.replace('\\', "/").trim_end_matches('/').to_ascii_lowercase()
+}
+
+/// `std::env::temp_dir()` in the long form the shell reports. On a CI runner the temp dir can be an 8.3 short path
+/// (`RUNNER~1`) while the shell reports the long one. Falls back to `temp_dir()` as it is if it cannot be canonicalized.
+fn temp_dir_long() -> String {
+    let dir = std::env::temp_dir();
+    let Ok(real) = std::fs::canonicalize(&dir) else {
+        return dir.to_string_lossy().into_owned();
+    };
+    let s = real.to_string_lossy().into_owned();
+    if let Some(unc) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else if let Some(local) = s.strip_prefix(r"\\?\") {
+        local.to_owned()
+    } else {
+        s
+    }
 }
 
 /// True while a process with this pid is listed by tasklist.
@@ -220,7 +243,7 @@ fn powershell_session_runs_commands_reports_cwd_and_terminates() {
     assert_eq!(native.exit_code, Some(3), "native exit code; pipestatus={:?}", native.pipestatus);
 
     // The cwd comes from OSC 7 (`/C:/...` on the wire). It must be an absolute Windows path that names the directory.
-    let dir = std::env::temp_dir().to_string_lossy().into_owned();
+    let dir = temp_dir_long();
     run(&s, &format!("Set-Location -LiteralPath '{}'", dir.replace('\'', "''")));
     let cwd = s.cwd().expect("cwd after Set-Location");
     assert!(Path::new(&cwd.path).is_absolute(), "cwd is not absolute: {:?}", cwd.path);
@@ -362,7 +385,7 @@ fn a_line_that_redefines_the_prompt_and_runs_work_finishes_without_more_input() 
     let _g = serial();
     let s = start("win-prompt-line");
     wait_prompt(&s);
-    let dir = std::env::temp_dir().to_string_lossy().into_owned();
+    let dir = temp_dir_long();
     run(&s, &format!("Set-Location -LiteralPath '{}'", dir.replace('\'', "''")));
     let before = s.records().len();
     let line = "function prompt { 'X> ' }; echo after-prompt";
@@ -416,7 +439,7 @@ fn a_redefined_prompt_line_that_changes_directory_updates_the_cwd() {
     let _g = serial();
     let s = start("win-prompt-cwd");
     wait_prompt(&s);
-    let dir = std::env::temp_dir().to_string_lossy().into_owned();
+    let dir = temp_dir_long();
     let line = format!("function prompt {{ 'X> ' }}; Set-Location -LiteralPath '{}'", dir.replace('\'', "''"));
     s.submit(Source::User, &line).expect("submit at an idle prompt");
     wait_finished(&s, &line);
@@ -482,7 +505,7 @@ fn a_prompt_that_chains_the_wrapper_does_not_wedge() {
     // The chained text is the whole prompt row: no leading space from the inner call. The snapshot trims trailing spaces.
     assert_eq!(last.trim_end(), "Y>", "the chained prompt row is not exactly the chained text; screen={rows:?}");
 
-    let dir = std::env::temp_dir().to_string_lossy().into_owned();
+    let dir = temp_dir_long();
     run_within(&s, &format!("Set-Location -LiteralPath '{}'", dir.replace('\'', "''")));
     let cwd = s.cwd().expect("cwd after Set-Location");
     assert_eq!(norm(&cwd.path), norm(&dir), "cwd {:?}", cwd.path);
@@ -596,6 +619,13 @@ fn agent_send_keys_ctrl_c_cancels_its_unclosed_line() {
     assert_eq!(s.state(), InputState::Continuation, "state={:?} screen={:?}", s.state(), s.screen_snapshot().rows);
 
     s.write_user(b"zqx").expect("the user types into the agent's continuation");
+    // Wait for PSReadLine to echo the typed text before the agent's Ctrl-C follows it. The two writes are back to back, and
+    // a key read before the echo is not guaranteed to be handled the same way.
+    assert!(
+        wait_until_within(Duration::from_secs(5), || s.screen_snapshot().rows.iter().any(|r| r.contains("zqx")).then_some(())).is_some(),
+        "the typed text was not echoed at the continuation within 5s: {:?}",
+        s.screen_snapshot().rows
+    );
     let sent = tools.call("send_keys", &json!({"keys": ["Ctrl-C"]}), None).expect("send_keys Ctrl-C at the agent's continuation");
     assert_eq!(sent["outcome"], "sent", "{sent}");
     wait_prompt(&s);

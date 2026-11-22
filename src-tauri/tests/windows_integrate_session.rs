@@ -188,9 +188,19 @@ fn ps51_and_operator_line_finishes_and_the_next_command_runs() {
     let s = start("win-ps51-and");
     wait_prompt(&s);
     s.submit(Source::User, NESTED_51).expect("submit the 5.1 shell");
+    // The outer prompt is still on screen until the nested shell draws its own, so wait for the 5.1 shell to be the
+    // foreground Shell first (as the sibling test does), then for its prompt.
+    let shown = wait_until(|| (s.foreground().map(|f| f.kind) == Some(ForegroundKind::Shell)).then_some(()));
+    assert!(shown.is_some(), "5.1 is not a foreground Shell: {:?} state={:?}", s.foreground(), s.state());
     assert!(wait_until(|| at_ps_prompt(&s).then_some(())).is_some(), "5.1 never drew its prompt: {:?}", s.screen_snapshot().rows);
     assert!(wait_until(|| (!s.integration_starting()).then_some(())).is_some(), "5.1 still starting");
-    assert!(matches!(s.integrate_shell(), IntegrateOutcome::Integrated { key: 1, .. }), "5.1 not integrated");
+    let outcome = s.integrate_shell();
+    assert!(
+        matches!(outcome, IntegrateOutcome::Integrated { key: 1, .. }),
+        "5.1 not integrated: {outcome:?}; rows={:?} levels={:?}",
+        s.screen_snapshot().rows,
+        s.levels()
+    );
     wait_prompt(&s);
 
     s.submit(Source::Agent { call_id: "ps51-and".into() }, "echo a && echo b").expect("agent submit at depth 2");
