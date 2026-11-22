@@ -142,6 +142,10 @@ export const api = {
   focusMainWindow() {
     return invoke<void>('focus_main_window');
   },
+  /** Opens DevTools for the main window (the layout inspector). Refused by the backend unless the developer setting is on. Errors reject. */
+  openDevtools() {
+    return invoke<void>('open_devtools');
+  },
   /** Summarizes the live conversation into a new conversation and switches to it. The old one stays in history. */
   compactConversation() {
     return invoke<LoadedConversation>('compact_conversation', { sessionId: SESSION_ID });

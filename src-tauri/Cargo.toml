@@ -20,7 +20,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "=2.12.5", features = [] }
+tauri = { version = "=2.12.5", features = ["devtools"] }
 portable-pty = "=0.9.0"
 vt100 = "=0.18.1"
 serde = { version = "1", features = ["derive"] }

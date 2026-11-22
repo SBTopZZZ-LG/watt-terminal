@@ -341,6 +341,8 @@ export interface UiState {
   suggest_prompts: boolean;
   /** Shows a system notification when the agent is done or asks something while Watt is in the background. Always a boolean: true when the file has no value. */
   notifications: boolean;
+  /** Enables the layout inspector (the right-click menu's "Open layout inspector" item). Always a boolean: false when the file has no value. */
+  devtools: boolean;
 }
 
 /** A change to the UI state. An absent field is left alone, `null` clears it, a value sets it. */
@@ -356,6 +358,8 @@ export interface UiStatePatch {
   suggest_prompts?: boolean;
   /** As `hide_marks`: a boolean, so `null` is ignored too. */
   notifications?: boolean;
+  /** As `hide_marks`: a boolean, so `null` is ignored too. */
+  devtools?: boolean;
 }
 
 // AI provider settings (src-tauri/src/core/settings). Secrets are never in these types: they are only written, as

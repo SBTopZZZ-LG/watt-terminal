@@ -29,7 +29,8 @@ export type MenuItemId =
   | 'copy-tool-output'
   | 'copy-tool-json'
   | 'copy-link'
-  | 'copy-chip';
+  | 'copy-chip'
+  | 'open-layout-inspector';
 
 export interface MenuItem {
   /** What the item does. `separator` for a divider row (no action). */
@@ -173,6 +174,20 @@ export function menuFor(ctx: MenuContext, mac: boolean = IS_MAC): MenuItem[] {
     case 'none':
       return [];
   }
+}
+
+/** The layout inspector item. Offered only while the developer setting is on (see withLayoutInspector). */
+const LAYOUT_INSPECTOR: MenuItem = { id: 'open-layout-inspector', label: 'Open layout inspector' };
+
+/**
+ * Adds the layout inspector after its own separator, when the developer setting is on and the menu has items. Nothing
+ * changes otherwise, so an empty menu stays empty. The app opens every menu through this, so the item is in each one.
+ */
+export function withLayoutInspector(items: MenuItem[], enabled: boolean): MenuItem[] {
+  if (!enabled || items.length === 0) {
+    return items;
+  }
+  return [...items, SEPARATOR, LAYOUT_INSPECTOR];
 }
 
 /** Indices of the items the keyboard and the mouse can land on: not a separator, not disabled. */

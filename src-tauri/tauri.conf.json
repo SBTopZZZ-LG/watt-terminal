@@ -19,7 +19,8 @@
         "minHeight": 600,
         "dragDropEnabled": false,
         "generalAutofillEnabled": false,
-        "allowLinkPreview": false
+        "allowLinkPreview": false,
+        "devtools": false
       }
     ],
     "security": {

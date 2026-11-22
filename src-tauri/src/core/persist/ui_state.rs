@@ -36,6 +36,8 @@ const HIDE_MARKS_DEFAULT: bool = true;
 const SUGGEST_PROMPTS_DEFAULT: bool = true;
 /// Desktop notifications (agent done, or asking something, while Watt is in the background) are on unless the file says otherwise.
 const NOTIFICATIONS_DEFAULT: bool = true;
+/// The layout inspector (WebView2 DevTools, from the right-click menu) is off unless the file says otherwise.
+const DEVTOOLS_DEFAULT: bool = false;
 /// Largest accepted panel size, in pixels.
 const MAX_PANEL_SIZE: f64 = 20_000.0;
 
@@ -78,6 +80,10 @@ pub struct UiState {
     /// in the file reads as the default, `true`.
     #[serde(default = "notifications_default")]
     pub notifications: bool,
+    /// Enables the layout inspector: the right-click menu's "Open layout inspector" item, and the command that opens
+    /// DevTools. Missing or invalid in the file reads as the default, `false`.
+    #[serde(default = "devtools_default")]
+    pub devtools: bool,
 }
 
 fn hide_marks_default() -> bool {
@@ -92,6 +98,10 @@ fn notifications_default() -> bool {
     NOTIFICATIONS_DEFAULT
 }
 
+fn devtools_default() -> bool {
+    DEVTOOLS_DEFAULT
+}
+
 impl Default for UiState {
     fn default() -> Self {
         Self {
@@ -104,6 +114,7 @@ impl Default for UiState {
             hide_marks: HIDE_MARKS_DEFAULT,
             suggest_prompts: SUGGEST_PROMPTS_DEFAULT,
             notifications: NOTIFICATIONS_DEFAULT,
+            devtools: DEVTOOLS_DEFAULT,
         }
     }
 }
@@ -128,6 +139,8 @@ pub struct UiStatePatch {
     pub suggest_prompts: Option<bool>,
     /// As `hide_marks`: a boolean, so `null` leaves it alone.
     pub notifications: Option<bool>,
+    /// As `hide_marks`: a boolean, so `null` leaves it alone.
+    pub devtools: Option<bool>,
 }
 
 /// Distinguishes an absent field (outer `None`, via `default`) from `null` (`Some(None)`).
@@ -187,6 +200,9 @@ impl UiStateStore {
         }
         if let Some(notify) = patch.notifications {
             state.notifications = notify;
+        }
+        if let Some(devtools) = patch.devtools {
+            state.devtools = devtools;
         }
         state.version = UI_STATE_VERSION;
         self.write(&state)?;
@@ -264,6 +280,7 @@ fn tolerant(value: &Value) -> UiState {
         hide_marks: obj.get("hide_marks").and_then(Value::as_bool).unwrap_or(HIDE_MARKS_DEFAULT),
         suggest_prompts: obj.get("suggest_prompts").and_then(Value::as_bool).unwrap_or(SUGGEST_PROMPTS_DEFAULT),
         notifications: obj.get("notifications").and_then(Value::as_bool).unwrap_or(NOTIFICATIONS_DEFAULT),
+        devtools: obj.get("devtools").and_then(Value::as_bool).unwrap_or(DEVTOOLS_DEFAULT),
     }
 }
 
@@ -387,6 +404,7 @@ mod tests {
             hide_marks: Some(false),
             suggest_prompts: Some(true),
             notifications: Some(false),
+            devtools: Some(true),
         };
         let written = s.patch(patch).unwrap();
         assert_eq!(s.load().unwrap(), written);
@@ -398,6 +416,7 @@ mod tests {
         assert!(!written.hide_marks);
         assert!(written.suggest_prompts);
         assert!(!written.notifications);
+        assert!(written.devtools);
     }
 
     #[test]
@@ -749,6 +768,38 @@ mod tests {
         assert!(on.notifications);
         assert!(s.load().unwrap().notifications);
         assert_eq!(patch_from(json!({})).notifications, None);
+    }
+
+    #[test]
+    fn devtools_is_off_by_default_and_a_boolean_only() {
+        let tmp = TempDir::new();
+        assert!(!store(&tmp).load().unwrap().devtools, "no file");
+        assert!(!UiState::default().devtools);
+        assert!(!read_text(&tmp, r#"{"font_size": 12}"#).devtools, "an old file has none");
+        assert!(read_text(&tmp, r#"{"devtools": true}"#).devtools);
+        assert!(!read_text(&tmp, r#"{"devtools": "yes"}"#).devtools, "non-boolean falls back to the default");
+        assert!(!read_text(&tmp, r#"{"devtools": 1}"#).devtools, "non-boolean falls back to the default");
+        assert!(!read_text(&tmp, r#"{"devtools": null}"#).devtools);
+    }
+
+    #[test]
+    fn devtools_patch_sets_persists_and_null_or_absent_leaves_it_alone() {
+        let tmp = TempDir::new();
+        let s = store(&tmp);
+        let on = s.patch(patch_from(json!({"devtools": true}))).unwrap();
+        assert!(on.devtools);
+        assert!(s.load().unwrap().devtools, "written to the file");
+
+        let untouched = s.patch(patch_from(json!({"font_size": 13}))).unwrap();
+        assert!(untouched.devtools, "an absent field leaves it alone");
+
+        let null = s.patch(patch_from(json!({"devtools": null}))).unwrap();
+        assert!(null.devtools, "null leaves it alone too");
+
+        let off = s.patch(patch_from(json!({"devtools": false}))).unwrap();
+        assert!(!off.devtools);
+        assert!(!s.load().unwrap().devtools);
+        assert_eq!(patch_from(json!({})).devtools, None);
     }
 
     #[test]

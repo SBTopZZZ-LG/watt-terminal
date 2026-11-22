@@ -39,7 +39,7 @@ import { itemsFromMessages } from './lib/historyView';
 import { agentActivity } from './lib/agentActivity';
 import { userAttachments } from './lib/attachments';
 import { defaultModelVision } from './lib/modelVision';
-import { createPatchSaver, fontPatch, hideMarksPatch, notificationsPatch, panelPatch, queueModePatch, reconcileFont, reconcileGroupBy, reconcileHideMarks, reconcileNotifications, reconcilePanel, reconcileQueueMode, reconcileSuggestPrompts, shouldRestoreLast, suggestPromptsPatch } from './lib/uiState';
+import { createPatchSaver, devtoolsPatch, fontPatch, hideMarksPatch, notificationsPatch, panelPatch, queueModePatch, reconcileDevtools, reconcileFont, reconcileGroupBy, reconcileHideMarks, reconcileNotifications, reconcilePanel, reconcileQueueMode, reconcileSuggestPrompts, shouldRestoreLast, suggestPromptsPatch } from './lib/uiState';
 import { decideAttention } from './lib/attention';
 import type { AttentionEvent } from './lib/attention';
 import { onNotificationClick, sendAttention, watchWindowFocus } from './lib/attentionClient';
@@ -187,6 +187,9 @@ export default function App() {
   // until the file says otherwise. `windowFocused` is the native focus state, kept by a listener; it starts true, so nothing
   // is sent before the state is known. `attentionKey` is the last question or approval already handled, so each shows once.
   const [notifications, setNotifications] = useState(true);
+  // The layout inspector setting (Terminal tab, Developer). Off until the file says otherwise; the backend refuses to open
+  // DevTools while it is off, and this only decides whether the right-click menu offers the item.
+  const [devtools, setDevtools] = useState(false);
   const windowFocused = useRef(true);
   const attentionKey = useRef<string | null>(null);
   // The UI state file, read at startup. Nothing is written to it until that read has been reconciled (see uiReady).
@@ -444,6 +447,10 @@ export default function App() {
       const notify = reconcileNotifications(remote.notifications);
       if (notify !== null) {
         setNotifications(notify);
+      }
+      const dev = reconcileDevtools(remote.devtools);
+      if (dev !== null) {
+        setDevtools(dev);
       }
     });
     const unsubscribeFont = onFontSizeChange((size) => persist(fontPatch(size)));
@@ -944,6 +951,12 @@ export default function App() {
   const setNotificationsSetting = (on: boolean) => {
     setNotifications(on);
     persist(notificationsPatch(on));
+  };
+
+  /** The developer (layout inspector) setting is applied at once and saved with the UI state. */
+  const setDevtoolsSetting = (on: boolean) => {
+    setDevtools(on);
+    persist(devtoolsPatch(on));
   };
 
   // Clears the agent's conversation. Refused while the agent is busy or a side command runs (the button is also disabled then),
@@ -1838,6 +1851,8 @@ export default function App() {
           onSuggestPromptsChange={setSuggestPromptsSetting}
           notifications={notifications}
           onNotificationsChange={setNotificationsSetting}
+          devtools={devtools}
+          onDevtoolsChange={setDevtoolsSetting}
         />
       )}
       {helpOpen && <HelpDialog load={helpState} onRetry={loadHelp} onClose={closeHelp} />}
@@ -1852,6 +1867,7 @@ export default function App() {
         onClearTerminal={() => clearTerminal(effectiveRef.current, handleTerminalInput)}
         onFindTerminal={openTerminalFind}
         onFindChat={openChatFind}
+        devtools={devtools}
       />
     </div>
   );
