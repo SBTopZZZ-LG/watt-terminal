@@ -568,7 +568,7 @@ async fn agent_message(
     let att = session(&reg, &session_id)?;
     // The project instructions come from the session's live working directory, read once before the
     // turn starts. Anything unreadable just means no rules; it never fails the turn.
-    let project_root = att.session.cwd().and_then(|cwd| workspace_root_for_cwd(&app, &cwd));
+    let project_root = session_project_root(&app, &att);
     let project_rooted_rules =
         project_root.as_ref().and_then(|root| instructions::load(root).map(|rules| (root.clone(), rules)));
     let project_rules = project_rooted_rules.as_ref().map(|(_, rules)| rules.clone());
@@ -906,12 +906,19 @@ fn skill_roots(app: &tauri::AppHandle, project_root: Option<PathBuf>) -> Vec<Roo
     skills::roots(config.as_deref(), home_dir().as_deref(), project_root.as_deref())
 }
 
-/// The skills for the settings view (core/skills): the folders of the shell's working directory (when given) and the
-/// user's, with the scan's warnings. Read on the blocking pool; a missing folder is not an error.
+/// The project root of a session: the workspace of the local shell's directory. None while a nested shell is on top, since
+/// its directory is on another machine.
+fn session_project_root(app: &tauri::AppHandle, att: &Attached) -> Option<PathBuf> {
+    att.session.local_cwd().and_then(|cwd| workspace_root_for_cwd(app, &cwd))
+}
+
+/// The skills for the settings view (core/skills): the user's folders, plus the session's project folders when its local
+/// shell is on top. Read on the blocking pool; a missing folder is not an error.
 #[tauri::command]
-async fn list_skills(cwd: Option<String>, app: tauri::AppHandle) -> Result<SkillsView, String> {
+async fn list_skills(session_id: String, app: tauri::AppHandle, reg: State<'_, Reg>) -> Result<SkillsView, String> {
+    let att = session(&reg, &session_id)?;
     blocking(move || {
-        let project_root = cwd.and_then(|path| workspace_root_for_cwd(&app, &Cwd { host: local_host().to_string(), path }));
+        let project_root = session_project_root(&app, &att);
         let folders = skill_roots(&app, project_root);
         Ok(skills::scan(&folders).view())
     })

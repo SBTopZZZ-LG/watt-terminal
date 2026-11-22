@@ -19,7 +19,7 @@ use crate::core::external_tools::{ExternalApproval, ExternalDisplay, ExternalToo
 use crate::core::llm::TurnCancel;
 
 use super::config::McpSettings;
-use super::runtime::{Msg, Runtime, SHUTDOWN_WAIT};
+use super::runtime::{Msg, RECONNECT_COOLDOWN, Runtime, SHUTDOWN_WAIT};
 use super::secrets::SecretValues;
 use super::tools::ToolInfo;
 
@@ -63,6 +63,11 @@ pub struct McpManager {
 impl McpManager {
     /// Starts the runtime thread. It starts with no servers: call `apply` to configure them.
     pub fn start() -> Result<McpManager, String> {
+        Self::start_with_cooldown(RECONNECT_COOLDOWN)
+    }
+
+    /// `start` with another reconnect cooldown, so a test can see an automatic reconnect without waiting 30 s.
+    pub fn start_with_cooldown(cooldown: Duration) -> Result<McpManager, String> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -71,7 +76,7 @@ impl McpManager {
         let events = tx.clone();
         let thread = std::thread::Builder::new()
             .name(THREAD_NAME.to_string())
-            .spawn(move || runtime.block_on(Runtime::new(events).run(rx)))
+            .spawn(move || runtime.block_on(Runtime::new(events).with_cooldown(cooldown).run(rx)))
             .map_err(|e| format!("could not start the MCP thread: {e}"))?;
         Ok(McpManager { tx, thread: Mutex::new(Some(thread)) })
     }

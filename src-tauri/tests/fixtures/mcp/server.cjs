@@ -35,6 +35,11 @@ const tools = [
 ];
 
 process.stderr.write(`fixture started FIXTURE_SECRET=${process.env.FIXTURE_SECRET ?? 'unset'}\n`);
+if (mode === 'long-stderr') {
+  // Over 1 MB with no newline, then a normal line: the runtime must keep draining past the long one.
+  process.stderr.write('y'.repeat(1_100_000));
+  process.stderr.write('\nafter the long line\n');
+}
 
 if (mode === 'stubborn') {
   const grandchild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });

@@ -271,9 +271,19 @@ impl McpService {
     }
 
     /// What a model turn needs: the runtime with the saved settings applied, and the MCP secret values to mask.
+    /// The secret store is read only when a saved server declares an env or header name: without one nothing can be stored.
     pub fn for_turn(&self) -> Result<TurnMcp, String> {
-        let manager = self.running_saved()?;
-        let secret_values = McpSecrets::new(&self.secrets).all_values().map_err(|e| e.to_string())?;
+        let settings = self.settings.mcp_settings()?;
+        let manager = self.running(&settings)?;
+        let declares_names = settings.servers.iter().any(|server| {
+            let (env, headers) = declared_names(&server.transport);
+            !env.is_empty() || !headers.is_empty()
+        });
+        let secret_values = if declares_names {
+            McpSecrets::new(&self.secrets).all_values().map_err(|e| e.to_string())?
+        } else {
+            Vec::new()
+        };
         Ok(TurnMcp { manager, secret_values })
     }
 
@@ -676,6 +686,48 @@ mod tests {
         let turn = f.mcp.for_turn().unwrap();
         assert!(turn.secret_values.iter().any(|v| v == TOKEN), "{:?}", turn.secret_values);
         f.mcp.shutdown();
+    }
+
+    /// A service on the same folder and store with no cached secrets, so a read shows in `loads`.
+    fn cold(f: &Fixture) -> McpService {
+        service_on(&f.dir, &f.store)
+    }
+
+    #[test]
+    fn a_turn_reads_no_secret_when_no_server_declares_a_name() {
+        let f = fixture();
+        f.mcp.save_server(input(stdio("fetch", &[]), &[], &[])).unwrap();
+        f.mcp.save_server(input(http("docs", "http://127.0.0.1:9/mcp", &[]), &[], &[])).unwrap();
+        let mcp = cold(&f);
+        let before = f.store.loads();
+        let turn = mcp.for_turn().unwrap();
+        assert!(turn.secret_values.is_empty(), "{:?}", turn.secret_values);
+        assert_eq!(f.store.loads(), before, "a turn read the secret store with no names declared");
+        mcp.shutdown();
+    }
+
+    #[test]
+    fn a_turn_reads_the_secrets_when_a_server_declares_a_name() {
+        let f = fixture();
+        f.mcp.save_server(input(stdio("fetch", &["TOKEN"]), &[("TOKEN", TOKEN)], &[])).unwrap();
+        let mcp = cold(&f);
+        let before = f.store.loads();
+        let turn = mcp.for_turn().unwrap();
+        assert!(f.store.loads() > before, "a turn with a declared name did not read the store");
+        assert!(turn.secret_values.iter().any(|v| v == TOKEN), "{:?}", turn.secret_values);
+        mcp.shutdown();
+    }
+
+    #[test]
+    fn a_turn_is_an_error_when_the_secret_read_fails_and_a_name_is_declared() {
+        let f = fixture();
+        let docs = http("docs", "http://127.0.0.1:9/mcp", &["Authorization"]);
+        f.mcp.save_server(input(docs, &[], &[("Authorization", HEADER)])).unwrap();
+        f.store.set_fail_loads(true);
+        let mcp = cold(&f);
+        let err = mcp.for_turn().err().expect("a failed read must not start a turn");
+        assert!(!err.contains(HEADER), "a value reached the error: {err}");
+        mcp.shutdown();
     }
 
     /// A loopback server that accepts connections and never answers, so its connect stays `Connecting` until a timeout.
