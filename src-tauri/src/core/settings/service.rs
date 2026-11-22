@@ -40,6 +40,7 @@ use super::{
 };
 use crate::core::chat::agent_loop::{LlmSettings, USER_AGENT, new_conversation_id};
 use crate::core::mcp::config::McpSettings;
+use crate::core::skills::SkillsSettings;
 use crate::core::chat::redact::Redactor;
 use crate::core::llm::{self, ChatRequest, ProviderConfig, TurnCancel};
 use crate::core::persist::now_secs;
@@ -626,6 +627,17 @@ impl SettingsService {
         Ok(self.usable()?.limits)
     }
 
+    /// Saves the skill folders and the switched-off skills. Refused while settings.json is broken or in last-good mode, like every change.
+    pub fn set_skills(&self, skills: SkillsSettings) -> Result<SettingsView, String> {
+        self.change_settings(|settings| settings.skills = skills)
+    }
+
+    /// The skill settings in use: the saved ones, or the last working copy's in last-good mode. Fails while settings.json is
+    /// broken, so the caller uses the default folders.
+    pub fn skills_settings(&self) -> Result<SkillsSettings, String> {
+        Ok(self.usable()?.skills)
+    }
+
     /// What a model-list request for `id` needs: the list URL, the key and the resolved headers.
     pub fn provider_for_fetch(&self, id: &str) -> Result<FetchPlan, String> {
         let settings = self.usable()?;
@@ -1160,6 +1172,25 @@ mod tests {
         let err = f.service.set_limits(bad).unwrap_err();
         assert!(err.contains("polling calls per turn must be 10 to 500"), "{err}");
         assert_eq!(f.service.limits_settings(), Ok(saved), "a refused change saved nothing");
+    }
+
+    #[test]
+    fn skill_settings_are_saved_read_back_and_refused_while_broken() {
+        let f = fixture();
+        assert_eq!(f.service.skills_settings(), Ok(SkillsSettings::default()), "no file: the defaults");
+        let saved = SkillsSettings { folders: Some(vec!["~/shared".into()]), disabled: vec!["pdf".into()] };
+        let view = f.service.set_skills(saved.clone()).unwrap();
+        assert_eq!(view.settings.skills, saved);
+        assert_eq!(service_on(&f.dir, &f.store).skills_settings(), Ok(saved.clone()), "a new service reads it back");
+
+        let bad = SkillsSettings { folders: Some(vec!["".into()]), disabled: Vec::new() };
+        assert!(f.service.set_skills(bad).unwrap_err().contains("skill folder 1 is empty"));
+        assert_eq!(f.service.skills_settings(), Ok(saved.clone()), "a refused change saved nothing");
+
+        break_settings(&f);
+        let service = service_on(&f.dir, &f.store);
+        assert!(service.skills_settings().is_err(), "a broken file runs no skill settings of its own");
+        assert!(service.set_skills(SkillsSettings::default()).unwrap_err().contains("unchanged"));
     }
 
     #[test]

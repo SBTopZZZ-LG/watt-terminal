@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::approval;
 use crate::core::mcp::config::McpSettings;
+use crate::core::skills::SkillsSettings;
 
 pub const SETTINGS_VERSION: u32 = 1;
 const SETTINGS_FILE: &str = "settings.json";
@@ -76,6 +77,9 @@ pub struct Settings {
     /// The MCP servers (core/mcp). Missing in older files: none. Secret values are not here.
     #[serde(default)]
     pub mcp: McpSettings,
+    /// The skill folders and the switched-off skills (core/skills). Missing in older files: the defaults.
+    #[serde(default)]
+    pub skills: SkillsSettings,
 }
 
 fn current_version() -> u32 {
@@ -93,6 +97,7 @@ impl Default for Settings {
             integration: IntegrationSettings::default(),
             limits: LimitsSettings::default(),
             mcp: McpSettings::default(),
+            skills: SkillsSettings::default(),
         }
     }
 }
@@ -371,6 +376,7 @@ impl Settings {
         problems.extend(approval::validate_settings(&self.approval));
         problems.extend(self.limits.validate());
         problems.extend(self.mcp.validate());
+        problems.extend(self.skills.validate());
 
         if problems.is_empty() { Ok(()) } else { Err(problems) }
     }
@@ -828,6 +834,7 @@ mod tests {
             integration: IntegrationSettings::default(),
             limits: LimitsSettings::default(),
             mcp: McpSettings::default(),
+            skills: SkillsSettings::default(),
         }
     }
 
@@ -1445,6 +1452,38 @@ mod tests {
             assert!(matches!(load(dir.path()), Err(SettingsError::Invalid(_))), "{}", String::from_utf8_lossy(json));
             assert_eq!(fs::read(settings_path(dir.path())).unwrap(), json);
         }
+    }
+
+    #[test]
+    fn skills_settings_round_trip_and_a_missing_section_is_the_defaults() {
+        let dir = TempDir::new();
+        let mut settings = valid();
+        settings.skills = SkillsSettings {
+            folders: Some(vec!["~/team/skills".into(), ".agents/skills".into()]),
+            disabled: vec!["pdf-tools".into()],
+        };
+        save(dir.path(), &settings).unwrap();
+        assert_eq!(load(dir.path()).unwrap().skills, settings.skills);
+
+        fs::write(settings_path(dir.path()), br#"{"version":1,"providers":[]}"#).unwrap();
+        assert_eq!(load(dir.path()).unwrap().skills, SkillsSettings::default());
+    }
+
+    #[test]
+    fn an_invalid_skill_folder_refuses_the_save_and_makes_the_file_invalid() {
+        let dir = TempDir::new();
+        save(dir.path(), &valid()).unwrap();
+        let before = fs::read(settings_path(dir.path())).unwrap();
+        let mut bad = valid();
+        bad.skills.folders = Some(vec!["  ".into()]);
+        let err = save(dir.path(), &bad).unwrap_err();
+        assert!(matches!(&err, SettingsError::Invalid(msg) if msg.contains("skill folder 1 is empty")), "{err}");
+        assert_eq!(fs::read(settings_path(dir.path())).unwrap(), before);
+
+        let file = br#"{"version":1,"skills":{"disabled":["Bad Name"]}}"#;
+        fs::write(settings_path(dir.path()), file).unwrap();
+        assert!(matches!(load(dir.path()), Err(SettingsError::Invalid(msg)) if msg.contains("disabled entry 1")));
+        assert_eq!(fs::read(settings_path(dir.path())).unwrap(), file);
     }
 
     fn variant(id: &str, source: VariantSource) -> ModelVariant {
