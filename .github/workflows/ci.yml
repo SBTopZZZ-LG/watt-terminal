@@ -28,6 +28,7 @@ jobs:
         os: [macos-latest, windows-latest, ubuntu-latest]
     name: frontend (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -51,6 +52,7 @@ jobs:
         os: [macos-latest, windows-latest, ubuntu-latest]
     name: backend (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
@@ -94,6 +96,27 @@ jobs:
           cat /etc/os-release | head -3
           nproc
           ls -la /etc/zsh || true
+          # Insecure zsh completion paths (info only), with owner and mode of each.
+          zsh -fc 'autoload -U compaudit; compaudit' || true
+          zsh -fc 'autoload -U compaudit; compaudit' 2>/dev/null | head -n 20 | xargs -r -d '\n' ls -ld || true
+
+      # Ubuntu's /etc/zsh/zshrc runs compinit, which asks a y/n question on insecure completion
+      # directories. An interactive test shell then never reaches its prompt, so the zsh tests hang.
+      # Remove group/other write, and hand paths owned by neither root nor the runner user to root.
+      # Never fails the job: whatever is still insecure is printed at the end.
+      - name: Make zsh completion directories secure (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          list() { zsh -fc 'autoload -U compaudit; compaudit' 2>/dev/null || true; }
+          list | xargs -r -d '\n' sudo chmod go-w -- || true
+          list | while IFS= read -r p; do
+            owner=$(stat -c %U -- "$p" 2>/dev/null || true)
+            if [ -n "$owner" ] && [ "$owner" != root ] && [ "$owner" != "$(id -un)" ]; then
+              sudo chown root -- "$p" || true
+            fi
+          done
+          echo "Still insecure after fix:"
+          list
 
       - name: Cargo tests
         working-directory: src-tauri
@@ -104,6 +127,7 @@ jobs:
   linux-docker:
     name: linux-docker (Debian bookworm)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
