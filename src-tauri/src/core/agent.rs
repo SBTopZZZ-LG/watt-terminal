@@ -21,6 +21,7 @@ use crate::core::chat::attachments::Attachment;
 use crate::core::chat::context::ContextUsage;
 use crate::core::chat::questions::{self, QuestionGate};
 use crate::core::chat::todo::Todo;
+use crate::core::external_tools::{ExternalApproval, ExternalToolHost};
 use crate::core::foreground::{self, Foreground, ForegroundKind};
 use crate::core::keys::{KeyPlan, TypedLine};
 use crate::core::llm::TurnCancel;
@@ -370,6 +371,11 @@ fn new_call_id() -> String {
 /// Tools that never change the shell. `read_tool` accepts only these. Must match `READ_NAMES` in core/chat/agent_loop.rs.
 const READ_TOOLS: [&str; 5] = ["list_commands", "get_command", "get_screen", "get_cwd", "wait"];
 
+/// Built-in tools that may run without a gate decision: the read tools, `todo_write` and `ask_user`. Neither of the last two
+/// touches the shell. Any other name needs a gate decision: a gated built-in, or a host tool (core/external_tools). Must match
+/// the names routed in core/chat/agent_loop.rs (`run_call`).
+const BUILTIN_UNGATED: [&str; 7] = ["list_commands", "get_command", "get_screen", "get_cwd", "wait", "todo_write", "ask_user"];
+
 /// What a turn reads from the saved settings when it decides. lib.rs builds one per user message. The defaults are the
 /// cautious ones: a nested shell is approved as before (its allow rules ask), and `request_integration` asks the user.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -387,6 +393,8 @@ pub struct AgentCtx<'a> {
     approvals: &'a ApprovalGate,
     policy: &'a dyn ApprovalPolicy,
     rules: TurnRules,
+    /// The host of tools the app does not own, and the turn's cancel token it is given (see `with_external_tools`).
+    external: Option<(&'a dyn ExternalToolHost, &'a TurnCancel)>,
     emit: &'a dyn Fn(AgentEvent),
 }
 
@@ -395,7 +403,24 @@ static MANUAL: ManualPolicy = ManualPolicy;
 
 impl<'a> AgentCtx<'a> {
     pub fn new(tools: &'a dyn AgentTools, approvals: &'a ApprovalGate, emit: &'a dyn Fn(AgentEvent)) -> Self {
-        AgentCtx { tools, approvals, policy: &MANUAL, rules: TurnRules::default(), emit }
+        AgentCtx { tools, approvals, policy: &MANUAL, rules: TurnRules::default(), external: None, emit }
+    }
+
+    /// Offers the tools of `host` (core/external_tools) to the model and gates their calls. `cancel` is the turn's token,
+    /// given to each call. Without a host, only the built-in tools exist.
+    pub fn with_external_tools(mut self, host: &'a dyn ExternalToolHost, cancel: &'a TurnCancel) -> Self {
+        self.external = Some((host, cancel));
+        self
+    }
+
+    /// The host of the external tools, if one is attached. The agent loop reads it per model request.
+    pub fn external_tools(&self) -> Option<&'a dyn ExternalToolHost> {
+        self.external.map(|(host, _)| host)
+    }
+
+    /// Whether the attached host owns `name`. False without a host.
+    pub fn owns_external_tool(&self, name: &str) -> bool {
+        self.external.is_some_and(|(host, _)| host.owns(name))
     }
 
     /// Uses `policy` for the calls that are not approve-all (core/approval). lib.rs builds one per user message.
@@ -575,10 +600,12 @@ impl<'a> AgentCtx<'a> {
         if name == "send_keys" {
             return self.gate_send_keys(call_id, args, &top);
         }
-        // Approve-all skips the policy for run_command. Nothing else is gated: it runs as it always did, without a card.
+        // Approve-all skips the policy for run_command. The built-in ungated names run as they always did, without a card.
+        // A host tool takes the external flow. Any other name is refused: it is not run and nobody is asked.
         let verdict = match name {
             "run_command" => self.run_command_verdict(&top, args),
-            _ => return self.run_ungated(name, args),
+            _ if BUILTIN_UNGATED.contains(&name) => return self.run_ungated(name, args),
+            _ => return self.gate_external(call_id, name, args, &top),
         };
         let level = (name == "run_command").then_some(top.key);
         match verdict {
@@ -804,10 +831,63 @@ impl<'a> AgentCtx<'a> {
         integration_result(&outcome)
     }
 
-    /// A gated name the gate does not know: no card and no policy. Runs as it did before the policy existed.
+    /// A name in `BUILTIN_UNGATED`: no card and no policy, as it always ran.
     fn run_ungated(&self, name: &str, args: &Value) -> (&'static str, Option<&'static str>, Result<Value, String>) {
         let result = self.execute(name, args, true, None);
         (if result.is_ok() { "auto" } else { "refused" }, None, result)
+    }
+
+    /// A tool the attached host owns (core/external_tools). A name no host owns is refused, not run, with no card. A
+    /// disabled tool (`Never`) is refused the same way. Otherwise, as for run_command: approve-all runs it without a card,
+    /// or asks (suspended) when it was switched on in another shell; else the host's approval runs it (`Auto`) or asks (`Ask`).
+    /// A denial is `DENIED`, so the turn stops, as it does for a denied run_command. The shell is not involved, so the
+    /// agent is not marked in control. The host owns its own timeouts.
+    fn gate_external(&self, call_id: &str, name: &str, args: &Value, top: &TopLevel) -> (&'static str, Option<&'static str>, Result<Value, String>) {
+        let Some((host, cancel)) = self.external.filter(|(host, _)| host.owns(name)) else {
+            return ("refused", None, Err(format!("unknown tool `{name}`")));
+        };
+        let approval = host.approval(name);
+        if approval == ExternalApproval::Never {
+            return ("refused", None, Err(format!("tool disabled: `{name}` is turned off")));
+        }
+        let verdict = match self.approvals.auto_state_across(top.key, self.rules.follow_local_in_nested) {
+            AutoState::On => Verdict::Auto(Reason::ApproveAll),
+            AutoState::Suspended => Verdict::Ask(Reason::ApproveAllSuspended),
+            AutoState::Off if approval == ExternalApproval::Auto => Verdict::Auto(Reason::ExternalTool),
+            AutoState::Off => Verdict::Ask(Reason::ExternalTool),
+        };
+        match verdict {
+            Verdict::Auto(reason) => {
+                let result = Self::execute_external(host, cancel, name, args);
+                (if result.is_ok() { "auto" } else { "refused" }, Some(reason.code()), result)
+            }
+            Verdict::Ask(reason) => {
+                let shown = host.display(name, args);
+                let text = serde_json::to_string_pretty(args).unwrap_or_else(|_| args.to_string());
+                let approved = self.approvals.ask(call_id, || {
+                    self.emit(AgentEvent::ApprovalRequest {
+                        call_id: call_id.to_string(),
+                        name: name.to_string(),
+                        text: text.clone(),
+                        display: Some(format!("{}: {}", shown.server, shown.tool)),
+                        reason: Some(reason.code()),
+                        level: top.key,
+                        location: top.location.clone(),
+                    })
+                });
+                if !approved {
+                    let err = format!("{DENIED}: the user did not approve this call (denied, cancelled, or timed out)");
+                    return ("denied", Some(reason.code()), Err(err));
+                }
+                // The user approved, so the decision stays "manual" even if the call then fails.
+                ("manual", Some(reason.code()), Self::execute_external(host, cancel, name, args))
+            }
+        }
+    }
+
+    /// Runs one host call. The text it returns is what the model reads, after the agent loop projects it.
+    fn execute_external(host: &dyn ExternalToolHost, cancel: &TurnCancel, name: &str, args: &Value) -> Result<Value, String> {
+        host.call(name, args.clone(), cancel).map(Value::String)
     }
 
     /// Calls the tool. For the calls that act on the shell, the agent is in control from before the call until after it.
@@ -2505,5 +2585,162 @@ mod tests {
             assert!(!approval_waiter.join().unwrap(), "the cancelled approval counts as denied");
             assert!(gate_ref.questions().decide("a-call", Vec::new()).is_err());
         });
+    }
+
+    // External tools (core/external_tools): the gate for a tool a host owns, and for a name nobody owns.
+
+    use crate::core::external_tools::ExternalApproval as Approval;
+    use crate::core::external_tools::testing::FakeHost;
+
+    #[test]
+    fn a_name_nobody_owns_is_refused_without_a_card_or_a_run() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        let err = ctx.call_tool("mystery_tool", json!({})).expect_err("unknown");
+        assert!(err.contains("unknown tool"), "{err}");
+        assert!(!err.starts_with(DENIED), "{err}");
+        assert_eq!(decisions(&log), [named("mystery_tool", "refused", false)]);
+        assert!(cards(&log).is_empty());
+        assert!(tools.reached().is_empty());
+    }
+
+    #[test]
+    fn a_host_tool_that_asks_runs_only_after_the_user_approves() {
+        let host = FakeHost::new(&[("ext_tool", Approval::Ask)], "fine");
+        let tools = Recorder::default();
+        let cancel = TurnCancel::new();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let log = Mutex::new(Vec::new());
+        // The card's emit runs after the call is registered, so the answer is already waiting when `ask` reads it.
+        let emit = |ev: AgentEvent| {
+            if let AgentEvent::ApprovalRequest { call_id, name, text, display, reason, .. } = &ev {
+                assert_eq!(name, "ext_tool");
+                assert_eq!(*reason, Some("external_tool"));
+                assert_eq!(display.as_deref(), Some("fake-server: ext_tool"));
+                assert!(text.contains("\"x\""), "the card shows the pretty args: {text}");
+                assert!(gate.decide(call_id, true));
+            }
+            log.lock().unwrap().push(ev);
+        };
+        let ctx = AgentCtx::new(&tools, &gate, &emit).with_external_tools(&host, &cancel);
+        assert_eq!(ctx.call_tool("ext_tool", json!({"x": 1})), Ok(json!("fine")));
+        assert_eq!(decisions(&log), [named("ext_tool", "manual", true)]);
+        assert_eq!(reasons(&log), [("ext_tool".to_string(), "manual", Some("external_tool"))]);
+        assert_eq!(host.reached(), ["ext_tool"]);
+        assert!(tools.reached().is_empty(), "a host tool never reaches the shell");
+    }
+
+    #[test]
+    fn a_denied_host_tool_is_not_run_and_stops_like_a_denied_command() {
+        let host = FakeHost::new(&[("ext_tool", Approval::Ask)], "fine");
+        let tools = Recorder::default();
+        let cancel = TurnCancel::new();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| {
+            if let AgentEvent::ApprovalRequest { call_id, .. } = &ev {
+                assert!(gate.decide(call_id, false));
+            }
+            log.lock().unwrap().push(ev);
+        };
+        let ctx = AgentCtx::new(&tools, &gate, &emit).with_external_tools(&host, &cancel);
+        let err = ctx.call_tool("ext_tool", json!({})).expect_err("denied");
+        assert!(err.starts_with(DENIED), "{err}");
+        assert_eq!(decisions(&log), [named("ext_tool", "denied", false)]);
+        assert!(host.reached().is_empty());
+    }
+
+    #[test]
+    fn a_cancelled_or_timed_out_host_tool_is_not_run() {
+        let host = FakeHost::new(&[("ext_tool", Approval::Ask)], "fine");
+        let tools = Recorder::default();
+        let cancel = TurnCancel::new();
+        // Stop: the user's cancel answers the card as a no.
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| {
+            if matches!(ev, AgentEvent::ApprovalRequest { .. }) {
+                gate.cancel_all();
+            }
+            log.lock().unwrap().push(ev);
+        };
+        let ctx = AgentCtx::new(&tools, &gate, &emit).with_external_tools(&host, &cancel);
+        assert!(ctx.call_tool("ext_tool", json!({})).expect_err("cancelled").starts_with(DENIED));
+        assert_eq!(decisions(&log), [named("ext_tool", "denied", false)]);
+        // Nobody answers: the timeout is a denial too.
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+        let ctx = AgentCtx::new(&tools, &gate, &emit).with_external_tools(&host, &cancel);
+        assert!(ctx.call_tool("ext_tool", json!({})).expect_err("timed out").starts_with(DENIED));
+        assert_eq!(decisions(&log), [named("ext_tool", "denied", false)]);
+        assert!(host.reached().is_empty());
+    }
+
+    #[test]
+    fn a_host_tool_approved_auto_runs_without_a_card() {
+        let host = FakeHost::new(&[("ext_tool", Approval::Auto)], "fine");
+        let tools = Recorder::default();
+        let cancel = TurnCancel::new();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+        let ctx = AgentCtx::new(&tools, &gate, &emit).with_external_tools(&host, &cancel);
+        assert!(ctx.call_tool("ext_tool", json!({})).is_ok());
+        assert_eq!(decisions(&log), [named("ext_tool", "auto", true)]);
+        assert_eq!(reasons(&log), [("ext_tool".to_string(), "auto", Some("external_tool"))]);
+        assert!(cards(&log).is_empty());
+        assert_eq!(host.reached(), ["ext_tool"]);
+    }
+
+    #[test]
+    fn approve_all_runs_a_host_tool_that_asks_without_a_card() {
+        let host = FakeHost::new(&[("ext_tool", Approval::Ask)], "fine");
+        let tools = Recorder::default();
+        let cancel = TurnCancel::new();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        gate.set_auto_approve(true, 0);
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+        let ctx = AgentCtx::new(&tools, &gate, &emit).with_external_tools(&host, &cancel);
+        assert!(ctx.call_tool("ext_tool", json!({})).is_ok());
+        assert_eq!(reasons(&log), [("ext_tool".to_string(), "auto", Some("approve_all"))]);
+        assert!(cards(&log).is_empty());
+        assert_eq!(host.reached(), ["ext_tool"]);
+    }
+
+    #[test]
+    fn a_disabled_host_tool_is_refused_even_with_approve_all() {
+        let host = FakeHost::new(&[("ext_off", Approval::Never)], "fine");
+        let tools = Recorder::default();
+        let cancel = TurnCancel::new();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        gate.set_auto_approve(true, 0);
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+        let ctx = AgentCtx::new(&tools, &gate, &emit).with_external_tools(&host, &cancel);
+        let err = ctx.call_tool("ext_off", json!({})).expect_err("disabled");
+        assert!(err.contains("tool disabled"), "{err}");
+        assert_eq!(decisions(&log), [named("ext_off", "refused", false)]);
+        assert!(cards(&log).is_empty());
+        assert!(host.reached().is_empty());
+    }
+
+    #[test]
+    fn a_builtin_name_is_never_sent_to_a_host() {
+        let host = FakeHost::new(&[("run_command", Approval::Auto)], "fine");
+        let tools = Recorder::default();
+        let cancel = TurnCancel::new();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        gate.set_auto_approve(true, 0);
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+        let ctx = AgentCtx::new(&tools, &gate, &emit).with_external_tools(&host, &cancel);
+        // The built-in run_command goes through its own gate (approve-all here): the host's Auto does not reach it.
+        assert!(ctx.call_tool("run_command", json!({"command": "pwd"})).is_ok());
+        assert_eq!(tools.reached(), ["run_command"]);
+        assert!(host.reached().is_empty());
     }
 }
