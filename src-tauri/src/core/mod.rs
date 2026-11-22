@@ -9,6 +9,7 @@ pub mod chat;
 pub mod env;
 pub mod external_tools;
 pub mod foreground;
+pub mod fs_tools;
 pub mod inject;
 pub mod keys;
 pub mod llm;

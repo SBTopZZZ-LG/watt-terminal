@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { toolCaption, toolCaptionFull, toolPreview, toolPreviewFull, toolRowHead, waitDuration } from './toolDisplay';
+import { MAX_CAPTION_CHARS, toolCaption, toolCaptionFull, toolPreview, toolPreviewFull, toolRowHead, waitDuration } from './toolDisplay';
 
 describe('toolCaption', () => {
   it('is null when the summary is absent, empty, or not a string', () => {
@@ -110,6 +110,20 @@ describe('toolRowHead: MCP tools and the skill tool', () => {
   it('falls back to the summary for the skill tool when there is no usable name', () => {
     expect(toolRowHead('skill', { name: '  ', summary: 'Review it' })).toEqual({ label: 'skill', caption: 'Review it', detail: null });
     expect(toolRowHead('skill', {})).toEqual({ label: 'skill', caption: null, detail: null });
+  });
+
+  it('captions the file tools by the path, glob or pattern they work on', () => {
+    expect(toolRowHead('read_file', { path: 'src/main.rs', offset: 10 })).toEqual({ label: 'read_file', caption: 'src/main.rs', detail: null });
+    expect(toolRowHead('list_dir', {})).toEqual({ label: 'list_dir', caption: null, detail: null });
+    expect(toolRowHead('glob', { pattern: '*.md' })).toEqual({ label: 'glob', caption: '*.md', detail: null });
+    expect(toolRowHead('grep', { pattern: 'needle' })).toEqual({ label: 'grep', caption: "'needle'", detail: null });
+    expect(toolRowHead('grep', { pattern: 'needle', path: 'src' })).toEqual({ label: 'grep', caption: "'needle' in src", detail: null });
+  });
+
+  it('caps and escapes a file tool caption like the other captions', () => {
+    const row = toolRowHead('read_file', { path: `${'a'.repeat(120)}‮` });
+    expect([...(row.caption ?? '')].length).toBeLessThanOrEqual(MAX_CAPTION_CHARS);
+    expect(row.caption).not.toContain('‮');
   });
 
   it('leaves a name that only looks like an MCP name as it is', () => {

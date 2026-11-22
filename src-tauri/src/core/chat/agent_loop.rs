@@ -41,6 +41,7 @@ use crate::core::chat::questions;
 use crate::core::chat::redact::Redactor;
 use crate::core::chat::todo::{self, Todo, TodoList};
 use crate::core::chat::trim::{self, TrimPlan};
+use crate::core::fs_tools::{self, Place, Scope};
 use crate::core::llm::{self, AssistantReply, ChatRequest, Delta, LlmError, ProviderConfig, ToolCall, TurnCancel};
 use crate::core::observer::{InputState, IntegrationStatus, ObserverStatus, OpenAgentRecord};
 use crate::core::persist::attachments::AttachmentStore;
@@ -478,6 +479,8 @@ pub struct LlmAgent {
     project_rules: Option<String>,
     /// The skills this turn can load (see `with_skills`). None: no skill is listed or loadable.
     skills: Option<Arc<SkillIndex>>,
+    /// The folder the file tools read in this turn (see `with_fs_scope`). None: no folder is known, so they refuse.
+    fs_scope: Option<Scope>,
     /// Saves the conversation at each checkpoint (see `with_checkpoint`).
     checkpoint: Option<Checkpoint>,
     /// The caps this turn runs under (see `with_limits`).
@@ -523,6 +526,7 @@ impl LlmAgent {
             resume_note: None,
             project_rules: None,
             skills: None,
+            fs_scope: None,
             checkpoint: None,
             limits: LimitsSettings::default(),
             attachments: None,
@@ -603,6 +607,13 @@ impl LlmAgent {
     /// message after the project rules, and the `skill` tool loads from them. Never stored in the history.
     pub fn with_skills(mut self, index: Arc<SkillIndex>) -> Self {
         self.skills = Some(index);
+        self
+    }
+
+    /// The folder the file tools (core/fs_tools) read in this turn: the session's project root, else its local folder, built
+    /// when the turn starts (as the skills are). None when no local folder is known.
+    pub fn with_fs_scope(mut self, scope: Option<Scope>) -> Self {
+        self.fs_scope = scope;
         self
     }
 
@@ -946,6 +957,8 @@ impl LlmAgent {
             todo::TOOL_NAME => ctx.local_tool(name, &args, |args| self.write_todos(args, ctx)),
             // Read-only like `todo_write`: the skill's text or file, from this turn's index (core/skills/tool).
             skill_tool::TOOL_NAME => ctx.local_tool(name, &args, |args| self.run_skill(args)),
+            // Read-only like `skill`: the file tools (core/fs_tools), on this machine only, inside this turn's folder.
+            _ if fs_tools::is_tool(name) => ctx.local_tool(name, &args, |args| self.run_fs(name, args, ctx)),
             // Chat-local like `todo_write`: answered by the user, never by the shell or an approval card. It counts
             // against neither the command cap nor the read names, and its result never stops the turn.
             questions::TOOL_NAME => ctx.ask_user(&args),
@@ -965,6 +978,18 @@ impl LlmAgent {
             Err(e) => project(name, false, &Value::String(e), &self.redactor),
         };
         (content, denied)
+    }
+
+    /// Runs a file tool call in the place the shell on top gives now: this turn's folder, or a refusal when the shell is nested
+    /// (its folder is on another machine) or no folder is known. Read per call, so a shell opened mid-turn counts.
+    fn run_fs(&self, name: &str, args: &Value, ctx: &AgentCtx<'_>) -> Result<Value, String> {
+        let top = ctx.top_level();
+        let place = if top.is_nested() {
+            Place::Remote { host: top.host.clone().unwrap_or_else(|| "another machine".to_string()) }
+        } else {
+            self.fs_scope.as_ref().map_or(Place::Unknown, Place::Local)
+        };
+        fs_tools::run(place, name, args).map(Value::String)
     }
 
     /// Runs a `skill` call against this turn's index. Without an index no skill exists, so any name is unknown.
