@@ -3809,6 +3809,86 @@ a {
   color: var(--accent);
 }
 
+.settings-tag-warn {
+  color: var(--warn);
+}
+
+.settings-error-line {
+  display: block;
+}
+
+.settings-mcp-list,
+.settings-mcp-tools,
+.settings-skills,
+.settings-mcp-roots ul,
+.settings-warn-list ul {
+  margin: 6px 0;
+  padding: 0;
+  list-style: none;
+}
+
+.settings-mcp,
+.settings-skill,
+.settings-mcp-tool {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 0;
+  border-top: 1px dashed var(--rule);
+  min-width: 0;
+}
+
+.settings-mcp-tool {
+  padding: 4px 0;
+}
+
+.settings-mcp-tool code {
+  overflow-wrap: anywhere;
+}
+
+.settings-mcp-tool select {
+  align-self: flex-start;
+}
+
+.settings-mcp-panel {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--rule);
+}
+
+.settings-mcp-form,
+.settings-mcp-json {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.settings-mcp-json textarea,
+.settings-mcp-form textarea {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: inherit;
+  font-size: 12px;
+}
+
+.settings-mcp-secret input[type="text"],
+.settings-mcp-secret input[type="password"] {
+  min-width: 0;
+  flex: 1 1 140px;
+}
+
+.settings-logs {
+  margin: 4px 0;
+  max-height: 180px;
+  overflow: auto;
+  padding: 6px 8px;
+  border: 1px dashed var(--rule);
+  color: var(--muted);
+  font-size: 11px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .settings-providers,
 .settings-models {
   margin: 4px 0;

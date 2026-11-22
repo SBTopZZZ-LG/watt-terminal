@@ -528,8 +528,16 @@ export function isBusy(t: Transcript): boolean {
   return t.inFlight > 0;
 }
 
-/** The title of an approval card. The name comes from the model, so an unknown one is shown escaped. */
-export function approvalTitle(name: string): string {
+/**
+ * The title of an approval card. The name comes from the model, so an unknown one is shown escaped. An external tool
+ * (reason external_tool) takes its title from `display`, the backend's `server: tool`, so the card names the server; a
+ * display without that form falls back to the name.
+ */
+export function approvalTitle(name: string, reason: ApprovalReasonCode | null = null, display: string | null = null): string {
+  const at = display === null ? -1 : display.indexOf(': ');
+  if (reason === 'external_tool' && display !== null && at > 0) {
+    return `The agent wants to use ${visibleEscapes(display.slice(at + 2))} from ${visibleEscapes(display.slice(0, at))}`;
+  }
   switch (name) {
     case 'run_command':
       return 'The agent wants to run a command';

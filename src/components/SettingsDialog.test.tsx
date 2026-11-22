@@ -105,10 +105,12 @@ function noticesProps(over: Partial<SettingsNoticesProps> = {}): SettingsNotices
 const notices = (over: Partial<SettingsNoticesProps> = {}) => renderToStaticMarkup(<SettingsNotices {...noticesProps(over)} />);
 
 describe('SETTINGS_TABS', () => {
-  it('Models first, then Approvals, Limits, Terminal and About, each with its label', () => {
+  it('Models first, then Approvals, MCP, Skills, Limits, Terminal and About, each with its label', () => {
     expect(SETTINGS_TABS.map((t) => [t.id, t.label])).toEqual([
       ['models', 'Models'],
       ['approvals', 'Approvals'],
+      ['mcp', 'MCP'],
+      ['skills', 'Skills'],
       ['limits', 'Limits'],
       ['terminal', 'Terminal'],
       ['about', 'About'],

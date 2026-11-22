@@ -39,8 +39,9 @@ const ASK_SENTENCE: Record<'unintegrated_shell', string> = {
 };
 
 /** Why a call ran without asking, as a sentence. */
-const RAN_TEXT: Record<'approve_all' | 'rule' | 'interrupt' | 'latched', string> = {
+const RAN_TEXT: Record<'approve_all' | 'rule' | 'interrupt' | 'latched' | 'external_tool', string> = {
   approve_all: `Ran without asking: ${BYPASS_LABEL} is on for this session.`,
+  external_tool: 'Ran without asking because MCP tool approval allows it.',
   rule: 'Ran without asking: an allow rule matches this command.',
   interrupt: 'Ran without asking: Ctrl-C, Ctrl-D or Esc into the command the agent started.',
   latched: "Ran without asking: you approved this command's first keystrokes, so its later ones run too until you type.",

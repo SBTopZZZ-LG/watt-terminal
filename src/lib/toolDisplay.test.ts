@@ -94,6 +94,29 @@ describe('toolCaptionFull and toolPreviewFull', () => {
   });
 });
 
+describe('toolRowHead: MCP tools and the skill tool', () => {
+  it('shows an MCP tool as server · tool, with its own caption and detail', () => {
+    expect(toolRowHead('mcp__you-com__search', { query: 'x', summary: 'Find the docs' })).toEqual({
+      label: 'you-com · search',
+      caption: 'Find the docs',
+      detail: null,
+    });
+  });
+
+  it('shows the skill tool as skill, captioned with the skill name', () => {
+    expect(toolRowHead('skill', { name: 'review-pr', summary: 'Review it' })).toEqual({ label: 'skill', caption: 'review-pr', detail: null });
+  });
+
+  it('falls back to the summary for the skill tool when there is no usable name', () => {
+    expect(toolRowHead('skill', { name: '  ', summary: 'Review it' })).toEqual({ label: 'skill', caption: 'Review it', detail: null });
+    expect(toolRowHead('skill', {})).toEqual({ label: 'skill', caption: null, detail: null });
+  });
+
+  it('leaves a name that only looks like an MCP name as it is', () => {
+    expect(toolRowHead('mcp__server', {})).toEqual({ label: 'mcp__server', caption: null, detail: null });
+  });
+});
+
 describe('toolRowHead', () => {
   it('is the bare name with the caption and the detail', () => {
     expect(toolRowHead('run_command', { command: 'git status', summary: 'Check the working tree' })).toEqual({
