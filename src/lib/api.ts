@@ -15,6 +15,10 @@ import type {
   IntegrationSettings,
   LimitsSettings,
   LoadedConversation,
+  McpImportResult,
+  McpLevel,
+  McpServerInput,
+  McpView,
   ModelRef,
   ProviderPreset,
   QuestionAnswerInput,
@@ -235,5 +239,36 @@ export const api = {
   /** Sends one short test message (a few tokens) to a model. The model need not be the default. */
   testConnection(providerId: string, modelId: string) {
     return invoke<TestResult>('test_connection', { providerId, modelId });
+  },
+  /** The MCP servers as saved, with their live state and tools. Starts the servers on first use. */
+  getMcp() {
+    return invoke<McpView>('get_mcp');
+  },
+  /** Adds the servers of a pasted `mcpServers` list. Refused as a whole when a name already exists. */
+  mcpImport(text: string) {
+    return invoke<McpImportResult>('mcp_import', { text });
+  },
+  /** Adds a server, or replaces the one with its name. Values in the input are stored, not returned. */
+  mcpSaveServer(input: McpServerInput) {
+    return invoke<McpView>('mcp_save_server', { input });
+  },
+  mcpRemoveServer(name: string) {
+    return invoke<McpView>('mcp_remove_server', { name });
+  },
+  mcpSetEnabled(name: string, enabled: boolean) {
+    return invoke<McpView>('mcp_set_enabled', { name, enabled });
+  },
+  mcpSetServerApproval(name: string, level: McpLevel) {
+    return invoke<McpView>('mcp_set_server_approval', { name, level });
+  },
+  /** Sets one tool's level, or clears its override with null (the tool then inherits the server's level). */
+  mcpSetToolApproval(name: string, tool: string, level: McpLevel | null) {
+    return invoke<McpView>('mcp_set_tool_approval', { name, tool, level });
+  },
+  mcpRestart(name: string) {
+    return invoke<McpView>('mcp_restart', { name });
+  },
+  mcpLogs(name: string) {
+    return invoke<string[]>('mcp_logs', { name });
   },
 };

@@ -102,3 +102,48 @@ describe('api side commands', () => {
     expect(invoke).toHaveBeenCalledWith('export_conversation', { sessionId: 'main' });
   });
 });
+
+describe('api MCP commands', () => {
+  beforeEach(() => invoke.mockClear());
+
+  const SERVER = {
+    config: { name: 'fetch', enabled: true, approval: 'ask' as const, transport: { type: 'stdio' as const, command: 'uvx', args: [], env: ['TOKEN'] } },
+    env_values: { TOKEN: 'typed-value' },
+    header_values: {},
+  };
+
+  it('getMcp takes no arguments', () => {
+    void api.getMcp();
+    expect(invoke).toHaveBeenCalledWith('get_mcp', undefined);
+  });
+
+  it('mcpImport sends the pasted text as text', () => {
+    void api.mcpImport('{"mcpServers": {}}');
+    expect(invoke).toHaveBeenCalledWith('mcp_import', { text: '{"mcpServers": {}}' });
+  });
+
+  it('mcpSaveServer sends the input as input, with its secret values', () => {
+    void api.mcpSaveServer(SERVER);
+    expect(invoke).toHaveBeenCalledWith('mcp_save_server', { input: SERVER });
+  });
+
+  it('mcpSetToolApproval sends a null level as null, which clears the override', () => {
+    void api.mcpSetToolApproval('fetch', 'search', null);
+    expect(invoke).toHaveBeenCalledWith('mcp_set_tool_approval', { name: 'fetch', tool: 'search', level: null });
+    void api.mcpSetToolApproval('fetch', 'search', 'never');
+    expect(invoke).toHaveBeenLastCalledWith('mcp_set_tool_approval', { name: 'fetch', tool: 'search', level: 'never' });
+  });
+
+  it('the server commands send the server name', () => {
+    void api.mcpRemoveServer('fetch');
+    expect(invoke).toHaveBeenLastCalledWith('mcp_remove_server', { name: 'fetch' });
+    void api.mcpSetEnabled('fetch', false);
+    expect(invoke).toHaveBeenLastCalledWith('mcp_set_enabled', { name: 'fetch', enabled: false });
+    void api.mcpSetServerApproval('fetch', 'auto');
+    expect(invoke).toHaveBeenLastCalledWith('mcp_set_server_approval', { name: 'fetch', level: 'auto' });
+    void api.mcpRestart('fetch');
+    expect(invoke).toHaveBeenLastCalledWith('mcp_restart', { name: 'fetch' });
+    void api.mcpLogs('fetch');
+    expect(invoke).toHaveBeenLastCalledWith('mcp_logs', { name: 'fetch' });
+  });
+});

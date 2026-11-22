@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::core::settings::secrets::{SecretError, Secrets};
+use crate::core::settings::secrets::{SecretError, SecretMap, Secrets};
 
 const PREFIX: &str = "mcp.";
 const ENV_PART: &str = "env.";
@@ -65,16 +65,7 @@ impl<'a> McpSecrets<'a> {
 
     /// Replaces every stored value of `server` with `values`, in one save. Empty values are not stored.
     pub fn set(&self, server: &str, values: SecretValues) -> Result<(), SecretError> {
-        let prefix = server_prefix(server);
-        self.secrets.edit(|map| {
-            map.retain(|key, _| !key.starts_with(&prefix));
-            for (name, value) in values.env_values.iter().filter(|(_, v)| !v.is_empty()) {
-                map.insert(format!("{prefix}{ENV_PART}{name}"), value.clone());
-            }
-            for (name, value) in values.header_values.iter().filter(|(_, v)| !v.is_empty()) {
-                map.insert(format!("{prefix}{HEADER_PART}{name}"), value.clone());
-            }
-        })
+        self.secrets.edit(|map| write_server(map, server, &values))
     }
 
     /// Removes every stored value of `server`.
@@ -91,6 +82,20 @@ impl<'a> McpSecrets<'a> {
             .filter(|(key, value)| key.starts_with(PREFIX) && !value.is_empty())
             .map(|(_, value)| value.clone())
             .collect())
+    }
+}
+
+/// Replaces the stored values of `server` in `map` with `values` (empty values are dropped). This is `McpSecrets::set`
+/// on a map the caller saves, so a change can write several servers and the settings in one save. An empty `values`
+/// removes the server's values.
+pub fn write_server(map: &mut SecretMap, server: &str, values: &SecretValues) {
+    let prefix = server_prefix(server);
+    map.retain(|key, _| !key.starts_with(&prefix));
+    for (name, value) in values.env_values.iter().filter(|(_, v)| !v.is_empty()) {
+        map.insert(format!("{prefix}{ENV_PART}{name}"), value.clone());
+    }
+    for (name, value) in values.header_values.iter().filter(|(_, v)| !v.is_empty()) {
+        map.insert(format!("{prefix}{HEADER_PART}{name}"), value.clone());
     }
 }
 

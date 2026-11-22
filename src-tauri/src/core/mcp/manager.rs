@@ -21,6 +21,7 @@ use crate::core::llm::TurnCancel;
 use super::config::McpSettings;
 use super::runtime::{Msg, Runtime, SHUTDOWN_WAIT};
 use super::secrets::SecretValues;
+use super::tools::ToolInfo;
 
 /// How often a waiting tool call checks the turn's cancel.
 const CALL_POLL: Duration = Duration::from_millis(100);
@@ -36,12 +37,12 @@ pub enum ServerState {
     NeedsAuth { message: String },
 }
 
-/// One server's state and its tool names (the server's own names).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One server's state and its tools as the server named them (see `ToolInfo`).
+#[derive(Debug, Clone, PartialEq)]
 pub struct ServerStatus {
     pub name: String,
     pub state: ServerState,
-    pub tools: Vec<String>,
+    pub tools: Vec<ToolInfo>,
 }
 
 /// Where a model-facing tool name points, and how it is approved.

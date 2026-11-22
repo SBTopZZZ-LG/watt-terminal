@@ -38,6 +38,7 @@ const SETTINGS: Settings = {
   approval: { mode: 'manual', allow: [], deny: [], nested: 'ask' },
   integration: { agent_requests: 'ask' },
   limits: { max_model_calls: 50, model_calls_unlimited: false, max_poll_calls: 60, max_commands_per_turn: 30, max_wait_minutes: 30 },
+  mcp: { servers: [] },
 };
 
 function view(over: Partial<SettingsView> = {}): SettingsView {

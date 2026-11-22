@@ -314,7 +314,7 @@ impl Runtime {
                     Status::Failed(error) => ServerState::Failed { error: error.clone() },
                     Status::NeedsAuth(message) => ServerState::NeedsAuth { message: message.clone() },
                 },
-                tools: server.tools.iter().map(|t| t.original.clone()).collect(),
+                tools: server.tools.clone(),
             })
             .collect()
     }
