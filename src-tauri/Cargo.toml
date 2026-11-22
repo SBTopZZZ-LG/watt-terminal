@@ -37,7 +37,13 @@ getrandom = "0.3"
 # LLM provider adapter (core/llm). Default features give rustls (no OpenSSL / native-tls).
 reqwest = { version = "0.13", features = ["json", "stream"] }
 futures-util = "0.3"
-tokio = { version = "1", features = ["sync", "time"] }
+tokio = { version = "1", features = ["sync", "time", "rt", "process", "io-util"] }
+# MCP client (core/mcp): stdio child process and Streamable HTTP over the reqwest client. Pinned: the API used in core/mcp
+# is checked against this exact version. The `reqwest` feature gives https (rustls).
+rmcp = { version = "=3.11.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
+# Child process wrapper for MCP stdio servers: a Job Object on Windows, a process group elsewhere, so a server's whole
+# process tree dies with it. Same major as rmcp's own dependency, so one copy is built.
+process-wrap = { version = "10", features = ["tokio1"] }
 # Provider API keys and secret headers live in one Keychain item (core/settings/secrets.rs). Default features only:
 # they give the macOS Keychain backend without OpenSSL / native-tls.
 keyring = "4.2"

@@ -56,6 +56,11 @@ impl NameTable {
     pub fn owns(&self, full_name: &str) -> bool {
         self.by_name.contains_key(full_name)
     }
+
+    /// Every offered name with the server's original tool name behind it, in name order.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.by_name.iter().map(|(name, original)| (name.as_str(), original.as_str()))
+    }
 }
 
 /// Replaces every character outside [A-Za-z0-9_-] with `_`, one `_` per character.
