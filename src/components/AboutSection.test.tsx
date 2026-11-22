@@ -20,6 +20,7 @@ describe('AboutSection', () => {
     for (const img of images) {
       expect(img).toContain('alt=""');
       expect(img).toContain('aria-hidden="true"');
+      expect(img).toContain('draggable="false"');
     }
   });
 

@@ -57,7 +57,7 @@ export function AgentPanel({ ref, view, onExpand, busy = false, approvalPending 
           title={`Show the agent (${shortcutLabel('agent')})`}
           aria-label="Show the agent panel"
         >
-          <img className="brand-mark" src={wattMark} width={212} height={256} alt="" aria-hidden="true" />
+          <img className="brand-mark" src={wattMark} width={212} height={256} alt="" aria-hidden="true" draggable={false} />
           {busy ? (
             <span className="agent-rail-busy" role="img" aria-label="Agent is working" title="Agent is working" />
           ) : null}

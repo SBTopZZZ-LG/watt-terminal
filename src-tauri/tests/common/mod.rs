@@ -156,6 +156,54 @@ pub fn wait_prompt(s: &Session) {
     assert!(wait_state(s, InputState::Prompt, Duration::from_secs(20)), "never reached prompt; state={:?}", s.state());
 }
 
+/// `wait_prompt` for a session from `start_recording`. On timeout the panic names what the harness can see: state,
+/// activity, observer status, foreground, stats, the screen rows, the records, and the tail of the raw PTY output.
+pub fn wait_prompt_diag(s: &Session, raw: &Mutex<Vec<u8>>) {
+    if wait_state(s, InputState::Prompt, Duration::from_secs(20)) {
+        return;
+    }
+    let bytes = raw.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let tail = &bytes[bytes.len().saturating_sub(4096)..];
+    let snap = s.screen_snapshot();
+    // Linux only (procfs): the shell's scheduler state and kernel wait channel, to tell a live shell that is not reading from a dead one.
+    let pid = s.shell_pid();
+    let proc = pid.map(|p| {
+        let stat = std::fs::read_to_string(format!("/proc/{p}/stat")).unwrap_or_default();
+        let wchan = std::fs::read_to_string(format!("/proc/{p}/wchan")).unwrap_or_default();
+        format!("stat={:?} wchan={:?}", stat.trim(), wchan.trim())
+    });
+    panic!(
+        "never reached prompt; state={:?}
+shell_pid={:?} proc: {}
+activity={:?} observer={:?} integration={:?}
+foreground={:?}
+stats={:?} user_writes={} typed_since_prompt={}
+records={:?}
+screen size={:?} cursor={:?} alternate={}
+rows:
+{}
+raw bytes total={} tail(4096)={:?}",
+        s.state(),
+        pid,
+        proc.unwrap_or_default(),
+        s.activity(),
+        s.observer_status(),
+        s.integration_status(),
+        s.foreground(),
+        s.stats(),
+        s.user_writes(),
+        s.user_typed_since_prompt(),
+        s.records(),
+        snap.size,
+        snap.cursor,
+        snap.alternate_screen,
+        snap.rows.iter().enumerate().map(|(i, r)| format!("  {i:2}|{r}")).collect::<Vec<_>>().join("
+"),
+        bytes.len(),
+        String::from_utf8_lossy(tail),
+    );
+}
+
 /// How long the screen must be still before a started program counts as up in `wait_program_up`.
 pub const PROGRAM_QUIET: Duration = Duration::from_millis(500);
 

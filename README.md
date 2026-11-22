@@ -25,7 +25,7 @@ An experimental terminal for macOS and Windows 11 where you and an AI agent shar
 - **Attachments.** Drop or paste images and text files onto the agent bar.
 - **Todo panel.** The agent keeps a todo list for multi-step work, pinned above the context meter.
 - **Conversations are saved.** Browse past conversations in the history view and pick one back up.
-- **Terminal comforts.** Find (Cmd+F), clear (Cmd+K), font zoom, a colour stripe per command showing its exit status, and a border that pulses while the agent works.
+- **Terminal comforts.** Find (Cmd+F for the chat or the terminal, Cmd+Shift+F for the terminal), clear (Cmd+K), font zoom, a colour stripe per command showing its exit status, and a border that pulses while the agent works.
 
 ## Getting started
 
@@ -72,7 +72,8 @@ The terminal is the main input: keys go to the shell, or to whatever program is 
 | Esc in the bar | Deny the first pending approval; with none, return to the terminal |
 | Ctrl+C in the bar | Interrupt the agent's turn and the running command |
 | Cmd+, | Settings |
-| Cmd+F | Find in the terminal (Enter / Shift+Enter step, Esc closes) |
+| Cmd+F | Find in the chat when focus is in the agent panel, else in the terminal (Enter / Shift+Enter step, Esc closes) |
+| Cmd+Shift+F | Find in the terminal |
 | Cmd+K | Clear scrollback (not in full-screen apps) |
 | Cmd+Plus / Minus / 0 | Font size up / down / reset (saved between launches) |
 | Option+Left/Right, Cmd+Left/Right, Cmd+Backspace | Word jump, line start/end, clear line |

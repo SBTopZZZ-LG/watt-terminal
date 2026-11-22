@@ -351,7 +351,7 @@ describe('Transcript: attachments on a message the user sent', () => {
       },
     ]);
     expect(html).toContain('<div class="msg-attachments">');
-    expect(html).toContain(`<img class="msg-attach-thumb" src="${THUMB}" alt="shot.png" title="shot.png"/>`);
+    expect(html).toContain(`<img class="msg-attach-thumb" src="${THUMB}" alt="shot.png" title="shot.png" draggable="false"/>`);
     expect(html).toContain('<span class="msg-attach-name" data-tip="notes.md" data-tip-clip="">notes.md</span><span class="msg-attach-size">300 B</span>');
     // The text comes first, then the attachments.
     expect(html.indexOf('what is in these')).toBeLessThan(html.indexOf('msg-attachments'));

@@ -43,7 +43,11 @@ export function secretStoreShortName(mac: boolean = IS_MAC): string {
   return mac ? 'Keychain' : 'Credential Manager';
 }
 
-export type ShortcutName = 'agent' | 'settings';
+/**
+ * The context menu's hints (copy, cut, paste, select-all, find, find-terminal, clear) name the key that does the same thing:
+ * Cmd on macOS, Ctrl elsewhere. Copy in the terminal is Ctrl+Shift+C off macOS (Ctrl+C there is the interrupt).
+ */
+export type ShortcutName = 'agent' | 'settings' | 'copy' | 'copy-terminal' | 'cut' | 'paste' | 'select-all' | 'find' | 'find-terminal' | 'clear';
 
 /** The shortcut as the UI shows it in tooltips and hints. The macOS text is what the app showed before the port. */
 export function shortcutLabel(name: ShortcutName, mac: boolean = IS_MAC): string {
@@ -52,6 +56,22 @@ export function shortcutLabel(name: ShortcutName, mac: boolean = IS_MAC): string
       return mac ? 'Ctrl/Cmd+Shift+A' : 'Ctrl+Shift+A';
     case 'settings':
       return mac ? 'Ctrl/Cmd+,' : 'Ctrl+,';
+    case 'copy':
+      return mac ? 'Cmd+C' : 'Ctrl+C';
+    case 'copy-terminal':
+      return mac ? 'Cmd+C' : 'Ctrl+Shift+C';
+    case 'cut':
+      return mac ? 'Cmd+X' : 'Ctrl+X';
+    case 'paste':
+      return mac ? 'Cmd+V' : 'Ctrl+V';
+    case 'select-all':
+      return mac ? 'Cmd+A' : 'Ctrl+A';
+    case 'find':
+      return mac ? 'Cmd+F' : 'Ctrl+F';
+    case 'find-terminal':
+      return mac ? 'Cmd+Shift+F' : 'Ctrl+Shift+F';
+    case 'clear':
+      return mac ? 'Cmd+K' : 'Ctrl+Shift+K';
   }
 }
 

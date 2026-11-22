@@ -1105,7 +1105,7 @@ fn unclosed_quote_waits_for_input_then_ctrl_c_recovers() {
 #[test]
 fn unclosed_quote_waits_for_input_then_agent_send_keys_ctrl_c_recovers() {
     let _g = serial();
-    let s = start();
+    let (s, raw) = start_recording();
     wait_prompt(&s);
     let tools = SessionTools::new(&s);
     let outcome = tools.run_command("echo `x", DEFAULT_RUN_WAIT, None).expect("run_command");
@@ -1113,9 +1113,16 @@ fn unclosed_quote_waits_for_input_then_agent_send_keys_ctrl_c_recovers() {
     assert_eq!(s.state(), InputState::Continuation, "the shell is not waiting");
 
     s.write_user(b"zqx").expect("the user types into the agent's continuation");
+    // Wait for zsh to echo the typed text before the agent's Ctrl-C follows it. The two writes are back to back. In the one
+    // Linux failure (1 in ~140 runs) zsh was alive in read with only the first byte echoed, and the rest and the Ctrl-C never took effect.
+    assert!(
+        wait_until(Duration::from_secs(5), || s.screen_snapshot().rows.iter().any(|r| r.contains("zqx")).then_some(())).is_some(),
+        "the typed text was not echoed at the continuation: {:?}",
+        s.screen_snapshot().rows
+    );
     let sent = tools.call("send_keys", &json!({"keys": ["Ctrl-C"]}), None).expect("send_keys Ctrl-C at the agent's continuation");
     assert_eq!(sent["outcome"], "sent", "{sent}");
-    wait_prompt(&s);
+    wait_prompt_diag(&s, &raw);
     assert!(!s.records().iter().any(|r| r.command.contains("echo `x")), "the unfinished line became a record");
     let ran = tools.run_command("echo ok", DEFAULT_RUN_WAIT, None).expect("run after the agent's ctrl-c");
     let RunOutcome::Finished { record } = ran else {

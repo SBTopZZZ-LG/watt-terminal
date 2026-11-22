@@ -11,8 +11,8 @@ const VERSION = typeof __APP_VERSION__ === 'string' ? __APP_VERSION__ : 'unknown
 export function AboutSection() {
   return (
     <div className="about">
-      <img className="about-mark" src={wattMark} width={212} height={256} alt="" aria-hidden="true" />
-      <img className="about-wordmark" src={wattWordmark} width={480} height={155} alt="" aria-hidden="true" />
+      <img className="about-mark" src={wattMark} width={212} height={256} alt="" aria-hidden="true" draggable={false} />
+      <img className="about-wordmark" src={wattWordmark} width={480} height={155} alt="" aria-hidden="true" draggable={false} />
       <p className="about-name">Watt Terminal</p>
       <p className="about-version">{`Version ${VERSION}`}</p>
     </div>

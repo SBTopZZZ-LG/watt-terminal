@@ -21,6 +21,8 @@ import { connect, reportError, restart, setSessionNonces, subscribe } from './li
 import type { Incoming } from './lib/session';
 import { clearTerminal, currentFontSize, fitToContainer, markConnected, marks, onFontSizeChange, receiveBytes, resetForNewSession, setFontSize, term, terminalSize, zoomFont } from './lib/terminal';
 import { appHotkeyFor } from './lib/appHotkeys';
+import { findZone } from './lib/findZone';
+import { isEditableElement, isSelectAllKey, selectAllTarget, selectContentsOf } from './lib/selectAll';
 import { effectiveState, focusAfter, inputReducer, INITIAL_INPUT, isFocusBarHotkey, routeFor } from './lib/inputState';
 import type { BarMode, Route } from './lib/inputState';
 import { agentDialogPhase, agentIntegratingQuietly, agentRequestAfter, agentRequestClosedBySession, agentRunning, canIntegrate, integratesLocalShell, nestedLevels } from './lib/integrate';
@@ -55,6 +57,7 @@ import { TodoPanel } from './components/TodoPanel';
 import { ContextMeter } from './components/ContextMeter';
 import { StatusChip } from './components/StatusChip';
 import { FindBar } from './components/FindBar';
+import { ChatFindBar } from './components/ChatFindBar';
 import { PanelDivider } from './components/PanelDivider';
 import { AgentPanel, Workspace } from './components/AgentPanel';
 import { AgentActivityToast } from './components/AgentActivityToast';
@@ -66,6 +69,7 @@ import { SettingsDialog } from './components/SettingsDialog';
 import { SettingsBanner } from './components/SettingsBanner';
 import { IntegrateDialog } from './components/IntegrateDialog';
 import { Tooltip } from './components/Tooltip';
+import { ContextMenu } from './components/ContextMenu';
 
 const CTRL_C = '\u0003';
 
@@ -128,6 +132,11 @@ export default function App() {
   // The find bar is mounted while open. Its token moves focus into it when Cmd+F is pressed again.
   const [findOpen, setFindOpen] = useState(false);
   const [findToken, setFindToken] = useState(0);
+  // The chat find (Cmd+F with focus in the agent panel) is independent of the terminal find: both can be open. Esc returns
+  // focus to the element that was focused when it opened (chatFindOrigin).
+  const [chatFindOpen, setChatFindOpen] = useState(false);
+  const [chatFindToken, setChatFindToken] = useState(0);
+  const chatFindOrigin = useRef<Element | null>(null);
   // The AI settings dialog (Cmd+, / Ctrl+, or the gear button in the status strip).
   const [settingsOpen, setSettingsOpen] = useState(false);
   // Bare `/model` opens Settings with the default-model select focused. Any other open leaves focus alone.
@@ -598,9 +607,13 @@ export default function App() {
       // While the AI settings are open they own the keyboard: only their own hotkey is taken here, so no shortcut reaches
       // the terminal or moves focus out of the dialog.
       if (settingsOpenRef.current) {
-        if (appHotkeyFor(e) === 'settings') {
+        const hotkey = appHotkeyFor(e);
+        if (hotkey === 'settings') {
           e.preventDefault();
           e.stopPropagation();
+        } else if (hotkey === 'find' || hotkey === 'find-terminal') {
+          // No find while the settings are open, but the browser's own find never shows.
+          e.preventDefault();
         }
         return;
       }
@@ -622,6 +635,24 @@ export default function App() {
         }
         return;
       }
+      // Ctrl+A (Cmd+A) outside a field selects the focus zone's text, never the whole page. The terminal keeps its key.
+      if (isSelectAllKey(e)) {
+        const el = e.target instanceof Element ? e.target : null;
+        const zone = selectAllTarget({
+          editable: isEditableElement(el),
+          inTerminal: el?.closest('.xterm') != null,
+          inAgentPanel: el?.closest('.agent-panel') != null,
+        });
+        if (zone !== null) {
+          e.preventDefault();
+          if (zone === 'terminal') {
+            term.selectAll();
+          } else {
+            selectContentsOf(document.querySelector('.transcript-body'));
+          }
+          return;
+        }
+      }
       const app = appHotkeyFor(e);
       if (app === null) {
         return;
@@ -629,7 +660,22 @@ export default function App() {
       e.preventDefault();
       e.stopPropagation();
       switch (app) {
-        case 'find':
+        case 'find': {
+          // Cmd+F / Ctrl+F finds in the zone that has focus. Each zone's find is opened or, when open, its input is focused.
+          const active = document.activeElement;
+          if (findZone({ inAgentPanel: active?.closest('.agent-panel') != null }) === 'chat') {
+            if (!active?.closest('.chat-find')) {
+              chatFindOrigin.current = active;
+            }
+            setChatFindOpen(true);
+            setChatFindToken((t) => t + 1);
+          } else {
+            setFindOpen(true);
+            setFindToken((t) => t + 1);
+          }
+          return;
+        }
+        case 'find-terminal':
           setFindOpen(true);
           setFindToken((t) => t + 1);
           return;
@@ -685,6 +731,31 @@ export default function App() {
   const closeFind = () => {
     setFindOpen(false);
     term.focus();
+  };
+
+  // Esc in the chat find: closes it and gives focus back to where it was opened from. The terminal find is not touched.
+  const closeChatFind = () => {
+    setChatFindOpen(false);
+    const origin = chatFindOrigin.current;
+    chatFindOrigin.current = null;
+    if (origin instanceof HTMLElement && origin.isConnected) {
+      origin.focus();
+    }
+  };
+
+  // The context menu's find items: the same as Ctrl+Shift+F, and Ctrl+F in the agent panel (see the keydown listener).
+  const openTerminalFind = () => {
+    setFindOpen(true);
+    setFindToken((t) => t + 1);
+  };
+
+  const openChatFind = () => {
+    const active = document.activeElement;
+    if (!active?.closest('.chat-find')) {
+      chatFindOrigin.current = active;
+    }
+    setChatFindOpen(true);
+    setChatFindToken((t) => t + 1);
   };
 
   const sendRaw = (text: string) => {
@@ -1644,6 +1715,7 @@ export default function App() {
             thinking={transcript.thinking}
             approvalPending={pendingApproval !== null}
           >
+            {chatFindOpen && <ChatFindBar focusToken={chatFindToken} onClose={closeChatFind} />}
             <Transcript
               items={transcript.items}
               busy={busy}
@@ -1775,6 +1847,12 @@ export default function App() {
         integrate.kind !== 'closed' && <IntegrateDialog key="user" phase={integrate} onStart={startIntegrate} onClose={closeIntegrate} local={localShell} />
       )}
       <Tooltip />
+      <ContextMenu
+        terminal={{ state: effective, agentBusy: busy || sideBusy, pasteRoutesToPty: keyRoute.keys === 'pty' }}
+        onClearTerminal={() => clearTerminal(effectiveRef.current, handleTerminalInput)}
+        onFindTerminal={openTerminalFind}
+        onFindChat={openChatFind}
+      />
     </div>
   );
 }

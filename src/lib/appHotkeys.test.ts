@@ -28,6 +28,11 @@ describe('appHotkeyFor: mappings', () => {
     expect(appHotkeyFor(ev('F', { meta: true }))).toBe('find');
   });
 
+  it('maps Cmd+Shift+F to find-terminal, in either letter case', () => {
+    expect(appHotkeyFor(ev('F', { meta: true, shift: true }))).toBe('find-terminal');
+    expect(appHotkeyFor(ev('f', { meta: true, shift: true }))).toBe('find-terminal');
+  });
+
   it('maps Cmd+K to clear, in either letter case', () => {
     expect(appHotkeyFor(ev('k', { meta: true }))).toBe('clear');
     expect(appHotkeyFor(ev('K', { meta: true }))).toBe('clear');
@@ -86,8 +91,7 @@ describe('appHotkeyFor: negatives', () => {
     expect(appHotkeyFor(ev('0', { ctrl: true }))).toBeNull();
   });
 
-  it('ignores Shift on every key except zoom-in', () => {
-    expect(appHotkeyFor(ev('F', { meta: true, shift: true }))).toBeNull();
+  it('ignores Shift on every key except zoom-in and find-terminal', () => {
     expect(appHotkeyFor(ev('K', { meta: true, shift: true }))).toBeNull();
     expect(appHotkeyFor(ev('-', { meta: true, shift: true }))).toBeNull();
     expect(appHotkeyFor(ev(')', { meta: true, shift: true }))).toBeNull();
@@ -114,16 +118,19 @@ describe('appHotkeyFor: negatives', () => {
 describe('appHotkeyFor: Windows and Linux (Ctrl, not Cmd)', () => {
   const win = (k: string, mods: Mods = {}, code = '') => appHotkeyFor(ev(k, mods, code), false);
 
-  it('maps Ctrl+Shift+F to find and Ctrl+Shift+K to clear, in either letter case', () => {
-    expect(win('f', { ctrl: true, shift: true })).toBe('find');
-    expect(win('F', { ctrl: true, shift: true })).toBe('find');
+  it('maps Ctrl+Shift+F to find-terminal and Ctrl+Shift+K to clear, in either letter case', () => {
+    expect(win('f', { ctrl: true, shift: true })).toBe('find-terminal');
+    expect(win('F', { ctrl: true, shift: true })).toBe('find-terminal');
     expect(win('k', { ctrl: true, shift: true })).toBe('clear');
     expect(win('K', { ctrl: true, shift: true })).toBe('clear');
   });
 
-  it('leaves Ctrl+F and Ctrl+K to the shell', () => {
-    expect(win('f', { ctrl: true })).toBeNull();
-    expect(win('F', { ctrl: true })).toBeNull();
+  it('maps Ctrl+F to find (the focus zone), in either letter case', () => {
+    expect(win('f', { ctrl: true })).toBe('find');
+    expect(win('F', { ctrl: true })).toBe('find');
+  });
+
+  it('leaves Ctrl+K to the shell', () => {
     expect(win('k', { ctrl: true })).toBeNull();
     expect(win('K', { ctrl: true })).toBeNull();
   });

@@ -17,6 +17,8 @@
   --line: var(--rule);
   --rule-strong: rgba(111, 211, 255, 0.5);
   --tint: rgba(111, 211, 255, 0.1);
+  /* Every chat find match (::highlight(chat-find)). The current match is --accent with --tip-fg text. */
+  --find-match: rgba(111, 211, 255, 0.28);
   --ink: #c6e4f7;
   /* Brighter ink for headings and strong text in markdown. */
   --ink-strong: #eaf7ff;
@@ -111,6 +113,52 @@ button,
 input {
   font: inherit;
   color: inherit;
+}
+
+/*
+ * Selection and native drags. The app is not a web page, so chrome text is not selectable: html and body are none, and
+ * only the text a user copies is allow-listed in the next block. To make more text selectable, add its selector there.
+ * Form fields are listed explicitly, because WebKit needs it when body is none. .xterm (its own rule in xterm.css) draws
+ * its own selection. .md-code-copy (the copy button in a code block) stays none (see its rule below the markdown styles).
+ */
+html,
+body {
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: default;
+}
+
+.msg,
+.msg .md,
+.tool pre,
+.tool-detail,
+.notice,
+.question-error,
+.chip-model,
+.chip-provider,
+.chip-cwd,
+.settings-path,
+.about,
+input,
+textarea,
+[contenteditable] {
+  -webkit-user-select: text;
+  user-select: text;
+  cursor: text;
+}
+
+/* Checkboxes and radios are inputs too; they keep the arrow. */
+input[type="checkbox"],
+input[type="radio"] {
+  cursor: default;
+}
+
+/* Images and links are not dragged out of the page (the drag itself is also cancelled in webviewGuards.ts). */
+img,
+svg,
+a {
+  -webkit-user-drag: none;
+  user-drag: none;
 }
 
 .app {
@@ -291,6 +339,37 @@ input {
   font-size: 11px;
   white-space: nowrap;
   text-align: right;
+}
+
+/*
+ * Chat find: the same bar, in the flow at the top of the agent panel (not over the terminal). Its input takes the free width.
+ * The matches are CSS Custom Highlights (see chatFindDom.ts); where the API is missing, only the selection marks the match.
+ */
+.chat-find {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 4px;
+  align-items: center;
+  margin: 6px 12px 0;
+  padding: 4px 6px;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  background: var(--panel);
+  box-shadow: 0 2px 8px var(--shadow);
+}
+
+.chat-find .find-input {
+  flex: 1 1 0;
+  width: 0;
+}
+
+::highlight(chat-find) {
+  background-color: var(--find-match);
+}
+
+::highlight(chat-find-current) {
+  background-color: var(--accent);
+  color: var(--tip-fg);
 }
 
 .find-button {
@@ -4727,4 +4806,59 @@ input {
   .tooltip {
     animation: none;
   }
+}
+
+/*
+ * The context menu (src/components/ContextMenu.tsx): the tooltip's look, an inverted light card, so it reads as part of
+ * the same family. One fixed box, opened at the pointer or at the focused element. No animation.
+ */
+.context-menu {
+  position: fixed;
+  z-index: 61;
+  min-width: 170px;
+  max-width: 320px;
+  padding: 4px;
+  border: 1px solid var(--accent);
+  border-radius: 2px;
+  background: var(--tip-bg);
+  color: var(--tip-fg);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.4;
+  box-shadow: 3px 3px 0 var(--scrim), 0 0 14px rgba(111, 211, 255, 0.3);
+  outline: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.context-menu-item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 3px 8px;
+  border-radius: 2px;
+  cursor: default;
+  white-space: nowrap;
+}
+
+.context-menu-item.is-highlighted {
+  background: var(--tip-fg);
+  color: var(--tip-bg);
+}
+
+.context-menu-item.is-disabled {
+  opacity: 0.42;
+}
+
+.context-menu-shortcut {
+  opacity: 0.6;
+  font-size: 11px;
+}
+
+.context-menu-sep {
+  height: 0;
+  margin: 4px 2px;
+  border-top: 1px solid var(--tip-rule);
+  opacity: 0.35;
 }

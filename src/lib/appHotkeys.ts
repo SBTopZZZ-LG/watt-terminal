@@ -6,12 +6,15 @@
 // not a terminal key (xterm sends nothing for it), so it does not clash with the shell. Shift is allowed only for zoom-in,
 // because Cmd+Plus is Cmd+Shift+= on a US keyboard. Matching is on the produced key, so it follows the keyboard layout.
 //
-// Elsewhere, Ctrl is matched, with Shift for Find and Clear (Windows Terminal's keys). Ctrl+F, Ctrl+K and Ctrl+L belong to
-// the shell (readline, PSReadLine), so they are never taken there.
+// Elsewhere, Ctrl is matched, with Shift for the terminal find and Clear (Windows Terminal's keys). Ctrl+K and Ctrl+L belong
+// to the shell (readline, PSReadLine), so they are never taken there.
+//
+// Find comes in two keys. 'find' (Cmd+F, Ctrl+F) finds in the focus zone: the chat when focus is in the agent panel, else
+// the terminal. 'find-terminal' (Cmd+Shift+F on macOS, Ctrl+Shift+F elsewhere) always finds in the terminal.
 
 import { IS_MAC } from './platform';
 
-export type AppHotkey = 'find' | 'clear' | 'zoom-in' | 'zoom-out' | 'zoom-reset' | 'settings';
+export type AppHotkey = 'find' | 'find-terminal' | 'clear' | 'zoom-in' | 'zoom-out' | 'zoom-reset' | 'settings';
 
 /** The fields of a keyboard event that the mapping reads. A DOM KeyboardEvent satisfies this. */
 export interface HotkeyEvent {
@@ -49,7 +52,7 @@ function macHotkeyFor(ev: HotkeyEvent): AppHotkey | null {
     return 'zoom-in';
   }
   if (ev.shiftKey) {
-    return null;
+    return key === 'f' ? 'find-terminal' : null;
   }
   switch (key) {
     case 'f':
@@ -80,12 +83,15 @@ function ctrlHotkeyFor(ev: HotkeyEvent): AppHotkey | null {
   if (ev.shiftKey) {
     switch (ev.key.toLowerCase()) {
       case 'f':
-        return 'find';
+        return 'find-terminal';
       case 'k':
         return 'clear';
       default:
         return null;
     }
+  }
+  if (ev.key.toLowerCase() === 'f') {
+    return 'find';
   }
   switch (ev.key) {
     case '-':
