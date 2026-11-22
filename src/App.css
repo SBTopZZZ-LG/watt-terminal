@@ -4749,6 +4749,7 @@ a {
   color: var(--ink-strong);
   white-space: pre-wrap;
   word-break: break-all;
+  tab-size: 4;
 }
 
 .approval-toast-actions {
