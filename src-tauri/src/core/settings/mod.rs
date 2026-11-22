@@ -22,6 +22,7 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 
 use crate::core::approval;
+use crate::core::mcp::config::McpSettings;
 
 pub const SETTINGS_VERSION: u32 = 1;
 const SETTINGS_FILE: &str = "settings.json";
@@ -72,6 +73,9 @@ pub struct Settings {
     /// The per-turn caps of the agent (`LimitsSettings`). Missing in older files: the defaults.
     #[serde(default)]
     pub limits: LimitsSettings,
+    /// The MCP servers (core/mcp). Missing in older files: none. Secret values are not here.
+    #[serde(default)]
+    pub mcp: McpSettings,
 }
 
 fn current_version() -> u32 {
@@ -88,6 +92,7 @@ impl Default for Settings {
             approval: ApprovalSettings::default(),
             integration: IntegrationSettings::default(),
             limits: LimitsSettings::default(),
+            mcp: McpSettings::default(),
         }
     }
 }
@@ -365,6 +370,7 @@ impl Settings {
 
         problems.extend(approval::validate_settings(&self.approval));
         problems.extend(self.limits.validate());
+        problems.extend(self.mcp.validate());
 
         if problems.is_empty() { Ok(()) } else { Err(problems) }
     }
@@ -821,6 +827,7 @@ mod tests {
             approval: ApprovalSettings::default(),
             integration: IntegrationSettings::default(),
             limits: LimitsSettings::default(),
+            mcp: McpSettings::default(),
         }
     }
 
