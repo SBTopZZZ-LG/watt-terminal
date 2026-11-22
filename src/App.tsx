@@ -171,10 +171,10 @@ export default function App() {
   useEffect(() => {
     document.documentElement.dataset.hideMarks = String(hideMarks);
   }, [hideMarks]);
-  // Follow-up prompts after a reply (see suggestions.ts). Off until the file says otherwise. `suggestGen` moves whenever the
+  // Follow-up prompts after a reply (see suggestions.ts). On until the file says otherwise. `suggestGen` moves whenever the
   // suggestions no longer follow the reply (a send, a turn, a conversation change, the setting, a click), so a late answer is
   // dropped. One request at a time; a trigger during one is run again after it.
-  const [suggestPrompts, setSuggestPrompts] = useState(false);
+  const [suggestPrompts, setSuggestPrompts] = useState(true);
   const [suggestions, setSuggestions] = useState<string[]>([]);
   const suggestGen = useRef(0);
   const suggesting = useRef(false);

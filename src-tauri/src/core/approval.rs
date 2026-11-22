@@ -5,7 +5,8 @@
 //!
 //! Two modes are saved: manual (every call asks) and regex (the rules below). Approve-all is not part of this module:
 //! it is the session-only flag in core/agent.rs, and it skips the policy. In a nested shell (ssh, a nested shell, one
-//! the app integrated: not the local machine) an allow rule never runs a command by itself: it asks with `nested_level`.
+//! the app integrated: not the local machine) an allow rule does not run a command by itself unless the user has chosen
+//! to follow the local rules there; otherwise it asks with `nested_level`.
 //!
 //! This is a floor, not a sandbox. The hard gate refuses shell syntax, and any command whose first word is not a plain
 //! command name (a path, an assignment, `=ls`, a leading `-`), and the programs and shell builtins on a deny list,

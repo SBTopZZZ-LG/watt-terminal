@@ -161,15 +161,15 @@ describe('ApprovalSection: Remote shells', () => {
   it('has a Remote shells block with the two controls', () => {
     const html = render();
     expect(html).toContain('Remote shells');
-    expect(html).toContain('Auto-approve in SSH and nested shells');
+    expect(html).toContain('Treat SSH and nested shells like local');
     expect(html).toContain('Let the agent integrate shells without asking');
   });
 
   it('the SSH and nested box is checked for same_as_local, and not otherwise', () => {
     const on = render({ draft: { ...BASE.draft, nested: 'same_as_local' } });
-    expect(tagHolding(on, 'input', 'Auto-approve in SSH and nested shells')).toContain('checked=""');
+    expect(tagHolding(on, 'input', 'Treat SSH and nested shells like local')).toContain('checked=""');
     const off = render();
-    expect(tagHolding(off, 'input', 'Auto-approve in SSH and nested shells')).not.toContain('checked=""');
+    expect(tagHolding(off, 'input', 'Treat SSH and nested shells like local')).not.toContain('checked=""');
   });
 
   it('the agent-request box is checked for auto only', () => {
@@ -182,7 +182,7 @@ describe('ApprovalSection: Remote shells', () => {
   it('carries the warnings: remote aliases, PATH and users; the hard gate and deny rules still apply; the loader and the prompts', () => {
     const html = render();
     expect(html).toContain('Remote aliases, PATH and users differ from this machine');
-    expect(html).toContain('The hard gate and the deny rules still apply everywhere.');
+    expect(html).toContain('Deny rules and the hard gate still apply, except while bypass is on.');
     expect(html).toContain('Applies when you save approvals.');
     expect(html).toContain('the agent can type the integration loader into whatever shell is in');
     expect(html).toContain('It refuses at password and other prompts.');
@@ -193,7 +193,7 @@ describe('ApprovalSection: Remote shells', () => {
     expect(tagHolding(saving, 'input', 'Let the agent integrate shells without asking')).toContain('disabled=""');
     expect(saving).toContain('Saving...');
     const locked = render({ locked: true });
-    expect(tagHolding(locked, 'input', 'Auto-approve in SSH and nested shells')).toContain('disabled=""');
+    expect(tagHolding(locked, 'input', 'Treat SSH and nested shells like local')).toContain('disabled=""');
     expect(tagHolding(locked, 'input', 'Let the agent integrate shells without asking')).toContain('disabled=""');
   });
 

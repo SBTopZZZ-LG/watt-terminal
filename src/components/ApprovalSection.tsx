@@ -36,7 +36,7 @@ const MODES: { value: ApprovalMode; label: string }[] = [
  * The Approvals section of the AI settings: how run_command is approved. Manual asks for every command. Regex rules run a
  * command without asking only when an allow rule matches all of it and no deny rule does, and the built-in checks pass.
  * The section is controlled: the dialog holds the draft and the save, as it does for the provider editor. Saved rules are
- * checked against a command with "Try a command", which needs no draft. The Remote shells block is here too: its SSH box is
+ * checked against a command with "Try a command", which needs no draft. The Remote shells block is here too: its nested-shell box is
  * part of the draft, and the agent box saves as soon as it changes (its own command, see the dialog).
  */
 export function ApprovalSection(p: ApprovalSectionProps) {
@@ -156,12 +156,13 @@ export function ApprovalSection(p: ApprovalSectionProps) {
             aria-describedby={`${uid}-nested-note`}
             onChange={(e) => p.onChange({ ...draft, nested: e.target.checked ? 'same_as_local' : 'ask' })}
           />
-          Auto-approve in SSH and nested shells
+          Treat SSH and nested shells like local
         </label>
         <p className="settings-warn" id={`${uid}-nested-note`}>
-          Off by default. Remote aliases, PATH and users differ from this machine, so with this on, allow rules and bypass
-          apply in SSH and nested shells too. The hard gate and the deny rules still apply everywhere. Applies when you save
-          approvals.
+          Off by default. Remote aliases, PATH and users differ from this machine, so by default allow rules ask in SSH and
+          nested shells, and bypass applies only in the shell where you switched it on. With this on they follow your local
+          rules there: allow rules run without asking and bypass applies everywhere. Deny rules and the hard gate still apply,
+          except while bypass is on. Applies when you save approvals.
         </p>
 
         <label className="settings-check">
