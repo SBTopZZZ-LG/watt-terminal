@@ -31,6 +31,7 @@ const ASK_CLAUSE: Record<Exclude<AskReasonCode, 'unintegrated_shell'>, string> =
   nested_level: 'this is a nested shell, so every command in it needs your approval.',
   approve_all_suspended: `${BYPASS_LABEL} is off in this shell, because it was turned on in another shell.`,
   external_tool: 'this tool is not part of the terminal, so it needs your approval before it runs.',
+  fs_write: 'writing a file changes it on disk, so each write needs your approval.',
 };
 
 /** Reasons that are a whole sentence on their own, so the card shows them as they are (no "Asked because"). */

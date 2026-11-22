@@ -31,6 +31,11 @@ const KEYCHAIN_ACCOUNT: &str = "secrets";
 const SECRETS_FILE_ENV: &str = "WATT_SECRETS_FILE";
 const LEGACY_SECRETS_FILE_ENV: &str = "AGENT_TERM_SECRETS_FILE";
 
+/// The opt-in secrets file (`WATT_SECRETS_FILE`), when one is set. The file tools never read or write it.
+pub fn secrets_file_path() -> Option<PathBuf> {
+    env_setting(SECRETS_FILE_ENV, LEGACY_SECRETS_FILE_ENV).map(PathBuf::from)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SecretError {
     /// The store cannot be read or written (Keychain denied or missing, file error). The message holds no secret.

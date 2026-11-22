@@ -115,7 +115,8 @@ export type ApprovalReasonCode =
   | 'auto_cap'
   | 'nested_level'
   | 'approve_all_suspended'
-  | 'external_tool';
+  | 'external_tool'
+  | 'fs_write';
 
 export type AgentEvent =
   | { type: 'text'; text: string }

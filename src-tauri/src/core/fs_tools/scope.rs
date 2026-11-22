@@ -28,13 +28,88 @@ pub struct Scope {
     root: PathBuf,
     /// The session's local directory. Relative paths resolve against it.
     cwd: PathBuf,
-    /// Watt's config folder: its settings and secret store are never read.
-    config_dir: Option<PathBuf>,
+    /// Watt's own folders and files: its config folder, its data folder (conversations) and the secrets file. Never read
+    /// or written.
+    guarded: Vec<PathBuf>,
+}
+
+/// Where a write goes (see `Scope::resolve_write`). `path` is canonical for an existing file. A new file's folders are
+/// checked too; `new_dirs` says some of them must be created first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteTarget {
+    pub path: PathBuf,
+    pub exists: bool,
+    pub new_dirs: bool,
 }
 
 impl Scope {
-    pub fn new(root: PathBuf, cwd: PathBuf, config_dir: Option<PathBuf>) -> Self {
-        Scope { root, cwd, config_dir }
+    pub fn new(root: PathBuf, cwd: PathBuf, guarded: Vec<PathBuf>) -> Self {
+        Scope { root, cwd, guarded }
+    }
+
+    /// The path shown to the model: relative to the project root when it is inside it.
+    pub fn relative(&self, path: &Path) -> String {
+        let root = canonical(&self.root).unwrap_or_else(|_| self.root.clone());
+        match path.strip_prefix(&root) {
+            Ok(rest) if !rest.as_os_str().is_empty() => plain(rest),
+            _ => plain(path),
+        }
+    }
+
+    /// Resolves the path a write names, under the same rules as reads, plus: never inside a `.git` folder, and a new file's
+    /// folder must exist unless `create_dirs`. The file itself may not exist. A symlink is followed, so a link inside the
+    /// root to a file outside it is refused.
+    pub fn resolve_write(&self, arg: &str, create_dirs: bool) -> Result<WriteTarget, String> {
+        let arg = arg.trim();
+        let shown = echo(arg);
+        if arg.is_empty() {
+            return Err("the path is empty".to_string());
+        }
+        let root = canonical(&self.root).map_err(|e| format!("cannot open the project folder ({e})"))?;
+        let cwd = canonical(&self.cwd).map_err(|e| format!("cannot open the working directory ({e})"))?;
+        let lexical = if Path::new(arg).is_absolute() { PathBuf::from(arg) } else { cwd.join(arg) };
+        if let Some(reason) = blocked_reason(&lexical.to_string_lossy()) {
+            return Err(blocked_text(&shown, reason));
+        }
+        match fs::canonicalize(&lexical) {
+            Ok(path) => {
+                if path.is_dir() {
+                    return Err(format!("`{shown}` is a folder, not a file"));
+                }
+                self.check(&path, &root, &shown)?;
+                check_not_git(&path, &shown)?;
+                Ok(WriteTarget { path, exists: true, new_dirs: false })
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let name = lexical.file_name().ok_or_else(|| format!("`{shown}` does not name a file"))?.to_os_string();
+                // Walk up to the nearest folder that exists. The folders between it and the file are new, so each must be a
+                // plain name: `..` is refused, and the existing part is canonical.
+                let mut missing = Vec::new();
+                let mut folder = lexical.parent().ok_or_else(|| format!("`{shown}` has no folder"))?.to_path_buf();
+                let mut existing = loop {
+                    match fs::canonicalize(&folder) {
+                        Ok(found) => break found,
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                            let part = folder.file_name().ok_or_else(|| format!("`{shown}` has a folder name that is not plain"))?;
+                            missing.push(part.to_os_string());
+                            folder = folder.parent().ok_or_else(|| format!("`{shown}` has no folder"))?.to_path_buf();
+                        }
+                        Err(e) => return Err(format!("cannot access `{shown}` ({e})")),
+                    }
+                };
+                if !missing.is_empty() && !create_dirs {
+                    return Err(format!("the folder of `{shown}` does not exist; set create_dirs to true to create it"));
+                }
+                for part in missing.iter().rev() {
+                    existing.push(part);
+                }
+                existing.push(&name);
+                self.check(&existing, &root, &shown)?;
+                check_not_git(&existing, &shown)?;
+                Ok(WriteTarget { path: existing, exists: false, new_dirs: !missing.is_empty() })
+            }
+            Err(e) => Err(format!("cannot access `{shown}` ({e})")),
+        }
     }
 
     /// Resolves a path argument to a canonical path inside the root that is not blocked. `None` or an empty argument is the
@@ -74,7 +149,7 @@ impl Scope {
     /// Whether a walk leaves this entry out: a blocked name, or Watt's config folder. It works on the walk's own (lexical)
     /// path, so a blocked folder is not entered at all.
     pub fn excluded(&self, entry: &Path) -> bool {
-        blocked_reason(&entry.to_string_lossy()).is_some() || self.in_config_dir(entry)
+        blocked_reason(&entry.to_string_lossy()).is_some() || self.in_guarded(entry)
     }
 
     /// The checks on a canonical target: the blocked names, the config folder, and the root.
@@ -83,8 +158,8 @@ impl Scope {
         if let Some(reason) = blocked_reason(&text) {
             return Err(blocked_text(shown, reason));
         }
-        if self.in_config_dir(target) {
-            return Err(blocked_text(shown, "Watt's own settings and secrets"));
+        if self.in_guarded(target) {
+            return Err(blocked_text(shown, "Watt's own settings, secrets and conversations"));
         }
         if !is_within(&text, &plain(root), CASE_INSENSITIVE) {
             return Err(format!(
@@ -95,13 +170,24 @@ impl Scope {
         Ok(())
     }
 
-    fn in_config_dir(&self, path: &Path) -> bool {
-        let Some(dir) = &self.config_dir else {
-            return false;
-        };
-        let dir = canonical(dir).unwrap_or_else(|_| dir.clone());
-        is_within(&plain(path), &plain(&dir), CASE_INSENSITIVE)
+    /// Whether `path` is one of Watt's guarded folders or files, or inside one. A guarded path that does not exist yet is
+    /// compared as written.
+    fn in_guarded(&self, path: &Path) -> bool {
+        let text = plain(path);
+        self.guarded.iter().any(|guarded| {
+            let guarded = canonical(guarded).unwrap_or_else(|_| guarded.clone());
+            is_within(&text, &plain(&guarded), CASE_INSENSITIVE)
+        })
     }
+}
+
+/// Refuses a path inside a `.git` folder: the file tools never write there.
+fn check_not_git(path: &Path, shown: &str) -> Result<(), String> {
+    let text = plain(path).replace('\\', "/");
+    if text.split('/').any(|part| part.eq_ignore_ascii_case(".git")) {
+        return Err(format!("`{shown}` is inside a .git folder: the file tools never write there."));
+    }
+    Ok(())
 }
 
 /// Why a path is never read, judged by its text: a credential folder anywhere on it, or a key, `.netrc` or `.env` file as
@@ -232,7 +318,7 @@ mod tests {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src").join("main.rs"), "fn main() {}").unwrap();
         fs::write(tmp.path().join("outside.txt"), "x").unwrap();
-        let scope = Scope::new(root.clone(), root.clone(), None);
+        let scope = Scope::new(root.clone(), root.clone(), Vec::new());
 
         assert!(scope.resolve(Some("src/main.rs")).is_ok());
         assert!(scope.resolve(Some("./src/../src/main.rs")).is_ok(), "`..` that stays inside is fine");
@@ -251,7 +337,7 @@ mod tests {
         fs::create_dir_all(root.join(".ssh")).unwrap();
         fs::write(root.join(".ssh").join("id_rsa"), "key").unwrap();
         fs::write(root.join(".env"), "TOKEN=1").unwrap();
-        let scope = Scope::new(root.clone(), root.clone(), None);
+        let scope = Scope::new(root.clone(), root.clone(), Vec::new());
 
         let env = scope.resolve(Some(".env")).unwrap_err();
         assert_eq!(env, "`.env` is blocked: the file tools never read .env files.");
@@ -266,7 +352,7 @@ mod tests {
         let config = root.join("watt-config");
         fs::create_dir_all(&config).unwrap();
         fs::write(config.join("settings.json"), "{}").unwrap();
-        let scope = Scope::new(root.clone(), root.clone(), Some(config.clone()));
+        let scope = Scope::new(root.clone(), root.clone(), vec![config.clone()]);
 
         assert!(scope.resolve(Some("watt-config/settings.json")).unwrap_err().contains("Watt's own settings"));
         assert!(scope.resolve(Some("watt-config")).unwrap_err().contains("Watt's own settings"));
@@ -285,7 +371,7 @@ mod tests {
         fs::write(tmp.path().join("outside.txt"), "x").unwrap();
         symlink(root.join(".ssh").join("config"), root.join("innocent.txt")).unwrap();
         symlink(tmp.path().join("outside.txt"), root.join("link-out.txt")).unwrap();
-        let scope = Scope::new(root.clone(), root.clone(), None);
+        let scope = Scope::new(root.clone(), root.clone(), Vec::new());
 
         assert!(scope.resolve(Some("innocent.txt")).unwrap_err().contains("credential folders"));
         assert!(scope.resolve(Some("link-out.txt")).unwrap_err().contains("outside the project folder"));
@@ -304,7 +390,81 @@ mod tests {
         if std::os::windows::fs::symlink_file(tmp.path().join("outside.txt"), root.join("link-out.txt")).is_err() {
             return;
         }
-        let scope = Scope::new(root.clone(), root.clone(), None);
+        let scope = Scope::new(root.clone(), root.clone(), Vec::new());
         assert!(scope.resolve(Some("link-out.txt")).unwrap_err().contains("outside the project folder"));
+    }
+
+    #[test]
+    fn the_data_folder_and_the_secrets_file_are_refused_too() {
+        let tmp = TempDir::new();
+        let root = tmp.path().join("home");
+        let data = root.join("watt-data");
+        let secrets = root.join("secrets.store");
+        fs::create_dir_all(data.join("conversations")).unwrap();
+        fs::write(data.join("conversations").join("c1.json"), "{}").unwrap();
+        fs::write(&secrets, "x").unwrap();
+        let scope = Scope::new(root.clone(), root.clone(), vec![data.clone(), secrets.clone()]);
+
+        assert!(scope.resolve(Some("watt-data/conversations/c1.json")).unwrap_err().contains("Watt's own settings"));
+        assert!(scope.resolve(Some("secrets.store")).unwrap_err().contains("Watt's own settings"));
+        assert!(scope.excluded(&fs::canonicalize(&secrets).unwrap()));
+        assert!(scope.resolve_write("watt-data/new.json", false).unwrap_err().contains("Watt's own settings"));
+        assert!(scope.resolve_write("secrets.store", false).unwrap_err().contains("Watt's own settings"));
+    }
+
+    #[test]
+    fn a_write_target_may_be_new_and_its_folders_must_exist_unless_created() {
+        let tmp = TempDir::new();
+        let root = tmp.path().join("proj");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src").join("a.rs"), "x").unwrap();
+        let scope = Scope::new(root.clone(), root.clone(), Vec::new());
+
+        let existing = scope.resolve_write("src/a.rs", false).unwrap();
+        assert!(existing.exists && !existing.new_dirs);
+        let new_file = scope.resolve_write("src/b.rs", false).unwrap();
+        assert!(!new_file.exists && !new_file.new_dirs);
+        assert_eq!(new_file.path, fs::canonicalize(root.join("src")).unwrap().join("b.rs"));
+        let missing = scope.resolve_write("deep/er/c.rs", false).unwrap_err();
+        assert!(missing.contains("create_dirs"), "{missing}");
+        let made = scope.resolve_write("deep/er/c.rs", true).unwrap();
+        assert!(!made.exists && made.new_dirs);
+        assert!(scope.resolve_write("src", false).unwrap_err().contains("is a folder"));
+        assert!(scope.resolve_write("../escape.rs", true).unwrap_err().contains("outside the project folder"));
+        // Windows folds `missing\..` before the file system is asked, so this may resolve to `x.rs` in the root. Either way the
+        // final path is checked: it is refused, or it is inside the root.
+        if let Ok(target) = scope.resolve_write("missing/../x.rs", true) {
+            assert!(target.path.starts_with(fs::canonicalize(&root).unwrap()), "{:?}", target.path);
+        }
+        assert!(scope.resolve_write("   ", false).unwrap_err().contains("empty"));
+    }
+
+    #[test]
+    fn a_write_never_goes_inside_git_or_into_a_blocked_name() {
+        let tmp = TempDir::new();
+        let root = tmp.path().join("proj");
+        fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        let scope = Scope::new(root.clone(), root.clone(), Vec::new());
+
+        assert!(scope.resolve_write(".git/config", false).unwrap_err().contains(".git"));
+        assert!(scope.resolve_write(".git/hooks/pre-commit", true).unwrap_err().contains(".git"));
+        assert!(scope.resolve_write(".env", false).unwrap_err().contains(".env"));
+        assert!(scope.resolve_write("key.pem", false).unwrap_err().contains("private key"));
+        assert!(scope.resolve_write("src/main.rs", false).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_write_through_a_link_out_of_the_root_is_refused() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new();
+        let root = tmp.path().join("proj");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(tmp.path().join("outside.txt"), "x").unwrap();
+        symlink(tmp.path().join("outside.txt"), root.join("link-out.txt")).unwrap();
+        let scope = Scope::new(root.clone(), root.clone(), Vec::new());
+
+        assert!(scope.resolve_write("link-out.txt", false).unwrap_err().contains("outside the project folder"));
     }
 }

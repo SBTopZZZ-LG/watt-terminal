@@ -1,11 +1,14 @@
 // The hidden-approval toast: a fixed overlay shown while an approval card waits and the chat body is hidden.
 // Approve and Deny answer the card; Show opens the chat without answering it. The command is the same truncated,
-// escaped preview the tool rows show (newlines as ⏎); a send_keys toast shows the decoded input instead.
+// escaped preview the tool rows show (newlines as ⏎); a send_keys toast shows the decoded input instead, and a file write
+// shows its preview in a block that keeps the lines.
 
+import { isFileWrite, showsDisplay } from '../lib/approvalCard';
 import { capDisplay, displayText } from '../lib/keysDisplay';
 import type { Dock } from '../lib/panelLayout';
 import { MAX_COMMAND_PREVIEW_CHARS, MAX_SEND_KEYS_PREVIEW_CHARS } from '../lib/toolDisplay';
 import type { TranscriptItem } from '../lib/transcript';
+import { visibleEscapes } from '../lib/visibleEscapes';
 import { ApprovalCountdown } from './ApprovalCountdown';
 
 type ApprovalItem = Extract<TranscriptItem, { kind: 'approval' }>;
@@ -19,8 +22,9 @@ interface ApprovalToastProps {
 
 export function ApprovalToast({ approval, dock, onApprove, onOpen }: ApprovalToastProps) {
   const sendKeys = approval.name === 'send_keys';
-  // A send_keys card shows its decoded input, and an external tool its `server: tool`; the other cards show the command.
-  const shownInstead = sendKeys || approval.reason === 'external_tool';
+  // A send_keys card shows its decoded input, an external tool its `server: tool`, a file write its preview; the other cards
+  // show the command.
+  const shownInstead = showsDisplay(approval.name, approval.reason);
   const preview = shownInstead ? (approval.display ?? approval.text) : approval.text.replace(/\r\n|\n|\r/g, '⏎');
   const max = sendKeys ? MAX_SEND_KEYS_PREVIEW_CHARS : MAX_COMMAND_PREVIEW_CHARS;
   const command = capDisplay(preview, max);
@@ -29,9 +33,13 @@ export function ApprovalToast({ approval, dock, onApprove, onOpen }: ApprovalToa
   return (
     <div className={`approval-toast dock-${dock}`} role="alertdialog" aria-label="Approval needed">
       <div className="approval-toast-title">Approval needed</div>
-      <code className="approval-toast-command" data-tip={displayText(preview)} data-tip-clip={[...preview].length > max ? undefined : ''}>
-        {command}
-      </code>
+      {isFileWrite(approval.name) ? (
+        <pre className="approval-toast-preview">{visibleEscapes(preview)}</pre>
+      ) : (
+        <code className="approval-toast-command" data-tip={displayText(preview)} data-tip-clip={[...preview].length > max ? undefined : ''}>
+          {command}
+        </code>
+      )}
       <div className="approval-toast-actions">
         <button type="button" className="approve" aria-label="Approve" onClick={() => onApprove(approval.callId, true)}>
           Approve

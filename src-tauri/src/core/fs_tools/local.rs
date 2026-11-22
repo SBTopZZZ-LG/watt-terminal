@@ -333,7 +333,7 @@ mod tests {
     fn project(tmp: &TempDir) -> (std::path::PathBuf, Scope) {
         let root = tmp.path().join("proj");
         fs::create_dir_all(&root).unwrap();
-        let scope = Scope::new(root.clone(), root.clone(), None);
+        let scope = Scope::new(root.clone(), root.clone(), Vec::new());
         (root, scope)
     }
 

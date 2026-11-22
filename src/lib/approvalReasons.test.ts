@@ -14,6 +14,7 @@ const ASK_CODES: ApprovalReasonCode[] = [
   'nested_level',
   'approve_all_suspended',
   'external_tool',
+  'fs_write',
 ];
 
 describe('askedBecause', () => {

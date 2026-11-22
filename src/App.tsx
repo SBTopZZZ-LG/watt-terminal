@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useReducer, useRef, useState }
 import type { RefObject } from 'react';
 import './App.css';
 import { api, errorText } from './lib/api';
+import { showsDisplay } from './lib/approvalCard';
 import { copyText } from './lib/clipboard';
 import {
   INIT_TEMPLATE,
@@ -1557,7 +1558,7 @@ export default function App() {
     if (pendingApprovalItem === null || !firstAttention(`approval:${pendingApprovalItem.callId}`)) {
       return;
     }
-    const shownInstead = pendingApprovalItem.name === 'send_keys' || pendingApprovalItem.reason === 'external_tool';
+    const shownInstead = showsDisplay(pendingApprovalItem.name, pendingApprovalItem.reason);
     const text = shownInstead ? (pendingApprovalItem.display ?? pendingApprovalItem.text) : pendingApprovalItem.text;
     notifyAttention({ type: 'approval', text });
   }, [pendingApprovalItem?.callId]);

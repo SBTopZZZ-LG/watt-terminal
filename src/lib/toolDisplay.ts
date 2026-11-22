@@ -131,15 +131,28 @@ const SKILL_TOOL = 'skill';
 
 /**
  * The caption of a file tool (core/fs_tools/tool.rs): the path it reads or lists, the glob, or the pattern searched (with the
- * folder when one is given). Null for other tools, and when the argument is absent or not a string.
+ * folder when one is given). A write shows its verb and path, and an edit its edit count. The content itself stays in the
+ * Input tab. Null for other tools, and when the argument is absent or not a string.
  */
 function fileToolCaption(name: string, args: unknown): string | null {
   if (typeof args !== 'object' || args === null) {
     return null;
   }
-  const { path, pattern } = args as { path?: unknown; pattern?: unknown };
+  const { path, pattern, edits } = args as { path?: unknown; pattern?: unknown; edits?: unknown };
   const text = (value: unknown): string | null => (typeof value === 'string' && value.trim() !== '' ? value.trim() : null);
   switch (name) {
+    case 'write_file': {
+      const target = text(path);
+      return target === null ? null : `Write ${target}`;
+    }
+    case 'edit_file': {
+      const target = text(path);
+      if (target === null) {
+        return null;
+      }
+      const count = Array.isArray(edits) ? edits.length : 0;
+      return `Edit ${target} (${count} ${count === 1 ? 'edit' : 'edits'})`;
+    }
     case 'read_file':
     case 'list_dir':
       return text(path);

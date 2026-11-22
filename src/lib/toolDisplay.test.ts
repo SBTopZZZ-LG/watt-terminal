@@ -115,6 +115,19 @@ describe('toolRowHead: MCP tools and the skill tool', () => {
   it('captions the file tools by the path, glob or pattern they work on', () => {
     expect(toolRowHead('read_file', { path: 'src/main.rs', offset: 10 })).toEqual({ label: 'read_file', caption: 'src/main.rs', detail: null });
     expect(toolRowHead('list_dir', {})).toEqual({ label: 'list_dir', caption: null, detail: null });
+    // A write shows its verb and path; the content stays in the Input tab, so there is no detail line.
+    expect(toolRowHead('write_file', { path: 'src/a.rs', content: 'x'.repeat(5000) })).toEqual({
+      label: 'write_file',
+      caption: 'Write src/a.rs',
+      detail: null,
+    });
+    expect(toolRowHead('edit_file', { path: 'src/a.rs', edits: [{ old_string: 'a', new_string: 'b' }, { old_string: 'c', new_string: 'd' }] })).toEqual({
+      label: 'edit_file',
+      caption: 'Edit src/a.rs (2 edits)',
+      detail: null,
+    });
+    expect(toolRowHead('edit_file', { path: 'src/a.rs', edits: [{ old_string: 'a', new_string: 'b' }] }).caption).toBe('Edit src/a.rs (1 edit)');
+    expect(toolRowHead('write_file', { content: 'x' }).caption).toBeNull();
     expect(toolRowHead('glob', { pattern: '*.md' })).toEqual({ label: 'glob', caption: '*.md', detail: null });
     expect(toolRowHead('grep', { pattern: 'needle' })).toEqual({ label: 'grep', caption: "'needle'", detail: null });
     expect(toolRowHead('grep', { pattern: 'needle', path: 'src' })).toEqual({ label: 'grep', caption: "'needle' in src", detail: null });

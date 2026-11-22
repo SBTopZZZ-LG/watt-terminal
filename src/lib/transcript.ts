@@ -543,6 +543,10 @@ export function approvalTitle(name: string, reason: ApprovalReasonCode | null = 
       return 'The agent wants to run a command';
     case 'send_keys':
       return 'The agent wants to type into a running command';
+    case 'write_file':
+      return 'The agent wants to write a file';
+    case 'edit_file':
+      return 'The agent wants to edit a file';
     default:
       return `The agent wants to use ${visibleEscapes(name)}`;
   }
