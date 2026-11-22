@@ -4,11 +4,13 @@ import { findChatMatches, keepMatch, stepMatch } from '../lib/chatFind';
 import type { ChatMatch } from '../lib/chatFind';
 import {
   clearHighlights,
+  highlightsSupported,
   paintHighlights,
   rangesFor,
   revealRange,
   searchableTextNodes,
   selectRange,
+  shouldSelectMatch,
 } from '../lib/chatFindDom';
 import { findLabel } from '../lib/find';
 import type { FindResults } from '../lib/find';
@@ -34,7 +36,7 @@ function elementOf(node: Node): Element | null {
 
 /**
  * The find bar over the agent transcript, at the top of the agent panel. The matches are the transcript's text (see
- * chatFindDom.ts): all are highlighted, and the current one is also selected and scrolled to. Typing searches as you go,
+ * chatFindDom.ts): all are highlighted, and the current one is also scrolled to and, unless the input has focus, selected. Typing searches as you go,
  * Enter and Shift+Enter step, Esc closes. A change in the transcript searches again, and keeps the current match.
  */
 export function ChatFindBar({ focusToken, onClose }: Props) {
@@ -75,8 +77,16 @@ export function ChatFindBar({ focusToken, onClose }: Props) {
     current.current = index;
     paintHighlights(ranges, index);
     if (index >= 0 && move.kind !== 'keep') {
+      // Typing and Enter keep focus in the input: a selection would take it (see shouldSelectMatch). The highlight shows the match.
+      const inputFocused = document.activeElement === inputRef.current;
       revealRange(ranges[index]);
-      selectRange(ranges[index]);
+      if (shouldSelectMatch({ inputFocused, highlightsSupported: highlightsSupported() })) {
+        selectRange(ranges[index]);
+      }
+      // The fallback selection (no highlight API) can still take the focus: give it back to the input.
+      if (inputFocused && document.activeElement !== inputRef.current) {
+        inputRef.current?.focus({ preventScroll: true });
+      }
     }
     setResults({ index, count });
   }
@@ -156,7 +166,8 @@ export function ChatFindBar({ focusToken, onClose }: Props) {
     }
   }
 
-  // The buttons keep focus in the input, so Enter and Esc keep working after a click.
+  // The buttons do not take focus (mousedown is prevented), so a click leaves it where it was: in the input while typing,
+  // so Enter and Esc keep working after a click.
   const keepFocus = (e: ReactMouseEvent<HTMLButtonElement>) => e.preventDefault();
 
   return (

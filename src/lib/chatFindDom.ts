@@ -1,5 +1,5 @@
-// Chat find, DOM side: the text nodes to search, their Ranges, the highlights and the reveal of a match. Not unit-tested
-// (no DOM in vitest); the pure matching is in chatFind.ts.
+// Chat find, DOM side: the text nodes to search, their Ranges, the highlights and the reveal of a match. The DOM is not
+// unit-tested (no DOM in vitest); the pure matching is in chatFind.ts, and the pure selection decision is shouldSelectMatch.
 
 import type { ChatMatch } from './chatFind';
 
@@ -60,6 +60,15 @@ export function clearHighlights(): void {
   }
   CSS.highlights.delete(ALL_MATCHES_HIGHLIGHT);
   CSS.highlights.delete(CURRENT_MATCH_HIGHLIGHT);
+}
+
+/**
+ * Whether the current match gets the document selection (selectRange). In WebView2/Chromium a selection in non-editable
+ * text takes focus from a focused input, so while the find input has focus the highlight alone marks the match. Without the
+ * highlight API the selection is the only mark, so it is made anyway (the caller then gives the input its focus back).
+ */
+export function shouldSelectMatch(state: { inputFocused: boolean; highlightsSupported: boolean }): boolean {
+  return !state.inputFocused || !state.highlightsSupported;
 }
 
 /** Makes the range's text the document selection. The current match also has its highlight, so it shows without this. */

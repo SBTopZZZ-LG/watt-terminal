@@ -2808,9 +2808,13 @@ a {
   color: var(--muted);
 }
 
+/*
+ * The base rule owns the box (padding, border, radius), so every mode has the same height. The modes below change colours only.
+ */
 .bar-approval-toggle {
-  padding: 0;
-  border: none;
+  padding: 1px 4px;
+  border: 1px solid transparent;
+  border-radius: 3px;
   background: none;
   color: var(--muted);
   font-size: 11px;
@@ -2820,10 +2824,8 @@ a {
 /* Bypass is on: orange text in a faint orange box. The one warning signal in the approval row. */
 .bar-approval-toggle.is-bypass {
   color: var(--bypass);
-  border: 1px solid var(--bypass);
+  border-color: var(--bypass);
   background: var(--bypass-tint);
-  padding: 0 4px;
-  border-radius: 3px;
 }
 
 .bar-approval-toggle.is-bypass:hover {
