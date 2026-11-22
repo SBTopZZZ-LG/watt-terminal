@@ -128,7 +128,8 @@ export type AgentEvent =
   | { type: 'tool_result'; call_id: string; name: string; ok: boolean; decision: ToolDecision; reason?: ApprovalReasonCode; result: unknown }
   /**
    * `reason` is why the call asks. `level` (0 is the local shell) and `location` (a nested shell's label) are always sent by the
-   * backend, optional here for existing fixtures. `display` is the decoded input of a send_keys card (`echo hi⏎`), sent only for that.
+   * backend, optional here for existing fixtures. `display` is the decoded input of a send_keys card (`echo hi⏎`), or for an
+   * external tool (reason external_tool) its `server: tool`. Absent for the other cards.
    */
   | { type: 'approval_request'; call_id: string; name: string; text: string; display?: string; reason?: ApprovalReasonCode; level?: number; location?: string }
   /** The agent is executing an approved shell call (true) and has finished it (false). */

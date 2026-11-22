@@ -424,7 +424,7 @@ function Entry({ item, onApprove, onAnswerQuestions }: { item: TranscriptItem; o
       const why = askedBecause(item.reason);
       return (
         <div className={`approval approval-${item.state}`}>
-          <div className="approval-title">{approvalTitle(item.name)}</div>
+          <div className="approval-title">{approvalTitle(item.name, item.reason, item.display)}</div>
           {item.location !== null && <div className="approval-location">on {item.location}</div>}
           {/* A send_keys card shows the decoded input (the text and the keys), escaped; the other cards show the command. */}
           {item.name === 'send_keys' ? (

@@ -32,6 +32,8 @@ import type { TabDef } from './SettingsTabs';
 import { TerminalSection } from './TerminalSection';
 import { QueueSection } from './QueueSection';
 import { NotifySection } from './NotifySection';
+import { McpTab } from './McpSection';
+import { SkillsTab } from './SkillsSection';
 import { SuggestSection } from './SuggestSection';
 import { secretStoreName } from '../lib/platform';
 
@@ -67,12 +69,15 @@ export interface EditorState {
 
 /**
  * The tabs of the AI settings, in order. Models holds the default model, the context limit, the providers and the editor;
- * Approvals holds the approval rules; Limits holds the per-turn caps; Terminal holds the terminal's display preferences; About
+ * Approvals holds the approval rules; MCP holds the MCP servers and their tools (saved at once); Skills lists the skills found
+ * (read-only); Limits holds the per-turn caps; Terminal holds the terminal's display preferences; About
  * shows the app's name and version. A new tab is one entry here and one panel in the dialog's render.
  */
 export const SETTINGS_TABS: readonly TabDef[] = [
   { id: 'models', label: 'Models' },
   { id: 'approvals', label: 'Approvals' },
+  { id: 'mcp', label: 'MCP' },
+  { id: 'skills', label: 'Skills' },
   { id: 'limits', label: 'Limits' },
   { id: 'terminal', label: 'Terminal' },
   { id: 'about', label: 'About' },
@@ -1136,6 +1141,10 @@ export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded, h
 
   const aboutPanel = <AboutSection />;
 
+  // The MCP and Skills tabs load when shown: `active` says whether the tab is the selected one.
+  const mcpPanel = <McpTab active={tab === 'mcp'} />;
+  const skillsPanel = <SkillsTab active={tab === 'skills'} />;
+
   return (
     <div
       className="modal-backdrop"
@@ -1183,13 +1192,17 @@ export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded, h
           panel={(id) =>
             id === 'approvals'
               ? approvalsPanel
-              : id === 'limits'
-                ? limitsPanel
-                : id === 'terminal'
-                  ? terminalPanel
-                  : id === 'about'
-                    ? aboutPanel
-                    : modelsPanel
+              : id === 'mcp'
+                ? mcpPanel
+                : id === 'skills'
+                  ? skillsPanel
+                  : id === 'limits'
+                    ? limitsPanel
+                    : id === 'terminal'
+                      ? terminalPanel
+                      : id === 'about'
+                        ? aboutPanel
+                        : modelsPanel
           }
         />
         <footer className="settings-foot">

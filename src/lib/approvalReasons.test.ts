@@ -58,6 +58,10 @@ describe('askedBecause', () => {
 });
 
 describe('ranBecause', () => {
+  it('says an external tool ran because MCP tool approval allows it', () => {
+    expect(ranBecause('external_tool')).toBe('Ran without asking because MCP tool approval allows it.');
+  });
+
   it('says why an automatic run happened, for both automatic codes', () => {
     expect(ranBecause('rule')).toBe('Ran without asking: an allow rule matches this command.');
     expect(ranBecause('approve_all')).toBe('Ran without asking: bypass is on for this session.');

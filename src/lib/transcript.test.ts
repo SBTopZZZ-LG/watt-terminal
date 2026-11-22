@@ -547,6 +547,28 @@ describe('approvalTitle', () => {
     expect(approvalTitle('x‮y')).toBe('The agent wants to use x\\u{202E}y');
     expect(approvalTitle('')).toBe('The agent wants to use ');
   });
+
+  it('names the server and tool of an external tool from its display (server: tool)', () => {
+    expect(approvalTitle('mcp__fetch__fetch', 'external_tool', 'fetch: fetch')).toBe('The agent wants to use fetch from fetch');
+    expect(approvalTitle('mcp__you-com__search', 'external_tool', 'you-com: search')).toBe('The agent wants to use search from you-com');
+    // The server is the part before the first ': '; the tool keeps the rest.
+    expect(approvalTitle('mcp__ctx__a', 'external_tool', 'ctx: a: b')).toBe('The agent wants to use a: b from ctx');
+  });
+
+  it('falls back to the name when the display is missing or has no server part', () => {
+    expect(approvalTitle('mcp__fetch__fetch', 'external_tool', null)).toBe('The agent wants to use mcp__fetch__fetch');
+    expect(approvalTitle('mcp__fetch__fetch', 'external_tool', 'no separator')).toBe('The agent wants to use mcp__fetch__fetch');
+    expect(approvalTitle('mcp__fetch__fetch', 'external_tool', ': tool')).toBe('The agent wants to use mcp__fetch__fetch');
+  });
+
+  it('ignores the display for other reasons, so a send_keys display is not a title', () => {
+    expect(approvalTitle('send_keys', 'send_keys', 'echo hi')).toBe('The agent wants to type into a running command');
+    expect(approvalTitle('fetch_url', 'manual_mode', 'a: b')).toBe('The agent wants to use fetch_url');
+  });
+
+  it('escapes the server and tool in the title', () => {
+    expect(approvalTitle('mcp__x__y', 'external_tool', 'x‮: y')).toBe('The agent wants to use y from x\\u{202E}');
+  });
 });
 
 describe('transcriptReducer: conversation_loaded', () => {

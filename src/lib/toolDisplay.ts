@@ -4,6 +4,7 @@
 
 import { capDisplay, displayText, sendKeysDisplay } from './keysDisplay';
 import { visibleEscapes } from './visibleEscapes';
+import { mcpToolLabel } from './mcpForm';
 import type { ToolStatus } from './transcript';
 
 /** A caption keeps at most this many words; the cut is marked with an ellipsis. */
@@ -107,8 +108,33 @@ export interface ToolRowHead {
   detail: string | null;
 }
 
+/**
+ * The row's head. An MCP tool shows as `server · tool` (its name is `mcp__server__tool`). The skill tool shows its skill's
+ * name as the caption, in place of the summary. Other tools show their name and their summary.
+ */
 export function toolRowHead(name: string, args: unknown): ToolRowHead {
-  return { label: visibleEscapes(name), caption: toolCaption(args), detail: toolPreview(name, args) };
+  const mcp = mcpToolLabel(name);
+  if (mcp !== null) {
+    return { label: `${visibleEscapes(mcp.server)} · ${visibleEscapes(mcp.tool)}`, caption: toolCaption(args), detail: toolPreview(name, args) };
+  }
+  const skill = name === SKILL_TOOL ? skillArgName(args) : null;
+  return {
+    label: visibleEscapes(name),
+    caption: skill !== null ? capDisplay(skill, MAX_CAPTION_CHARS) : toolCaption(args),
+    detail: toolPreview(name, args),
+  };
+}
+
+/** The skill tool's name (core/skills/tool.rs TOOL_NAME). */
+const SKILL_TOOL = 'skill';
+
+/** The `name` argument of a skill call, when it is a non-empty string. */
+function skillArgName(args: unknown): string | null {
+  if (typeof args !== 'object' || args === null) {
+    return null;
+  }
+  const { name } = args as { name?: unknown };
+  return typeof name === 'string' && name.trim() !== '' ? name.trim() : null;
 }
 
 /** The backend's default and largest `wait` seconds (core/tools DEFAULT_WAIT_SECONDS, MAX_WAIT_SECONDS). */

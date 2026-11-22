@@ -19,7 +19,9 @@ interface ApprovalToastProps {
 
 export function ApprovalToast({ approval, dock, onApprove, onOpen }: ApprovalToastProps) {
   const sendKeys = approval.name === 'send_keys';
-  const preview = sendKeys ? (approval.display ?? approval.text) : approval.text.replace(/\r\n|\n|\r/g, '⏎');
+  // A send_keys card shows its decoded input, and an external tool its `server: tool`; the other cards show the command.
+  const shownInstead = sendKeys || approval.reason === 'external_tool';
+  const preview = shownInstead ? (approval.display ?? approval.text) : approval.text.replace(/\r\n|\n|\r/g, '⏎');
   const max = sendKeys ? MAX_SEND_KEYS_PREVIEW_CHARS : MAX_COMMAND_PREVIEW_CHARS;
   const command = capDisplay(preview, max);
   // The tip is the whole preview, escaped the same way, so it cannot say something the command does not. A cut preview

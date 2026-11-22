@@ -1544,8 +1544,8 @@ export default function App() {
     if (pendingApprovalItem === null || !firstAttention(`approval:${pendingApprovalItem.callId}`)) {
       return;
     }
-    const text =
-      pendingApprovalItem.name === 'send_keys' ? (pendingApprovalItem.display ?? pendingApprovalItem.text) : pendingApprovalItem.text;
+    const shownInstead = pendingApprovalItem.name === 'send_keys' || pendingApprovalItem.reason === 'external_tool';
+    const text = shownInstead ? (pendingApprovalItem.display ?? pendingApprovalItem.text) : pendingApprovalItem.text;
     notifyAttention({ type: 'approval', text });
   }, [pendingApprovalItem?.callId]);
   // Same busy as the input bar's loader (busy || sideBusy). An exited shell takes the border off even if a turn is still open.
