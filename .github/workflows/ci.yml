@@ -85,9 +85,19 @@ jobs:
         working-directory: src-tauri
         run: cargo clippy --all-targets -- -D warnings
 
+      # Diagnostics only (no behaviour change): the zsh and OS the Linux runner has, to compare with the Debian container.
+      - name: Linux diagnostics (zsh, OS)
+        if: runner.os == 'Linux'
+        run: |
+          zsh --version
+          which zsh
+          cat /etc/os-release | head -3
+          nproc
+          ls -la /etc/zsh || true
+
       - name: Cargo tests
         working-directory: src-tauri
-        run: cargo test
+        run: cargo test --no-fail-fast
 
   # Clean Debian bookworm with zsh 5.9, independent of the runner image. The Rust build needs ../dist,
   # so the frontend is built on the host first. The container steps are in scripts/test-all.mjs.
