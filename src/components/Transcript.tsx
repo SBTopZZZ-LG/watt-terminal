@@ -108,7 +108,7 @@ export function Transcript({
         section.style.setProperty('--transcript-chrome', '0px');
         section.style.setProperty('--transcript-floor', '0px');
       }
-      settleTight(agent);
+      settleTight(agent, body && section.contains(body) ? body : null);
     };
     settle();
     if (typeof ResizeObserver === 'undefined') {
