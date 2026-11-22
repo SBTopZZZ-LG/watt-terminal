@@ -371,10 +371,23 @@ fn new_call_id() -> String {
 /// Tools that never change the shell. `read_tool` accepts only these. Must match `READ_NAMES` in core/chat/agent_loop.rs.
 const READ_TOOLS: [&str; 5] = ["list_commands", "get_command", "get_screen", "get_cwd", "wait"];
 
-/// Built-in tools that may run without a gate decision: the read tools, `todo_write`, `ask_user` and `skill`. None of the
-/// last three touches the shell. Any other name needs a gate decision: a gated built-in, or a host tool (core/external_tools).
-/// Must match the names routed in core/chat/agent_loop.rs (`run_call`).
-const BUILTIN_UNGATED: [&str; 8] = ["list_commands", "get_command", "get_screen", "get_cwd", "wait", "todo_write", "ask_user", "skill"];
+/// Built-in tools that may run without a gate decision: the read tools, `todo_write`, `ask_user`, `skill` and the file tools
+/// (core/fs_tools). None of them touches the shell. Any other name needs a gate decision: a gated built-in, or a host tool
+/// (core/external_tools). Must match the names routed in core/chat/agent_loop.rs (`run_call`).
+const BUILTIN_UNGATED: [&str; 12] = [
+    "list_commands",
+    "get_command",
+    "get_screen",
+    "get_cwd",
+    "wait",
+    "todo_write",
+    "ask_user",
+    "skill",
+    "read_file",
+    "list_dir",
+    "glob",
+    "grep",
+];
 
 /// What a turn reads from the saved settings when it decides. lib.rs builds one per user message. The defaults are the
 /// cautious ones: a nested shell is approved as before (its allow rules ask), and `request_integration` asks the user.
@@ -2742,5 +2755,13 @@ mod tests {
         assert!(ctx.call_tool("run_command", json!({"command": "pwd"})).is_ok());
         assert_eq!(tools.reached(), ["run_command"]);
         assert!(host.reached().is_empty());
+    }
+
+    #[test]
+    fn every_file_tool_is_an_ungated_builtin() {
+        for name in crate::core::fs_tools::TOOL_NAMES {
+            assert!(BUILTIN_UNGATED.contains(&name), "{name} is not in BUILTIN_UNGATED");
+        }
+        assert!(!READ_TOOLS.contains(&"grep"), "file tools are not shell reads: read_tool must refuse them");
     }
 }

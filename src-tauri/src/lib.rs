@@ -38,6 +38,7 @@ use crate::core::chat::history::History;
 use crate::core::chat::redact::Redactor;
 use crate::core::chat::todo::{Todo, TodoList};
 use crate::core::foreground::Foreground;
+use crate::core::fs_tools::Scope;
 use crate::core::llm::TurnCancel;
 use crate::core::observer::{EventSink, InputState, IntegrationStatus, LevelInfo, ObserverStatus, SessionEvent};
 use crate::core::persist::conversations::{self, ConversationMeta};
@@ -569,6 +570,8 @@ async fn agent_message(
     // The project instructions come from the session's live working directory, read once before the
     // turn starts. Anything unreadable just means no rules; it never fails the turn.
     let project_root = session_project_root(&app, &att);
+    // The folder the file tools read this turn (core/fs_tools), from the same live directory.
+    let fs_scope = fs_scope_for(&app, &att, project_root.clone());
     let project_rooted_rules =
         project_root.as_ref().and_then(|root| instructions::load(root).map(|rules| (root.clone(), rules)));
     let project_rules = project_rooted_rules.as_ref().map(|(_, rules)| rules.clone());
@@ -638,6 +641,7 @@ async fn agent_message(
                     .with_resume_note(att.conversation.take_resume_note())
                     .with_project_rules(project_rules)
                     .with_skills(Arc::new(skill_index))
+                    .with_fs_scope(fs_scope)
                     .with_checkpoint(checkpoint)
                     .with_limits(limits)
                     .with_no_vision(att.conversation.no_vision())
@@ -887,7 +891,7 @@ fn list_commands(
 /// The workspace root for a shell working directory. None without a usable root, or when the
 /// shell runs on another machine, whose filesystem cannot be read.
 fn workspace_root_for_cwd(app: &tauri::AppHandle, cwd: &Cwd) -> Option<PathBuf> {
-    if !cwd.host.is_empty() && cwd.host != "localhost" && cwd.host != local_host() {
+    if !is_local_cwd(cwd) {
         return None;
     }
     let home = app.path().home_dir().ok();
@@ -910,6 +914,20 @@ fn skill_roots(app: &tauri::AppHandle, project_root: Option<PathBuf>) -> Vec<Roo
 /// its directory is on another machine.
 fn session_project_root(app: &tauri::AppHandle, att: &Attached) -> Option<PathBuf> {
     att.session.local_cwd().and_then(|cwd| workspace_root_for_cwd(app, &cwd))
+}
+
+/// Whether a shell working directory is on this machine. A directory reported by another host cannot be read here.
+fn is_local_cwd(cwd: &Cwd) -> bool {
+    cwd.host.is_empty() || cwd.host == "localhost" || cwd.host == local_host()
+}
+
+/// The folder the file tools (core/fs_tools) may read in a turn: the session's project root, else its local directory. None
+/// while a nested shell is on top (its directory is on another machine), or when the local directory is not on this machine.
+fn fs_scope_for(app: &tauri::AppHandle, att: &Attached, project_root: Option<PathBuf>) -> Option<Scope> {
+    let cwd = att.session.local_cwd().filter(is_local_cwd)?;
+    let local = PathBuf::from(&cwd.path);
+    let root = project_root.unwrap_or_else(|| local.clone());
+    Some(Scope::new(root, local, resolve_config_dir(app)))
 }
 
 /// The skills for the settings view (core/skills): the user's folders, plus the session's project folders when its local

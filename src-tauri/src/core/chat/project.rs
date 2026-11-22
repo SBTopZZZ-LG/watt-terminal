@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use crate::core::chat::redact::Redactor;
 use crate::core::chat::{questions, todo};
 use crate::core::foreground::{Foreground, ForegroundKind};
+use crate::core::fs_tools;
 use crate::core::mcp::result::RESULT_LIMIT as MCP_RESULT_LIMIT;
 use crate::core::observer::{SCREEN_HISTORY_CAP, SHELL_EXITED_TEXT};
 use crate::core::skills::tool as skill_tool;
@@ -60,6 +61,11 @@ pub fn project(name: &str, ok: bool, result: &Value, redactor: &Redactor) -> Str
             // A skill's instructions or file (core/skills/tool): plain text, cut at the skill cap.
             skill_tool::TOOL_NAME => match result.as_str() {
                 Some(text) => skill_tool::cap_text(text, skill_tool::TEXT_LIMIT),
+                None => compact_json(result),
+            },
+            // A file tool (core/fs_tools): plain text, already bounded by the tool; the redaction below still applies.
+            _ if fs_tools::is_tool(name) => match result.as_str() {
+                Some(text) => text.to_string(),
                 None => compact_json(result),
             },
             // An MCP tool (core/mcp): its result is plain text, kept as it is up to the MCP cap (the runtime caps it too).
@@ -1243,5 +1249,14 @@ mod tests {
         assert_eq!(shown, "token [REDACTED] here");
         let failed = project("mcp__s__t", false, &json!("boom"), &none());
         assert_eq!(failed, "error: boom");
+    }
+
+    #[test]
+    fn a_file_tool_result_is_plain_text_and_redacted() {
+        let redactor = Redactor::new(vec!["file-secret-value".to_string()]);
+        let shown = project("grep", true, &json!("src/a.rs:3:let k = \"file-secret-value\";"), &redactor);
+        assert_eq!(shown, "src/a.rs:3:let k = \"[REDACTED]\";");
+        let failed = project("read_file", false, &json!("`x` does not exist"), &none());
+        assert_eq!(failed, "error: `x` does not exist");
     }
 }

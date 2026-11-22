@@ -118,15 +118,45 @@ export function toolRowHead(name: string, args: unknown): ToolRowHead {
     return { label: `${visibleEscapes(mcp.server)} · ${visibleEscapes(mcp.tool)}`, caption: toolCaption(args), detail: toolPreview(name, args) };
   }
   const skill = name === SKILL_TOOL ? skillArgName(args) : null;
+  const file = fileToolCaption(name, args);
   return {
     label: visibleEscapes(name),
-    caption: skill !== null ? capDisplay(skill, MAX_CAPTION_CHARS) : toolCaption(args),
+    caption: skill !== null ? capDisplay(skill, MAX_CAPTION_CHARS) : file !== null ? capDisplay(file, MAX_CAPTION_CHARS) : toolCaption(args),
     detail: toolPreview(name, args),
   };
 }
 
 /** The skill tool's name (core/skills/tool.rs TOOL_NAME). */
 const SKILL_TOOL = 'skill';
+
+/**
+ * The caption of a file tool (core/fs_tools/tool.rs): the path it reads or lists, the glob, or the pattern searched (with the
+ * folder when one is given). Null for other tools, and when the argument is absent or not a string.
+ */
+function fileToolCaption(name: string, args: unknown): string | null {
+  if (typeof args !== 'object' || args === null) {
+    return null;
+  }
+  const { path, pattern } = args as { path?: unknown; pattern?: unknown };
+  const text = (value: unknown): string | null => (typeof value === 'string' && value.trim() !== '' ? value.trim() : null);
+  switch (name) {
+    case 'read_file':
+    case 'list_dir':
+      return text(path);
+    case 'glob':
+      return text(pattern);
+    case 'grep': {
+      const searched = text(pattern);
+      if (searched === null) {
+        return null;
+      }
+      const folder = text(path);
+      return folder === null ? `'${searched}'` : `'${searched}' in ${folder}`;
+    }
+    default:
+      return null;
+  }
+}
 
 /** The `name` argument of a skill call, when it is a non-empty string. */
 function skillArgName(args: unknown): string | null {
