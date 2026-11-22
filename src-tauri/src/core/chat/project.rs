@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use crate::core::chat::redact::Redactor;
 use crate::core::chat::{questions, todo};
 use crate::core::foreground::{Foreground, ForegroundKind};
+use crate::core::mcp::result::RESULT_LIMIT as MCP_RESULT_LIMIT;
 use crate::core::observer::{SCREEN_HISTORY_CAP, SHELL_EXITED_TEXT};
 use crate::core::tools::foreground_next_step;
 
@@ -55,6 +56,11 @@ pub fn project(name: &str, ok: bool, result: &Value, redactor: &Redactor) -> Str
             "request_integration" => result.as_str().unwrap_or_default().to_string(),
             "list_commands" => list_commands_text(result, redactor),
             "get_cwd" => cwd_text(Some(result)),
+            // An MCP tool (core/mcp): its result is plain text, kept as it is up to the MCP cap (the runtime caps it too).
+            _ if name.starts_with("mcp__") => match result.as_str() {
+                Some(text) => cap(text, MCP_RESULT_LIMIT),
+                None => compact_json(result),
+            },
             _ => compact_json(result),
         }
     };
@@ -1197,5 +1203,25 @@ mod tests {
         assert!(text.ends_with(&format!("approximate ids 5: {APPROXIMATE_NOTE}")), "{text}");
         let plain = json!([{"id": 4, "command": "a", "exit_code": 0, "output_bytes": 1, "status": "complete", "source": {"kind": "agent"}}]);
         assert!(!project("list_commands", true, &plain, &none()).contains("approximate"));
+    }
+
+    #[test]
+    fn an_mcp_result_is_plain_text_up_to_the_mcp_cap_and_not_quoted() {
+        let text = "line one\n\"quoted\" é";
+        assert_eq!(project("mcp__fetch__fetch", true, &json!(text), &none()), text);
+        // Over the MCP cap: cut on a character boundary with the marker, not at the small limit.
+        let big = "é".repeat(MCP_RESULT_LIMIT);
+        let shown = project("mcp__fetch__fetch", true, &json!(big), &none());
+        assert!(shown.len() <= MCP_RESULT_LIMIT && shown.ends_with(TRUNCATED_MARK), "{}", shown.len());
+        assert!(shown.len() > SMALL_LIMIT, "an MCP result is not held to the small limit");
+    }
+
+    #[test]
+    fn an_mcp_result_is_redacted_and_an_error_is_still_an_error() {
+        let redactor = Redactor::new(vec!["fetch-secret-value".to_string()]);
+        let shown = project("mcp__s__t", true, &json!("token fetch-secret-value here"), &redactor);
+        assert_eq!(shown, "token [REDACTED] here");
+        let failed = project("mcp__s__t", false, &json!("boom"), &none());
+        assert_eq!(failed, "error: boom");
     }
 }
