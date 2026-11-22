@@ -3,6 +3,9 @@
 //! shell is a real `zsh -f -i`, integrated as level 1 by the app's own handshake (see tests/integrate_session.rs).
 //! Harness: common/mod.rs. The unit tests of the same rules are in core/agent.rs and core/approval.rs.
 
+// Every test runs a real zsh (nested `zsh -f -i`) through common/mod.rs: no zsh on Windows.
+#![cfg(unix)]
+
 mod common;
 
 use std::sync::{Arc, Mutex};

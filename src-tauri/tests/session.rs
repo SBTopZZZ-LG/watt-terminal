@@ -1,6 +1,9 @@
 //! Real-PTY tests for the session core. Each test runs `zsh -l` through the shim with a temporary real
 //! ZDOTDIR (see common/mod.rs), so the user's history file is never touched.
 
+// Every test runs a zsh session through common/mod.rs and checks zsh behaviour: no zsh on Windows.
+#![cfg(unix)]
+
 mod common;
 
 use std::fs::{self, File};

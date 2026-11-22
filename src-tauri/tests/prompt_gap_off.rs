@@ -2,6 +2,9 @@
 //! the integration, and every session inherits this process's environment. The variable is set here, so this file
 //! is its own test binary with a single test: nothing else in the process reads it or runs beside it.
 
+// Runs a zsh session through common/mod.rs: no zsh on Windows.
+#![cfg(unix)]
+
 mod common;
 
 use std::time::Duration;

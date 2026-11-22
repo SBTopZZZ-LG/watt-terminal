@@ -2,22 +2,48 @@
 
 mod common;
 
+#[cfg(unix)]
 use std::fs;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Mutex};
+#[cfg(unix)]
+use std::sync::Barrier;
+#[cfg(unix)]
 use std::thread;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
-use watt_terminal_lib::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate, DENIED, MockAgent, UserMessage, user_input};
+use watt_terminal_lib::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate, MockAgent, UserMessage};
+#[cfg(unix)]
+use watt_terminal_lib::core::agent::{DENIED, user_input};
+#[cfg(unix)]
 use watt_terminal_lib::core::approval::RegexPolicy;
+#[cfg(unix)]
 use watt_terminal_lib::core::chat::project::project;
+#[cfg(unix)]
 use watt_terminal_lib::core::chat::redact::Redactor;
+#[cfg(unix)]
 use watt_terminal_lib::core::llm::TurnCancel;
+#[cfg(unix)]
 use watt_terminal_lib::core::foreground::ForegroundKind;
-use watt_terminal_lib::core::observer::{EventSink, InputState, IntegrationStatus, ObserverStatus, SessionEvent};
-use watt_terminal_lib::core::record::{RecordStatus, Source};
-use watt_terminal_lib::core::session::{Session, USER_TEXT_CODE};
+#[cfg(unix)]
+use watt_terminal_lib::core::observer::{EventSink, InputState, SessionEvent};
+#[cfg(unix)]
+use watt_terminal_lib::core::observer::{IntegrationStatus, ObserverStatus};
+#[cfg(unix)]
+use watt_terminal_lib::core::record::Source;
+#[cfg(unix)]
+use watt_terminal_lib::core::record::RecordStatus;
+use watt_terminal_lib::core::session::Session;
+#[cfg(unix)]
+use watt_terminal_lib::core::session::USER_TEXT_CODE;
+#[cfg(unix)]
 use watt_terminal_lib::core::settings::{ApprovalMode, ApprovalSettings};
-use watt_terminal_lib::core::tools::{schemas, AgentTools, NotRunReason, RunOutcome, SessionTools, WaitReason, DEFAULT_RUN_WAIT};
+use watt_terminal_lib::core::tools::SessionTools;
+#[cfg(unix)]
+use watt_terminal_lib::core::tools::AgentTools;
+#[cfg(unix)]
+use watt_terminal_lib::core::tools::{schemas, NotRunReason, RunOutcome, WaitReason, DEFAULT_RUN_WAIT};
+#[cfg(unix)]
 use serde_json::{json, Value};
 
 use common::*;
@@ -36,6 +62,7 @@ fn turn(s: &Session, approvals: &ApprovalGate, text: &str) -> Vec<AgentEvent> {
 }
 
 /// Runs one turn on another thread, for turns that wait for an approval. Returns the thread and the event log.
+#[cfg(unix)]
 fn turn_in_thread(s: Arc<Session>, approvals: Arc<ApprovalGate>, text: &str) -> (thread::JoinHandle<()>, Log) {
     let log: Log = Arc::default();
     let sink = log.clone();
@@ -49,6 +76,7 @@ fn turn_in_thread(s: Arc<Session>, approvals: Arc<ApprovalGate>, text: &str) -> 
     (h, log)
 }
 
+#[cfg(unix)]
 fn approval_ids(log: &Log) -> Vec<(String, String)> {
     log.lock()
         .unwrap()
@@ -62,6 +90,7 @@ fn approval_ids(log: &Log) -> Vec<(String, String)> {
 
 /// Waits for the first approval request and returns (call_id, text). On timeout the panic carries what the turn and
 /// the session know at that moment (see `dump_turn`).
+#[cfg(unix)]
 fn wait_approval(s: &Session, log: &Log) -> (String, String) {
     match wait_until(Duration::from_secs(10), || approval_ids(log).first().cloned()) {
         Some(v) => v,
@@ -71,6 +100,7 @@ fn wait_approval(s: &Session, log: &Log) -> (String, String) {
 
 /// Diagnostic dump for a stalled turn: the agent events so far (tool results with their error text), session state,
 /// foreground, the typed-since-prompt flag, the newest records, and the last 15 screen rows.
+#[cfg(unix)]
 fn dump_turn(s: &Session, log: &Log) -> String {
     let events = log.lock().unwrap().clone();
     let mut out = format!(
@@ -110,11 +140,13 @@ fn text_of(events: &[AgentEvent]) -> String {
         .join("\n")
 }
 
+#[cfg(unix)]
 fn has_approval(events: &[AgentEvent]) -> bool {
     events.iter().any(|e| matches!(e, AgentEvent::ApprovalRequest { .. }))
 }
 
 /// `ok` of the last `run_command` ToolResult.
+#[cfg(unix)]
 fn run_ok(events: &[AgentEvent]) -> Option<bool> {
     events.iter().rev().find_map(|e| match e {
         AgentEvent::ToolResult { name, ok, .. } if name == "run_command" => Some(*ok),
@@ -122,11 +154,13 @@ fn run_ok(events: &[AgentEvent]) -> Option<bool> {
     })
 }
 
+#[cfg(unix)]
 fn run_command_ok(log: &Log) -> Option<bool> {
     run_ok(&log.lock().unwrap())
 }
 
 /// The `active` value of each agent_control event, in order.
+#[cfg(unix)]
 fn control_events(log: &Log) -> Vec<bool> {
     log.lock()
         .unwrap()
@@ -138,6 +172,8 @@ fn control_events(log: &Log) -> Vec<bool> {
         .collect()
 }
 
+// Runs zsh through common/mod.rs: no zsh on Windows, so this test is unix-only.
+#[cfg(unix)]
 #[test]
 fn list_and_get_command_page_and_json_calls() {
     let _g = serial();
@@ -170,6 +206,7 @@ fn list_and_get_command_page_and_json_calls() {
     assert!(tools.call("get_command", &json!({}), None).is_err(), "id is required");
 }
 
+#[cfg(unix)]
 #[test]
 fn get_screen_shows_output_and_alt_flag() {
     let _g = serial();
@@ -190,6 +227,7 @@ fn get_screen_shows_output_and_alt_flag() {
     assert!(!tools.get_screen().alternate_screen);
 }
 
+#[cfg(unix)]
 #[test]
 fn get_cwd_follows_cd() {
     let _g = serial();
@@ -200,6 +238,7 @@ fn get_cwd_follows_cd() {
     assert!(!cwd.host.is_empty());
 }
 
+#[cfg(unix)]
 #[test]
 fn run_command_when_idle_returns_record_with_exit_code_and_output() {
     let _g = serial();
@@ -217,6 +256,7 @@ fn run_command_when_idle_returns_record_with_exit_code_and_output() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[cfg(unix)]
 #[test]
 fn run_command_is_refused_while_running_and_in_alt_screen() {
     let _g = serial();
@@ -238,6 +278,7 @@ fn run_command_is_refused_while_running_and_in_alt_screen() {
     assert!(!s.records().iter().any(|r| r.command.starts_with("echo refused")), "a refused command ran");
 }
 
+#[cfg(unix)]
 #[test]
 fn run_command_returns_running_at_its_wait_and_the_session_stays_usable() {
     let _g = serial();
@@ -259,6 +300,7 @@ fn run_command_returns_running_at_its_wait_and_the_session_stays_usable() {
 
 /// At an idle prompt there is no command of the agent's to type into: the refusal says to use run_command. The schemas list
 /// every tool, send_keys among them.
+#[cfg(unix)]
 #[test]
 fn send_keys_is_refused_at_a_prompt_and_the_schemas_list_every_tool() {
     let _g = serial();
@@ -275,11 +317,13 @@ fn send_keys_is_refused_at_a_prompt_and_the_schemas_list_every_tool() {
 }
 
 /// Submits `cmd` as the user and waits until the shell reports it running.
+#[cfg(unix)]
 fn start_running(s: &Session, cmd: &str) {
     s.submit(Source::User, cmd).expect("submit");
     assert!(wait_state(s, InputState::Running, Duration::from_secs(10)), "state={:?}", s.state());
 }
 
+#[cfg(unix)]
 #[test]
 fn wait_returns_at_once_when_a_command_finishes_and_carries_its_record() {
     let _g = serial();
@@ -297,6 +341,7 @@ fn wait_returns_at_once_when_a_command_finishes_and_carries_its_record() {
     assert_eq!(record.exit_code, Some(0));
 }
 
+#[cfg(unix)]
 #[test]
 fn wait_returns_early_when_output_appears_while_the_command_still_runs() {
     let _g = serial();
@@ -315,6 +360,7 @@ fn wait_returns_early_when_output_appears_while_the_command_still_runs() {
 }
 
 /// With `ignore_updates` the output does not wake the wait: it ends when the command finishes, with the record.
+#[cfg(unix)]
 #[test]
 fn wait_with_ignore_updates_ignores_output_and_ends_at_the_command_finish() {
     let _g = serial();
@@ -330,6 +376,7 @@ fn wait_with_ignore_updates_ignores_output_and_ends_at_the_command_finish() {
     assert_eq!(record.exit_code, Some(0));
 }
 
+#[cfg(unix)]
 #[test]
 fn wait_times_out_on_a_quiet_command_and_the_session_stays_usable() {
     let _g = serial();
@@ -350,6 +397,7 @@ fn wait_times_out_on_a_quiet_command_and_the_session_stays_usable() {
     assert_eq!(r.output, "alive-after-wait");
 }
 
+#[cfg(unix)]
 #[test]
 fn wait_at_an_idle_prompt_returns_at_once_with_or_without_ignore_updates() {
     let _g = serial();
@@ -364,6 +412,7 @@ fn wait_at_an_idle_prompt_returns_at_once_with_or_without_ignore_updates() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn cancel_ends_a_wait_within_a_second_and_leaves_the_command_alone() {
     let _g = serial();
@@ -388,6 +437,7 @@ fn cancel_ends_a_wait_within_a_second_and_leaves_the_command_alone() {
 
 /// The JSON path: a missing `seconds` is the default, an out-of-range one is clamped with a note, and a bad type is an
 /// error. The clamp is seen in a real wait: `seconds: 0` becomes 1 and says so.
+#[cfg(unix)]
 #[test]
 fn wait_arguments_are_clamped_and_the_clamp_is_noted() {
     let _g = serial();
@@ -413,6 +463,7 @@ fn wait_arguments_are_clamped_and_the_clamp_is_noted() {
 
 /// The wait budget is per turn: a wait starts only while the turn has budget left, and the one that starts is allowed to
 /// finish. Here the budget is 500 ms, so the first 1 s wait is allowed and the second is refused without waiting.
+#[cfg(unix)]
 #[test]
 fn wait_budget_is_per_turn_and_refuses_a_wait_started_after_it_is_used_up() {
     let _g = serial();
@@ -435,6 +486,7 @@ fn wait_budget_is_per_turn_and_refuses_a_wait_started_after_it_is_used_up() {
     wait_prompt(&s);
 }
 
+#[cfg(unix)]
 #[test]
 fn user_submit_and_agent_run_command_race_exactly_one_proceeds() {
     let _g = serial();
@@ -473,6 +525,7 @@ fn user_submit_and_agent_run_command_race_exactly_one_proceeds() {
     assert_eq!(commands.len(), 1, "the losing command ran too: {commands:?}");
 }
 
+#[cfg(unix)]
 #[test]
 fn last_command_answer_states_exit_code_and_cwd() {
     let _g = serial();
@@ -493,6 +546,7 @@ fn last_command_answer_states_exit_code_and_cwd() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn screen_and_directory_answers_use_the_session() {
     let _g = serial();
@@ -522,6 +576,7 @@ fn unknown_message_gets_the_help_reply() {
     assert!(!events.iter().any(|e| matches!(e, AgentEvent::ToolCall { .. })), "help must not call tools");
 }
 
+#[cfg(unix)]
 #[test]
 fn run_request_with_auto_approve_runs_without_asking() {
     let _g = serial();
@@ -538,6 +593,7 @@ fn run_request_with_auto_approve_runs_without_asking() {
     assert!(matches!(r.source, Source::Agent { .. }));
 }
 
+#[cfg(unix)]
 #[test]
 fn denied_command_never_runs() {
     let _g = serial();
@@ -560,6 +616,7 @@ fn denied_command_never_runs() {
 
 /// The agent is in control only from the approved start of run_command until its result, never while it waits for
 /// the approval.
+#[cfg(unix)]
 #[test]
 fn agent_control_is_on_only_while_an_approved_command_runs() {
     let _g = serial();
@@ -577,6 +634,7 @@ fn agent_control_is_on_only_while_an_approved_command_runs() {
     assert_eq!(r.exit_code, Some(0));
 }
 
+#[cfg(unix)]
 #[test]
 fn approved_command_runs_in_the_session() {
     let _g = serial();
@@ -595,6 +653,7 @@ fn approved_command_runs_in_the_session() {
 }
 
 /// Waits for the record of `command` to finish, and returns its id.
+#[cfg(unix)]
 fn finished_id(s: &Session, command: &str) -> u64 {
     wait_until(Duration::from_secs(10), || {
         s.records().into_iter().find(|r| r.command == command && r.exit_code.is_some()).map(|r| r.id)
@@ -604,6 +663,7 @@ fn finished_id(s: &Session, command: &str) -> u64 {
 
 /// A cancel while run_command waits returns NotRun{Cancelled} within a poll, and sends nothing to stop the command: the
 /// command finishes on its own.
+#[cfg(unix)]
 #[test]
 fn cancel_while_run_command_waits_returns_at_once_and_the_command_keeps_running() {
     let _g = serial();
@@ -631,6 +691,7 @@ fn cancel_while_run_command_waits_returns_at_once_and_the_command_keeps_running(
 }
 
 /// A cancel that is already set when run_command is called sends nothing: the line never reaches the shell.
+#[cfg(unix)]
 #[test]
 fn cancel_before_run_command_sends_nothing() {
     let _g = serial();
@@ -650,6 +711,7 @@ fn cancel_before_run_command_sends_nothing() {
 
 /// The cancel path the app uses (`agent::cancel_turn`, which Ctrl-C and cancel_agent both call) stops a turn that is
 /// waiting in run_command: the turn ends at once with the cancelled sentence, and its command keeps running.
+#[cfg(unix)]
 #[test]
 fn cancel_turn_ends_a_turn_waiting_in_run_command_and_keeps_its_command() {
     let _g = serial();
@@ -679,6 +741,7 @@ fn cancel_turn_ends_a_turn_waiting_in_run_command_and_keeps_its_command() {
 }
 
 /// The decision on each ToolResult, through the real turn: read, auto, manual, denied and refused.
+#[cfg(unix)]
 #[test]
 fn tool_result_decisions_on_the_real_path() {
     let _g = serial();
@@ -725,6 +788,7 @@ fn tool_result_decisions_on_the_real_path() {
     wait_prompt(&s);
 }
 
+#[cfg(unix)]
 #[test]
 fn ctrl_c_cancels_a_pending_approval() {
     let _g = serial();
@@ -741,6 +805,7 @@ fn ctrl_c_cancels_a_pending_approval() {
     assert!(err.starts_with(DENIED), "a cancelled approval must carry the DENIED prefix: {err}");
 }
 
+#[cfg(unix)]
 #[test]
 fn approval_timeout_counts_as_denial() {
     let _g = serial();
@@ -753,6 +818,7 @@ fn approval_timeout_counts_as_denial() {
     assert!(!s.records().iter().any(|r| r.command == "echo timeout-cmd"), "timed-out approval still ran the command");
 }
 
+#[cfg(unix)]
 #[test]
 fn user_input_without_ctrl_c_keeps_approvals_pending() {
     let _g = serial();
@@ -769,18 +835,21 @@ fn user_input_without_ctrl_c_keeps_approvals_pending() {
 }
 
 /// Whether any screen row contains `text`.
+#[cfg(unix)]
 fn screen_has(s: &Session, text: &str) -> bool {
     snapshot(s).rows.iter().any(|r| r.contains(text))
 }
 
 /// The row the cursor is on. zsh keeps an abandoned line (after Ctrl-C) above the new prompt, so only this row shows
 /// whether the user's text is still on the prompt line.
+#[cfg(unix)]
 fn prompt_line(s: &Session) -> String {
     let snap = snapshot(s);
     snap.rows.get(snap.cursor.0 as usize).cloned().unwrap_or_default()
 }
 
 /// The `error` of the last run_command ToolResult, if it failed.
+#[cfg(unix)]
 fn run_command_error(log: &Log) -> Option<String> {
     log.lock().unwrap().iter().rev().find_map(|e| match e {
         AgentEvent::ToolResult { name, result, .. } if name == "run_command" => result["error"].as_str().map(str::to_string),
@@ -790,6 +859,7 @@ fn run_command_error(log: &Log) -> Option<String> {
 
 /// Text the user typed on the prompt (no CR) does not refuse run_command: it is cleared with Ctrl-C, and then the agent's
 /// command is submitted to the clean line. The command's record holds only its own output, and the user's text never runs.
+#[cfg(unix)]
 #[test]
 fn user_text_at_the_prompt_is_cleared_before_run_command() {
     let _g = serial();
@@ -813,6 +883,7 @@ fn user_text_at_the_prompt_is_cleared_before_run_command() {
 
 /// The result of a run_command that cleared the user's text says so (`typed_text_cleared`, and a note the model reads). A
 /// later run with nothing typed says nothing of it.
+#[cfg(unix)]
 #[test]
 fn run_command_result_says_the_typed_text_was_cleared() {
     let _g = serial();
@@ -832,6 +903,7 @@ fn run_command_result_says_the_typed_text_was_cleared() {
 }
 
 /// The approval card is still raised for a command over the user's text, and the approved command runs after the clear.
+#[cfg(unix)]
 #[test]
 fn user_text_at_the_prompt_does_not_refuse_before_the_approval_card() {
     let _g = serial();
@@ -859,6 +931,7 @@ fn user_text_at_the_prompt_does_not_refuse_before_the_approval_card() {
 }
 
 /// Text typed while the approval card waits is cleared when the approved command runs: the command runs on a clean line.
+#[cfg(unix)]
 #[test]
 fn user_text_typed_while_an_approval_waits_is_cleared_at_execution() {
     let _g = serial();
@@ -880,6 +953,7 @@ fn user_text_typed_while_an_approval_waits_is_cleared_at_execution() {
 
 /// The writer still refuses a submit over text typed after the clear: the backstop for text that arrives between the clear
 /// and the submit. Nothing is written, and the text stays on the line.
+#[cfg(unix)]
 #[test]
 fn a_submit_over_text_typed_after_the_clear_is_refused_by_the_writer() {
     let _g = serial();
@@ -897,6 +971,7 @@ fn a_submit_over_text_typed_after_the_clear_is_refused_by_the_writer() {
 }
 
 /// With nothing typed by the user, run_command works as before.
+#[cfg(unix)]
 #[test]
 fn run_command_works_when_the_user_has_typed_nothing() {
     let _g = serial();
@@ -911,6 +986,7 @@ fn run_command_works_when_the_user_has_typed_nothing() {
 }
 
 /// A line the user submits leaves the prompt clean: once it has finished, the agent's command runs.
+#[cfg(unix)]
 #[test]
 fn a_line_the_user_submits_leaves_the_prompt_clean() {
     let _g = serial();
@@ -928,6 +1004,7 @@ fn a_line_the_user_submits_leaves_the_prompt_clean() {
 
 /// Keys typed while a command runs do not count toward the prompt check. Enter is used here, so the next prompt is
 /// left empty and the agent's command runs.
+#[cfg(unix)]
 #[test]
 fn keys_typed_while_a_command_runs_do_not_block_the_next_agent_command() {
     let _g = serial();
@@ -948,6 +1025,7 @@ fn keys_typed_while_a_command_runs_do_not_block_the_next_agent_command() {
 
 
 /// Ctrl-L redraws the line and keeps the user's text. run_command does not refuse over it: it clears the line first.
+#[cfg(unix)]
 #[test]
 fn ctrl_l_keeps_user_text_and_run_command_clears_it() {
     let _g = serial();
@@ -971,6 +1049,7 @@ fn ctrl_l_keeps_user_text_and_run_command_clears_it() {
 
 /// Text typed while a command runs is type-ahead: zsh draws it on the next prompt line. run_command clears it with Ctrl-C
 /// and then submits the agent's command to the clean line, so the record is the agent's command alone.
+#[cfg(unix)]
 #[test]
 fn type_ahead_during_a_command_is_cleared_before_the_next_agent_command() {
     let _g = serial();
@@ -995,6 +1074,7 @@ fn type_ahead_during_a_command_is_cleared_before_the_next_agent_command() {
 
 /// Ctrl-C while a command runs does not clear type-ahead from the flag, so run_command clears it at the next prompt: the
 /// agent's record is its own command alone.
+#[cfg(unix)]
 #[test]
 fn ctrl_c_during_a_command_keeps_the_type_ahead_for_the_clear() {
     let _g = serial();
@@ -1016,6 +1096,7 @@ fn ctrl_c_during_a_command_keeps_the_type_ahead_for_the_clear() {
 
 /// The agent's command reads a line (`read line`) and the user answers "y" and Enter. The Enter ends the typed line, so the
 /// agent's next run_command is not refused by it.
+#[cfg(unix)]
 #[test]
 fn enter_answering_the_agents_read_does_not_refuse_the_next_command() {
     let _g = serial();
@@ -1035,6 +1116,7 @@ fn enter_answering_the_agents_read_does_not_refuse_the_next_command() {
 
 /// Two lines pasted at the prompt: the first runs, and the second is left typed on the next prompt line. run_command clears
 /// that tail with Ctrl-C and submits the agent's command to the clean line: the record is the agent's command alone.
+#[cfg(unix)]
 #[test]
 fn text_pasted_after_a_submitted_line_is_cleared_before_the_agents_command() {
     let _g = serial();
@@ -1057,6 +1139,7 @@ fn text_pasted_after_a_submitted_line_is_cleared_before_the_agents_command() {
 }
 
 /// Keys typed in the alt screen go to the full-screen program, not to the prompt, so they do not refuse run_command.
+#[cfg(unix)]
 #[test]
 fn keys_typed_in_the_alt_screen_do_not_refuse_run_command() {
     let _g = serial();
@@ -1078,6 +1161,7 @@ fn keys_typed_in_the_alt_screen_do_not_refuse_run_command() {
 /// A line with an unclosed backtick makes zsh ask for more (PS2). run_command returns WaitingForInput after the
 /// continuation wait, and does not send anything. Ctrl-C at the continuation prompt then cancels the line, and the
 /// next command runs.
+#[cfg(unix)]
 #[test]
 fn unclosed_quote_waits_for_input_then_ctrl_c_recovers() {
     let _g = serial();
@@ -1102,6 +1186,7 @@ fn unclosed_quote_waits_for_input_then_ctrl_c_recovers() {
 
 /// The agent's own unclosed line: after run_command returns WaitingForInput, send_keys with Ctrl-C alone and no id cancels
 /// it. The user's text typed into that continuation is cleared too, so the next run_command is not refused for it.
+#[cfg(unix)]
 #[test]
 fn unclosed_quote_waits_for_input_then_agent_send_keys_ctrl_c_recovers() {
     let _g = serial();
@@ -1132,6 +1217,7 @@ fn unclosed_quote_waits_for_input_then_agent_send_keys_ctrl_c_recovers() {
 }
 
 /// Through the agent's approval path (auto-approve on), the WaitingForInput outcome reaches the tool result as JSON.
+#[cfg(unix)]
 #[test]
 fn waiting_for_input_reaches_the_agent_as_a_not_run_result() {
     let _g = serial();
@@ -1156,6 +1242,7 @@ fn waiting_for_input_reaches_the_agent_as_a_not_run_result() {
 
 /// Ctrl-C while the agent's line is still in the shell's continuation: the call returns Abandoned at once, well before
 /// the continuation wait would have ended, and the session recovers.
+#[cfg(unix)]
 #[test]
 fn ctrl_c_in_continuation_abandons_the_call_promptly() {
     let _g = serial();
@@ -1182,6 +1269,7 @@ fn ctrl_c_in_continuation_abandons_the_call_promptly() {
 
 /// The user finishes the agent's unclosed line themselves. The agent's line never runs, so the call returns Abandoned
 /// at once instead of waiting out the timeout.
+#[cfg(unix)]
 #[test]
 fn user_finishing_the_agent_line_abandons_the_call() {
     let _g = serial();
@@ -1205,6 +1293,7 @@ fn user_finishing_the_agent_line_abandons_the_call() {
 
 /// A regex rule runs a matching command without a card, through the real shell, and the result says it was a rule. A
 /// command the hard gate refuses still asks, even though a rule would match it.
+#[cfg(unix)]
 #[test]
 fn a_regex_rule_runs_an_allowed_command_without_a_card_and_a_gated_one_still_asks() {
     let _g = serial();
@@ -1249,8 +1338,10 @@ fn a_regex_rule_runs_an_allowed_command_without_a_card_and_a_gated_one_still_ask
 
 /// Every session event, in order, for the state-event checks.
 #[derive(Default)]
+#[cfg(unix)]
 struct Events(Mutex<Vec<SessionEvent>>);
 
+#[cfg(unix)]
 impl EventSink for Events {
     fn event(&self, ev: SessionEvent) {
         self.0.lock().unwrap().push(ev);
@@ -1260,6 +1351,7 @@ impl EventSink for Events {
 /// A nested interactive zsh with no integration is the foreground program. The hint says so on the screen and on the state
 /// event, `run_command` is refused before any approval card, and when the nested shell exits the hint goes away and the
 /// agent can run commands again.
+#[cfg(unix)]
 #[test]
 fn a_nested_shell_is_the_foreground_hint_and_refuses_run_command_without_a_card() {
     let _g = serial();
@@ -1343,6 +1435,7 @@ fn a_nested_shell_is_the_foreground_hint_and_refuses_run_command_without_a_card(
 
 /// An ordinary command still running is also the hint (kind other): run_command is refused without a card, and the
 /// refusal says the command is still running. When it finishes on its own the hint is gone and the agent can run.
+#[cfg(unix)]
 #[test]
 fn an_ordinary_running_command_is_the_hint_and_refuses_without_a_card() {
     let _g = serial();
@@ -1376,6 +1469,7 @@ fn an_ordinary_running_command_is_the_hint_and_refuses_without_a_card() {
 
 /// In the alternate screen the shell is not at a prompt, so the precheck refuses before the card, with the plain refusal (no
 /// hint: a full-screen program has no foreground hint).
+#[cfg(unix)]
 #[test]
 fn run_command_in_the_alt_screen_is_refused_before_the_card() {
     let _g = serial();
@@ -1400,6 +1494,7 @@ fn run_command_in_the_alt_screen_is_refused_before_the_card() {
 /// A user precmd hook that takes 0.4 s runs before the shell's prompt mark (A). A run_command that returned at the command's
 /// D used to be followed by a refusal ("not at an idle prompt") in that gap. run_command now waits for the prompt, so two
 /// calls back to back both run. The test waits for nothing itself.
+#[cfg(unix)]
 #[test]
 fn back_to_back_run_commands_both_run_with_a_slow_precmd_hook() {
     let _g = serial();
@@ -1414,6 +1509,7 @@ fn back_to_back_run_commands_both_run_with_a_slow_precmd_hook() {
 
 /// A command that outlives its wait is returned `running`, with its record id, the call id, the screen tail and the next step.
 /// `wait` with that id then returns the finished record, and `get_command` reads it afterwards.
+#[cfg(unix)]
 #[test]
 fn a_run_that_outlives_its_wait_is_returned_running_and_wait_by_id_finishes_it() {
     let _g = serial();
@@ -1452,6 +1548,7 @@ fn a_run_that_outlives_its_wait_is_returned_running_and_wait_by_id_finishes_it()
 }
 
 /// A quick command finishes within the default wait. A `wait_seconds` past the cap is clamped, and the result says so.
+#[cfg(unix)]
 #[test]
 fn a_quick_command_finishes_within_the_default_wait_and_a_big_wait_seconds_is_clamped() {
     let _g = serial();
@@ -1471,6 +1568,7 @@ fn a_quick_command_finishes_within_the_default_wait_and_a_big_wait_seconds_is_cl
 
 /// `get_screen` with `lines` reaches back past the visible rows. Without it the answer is the visible screen, as before.
 /// The history is recorded for the agent's own commands only, so the command runs through run_command.
+#[cfg(unix)]
 #[test]
 fn get_screen_lines_returns_the_scrolled_history_and_the_default_is_unchanged() {
     let _g = serial();
@@ -1503,6 +1601,7 @@ fn get_screen_lines_returns_the_scrolled_history_and_the_default_is_unchanged() 
 
 /// A command that yielded keeps its history: after more output, `get_screen` with `lines` still reads the early lines, and
 /// `wait` by its id finishes it.
+#[cfg(unix)]
 #[test]
 fn a_yielded_commands_history_is_readable_after_more_output() {
     let _g = serial();
@@ -1524,6 +1623,7 @@ fn a_yielded_commands_history_is_readable_after_more_output() {
 
 /// The agent's own command is the open record while it runs, through the alternate screen, where the foreground hint is gone.
 /// The refusal names its id, and `wait` by that id finishes it.
+#[cfg(unix)]
 #[test]
 fn the_agents_open_command_is_visible_through_the_alternate_screen_and_refusals_name_it() {
     let _g = serial();
@@ -1562,6 +1662,7 @@ fn the_agents_open_command_is_visible_through_the_alternate_screen_and_refusals_
 }
 
 /// `wait` without an id is keyed to the one agent command open at the start, so it returns when that command finishes.
+#[cfg(unix)]
 #[test]
 fn a_wait_without_an_id_is_keyed_to_the_only_open_agent_command() {
     let _g = serial();
@@ -1580,6 +1681,7 @@ fn a_wait_without_an_id_is_keyed_to_the_only_open_agent_command() {
 }
 
 /// An id that is neither running nor finished is refused, and the refusal says so.
+#[cfg(unix)]
 #[test]
 fn wait_refuses_an_id_that_is_not_running_or_finished() {
     let _g = serial();
@@ -1590,6 +1692,7 @@ fn wait_refuses_an_id_that_is_not_running_or_finished() {
 }
 
 /// Calls run_command the way the agent does (`call`, with wait_seconds), and returns the result with the time the call took.
+#[cfg(unix)]
 fn timed_run(tools: &SessionTools, command: &str, wait_seconds: u64) -> (Value, Duration) {
     let started = Instant::now();
     let v = tools.call("run_command", &json!({"command": command, "wait_seconds": wait_seconds}), None).expect("run_command");
@@ -1599,6 +1702,7 @@ fn timed_run(tools: &SessionTools, command: &str, wait_seconds: u64) -> (Value, 
 /// A zsh started with no command (`zsh -f -i`) is a login with no shell integration. Its prompt turns bracketed paste on, so
 /// run_command returns at once with reason remote_shell, well before its 30 s wait. The hint names the command and does not
 /// suggest typing into it.
+#[cfg(unix)]
 #[test]
 fn run_command_into_a_zsh_without_integration_returns_remote_shell_early() {
     let _g = serial();
@@ -1623,6 +1727,7 @@ fn run_command_into_a_zsh_without_integration_returns_remote_shell_early() {
 }
 
 /// `sh -c` is not a login: it runs a command, not a shell. Its command finishes inside the wait, and nothing returns early.
+#[cfg(unix)]
 #[test]
 fn a_shell_given_a_command_is_not_returned_early() {
     let _g = serial();
@@ -1637,6 +1742,7 @@ fn a_shell_given_a_command_is_not_returned_early() {
 
 /// A password-like prompt on the last row, quiet for 300 ms, returns at once with reason needs_user. The do-not-type note
 /// comes with it, and the agent is told to ask the user, then wait.
+#[cfg(unix)]
 #[test]
 fn a_password_prompt_returns_needs_user_at_once() {
     let _g = serial();
@@ -1659,6 +1765,7 @@ fn a_password_prompt_returns_needs_user_at_once() {
 /// The foreground ssh that runs a program on the remote host (`ssh host sleep 3`) has no shell to integrate. The precheck
 /// refuses request_integration with the remote-program text, and run_command does not return early for it.
 /// A shell function named ssh stands in for it here, so no network is needed: the command text is what the hint reads.
+#[cfg(unix)]
 #[test]
 fn request_integration_is_refused_while_an_ssh_runs_a_remote_command() {
     let _g = serial();
@@ -1686,6 +1793,7 @@ fn request_integration_is_refused_while_an_ssh_runs_a_remote_command() {
 
 /// `send_keys` types into the command the agent started: the echo and cat's copy show the text, and Ctrl-D ends cat, so the
 /// call reports the finished command.
+#[cfg(unix)]
 #[test]
 fn send_keys_types_into_a_running_command_and_ctrl_d_finishes_it() {
     let _g = serial();
@@ -1709,6 +1817,7 @@ fn send_keys_types_into_a_running_command_and_ctrl_d_finishes_it() {
 }
 
 /// Ctrl-C interrupts the agent's own `sleep`: the record finishes with exit 130.
+#[cfg(unix)]
 #[test]
 fn send_keys_ctrl_c_interrupts_the_agents_own_command() {
     let _g = serial();
@@ -1725,6 +1834,7 @@ fn send_keys_ctrl_c_interrupts_the_agents_own_command() {
 }
 
 /// An id that is not the command on top is refused, and nothing is typed.
+#[cfg(unix)]
 #[test]
 fn send_keys_refuses_an_id_that_is_not_the_command_on_top() {
     let _g = serial();
@@ -1740,6 +1850,7 @@ fn send_keys_refuses_an_id_that_is_not_the_command_on_top() {
 }
 
 /// A program asking for a password is never typed into, even by the agent's own command.
+#[cfg(unix)]
 #[test]
 fn send_keys_refuses_a_password_prompt() {
     let _g = serial();
@@ -1758,6 +1869,7 @@ fn send_keys_refuses_a_password_prompt() {
 
 /// An interrupt-only `send_keys` (Ctrl-C, no text) still goes through at a password prompt: it can only stop the
 /// command, never type a secret into it. Esc passes the same way; text is still refused (see above).
+#[cfg(unix)]
 #[test]
 fn send_keys_interrupt_passes_at_a_password_prompt() {
     let _g = serial();
@@ -1777,6 +1889,7 @@ fn send_keys_interrupt_passes_at_a_password_prompt() {
 
 /// Through the approval gate on a real shell: the first write shows a card, the next one runs without it, and Ctrl-D needs
 /// no card at all.
+#[cfg(unix)]
 #[test]
 fn the_approval_gate_asks_for_the_first_send_keys_and_then_latches_the_command() {
     let _g = serial();
@@ -1822,6 +1935,7 @@ fn the_approval_gate_asks_for_the_first_send_keys_and_then_latches_the_command()
 }
 
 /// `(name, decision, reason)` of every ToolResult, in order.
+#[cfg(unix)]
 fn reasons_of(log: &Log) -> Vec<(String, &'static str, Option<&'static str>)> {
     log.lock()
         .unwrap()

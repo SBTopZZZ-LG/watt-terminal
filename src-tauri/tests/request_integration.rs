@@ -2,6 +2,9 @@
 //! without integration). The agent asks through `AgentCtx`, with the tools of a real `SessionTools`, and the answer comes
 //! from the consent dialog's side: an emit callback that answers the ask, as the UI would. Nothing here needs docker.
 
+// Every test runs a zsh session through common/mod.rs: no zsh on Windows.
+#![cfg(unix)]
+
 mod common;
 
 use std::sync::Mutex;

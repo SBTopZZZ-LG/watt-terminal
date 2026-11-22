@@ -85,8 +85,13 @@ fn start_capturing(id: &str, cols: u16) -> (Arc<Session>, Arc<Mutex<Vec<u8>>>) {
     (session, log)
 }
 
-fn wait_until<T>(mut f: impl FnMut() -> Option<T>) -> Option<T> {
-    let end = Instant::now() + WAIT;
+fn wait_until<T>(f: impl FnMut() -> Option<T>) -> Option<T> {
+    wait_until_within(WAIT, f)
+}
+
+/// Like `wait_until`, with the given limit instead of WAIT.
+fn wait_until_within<T>(limit: Duration, mut f: impl FnMut() -> Option<T>) -> Option<T> {
+    let end = Instant::now() + limit;
     loop {
         if let Some(v) = f() {
             return Some(v);
@@ -596,6 +601,13 @@ fn agent_send_keys_ctrl_c_cancels_its_unclosed_line() {
     assert_eq!(s.state(), InputState::Continuation, "state={:?} screen={:?}", s.state(), s.screen_snapshot().rows);
 
     s.write_user(b"zqx").expect("the user types into the agent's continuation");
+    // Wait for PSReadLine to echo the typed text before the agent's Ctrl-C follows it. The two writes are back to back, and
+    // a key read before the echo is not guaranteed to be handled the same way.
+    assert!(
+        wait_until_within(Duration::from_secs(5), || s.screen_snapshot().rows.iter().any(|r| r.contains("zqx")).then_some(())).is_some(),
+        "the typed text was not echoed at the continuation within 5s: {:?}",
+        s.screen_snapshot().rows
+    );
     let sent = tools.call("send_keys", &json!({"keys": ["Ctrl-C"]}), None).expect("send_keys Ctrl-C at the agent's continuation");
     assert_eq!(sent["outcome"], "sent", "{sent}");
     wait_prompt(&s);
