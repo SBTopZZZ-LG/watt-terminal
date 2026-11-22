@@ -160,14 +160,9 @@ fn drain_stderr(server: String, stderr: ChildStderr, events: UnboundedSender<Msg
     tokio::spawn(async move {
         let mut reader = BufReader::new(stderr);
         let mut buf = Vec::new();
-        loop {
-            match read_capped_line(&mut reader, &mut buf).await {
-                Ok(true) => {
-                    let line = String::from_utf8_lossy(&buf).trim_end_matches(['\r', '\n']).to_string();
-                    let _ = events.send(Msg::Log { server: server.clone(), line });
-                }
-                Ok(false) | Err(_) => break,
-            }
+        while let Ok(true) = read_capped_line(&mut reader, &mut buf).await {
+            let line = String::from_utf8_lossy(&buf).trim_end_matches(['\r', '\n']).to_string();
+            let _ = events.send(Msg::Log { server: server.clone(), line });
         }
     });
 }
