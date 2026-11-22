@@ -1,7 +1,10 @@
 //! The program to start for a stdio server. On Windows a bare command name is looked up on Watt's own PATH, in PATH
 //! order, the way a shell would find it (`npx` finds `npx.exe` or `npx.cmd`, whichever comes first in its directory).
 //! Node's launchers keep a `.cmd` fallback for when nothing is found. Everything else is started as written.
+//! On unix the lookup is `resolve_on_path`, over the PATH the child is started with (client.rs).
 
+#[cfg(unix)]
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 /// The extensions tried in each PATH directory for a bare name on Windows, in this order.
@@ -43,6 +46,35 @@ fn find_on_path(command: &str, dirs: &[PathBuf], is_file: impl Fn(&Path) -> bool
         .flat_map(|dir| WINDOWS_EXTENSIONS.iter().map(move |ext| dir.join(format!("{command}.{ext}"))))
         .find(|candidate| is_file(candidate.as_path()))
         .map(|path| path.to_string_lossy().into_owned())
+}
+
+/// The program to start on unix: a bare name is looked up on `path`, the PATH the child is started with. The first
+/// directory holding an executable file of that name wins. Not found, or a name with a `/`, gives the name as written,
+/// so the spawn fails with the same NotFound the lookup would have given.
+#[cfg(unix)]
+pub fn resolve_on_path(command: &str, path: &OsStr) -> String {
+    let dirs: Vec<PathBuf> = std::env::split_paths(path).collect();
+    find_executable(command, &dirs, is_executable_file).unwrap_or_else(|| command.to_string())
+}
+
+/// The first `dir/command` that is executable, in PATH order. Empty PATH entries are skipped, as on Windows: they would
+/// mean the current directory.
+#[cfg(unix)]
+fn find_executable(command: &str, dirs: &[PathBuf], is_executable: impl Fn(&Path) -> bool) -> Option<String> {
+    if command.is_empty() || command.contains('/') {
+        return None;
+    }
+    dirs.iter()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join(command))
+        .find(|candidate| is_executable(candidate.as_path()))
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 
 #[cfg(test)]
@@ -165,5 +197,58 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
 
         assert_eq!(resolved, dir_b.join("npx.cmd").to_string_lossy());
+    }
+
+    #[cfg(unix)]
+    mod unix {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        /// A fresh temp dir with one file per `(name, mode)`. The caller removes it.
+        fn make_dir(tag: &str, files: &[(&str, u32)]) -> PathBuf {
+            let root = std::env::temp_dir().join(format!(
+                "watt-launch-unix-{tag}-{}-{}",
+                std::process::id(),
+                SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+            ));
+            fs::create_dir_all(&root).expect("create test dir");
+            for (name, mode) in files {
+                let file = root.join(name);
+                fs::write(&file, b"#!/bin/sh\n").expect("create test file");
+                fs::set_permissions(&file, fs::Permissions::from_mode(*mode)).expect("chmod test file");
+            }
+            root
+        }
+
+        #[test]
+        fn the_first_executable_in_path_order_wins_and_a_plain_file_does_not() {
+            let a = make_dir("a", &[("tool", 0o644)]);
+            let b = make_dir("b", &[("tool", 0o755)]);
+            let c = make_dir("c", &[("tool", 0o755)]);
+            let path = std::env::join_paths([&a, &b, &c]).expect("join");
+            let resolved = resolve_on_path("tool", &path);
+            for dir in [&a, &b, &c] {
+                let _ = fs::remove_dir_all(dir);
+            }
+            assert_eq!(resolved, b.join("tool").to_string_lossy());
+        }
+
+        #[test]
+        fn a_name_not_found_or_with_a_slash_is_returned_as_written() {
+            let a = make_dir("none", &[("other", 0o755)]);
+            let path = std::env::join_paths([&a]).expect("join");
+            assert_eq!(resolve_on_path("uvx", &path), "uvx");
+            assert_eq!(resolve_on_path("./tool", &path), "./tool");
+            assert_eq!(resolve_on_path("", &path), "");
+            let _ = fs::remove_dir_all(&a);
+        }
+
+        #[test]
+        fn empty_path_entries_are_skipped() {
+            // A bare "tool" would be found first if the empty entry were searched as the current directory.
+            let executable = |p: &Path| p == Path::new("tool") || p == Path::new("/opt/bin/tool");
+            let dirs = [PathBuf::new(), PathBuf::from("/opt/bin")];
+            assert_eq!(find_executable("tool", &dirs, executable).as_deref(), Some("/opt/bin/tool"));
+        }
     }
 }
