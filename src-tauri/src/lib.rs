@@ -8,7 +8,7 @@
 //! told apart by `type`.
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
@@ -60,7 +60,7 @@ use crate::core::settings::service::{
 use crate::core::settings::{AgentRequests, ApprovalSettings, IntegrationSettings, LimitsSettings, ModelRef, Nested};
 use crate::core::mcp::config::McpLevel;
 use crate::core::mcp::service::{McpImportResult, McpServerInput, McpService, McpView, TurnMcp};
-use crate::core::skills::{self, Root, SkillsView};
+use crate::core::skills::{self, Places, SkillsSettings, SkillsView};
 use crate::core::tools::SessionTools;
 
 type Reg = Registry<Attached>;
@@ -638,9 +638,9 @@ async fn agent_message(
                         }
                     }
                 }
-                // The skill folders of this turn (core/skills), scanned on the blocking pool. A scan never fails the turn.
-                let skill_folders = skill_roots(&app, project_root);
-                let skill_index = blocking(move || Ok(skills::scan(&skill_folders))).await.unwrap_or_default();
+                // The skills of this turn (core/skills), read from the folders on the blocking pool. A scan never fails the turn.
+                let setup = skill_setup(&app, project_root);
+                let skill_index = blocking(move || Ok(setup.load().0)).await.unwrap_or_default();
                 let mut agent = LlmAgent::new(client, llm_settings, &conversation_id, history, todos, cancel.clone())
                     // The note is taken only by a turn that calls the model: a turn that fails to start keeps it.
                     .with_resume_note(att.conversation.take_resume_note())
@@ -908,11 +908,46 @@ fn workspace_root_for_cwd(app: &tauri::AppHandle, cwd: &Cwd) -> Option<PathBuf> 
     Some(PathBuf::from(workspace.root))
 }
 
-/// The skill folders (core/skills) in priority order: the Watt config folder, the user's folders in the home directory,
-/// then the workspace's folders when there is a workspace root.
-fn skill_roots(app: &tauri::AppHandle, project_root: Option<PathBuf>) -> Vec<Root> {
-    let config = resolve_config_dir(app);
-    skills::roots(config.as_deref(), home_dir().as_deref(), project_root.as_deref())
+/// What the skills of a session are read from (core/skills): the places folder settings resolve against, the skill settings
+/// in use, and a warning when they cannot be used (the default folders are then read).
+struct SkillSetup {
+    places: Places,
+    settings: SkillsSettings,
+    warning: Option<String>,
+}
+
+impl SkillSetup {
+    /// The skills and the folder layout. Reads the folders, so it runs on the blocking pool.
+    fn load(&self) -> (skills::SkillIndex, skills::Layout) {
+        let (mut index, layout) = skills::load(&self.places, &self.settings);
+        if let Some(warning) = &self.warning {
+            index.warnings.insert(0, warning.clone());
+        }
+        (index, layout)
+    }
+}
+
+/// The skill setup of a session: the Watt config, home and guarded folders, and the session's project root for relative
+/// folders. The settings are the ones in use.
+fn skill_setup(app: &tauri::AppHandle, project_root: Option<PathBuf>) -> SkillSetup {
+    let (settings, warning) = match app.state::<SettingsState>().get().and_then(|s| s.skills_settings()) {
+        Ok(settings) => (settings, None),
+        Err(e) => (SkillsSettings::default(), Some(format!("skill folder settings are not used ({e}); the default folders are read"))),
+    };
+    SkillSetup { places: skill_places(app, project_root), settings, warning }
+}
+
+/// The places skill folders resolve against and are refused against. Watt's config, data and secrets folders are guarded
+/// like the file tools guard them (see `guarded_paths`), and so is the secrets file's folder.
+fn skill_places(app: &tauri::AppHandle, project_root: Option<PathBuf>) -> Places {
+    let mut guarded = guarded_paths(app);
+    guarded.extend(secrets_file_path().and_then(|p| p.parent().map(Path::to_path_buf)).filter(|p| !p.as_os_str().is_empty()));
+    Places { config: resolve_config_dir(app), home: home_dir(), project: project_root, guarded }
+}
+
+/// Watt's own folders and the secrets file: the paths the file tools and the skill folders never read.
+fn guarded_paths(app: &tauri::AppHandle) -> Vec<PathBuf> {
+    [resolve_config_dir(app), resolve_data_dir(app), secrets_file_path()].into_iter().flatten().collect()
 }
 
 /// The project root of a session: the workspace of the local shell's directory. None while a nested shell is on top, since
@@ -933,19 +968,42 @@ fn fs_scope_for(app: &tauri::AppHandle, att: &Attached, project_root: Option<Pat
     let local = PathBuf::from(&cwd.path);
     let root = project_root.unwrap_or_else(|| local.clone());
     // Watt's own folders and the secrets file: the file tools never read or write them, whatever the paths are.
-    let guarded = [resolve_config_dir(app), resolve_data_dir(app), secrets_file_path()].into_iter().flatten().collect();
-    Some(Scope::new(root, local, guarded))
+    Some(Scope::new(root, local, guarded_paths(app)))
 }
 
-/// The skills for the settings view (core/skills): the user's folders, plus the session's project folders when its local
-/// shell is on top. Read on the blocking pool; a missing folder is not an error.
+/// The skills for the settings view (core/skills): the folders in use, the skills in them and the ones switched off. The
+/// project's folders are read when the session's local shell is on top. Read on the blocking pool; a missing folder is not
+/// an error.
 #[tauri::command]
 async fn list_skills(session_id: String, app: tauri::AppHandle, reg: State<'_, Reg>) -> Result<SkillsView, String> {
     let att = session(&reg, &session_id)?;
     blocking(move || {
         let project_root = session_project_root(&app, &att);
-        let folders = skill_roots(&app, project_root);
-        Ok(skills::scan(&folders).view())
+        let setup = skill_setup(&app, project_root);
+        let (index, layout) = setup.load();
+        Ok(skills::view(&index, &layout, &setup.settings))
+    })
+    .await
+}
+
+/// Saves the skill folders and the switched-off skills. Refused while settings.json is broken or in last-good mode, and when a
+/// folder is refused: Watt's own folders, the secrets file's folder, or a credential folder (see core/skills/folders).
+#[tauri::command]
+async fn set_skills_settings(
+    input: SkillsSettings,
+    app: tauri::AppHandle,
+    settings: State<'_, SettingsState>,
+) -> Result<SettingsView, String> {
+    let service = settings.get()?;
+    let places = skill_places(&app, None);
+    blocking(move || {
+        if let Some(folders) = &input.folders {
+            let refused = skills::folders::refusals(&places, folders);
+            if !refused.is_empty() {
+                return Err(refused.join("; "));
+            }
+        }
+        service.set_skills(input)
     })
     .await
 }
@@ -1770,6 +1828,7 @@ pub fn run() {
             set_approval_settings,
             set_integration_settings,
             set_limits_settings,
+            set_skills_settings,
             answer_integration,
             answer_questions,
             test_approval,

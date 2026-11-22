@@ -160,4 +160,11 @@ describe('api skills commands', () => {
     void api.listSkills();
     expect(invoke).toHaveBeenLastCalledWith('list_skills', { sessionId: 'main' });
   });
+
+  it('setSkillsSettings sends the folders (null for the defaults) and the switched-off names as one input', () => {
+    void api.setSkillsSettings({ folders: ['~/team/skills'], disabled: ['pdf'] });
+    expect(invoke).toHaveBeenLastCalledWith('set_skills_settings', { input: { folders: ['~/team/skills'], disabled: ['pdf'] } });
+    void api.setSkillsSettings({ folders: null, disabled: [] });
+    expect(invoke).toHaveBeenLastCalledWith('set_skills_settings', { input: { folders: null, disabled: [] } });
+  });
 });

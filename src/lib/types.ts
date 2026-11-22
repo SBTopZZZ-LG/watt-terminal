@@ -655,21 +655,58 @@ export interface CommandCatalog {
   skipped?: string[];
 }
 
-/** One skill (core/skills): where it came from, and whether the model is offered it (false for disable-model-invocation). */
+/**
+ * One skill (core/skills). `model_invocable` is false for disable-model-invocation in its frontmatter (the model is never
+ * offered it; the user's switch cannot change that). `enabled` is the user's switch. `shadowed_by` is set for a skill hidden by
+ * a same-named one in an earlier folder: the folder of the one in use.
+ */
 export interface SkillView {
   name: string;
   description: string;
+  /** `watt`: the Watt config folder. `user`: a folder set by an absolute path or `~`. `project`: a folder set relative to the workspace. */
   source: 'watt' | 'user' | 'project';
   /** The skill's folder. */
   path: string;
   model_invocable: boolean;
+  enabled: boolean;
+  shadowed_by: string | null;
 }
 
-/** The skills for the settings view: every skill found, the warnings for the ones skipped, and the folders scanned in order. */
+/** One folder scanned (core/skills RootView). `exists` is false for a folder that is not there yet. */
+export interface RootView {
+  path: string;
+  exists: boolean;
+  source: 'watt' | 'user' | 'project';
+}
+
+/** What became of one configured folder: `found`, `not_found`, `blocked` (refused), `unresolved` (no project, or ~ without home), `duplicate`. */
+export type FolderStatus = 'found' | 'not_found' | 'blocked' | 'unresolved' | 'duplicate';
+
+/** One configured folder row as the settings editor shows it. `folder` is the setting as written; `path` is what it names, if known. */
+export interface FolderEntry {
+  folder: string;
+  path: string | null;
+  status: FolderStatus;
+}
+
+/** The skills for the settings view: the skills, the warnings, the folders scanned, and the folder settings and switches. */
 export interface SkillsView {
   skills: SkillView[];
   warnings: string[];
-  roots: string[];
+  /** The folders scanned, in priority order, each once. The Watt folder is first. */
+  roots: RootView[];
+  /** The configured folders, one row each, in order (the Watt folder is not one of them). */
+  folders: FolderEntry[];
+  /** True when no folders are saved and the defaults apply. */
+  using_defaults: boolean;
+  /** The skill names switched off (saved). */
+  disabled: string[];
+}
+
+/** What set_skills_settings saves. `folders: null` restores the defaults. */
+export interface SkillsSettingsInput {
+  folders: string[] | null;
+  disabled: string[];
 }
 
 /**

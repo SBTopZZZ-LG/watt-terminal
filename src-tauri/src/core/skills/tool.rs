@@ -56,11 +56,10 @@ pub fn run(index: &SkillIndex, args: &Value) -> Result<String, String> {
         .map(str::trim)
         .filter(|n| !n.is_empty())
         .ok_or_else(|| "the skill tool needs a `name`: the skill's name, as listed".to_string())?;
-    let skill = index
-        .skills
-        .iter()
-        .find(|s| s.model_invocable && s.name == name)
-        .ok_or_else(|| unknown(index, name))?;
+    let skill = match index.skills.iter().find(|s| s.model_invocable && s.enabled && s.name == name) {
+        Some(skill) => skill,
+        None => return Err(unavailable(index, name)),
+    };
     match args.get("file") {
         None | Some(Value::Null) => body(skill),
         Some(Value::String(file)) if file.trim().is_empty() => body(skill),
@@ -81,9 +80,16 @@ pub fn cap_text(text: &str, limit: usize) -> String {
     format!("{}\n\n[truncated {} bytes]", &text[..keep], text.len() - keep)
 }
 
+/// Why a name is not loaded: the user switched the skill off, or the name is unknown (the names the model may load are listed).
+fn unavailable(index: &SkillIndex, name: &str) -> String {
+    let off = index.skills.iter().any(|s| s.model_invocable && !s.enabled && s.name == name);
+    if off { format!("skill '{}' is switched off in Watt's settings, so it is not loaded.", echo(name)) } else { unknown(index, name) }
+}
+
 fn unknown(index: &SkillIndex, name: &str) -> String {
     let shown = echo(name);
-    let names: Vec<&str> = index.skills.iter().filter(|s| s.model_invocable).map(|s| s.name.as_str()).collect();
+    let names: Vec<&str> =
+        index.skills.iter().filter(|s| s.model_invocable && s.enabled).map(|s| s.name.as_str()).collect();
     if names.is_empty() {
         return format!("unknown skill '{shown}'. No skills are available.");
     }
@@ -314,6 +320,31 @@ mod tests {
         let long = "x".repeat(500);
         let err = run(&index, &json!({"name": long})).unwrap_err();
         assert!(err.starts_with("unknown skill 'xxx") && err.len() < 300, "{err}");
+    }
+
+    #[test]
+    fn a_switched_off_skill_is_refused_by_name_and_left_out_of_the_available_list() {
+        let tmp = TempDir::new();
+        skill_folder(&tmp, "demo", DEMO);
+        skill_folder(&tmp, "other", "---\nname: other\ndescription: Other\n---\nBody\n");
+        let mut index = index_of(tmp.path());
+        index.apply_disabled(&["demo".to_string()]);
+        assert_eq!(
+            run(&index, &json!({"name": "demo"})).unwrap_err(),
+            "skill 'demo' is switched off in Watt's settings, so it is not loaded."
+        );
+        assert_eq!(run(&index, &json!({"name": "nope"})).unwrap_err(), "unknown skill 'nope'. Available: other");
+        assert!(run(&index, &json!({"name": "other"})).unwrap().starts_with("Body\n"));
+    }
+
+    #[test]
+    fn a_frontmatter_hidden_skill_stays_hidden_when_it_is_switched_on() {
+        let tmp = TempDir::new();
+        skill_folder(&tmp, "manual", "---\nname: manual\ndescription: Only when asked\ndisable-model-invocation: true\n---\nBody\n");
+        let mut index = index_of(tmp.path());
+        index.apply_disabled(&[]);
+        assert!(index.skills[0].enabled);
+        assert!(run(&index, &json!({"name": "manual"})).unwrap_err().starts_with("unknown skill 'manual'"));
     }
 
     #[test]

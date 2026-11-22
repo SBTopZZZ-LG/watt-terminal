@@ -15,7 +15,7 @@ mod scope;
 mod tool;
 mod write;
 
-pub use scope::Scope;
+pub use scope::{Scope, blocked_reason, is_within, strip_verbatim};
 pub use tool::{
     FS_WRITES_PER_TURN, Place, TOOL_NAMES, WRITE_TOOL_NAMES, is_tool, is_write, preview_write, run, run_write, schemas,
 };

@@ -25,6 +25,7 @@ import type {
   RecoverAction,
   SaveProviderInput,
   SettingsView,
+  SkillsSettingsInput,
   SkillsView,
   StartResult,
   Status,
@@ -228,6 +229,10 @@ export const api = {
   /** Saves the per-turn caps. Refused while settings.json is broken. A value out of range fails with its name in the message. */
   setLimitsSettings(input: LimitsSettings) {
     return invoke<SettingsView>('set_limits_settings', { input });
+  },
+  /** Saves the skill folders (null: the defaults) and the switched-off skills. Refused while settings.json is broken, or when a folder is refused. */
+  setSkillsSettings(input: SkillsSettingsInput) {
+    return invoke<SettingsView>('set_skills_settings', { input });
   },
   /** What the saved approval settings would decide for a command, without running it. Approve-all is not part of it. */
   testApproval(command: string) {

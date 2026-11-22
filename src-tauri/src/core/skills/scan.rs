@@ -2,13 +2,13 @@
 //! skipped with a warning, an unreadable root is skipped, and nothing here fails a turn. Symlinked skill folders are
 //! followed (users link them in); each skill's `SKILL.md` must be a regular file once links are followed.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use super::frontmatter;
-use super::{Root, Skill, SkillIndex, Source};
+use super::{Root, Shadowed, Skill, SkillIndex, Source};
 
 pub const SKILL_FILE: &str = "SKILL.md";
 /// Most skills loaded across all roots. Once reached, the rest are not loaded and one warning says so.
@@ -19,11 +19,13 @@ pub const MAX_NAME: usize = 64;
 /// Descriptions are cut to this many characters.
 pub const MAX_DESCRIPTION: usize = 1024;
 
-/// Scans the roots in order and returns the skills found. The first root that has a name wins: a later duplicate is
-/// dropped without a warning, so the user's folders beat the project's.
+/// Scans the roots in order and returns the skills found. The first root that has a name wins: a later skill of the same
+/// name is listed as shadowed, with a warning. A skill folder reached twice (a link, or two roots over one folder) is
+/// loaded once, silently.
 pub fn scan(roots: &[Root]) -> SkillIndex {
     let mut index = SkillIndex { roots: roots.iter().map(|r| r.dir.clone()).collect(), ..SkillIndex::default() };
-    let mut seen = HashSet::new();
+    let mut winners: HashMap<String, PathBuf> = HashMap::new();
+    let mut loaded_dirs: HashSet<PathBuf> = HashSet::new();
     for root in roots {
         let entries = match fs::read_dir(&root.dir) {
             Ok(entries) => entries,
@@ -41,13 +43,25 @@ pub fn scan(roots: &[Root]) -> SkillIndex {
             if !dir.join(SKILL_FILE).is_file() {
                 continue;
             }
-            if index.skills.len() >= MAX_SKILLS {
+            if index.skills.len() + index.shadowed.len() >= MAX_SKILLS {
                 index.warnings.push(format!("more than {MAX_SKILLS} skills: the rest are not loaded"));
                 return index;
             }
             match load(&dir, root.source) {
                 Ok(skill) => {
-                    if seen.insert(skill.name.clone()) {
+                    if !loaded_dirs.insert(fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone())) {
+                        continue;
+                    }
+                    if let Some(winner) = winners.get(&skill.name) {
+                        index.warnings.push(format!(
+                            "{} in {} is shadowed by the one in {}",
+                            skill.name,
+                            root.dir.display(),
+                            winner.display()
+                        ));
+                        index.shadowed.push(Shadowed { skill, by: winner.clone() });
+                    } else {
+                        winners.insert(skill.name.clone(), root.dir.clone());
                         index.skills.push(skill);
                     }
                 }
@@ -103,7 +117,7 @@ fn load(dir: &Path, source: Source) -> Result<Skill, String> {
         .flag("disable-model-invocation")
         .or_else(|| parsed.flag("disable_model_invocation"))
         .unwrap_or(false);
-    Ok(Skill { name: name.to_string(), description, source, dir: dir.to_path_buf(), model_invocable: !disabled })
+    Ok(Skill { name: name.to_string(), description, source, dir: dir.to_path_buf(), model_invocable: !disabled, enabled: true })
 }
 
 #[cfg(test)]
@@ -167,7 +181,7 @@ mod tests {
     }
 
     #[test]
-    fn the_first_root_wins_and_duplicates_are_dropped_silently() {
+    fn the_first_root_wins_and_a_same_named_skill_is_shadowed_with_a_warning() {
         let user = TempDir::new();
         let project = TempDir::new();
         write_skill(user.path(), "shared", &good("shared", "From the user"));
@@ -176,6 +190,28 @@ mod tests {
         assert_eq!(index.skills.len(), 1);
         assert_eq!(index.skills[0].description, "From the user");
         assert_eq!(index.skills[0].source, Source::User);
+        assert_eq!(index.shadowed.len(), 1);
+        assert_eq!(index.shadowed[0].skill.description, "From the repo");
+        assert_eq!(index.shadowed[0].by, user.path().to_path_buf());
+        assert_eq!(index.warnings.len(), 1, "{:?}", index.warnings);
+        assert_eq!(
+            index.warnings[0],
+            format!("shared in {} is shadowed by the one in {}", project.path().display(), user.path().display())
+        );
+    }
+
+    #[test]
+    fn the_same_skill_folder_reached_through_two_roots_is_loaded_once_silently() {
+        let real = TempDir::new();
+        let link_root = TempDir::new();
+        write_skill(real.path(), "same", &good("same", "Once"));
+        fs::create_dir_all(link_root.path()).unwrap();
+        if !make_dir_link(&real.path().join("same"), &link_root.path().join("same")) {
+            return;
+        }
+        let index = scan(&[root(real.path(), Source::User), root(link_root.path(), Source::Project)]);
+        assert_eq!(names(&index), ["same"]);
+        assert!(index.shadowed.is_empty(), "{:?}", index.shadowed);
         assert!(index.warnings.is_empty(), "{:?}", index.warnings);
     }
 
