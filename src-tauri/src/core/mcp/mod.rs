@@ -11,6 +11,7 @@ pub mod config;
 pub mod expand;
 pub mod launch;
 pub mod logs;
+pub mod login_path;
 pub mod manager;
 pub mod names;
 pub mod parse;

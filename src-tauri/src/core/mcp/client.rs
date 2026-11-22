@@ -3,6 +3,7 @@
 //! is returned as a `Live` for the runtime to keep and close.
 
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::OsString;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -25,7 +26,12 @@ use windows::Win32::System::Threading::{CREATE_NO_WINDOW, PROCESS_CREATION_FLAGS
 use process_wrap::tokio::ProcessGroup;
 
 use super::expand::ResolvedTransport;
+#[cfg(windows)]
 use super::launch::resolve_launch;
+#[cfg(unix)]
+use super::launch::resolve_on_path;
+#[cfg(unix)]
+use super::login_path;
 use super::runtime::Msg;
 
 /// How long a server gets to start, initialize and list its tools. Cold `npx` and `uvx` starts can take 10 s or more.
@@ -86,7 +92,7 @@ async fn connect_inner(
     let handler = Handler { server: server.to_string(), attempt, events: events.clone() };
     match transport {
         ResolvedTransport::Stdio { command, args, cwd, env } => {
-            let (process, stderr) = spawn_stdio(&command, args, cwd, env).map_err(ConnectFailure::Failed)?;
+            let (process, stderr) = spawn_stdio(&command, args, cwd, env).await.map_err(ConnectFailure::Failed)?;
             if let Some(stderr) = stderr {
                 drain_stderr(server.to_string(), stderr, events);
             }
@@ -106,19 +112,40 @@ async fn connect_inner(
 
 /// Starts the stdio server. The process is wrapped so that its whole tree is killed with it: a Job Object on Windows
 /// (killed when the job closes), a process group elsewhere. Stderr is piped so it can be drained.
-fn spawn_stdio(
+async fn spawn_stdio(
     command: &str,
     args: Vec<String>,
     cwd: Option<String>,
     env: BTreeMap<String, String>,
 ) -> Result<(TokioChildProcess, Option<ChildStderr>), String> {
-    let program = resolve_launch(command, cfg!(windows));
+    #[cfg(windows)]
+    let (program, search_path, searched): (String, Option<OsString>, &str) =
+        (resolve_launch(command, true), None, "Watt's PATH");
+    #[cfg(unix)]
+    let (program, search_path, searched) = {
+        // A PATH in the server's own config wins, as every value in `env` does. Otherwise the child gets the login
+        // shell's PATH merged with Watt's, when the login shell can be read.
+        let (search, searched) = match env.get("PATH") {
+            Some(path) => (OsString::from(path), "the PATH set for this server"),
+            None => {
+                let inherited = std::env::var_os("PATH").unwrap_or_default();
+                match login_path::child_path(inherited.clone()).await {
+                    Some(path) => (path, "Watt's PATH and your login shell's PATH"),
+                    None => (inherited, "Watt's PATH (your login shell's PATH could not be read)"),
+                }
+            }
+        };
+        (resolve_on_path(command, &search), Some(search), searched)
+    };
     let mut wrapped = CommandWrap::with_new(program, move |c| {
         c.args(&args);
         if let Some(cwd) = &cwd {
             c.current_dir(cwd);
         }
-        // The server's own values go on top of the inherited environment (no env_clear).
+        if let Some(path) = &search_path {
+            c.env("PATH", path);
+        }
+        // The server's own values go on top of the inherited environment (no env_clear), so its PATH wins over ours.
         c.envs(&env);
     });
     #[cfg(windows)]
@@ -130,7 +157,17 @@ fn spawn_stdio(
     TokioChildProcess::builder(wrapped)
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("could not start the server process: {e}"))
+        .map_err(|e| spawn_failure(command, searched, &e))
+}
+
+/// The message for a server that did not start. A NotFound names the command as configured and where it was searched.
+/// The PATH is fixed when Watt starts, so a program installed later needs a restart of Watt.
+fn spawn_failure(command: &str, searched: &str, e: &std::io::Error) -> String {
+    let mut message = format!("could not start the server process: {e}");
+    if e.kind() == std::io::ErrorKind::NotFound {
+        message.push_str(&format!(" (\"{command}\" was searched on {searched}. Restart Watt after installing it)"));
+    }
+    message
 }
 
 /// The creation flags of a stdio server on Windows. CREATE_NO_WINDOW: a console program (such as `uvx`) gets no console
@@ -309,5 +346,23 @@ mod tests {
         assert!(read_capped_line(&mut reader, &mut buf).await.unwrap());
         assert_eq!(buf, b"last line with no newline");
         assert!(!read_capped_line(&mut reader, &mut buf).await.unwrap());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_command_is_found_on_the_path_the_server_config_sets() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // The directory is not on the inherited PATH, so the spawn only succeeds if the config's PATH is searched.
+        let dir = std::env::temp_dir().join(format!("watt-client-path-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let server = dir.join("watt-test-server");
+        std::fs::write(&server, b"#!/bin/sh\nexit 0\n").expect("write script");
+        std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).expect("chmod script");
+        let env = BTreeMap::from([("PATH".to_string(), dir.to_string_lossy().into_owned())]);
+
+        let spawned = spawn_stdio("watt-test-server", Vec::new(), None, env).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(spawned.is_ok(), "{:?}", spawned.err());
     }
 }
