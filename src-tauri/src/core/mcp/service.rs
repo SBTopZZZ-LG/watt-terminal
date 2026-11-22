@@ -22,8 +22,8 @@ use super::manager::{McpManager, ServerState, ServerStatus};
 use super::parse::{ParsedImport, parse_pasted};
 use super::secrets::{McpSecrets, SecretValues, write_server};
 
-/// How long a turn waits, after the servers were first started, for the ones still connecting.
-const FIRST_CONNECT_WAIT: Duration = Duration::from_secs(8);
+/// How long a turn waits for the enabled servers that are still connecting.
+const CONNECT_WAIT: Duration = Duration::from_secs(8);
 const SETTLE_POLL: Duration = Duration::from_millis(100);
 /// Tool descriptions are shown up to this many characters.
 const DESCRIPTION_CHARS: usize = 200;
@@ -95,20 +95,19 @@ pub struct McpServerInput {
 /// What a model turn gets from MCP. `secret_values` are the values the turn's output must mask. Holds secrets: no `Debug`.
 pub struct TurnMcp {
     pub manager: Arc<McpManager>,
-    /// True when this call started the servers. Only then does the turn wait for them (see `settle`).
-    pub first_start: bool,
     pub secret_values: Vec<String>,
 }
 
 impl TurnMcp {
-    /// After the first start, gives the servers up to `FIRST_CONNECT_WAIT` to finish connecting, so this turn offers their
-    /// tools. Returns at once when no server is connecting, or when the turn is cancelled. A server still connecting after
-    /// that is not offered this turn. A turn that did not start the servers does not wait.
+    /// Gives the enabled servers that are still connecting up to `CONNECT_WAIT` to finish, so this turn offers their tools.
+    /// Returns at once when none is connecting, or when the turn is cancelled. A server still connecting after that is not
+    /// offered this turn.
     pub fn settle(&self, cancel: &TurnCancel) {
-        if !self.first_start {
-            return;
-        }
-        let deadline = Instant::now() + FIRST_CONNECT_WAIT;
+        self.settle_within(cancel, CONNECT_WAIT);
+    }
+
+    fn settle_within(&self, cancel: &TurnCancel, wait: Duration) {
+        let deadline = Instant::now() + wait;
         while !cancel.is_cancelled() && Instant::now() < deadline {
             if !self.manager.status().iter().any(|s| s.state == ServerState::Connecting) {
                 return;
@@ -118,11 +117,14 @@ impl TurnMcp {
     }
 }
 
-/// The runtime handle and whether the saved settings are applied to it.
+/// The runtime handle and the settings it was last applied with.
 #[derive(Default)]
 struct Started {
     manager: Option<Arc<McpManager>>,
-    applied: bool,
+    applied: McpSettings,
+    /// How many times the runtime was applied. Tests read it to see that unchanged settings are not applied again.
+    #[cfg(test)]
+    applies: usize,
 }
 
 pub struct McpService {
@@ -143,10 +145,11 @@ impl McpService {
         let Ok(settings) = self.settings.mcp_settings() else {
             return Ok(McpView::default());
         };
-        if settings.servers.is_empty() {
+        // Nothing configured and nothing running: nothing to show, and nothing to start.
+        if settings.servers.is_empty() && lock(&self.started).manager.is_none() {
             return Ok(McpView::default());
         }
-        let (manager, _) = self.ensure_applied()?;
+        let manager = self.running(&settings)?;
         let status = manager.status();
         let servers = settings
             .servers
@@ -258,22 +261,20 @@ impl McpService {
 
     /// Stops and starts one server now, then returns the view.
     pub fn restart(&self, name: &str) -> Result<McpView, String> {
-        let (manager, _) = self.ensure_applied()?;
-        manager.restart(name)?;
+        self.running_saved()?.restart(name)?;
         self.view()
     }
 
     /// The last log lines of a server, oldest first (the runtime redacts them).
     pub fn logs(&self, name: &str) -> Result<Vec<String>, String> {
-        let (manager, _) = self.ensure_applied()?;
-        manager.logs(name).ok_or_else(|| no_server(name))
+        self.running_saved()?.logs(name).ok_or_else(|| no_server(name))
     }
 
-    /// What a model turn needs: the runtime, started and applied on the first call, and the MCP secret values to mask.
+    /// What a model turn needs: the runtime with the saved settings applied, and the MCP secret values to mask.
     pub fn for_turn(&self) -> Result<TurnMcp, String> {
-        let (manager, first_start) = self.ensure_applied()?;
+        let manager = self.running_saved()?;
         let secret_values = McpSecrets::new(&self.secrets).all_values().map_err(|e| e.to_string())?;
-        Ok(TurnMcp { manager, first_start, secret_values })
+        Ok(TurnMcp { manager, secret_values })
     }
 
     /// Stops the servers and the runtime thread, if it was started. Safe to call twice.
@@ -303,36 +304,50 @@ impl McpService {
         secrets: impl FnOnce(&mut SecretMap),
     ) -> Result<McpView, String> {
         self.settings.change_settings_with_secrets(|settings| edit(&mut settings.mcp), secrets)?;
-        {
-            let mut started = lock(&self.started);
-            self.apply_saved(&mut started)
-                .map_err(|e| format!("the change was saved, but the servers were not updated: {e}"))?;
-        }
+        self.apply_saved()
+            .map_err(|e| format!("the change was saved, but the servers were not updated: {e}"))?;
         self.view()
     }
 
-    /// The runtime with the saved settings applied. The first call applies them, which starts the runtime and the
-    /// servers; later calls change nothing. The bool is true when this call did the apply.
-    fn ensure_applied(&self) -> Result<(Arc<McpManager>, bool), String> {
+    /// Applies the saved settings now, even if the runtime already runs them. Used after a change.
+    fn apply_saved(&self) -> Result<(), String> {
+        let settings = self.settings.mcp_settings()?;
         let mut started = lock(&self.started);
-        if started.applied && let Some(manager) = &started.manager {
-            return Ok((manager.clone(), false));
-        }
-        let manager = self.apply_saved(&mut started)?;
-        Ok((manager, true))
+        self.apply_settings(&mut started, &settings).map(|_| ())
     }
 
-    /// Applies the saved settings to the runtime, starting the runtime on first use.
-    fn apply_saved(&self, started: &mut Started) -> Result<Arc<McpManager>, String> {
+    /// The saved settings, applied to the runtime (see `running`).
+    fn running_saved(&self) -> Result<Arc<McpManager>, String> {
         let settings = self.settings.mcp_settings()?;
-        let secrets = self.secret_map(&settings)?;
+        self.running(&settings)
+    }
+
+    /// The runtime with `settings` applied. Starts it on first use, and applies again when `settings` differ from the ones
+    /// it last ran (a hand edit of settings.json, for one). Changes nothing when they match.
+    fn running(&self, settings: &McpSettings) -> Result<Arc<McpManager>, String> {
+        let mut started = lock(&self.started);
+        if let Some(manager) = &started.manager
+            && started.applied == *settings
+        {
+            return Ok(manager.clone());
+        }
+        self.apply_settings(&mut started, settings)
+    }
+
+    /// Applies `settings` to the runtime, starting the runtime on first use. Records them as applied once they are.
+    fn apply_settings(&self, started: &mut Started, settings: &McpSettings) -> Result<Arc<McpManager>, String> {
+        let secrets = self.secret_map(settings)?;
         let manager = match &started.manager {
             Some(manager) => manager.clone(),
             None => Arc::new(McpManager::start()?),
         };
         started.manager = Some(manager.clone());
-        manager.apply(&settings, &secrets)?;
-        started.applied = true;
+        manager.apply(settings, &secrets)?;
+        started.applied = settings.clone();
+        #[cfg(test)]
+        {
+            started.applies += 1;
+        }
         Ok(manager)
     }
 
@@ -655,36 +670,114 @@ mod tests {
     }
 
     #[test]
-    fn a_turn_masks_the_mcp_values_and_only_the_first_turn_is_a_first_start() {
+    fn a_turn_masks_the_mcp_values() {
         let f = fixture();
         f.mcp.save_server(input(stdio("fetch", &["TOKEN"]), &[("TOKEN", TOKEN)], &[])).unwrap();
-        // The servers were started by the save, so a later turn of this service is not a first start.
-        let later = f.mcp.for_turn().unwrap();
-        assert!(!later.first_start);
-        assert!(later.secret_values.iter().any(|v| v == TOKEN), "{:?}", later.secret_values);
-        // A new service on the same folder finds the servers unstarted: its first turn is the first start.
-        let fresh = service_on(&f.dir, &f.store);
-        let first = fresh.for_turn().unwrap();
-        assert!(first.first_start);
-        assert!(first.secret_values.iter().any(|v| v == TOKEN));
-        fresh.shutdown();
+        let turn = f.mcp.for_turn().unwrap();
+        assert!(turn.secret_values.iter().any(|v| v == TOKEN), "{:?}", turn.secret_values);
+        f.mcp.shutdown();
+    }
+
+    /// A loopback server that accepts connections and never answers, so its connect stays `Connecting` until a timeout.
+    fn silent_server_url() -> (TcpListener, String) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        (listener, url)
+    }
+
+    #[test]
+    fn settle_returns_at_once_when_no_server_is_connecting() {
+        let f = fixture();
+        let cancel = TurnCancel::new();
+        // No servers at all.
+        let turn = f.mcp.for_turn().unwrap();
+        let started = Instant::now();
+        turn.settle_within(&cancel, Duration::from_secs(60));
+        assert!(started.elapsed() < Duration::from_secs(1), "settle waited with no server");
+        // A disabled server is never connecting.
+        let mut config = stdio("fetch", &[]);
+        config.enabled = false;
+        f.mcp.save_server(input(config, &[], &[])).unwrap();
+        let turn = f.mcp.for_turn().unwrap();
+        let started = Instant::now();
+        turn.settle_within(&cancel, Duration::from_secs(60));
+        assert!(started.elapsed() < Duration::from_secs(1), "settle waited for a disabled server");
         f.mcp.shutdown();
     }
 
     #[test]
-    fn settle_returns_at_once_when_the_turn_is_already_cancelled() {
+    fn settle_is_bounded_by_its_wait_for_a_server_that_stays_connecting() {
         let f = fixture();
-        f.mcp.import(&paste("fetch")).unwrap();
-        let fresh = service_on(&f.dir, &f.store);
-        let turn = fresh.for_turn().unwrap();
-        assert!(turn.first_start);
+        let (_listener, url) = silent_server_url();
+        f.mcp.save_server(input(http("slow", &url, &[]), &[], &[])).unwrap();
+        let turn = f.mcp.for_turn().unwrap();
+        let started = Instant::now();
+        turn.settle_within(&TurnCancel::new(), Duration::from_millis(400));
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(400), "settle returned early: {waited:?}");
+        assert!(waited < Duration::from_secs(10), "settle ignored its wait: {waited:?}");
+        let states: Vec<ServerState> = turn.manager.status().into_iter().map(|s| s.state).collect();
+        assert_eq!(states, [ServerState::Connecting], "the silent server should still be connecting");
+        f.mcp.shutdown();
+    }
+
+    #[test]
+    fn settle_stops_at_once_when_the_turn_is_cancelled() {
+        let f = fixture();
+        let (_listener, url) = silent_server_url();
+        f.mcp.save_server(input(http("slow", &url, &[]), &[], &[])).unwrap();
+        let turn = f.mcp.for_turn().unwrap();
         let cancel = TurnCancel::new();
         cancel.cancel();
         let started = Instant::now();
-        turn.settle(&cancel);
-        assert!(started.elapsed() < FIRST_CONNECT_WAIT, "settle waited after a cancel");
-        fresh.shutdown();
+        turn.settle_within(&cancel, Duration::from_secs(60));
+        assert!(started.elapsed() < Duration::from_secs(1), "settle waited after a cancel");
         f.mcp.shutdown();
+    }
+
+    #[test]
+    fn a_hand_edit_is_applied_on_the_next_turn_and_view_without_a_mutation() {
+        let f = fixture();
+        f.mcp.import(&paste("fetch")).unwrap();
+        let server_names = |manager: &McpManager| -> Vec<String> {
+            let mut names: Vec<String> = manager.status().into_iter().map(|s| s.name).collect();
+            names.sort();
+            names
+        };
+        // Edit settings.json by hand, then reload it. No mcp_* command runs.
+        hand_edit_servers(&f, vec![stdio("ctx", &[])]);
+        let turn = f.mcp.for_turn().unwrap();
+        assert_eq!(server_names(&turn.manager), ["ctx"]);
+        hand_edit_servers(&f, vec![stdio("fetch", &[]), stdio("ctx", &[])]);
+        let view = f.mcp.view().unwrap();
+        assert_eq!(names(&view), ["fetch", "ctx"]);
+        assert_eq!(server_names(&f.mcp.for_turn().unwrap().manager), ["ctx", "fetch"]);
+        f.mcp.shutdown();
+    }
+
+    #[test]
+    fn unchanged_settings_are_not_applied_again() {
+        let f = fixture();
+        f.mcp.import(&paste("fetch")).unwrap();
+        let applies = |f: &Fixture| lock(&f.mcp.started).applies;
+        let before = applies(&f);
+        f.mcp.for_turn().unwrap();
+        f.mcp.view().unwrap();
+        f.mcp.view().unwrap();
+        assert_eq!(applies(&f), before, "unchanged settings were applied again");
+        hand_edit_servers(&f, vec![stdio("ctx", &[])]);
+        f.mcp.for_turn().unwrap();
+        assert_eq!(applies(&f), before + 1, "a changed file was not applied");
+        f.mcp.shutdown();
+    }
+
+    /// Writes the MCP servers into settings.json by hand, then reloads the settings as the app does.
+    fn hand_edit_servers(f: &Fixture, servers: Vec<McpServerConfig>) {
+        let path = settings_path(f.dir.path());
+        let mut file: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        file["mcp"] = serde_json::to_value(McpSettings { servers }).unwrap();
+        fs::write(&path, serde_json::to_string_pretty(&file).unwrap()).unwrap();
+        f.mcp.settings.reload().unwrap();
     }
 
     #[test]
@@ -703,6 +796,31 @@ mod tests {
 
     fn node_available() -> bool {
         Command::new("node").arg("--version").output().is_ok_and(|o| o.status.success())
+    }
+
+    #[test]
+    fn settle_returns_once_a_connecting_node_fixture_server_connects() {
+        if !node_available() {
+            eprintln!("SKIPPED: `node` is not on PATH; the settle fixture test did not run");
+            return;
+        }
+        let f = fixture();
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp/server.cjs");
+        let mut config = stdio("fixture", &[]);
+        config.transport = McpTransport::Stdio {
+            command: "node".into(),
+            args: vec![script.to_string_lossy().into_owned()],
+            cwd: None,
+            env: vec![],
+        };
+        f.mcp.save_server(input(config, &[], &[])).unwrap();
+        let turn = f.mcp.for_turn().unwrap();
+        let started = Instant::now();
+        turn.settle_within(&TurnCancel::new(), Duration::from_secs(60));
+        assert!(started.elapsed() < Duration::from_secs(60), "settle ran to its wait");
+        let states: Vec<ServerState> = turn.manager.status().into_iter().map(|s| s.state).collect();
+        assert!(matches!(states.as_slice(), [ServerState::Connected { .. }]), "{states:?}");
+        f.mcp.shutdown();
     }
 
     #[test]
