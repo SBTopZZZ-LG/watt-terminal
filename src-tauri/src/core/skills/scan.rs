@@ -8,7 +8,7 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use super::frontmatter;
-use super::{Root, Shadowed, Skill, SkillIndex, Source};
+use super::{Root, Shadowed, Skill, SkillIndex, SkillLevel, Source};
 
 pub const SKILL_FILE: &str = "SKILL.md";
 /// Most skills loaded across all roots. Once reached, the rest are not loaded and one warning says so.
@@ -117,7 +117,7 @@ fn load(dir: &Path, source: Source) -> Result<Skill, String> {
         .flag("disable-model-invocation")
         .or_else(|| parsed.flag("disable_model_invocation"))
         .unwrap_or(false);
-    Ok(Skill { name: name.to_string(), description, source, dir: dir.to_path_buf(), model_invocable: !disabled, enabled: true })
+    Ok(Skill { name: name.to_string(), description, source, dir: dir.to_path_buf(), model_invocable: !disabled, enabled: true, level: SkillLevel::Ask })
 }
 
 #[cfg(test)]

@@ -230,7 +230,7 @@ export const api = {
   setLimitsSettings(input: LimitsSettings) {
     return invoke<SettingsView>('set_limits_settings', { input });
   },
-  /** Saves the skill folders (null: the defaults) and the switched-off skills. Refused while settings.json is broken, or when a folder is refused. */
+  /** Saves the skill folders (null: the defaults), the switched-off skills and the approval levels. Refused while settings.json is broken, or when a folder is refused. */
   setSkillsSettings(input: SkillsSettingsInput) {
     return invoke<SettingsView>('set_skills_settings', { input });
   },

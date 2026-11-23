@@ -1161,7 +1161,9 @@ fn skill_root(tag: &str) -> std::path::PathBuf {
 #[test]
 fn skill_tool_is_a_read_and_the_system_message_lists_the_skill() {
     let root = skill_root("loads");
-    let index = skills::scan(&[Root { dir: root.clone(), source: skills::Source::Watt }]);
+    let mut index = skills::scan(&[Root { dir: root.clone(), source: skills::Source::Watt }]);
+    // The default approval level (auto): a skill loads with no card.
+    index.apply_levels(skills::SkillLevel::Auto, &Default::default());
     let provider = serve(vec![
         Script::json(tool_reply(&[
             ("call_s1", "skill", r#"{"name":"demo"}"#),
@@ -1195,6 +1197,88 @@ fn skill_tool_is_a_read_and_the_system_message_lists_the_skill() {
     assert_eq!(tool_content(&msgs, "call_s2"), "echo ok");
     assert!(tool_content(&msgs, "call_s3").starts_with("error: unknown skill 'nope'. Available: demo"));
     assert!(!serde_json::to_string(&msgs).unwrap().contains("reusable instruction packs"), "the listing is never stored");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Runs one turn with a gate that answers every approval card with `approve`, and returns the events.
+fn turn_approving(agent: &mut LlmAgent, tools: &FakeTools, gate: &ApprovalGate, text: &str, approve: bool) -> Vec<AgentEvent> {
+    let log: Mutex<Vec<AgentEvent>> = Mutex::new(Vec::new());
+    let emit = |ev: AgentEvent| {
+        if let AgentEvent::ApprovalRequest { call_id, .. } = &ev {
+            assert!(gate.decide(call_id, approve), "the card is waiting");
+        }
+        log.lock().unwrap().push(ev);
+    };
+    let ctx = AgentCtx::new(tools, gate, &emit);
+    agent::run_turn(agent, &UserMessage::text(text), &ctx);
+    log.into_inner().unwrap()
+}
+
+/// A skill set to ask: the first call asks once, and the same skill's later calls in the turn (its file too) run with no
+/// card. An unknown name is refused without a card.
+#[test]
+fn a_skill_set_to_ask_is_approved_once_for_the_turn() {
+    let root = skill_root("ask-once");
+    let mut index = skills::scan(&[Root { dir: root.clone(), source: skills::Source::Watt }]);
+    index.apply_levels(skills::SkillLevel::Ask, &Default::default());
+    let provider = serve(vec![
+        Script::json(tool_reply(&[
+            ("call_a1", "skill", r#"{"name":"demo"}"#),
+            ("call_a2", "skill", r#"{"name":"demo","file":"scripts/check.sh"}"#),
+            ("call_a3", "skill", r#"{"name":"nope"}"#),
+        ])),
+        Script::json(text_reply("done")),
+    ]);
+    let conv = Conversation::new().unwrap();
+    let tools = FakeTools::default();
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new())).with_skills(Arc::new(index));
+    let gate = no_gate();
+    let events = turn_approving(&mut agent, &tools, &gate, "use the demo skill", true);
+
+    assert!(tools.reached().is_empty(), "skill reached the backend: {:?}", tools.reached());
+    let cards: Vec<(String, Option<String>)> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ApprovalRequest { name, display, reason, .. } => Some((format!("{name}:{}", display.clone().unwrap_or_default()), reason.map(str::to_string))),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(cards, [("skill:Load skill \"demo\"".to_string(), Some("skill_read".to_string()))]);
+    assert_eq!(
+        decisions(&events),
+        [("skill".to_string(), "manual", true), ("skill".to_string(), "read", true), ("skill".to_string(), "read", false)]
+    );
+    let msgs = stored(&conv.history());
+    assert_paired(&msgs);
+    assert_eq!(tool_content(&msgs, "call_a2"), "echo ok");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A declined skill is not loaded, and the turn goes on: the model gets the decline as the tool result and answers.
+#[test]
+fn a_declined_skill_does_not_stop_the_turn() {
+    let root = skill_root("declined");
+    let mut index = skills::scan(&[Root { dir: root.clone(), source: skills::Source::Watt }]);
+    index.apply_levels(skills::SkillLevel::Ask, &Default::default());
+    let provider = serve(vec![
+        Script::json(tool_reply(&[("call_d1", "skill", r#"{"name":"demo"}"#)])),
+        Script::json(text_reply("carrying on without it")),
+    ]);
+    let conv = Conversation::new().unwrap();
+    let tools = FakeTools::default();
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new())).with_skills(Arc::new(index));
+    let gate = no_gate();
+    let events = turn_approving(&mut agent, &tools, &gate, "use the demo skill", false);
+
+    assert_eq!(decisions(&events), [("skill".to_string(), "denied", false)]);
+    assert!(
+        !events.iter().any(|e| matches!(e, AgentEvent::Text { text } if text.starts_with("Stopped"))),
+        "a declined skill must not stop the turn"
+    );
+    assert_eq!(provider.requests().len(), 2, "the model answers after the decline");
+    let msgs = stored(&conv.history());
+    assert_paired(&msgs);
+    assert!(tool_content(&msgs, "call_d1").starts_with("error: the user did not approve loading skill 'demo'"), "{msgs:?}");
     let _ = std::fs::remove_dir_all(&root);
 }
 

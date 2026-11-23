@@ -1461,6 +1461,7 @@ mod tests {
         settings.skills = SkillsSettings {
             folders: Some(vec!["~/team/skills".into(), ".agents/skills".into()]),
             disabled: vec!["pdf-tools".into()],
+            ..Default::default()
         };
         save(dir.path(), &settings).unwrap();
         assert_eq!(load(dir.path()).unwrap().skills, settings.skills);

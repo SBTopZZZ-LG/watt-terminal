@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   MAX_SKILL_FOLDERS,
+  LEVEL_LABEL,
   MAX_SKILL_FOLDER_CHARS,
   addFolder,
   folderProblem,
@@ -8,6 +9,7 @@ import {
   rowsProblem,
   saveInput,
   setFolder,
+  setOverride,
   setSwitch,
   shadowNote,
 } from './skillFolders';
@@ -50,8 +52,23 @@ describe('skill switches', () => {
 
 describe('save input', () => {
   it('trims folders and sends null for the defaults', () => {
-    expect(saveInput([' ~/a ', '/b'], ['pdf'])).toEqual({ folders: ['~/a', '/b'], disabled: ['pdf'] });
-    expect(saveInput(null, [])).toEqual({ folders: null, disabled: [] });
+    const kept = { approval: 'ask' as const, overrides: { pdf: 'auto' as const } };
+    expect(saveInput([' ~/a ', '/b'], ['pdf'], kept)).toEqual({ folders: ['~/a', '/b'], disabled: ['pdf'], ...kept });
+    expect(saveInput(null, [], { approval: 'auto', overrides: {} })).toEqual({ folders: null, disabled: [], approval: 'auto', overrides: {} });
+  });
+
+  it('a folder or switch save keeps the approval levels, and an override is set or removed by name', () => {
+    const view = { approval: 'ask' as const, overrides: { git: 'auto' as const } };
+    expect(saveInput(null, ['pdf'], view).overrides).toEqual({ git: 'auto' });
+    expect(setOverride({ git: 'auto' }, 'pdf', 'ask')).toEqual({ git: 'auto', pdf: 'ask' });
+    expect(setOverride({ git: 'auto', pdf: 'ask' }, 'pdf', null)).toEqual({ git: 'auto' });
+    const before = { git: 'auto' as const };
+    setOverride(before, 'git', null);
+    expect(before).toEqual({ git: 'auto' });
+  });
+
+  it('names the approval levels the way the settings do', () => {
+    expect(LEVEL_LABEL).toEqual({ ask: 'Ask first', auto: "Don't ask" });
   });
 
   it('names the shadowing folder in the note', () => {

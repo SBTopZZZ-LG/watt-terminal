@@ -247,9 +247,9 @@ mod tests {
     #[test]
     fn no_saved_folders_means_the_four_defaults() {
         assert_eq!(defaults(), ["~/.agents/skills", "~/.claude/skills", ".agents/skills", ".claude/skills"]);
-        let saved = SkillsSettings { folders: Some(vec!["/x".into()]), disabled: Vec::new() };
+        let saved = SkillsSettings { folders: Some(vec!["/x".into()]), ..Default::default() };
         assert_eq!(configured(&saved), ["/x"]);
-        let empty = SkillsSettings { folders: Some(Vec::new()), disabled: Vec::new() };
+        let empty = SkillsSettings { folders: Some(Vec::new()), ..Default::default() };
         assert!(configured(&empty).is_empty(), "a saved empty list means no user folders");
     }
 

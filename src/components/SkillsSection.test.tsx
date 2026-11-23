@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { SkillsSection, SKILL_DESCRIPTION_CHARS } from './SkillsSection';
 import type { SkillsSectionProps } from './SkillsSection';
-import type { SkillsView } from '../lib/types';
+import type { SkillView, SkillsView } from '../lib/types';
 
 const NOOP = () => undefined;
 
@@ -17,12 +17,14 @@ const VIEW: SkillsView = {
   ],
   using_defaults: false,
   disabled: ['deploy'],
+  approval: 'auto',
+  overrides: {},
   warnings: ['broken/SKILL.md: missing description'],
   skills: [
-    { name: 'review-pr', description: 'Review a pull request', source: 'user', path: 'C:/skills/review-pr', model_invocable: true, enabled: true, shadowed_by: null },
-    { name: 'deploy', description: 'Ship it', source: 'project', path: 'C:/repo/.claude/skills/deploy', model_invocable: false, enabled: false, shadowed_by: null },
-    { name: 'watt-help', description: 'Built in help', source: 'watt', path: 'C:/cfg/skills/watt-help', model_invocable: true, enabled: true, shadowed_by: null },
-    { name: 'review-pr', description: 'Old copy', source: 'project', path: 'C:/repo/.agents/skills/review-pr', model_invocable: true, enabled: true, shadowed_by: 'C:/skills' },
+    { name: 'review-pr', description: 'Review a pull request', source: 'user', path: 'C:/skills/review-pr', model_invocable: true, enabled: true, approval: 'auto', override: null, shadowed_by: null },
+    { name: 'deploy', description: 'Ship it', source: 'project', path: 'C:/repo/.claude/skills/deploy', model_invocable: false, enabled: false, approval: 'auto', override: null, shadowed_by: null },
+    { name: 'watt-help', description: 'Built in help', source: 'watt', path: 'C:/cfg/skills/watt-help', model_invocable: true, enabled: true, approval: 'auto', override: null, shadowed_by: null },
+    { name: 'review-pr', description: 'Old copy', source: 'project', path: 'C:/repo/.agents/skills/review-pr', model_invocable: true, enabled: true, approval: 'auto', override: null, shadowed_by: 'C:/skills' },
   ],
 };
 
@@ -69,6 +71,18 @@ describe('SkillsSection', () => {
     // One switch per skill in use (three); none for the shadowed one.
     expect(html.split('type="checkbox"').length).toBe(4);
     expect(html).toContain('switched off');
+  });
+
+  it('shows the global approval level and a level per skill in use, not for the shadowed one', () => {
+    const html = render({ view: { ...VIEW, approval: 'ask', overrides: { 'watt-help': 'auto' }, skills: VIEW.skills.map((s): SkillView => (s.name === 'watt-help' ? { ...s, approval: 'auto', override: 'auto' } : { ...s, approval: 'ask' })) } });
+    expect(html).toContain('Loading skills');
+    expect(html).toContain('<option value="ask" selected="">Ask first</option>');
+    expect(html).toContain('<option value="auto">Don&#x27;t ask</option>');
+    // The global select, then one select per skill in use (three).
+    expect(html.split('<select').length).toBe(5);
+    expect(html).toContain('aria-label="Loading review-pr"');
+    expect(html).toContain('<option value="global">Global default (Ask first)</option>');
+    expect(html).toContain('<option value="auto" selected="">Don&#x27;t ask</option>');
   });
 
   it('marks a shadowed skill with its note and no switch', () => {

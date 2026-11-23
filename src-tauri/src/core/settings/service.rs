@@ -855,6 +855,7 @@ mod tests {
         VariantSource, last_good_path, load, save as save_file,
     };
     use super::*;
+    use crate::core::skills::SkillLevel;
 
     const KEY: &str = "DUMMY-key-0123456789abcdef";
     const HEADER: &str = "DUMMY-header-fedcba9876543210";
@@ -1178,14 +1179,23 @@ mod tests {
     fn skill_settings_are_saved_read_back_and_refused_while_broken() {
         let f = fixture();
         assert_eq!(f.service.skills_settings(), Ok(SkillsSettings::default()), "no file: the defaults");
-        let saved = SkillsSettings { folders: Some(vec!["~/shared".into()]), disabled: vec!["pdf".into()] };
+        let saved = SkillsSettings { folders: Some(vec!["~/shared".into()]), disabled: vec!["pdf".into()], ..Default::default() };
         let view = f.service.set_skills(saved.clone()).unwrap();
         assert_eq!(view.settings.skills, saved);
         assert_eq!(service_on(&f.dir, &f.store).skills_settings(), Ok(saved.clone()), "a new service reads it back");
 
-        let bad = SkillsSettings { folders: Some(vec!["".into()]), disabled: Vec::new() };
+        // The approval levels save with the folders and the switched-off skills, and a save keeps all of them.
+        let approvals = SkillsSettings {
+            approval: SkillLevel::Ask,
+            overrides: [("git".to_string(), SkillLevel::Auto)].into_iter().collect(),
+            ..saved.clone()
+        };
+        f.service.set_skills(approvals.clone()).unwrap();
+        assert_eq!(service_on(&f.dir, &f.store).skills_settings(), Ok(approvals.clone()), "approvals read back");
+
+        let bad = SkillsSettings { folders: Some(vec!["".into()]), ..Default::default() };
         assert!(f.service.set_skills(bad).unwrap_err().contains("skill folder 1 is empty"));
-        assert_eq!(f.service.skills_settings(), Ok(saved.clone()), "a refused change saved nothing");
+        assert_eq!(f.service.skills_settings(), Ok(approvals.clone()), "a refused change saved nothing");
 
         break_settings(&f);
         let service = service_on(&f.dir, &f.store);

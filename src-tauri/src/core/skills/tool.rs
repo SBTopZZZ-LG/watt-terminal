@@ -10,12 +10,14 @@ use serde_json::{Value, json};
 
 use super::frontmatter;
 use super::scan::{SKILL_FILE, MAX_SKILL_FILE, read_skill_md};
-use super::{Skill, SkillIndex};
+use super::{Skill, SkillIndex, SkillLevel, Source};
 use crate::core::tools::ToolSchema;
 
 pub const TOOL_NAME: &str = "skill";
 /// The most text a skill body or a file is shown with. Longer text is cut at a character boundary, with a notice.
 pub const TEXT_LIMIT: usize = 32 * 1024;
+/// The most of the skill's description the approval card shows.
+const CARD_TEXT_LIMIT: usize = 1000;
 /// Bytes kept free for the truncation notice, so a cut text stays within its limit.
 const NOTICE_RESERVE: usize = 64;
 /// The most relative paths listed after a body.
@@ -50,6 +52,58 @@ pub fn schema() -> ToolSchema {
 /// Runs one `skill` call against the turn's index. The text is what the model reads back. An unknown name, or a skill the
 /// model may not load, is an error that names the skills it may load.
 pub fn run(index: &SkillIndex, args: &Value) -> Result<String, String> {
+    let request = request(index, args)?;
+    match &request.file {
+        None => body(request.skill),
+        Some(file) => file_text(request.skill, file),
+    }
+}
+
+/// A `skill` call the gate may ask about (see `AgentCtx::call_skill`): the skill's name and level, and what the card shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Checked {
+    pub name: String,
+    pub level: SkillLevel,
+    /// The card's text: the description, where the skill lives, and the file read, if any.
+    pub text: String,
+    /// The card's one-line summary, such as `Load skill "pdf"`.
+    pub display: String,
+}
+
+/// Checks a `skill` call before anything is read, with the refusals `run` gives. Only a call that `run` would accept gets a
+/// card; the file path is checked too, so a path that leaves the folder is refused without asking.
+pub fn check(index: &SkillIndex, args: &Value) -> Result<Checked, String> {
+    let request = request(index, args)?;
+    let skill = request.skill;
+    let source = match skill.source {
+        Source::Watt => "Watt's skills folder",
+        Source::User => "a user skills folder",
+        Source::Project => "the project's skills folder",
+    };
+    let mut text = format!(
+        "{}\nFrom {source}.\nSKILL.md: {}",
+        cap_text(&skill.description, CARD_TEXT_LIMIT),
+        skill.dir.join(SKILL_FILE).display()
+    );
+    let display = match &request.file {
+        None => format!("Load skill \"{}\"", skill.name),
+        Some(file) => {
+            text.push_str(&format!("\nFile: {}", echo(file)));
+            format!("Read \"{}\" from skill \"{}\"", echo(file), skill.name)
+        }
+    };
+    Ok(Checked { name: skill.name.clone(), level: skill.level, text, display })
+}
+
+/// A `skill` call that names a skill the model may load, and the file in its folder it asks for (None: the instructions).
+struct Request<'a> {
+    skill: &'a Skill,
+    file: Option<String>,
+}
+
+/// Reads the arguments of a `skill` call against the index: the skill must be known, on and model-invocable, and `file`, when
+/// given, must be a string and a path relative to the skill folder.
+fn request<'a>(index: &'a SkillIndex, args: &Value) -> Result<Request<'a>, String> {
     let name = args
         .get("name")
         .and_then(Value::as_str)
@@ -60,12 +114,16 @@ pub fn run(index: &SkillIndex, args: &Value) -> Result<String, String> {
         Some(skill) => skill,
         None => return Err(unavailable(index, name)),
     };
-    match args.get("file") {
-        None | Some(Value::Null) => body(skill),
-        Some(Value::String(file)) if file.trim().is_empty() => body(skill),
-        Some(Value::String(file)) => file_text(skill, file.trim()),
-        Some(_) => Err("`file` must be a string: a path relative to the skill folder".to_string()),
-    }
+    let file = match args.get("file") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(file)) if file.trim().is_empty() => None,
+        Some(Value::String(file)) => {
+            relative_path(file.trim())?;
+            Some(file.trim().to_string())
+        }
+        Some(_) => return Err("`file` must be a string: a path relative to the skill folder".to_string()),
+    };
+    Ok(Request { skill, file })
 }
 
 /// Cuts `text` to at most `limit` bytes, at a character boundary, and says how many bytes were left out.
@@ -395,5 +453,45 @@ mod tests {
         assert_eq!(schema.name, TOOL_NAME);
         assert_eq!(schema.parameters["required"], json!(["name"]));
         assert!(schema.parameters["properties"].get("file").is_some());
+    }
+
+    #[test]
+    fn check_describes_the_card_and_refuses_what_run_refuses() {
+        let tmp = TempDir::new();
+        let dir = skill_folder(&tmp, "demo", DEMO);
+        fs::create_dir_all(dir.join("scripts")).unwrap();
+        skill_folder(&tmp, "manual", "---\nname: manual\ndescription: Only when asked\ndisable-model-invocation: true\n---\nBody\n");
+        skill_folder(&tmp, "off", "---\nname: off\ndescription: Off\n---\nBody\n");
+        let mut index = index_of(tmp.path());
+        index.apply_disabled(&["off".to_string()]);
+        index.apply_levels(SkillLevel::Ask, &Default::default());
+
+        let card = check(&index, &json!({"name": "demo"})).expect("checked");
+        assert_eq!(card.name, "demo");
+        assert_eq!(card.level, SkillLevel::Ask);
+        assert_eq!(card.display, "Load skill \"demo\"");
+        assert!(card.text.starts_with("Demo skill\nFrom a user skills folder.\nSKILL.md: "), "{}", card.text);
+        assert!(card.text.ends_with(&dir.join(SKILL_FILE).display().to_string()), "{}", card.text);
+
+        let file = check(&index, &json!({"name": "demo", "file": "scripts/check.sh"})).expect("checked");
+        assert_eq!(file.display, "Read \"scripts/check.sh\" from skill \"demo\"");
+        assert!(file.text.ends_with("\nFile: scripts/check.sh"), "{}", file.text);
+
+        assert!(check(&index, &json!({"name": "manual"})).unwrap_err().starts_with("unknown skill 'manual'"));
+        assert!(check(&index, &json!({"name": "off"})).unwrap_err().contains("switched off"));
+        assert!(check(&index, &json!({"name": "nope"})).unwrap_err().starts_with("unknown skill 'nope'"));
+        assert!(check(&index, &json!({"name": "demo", "file": "../secret.txt"})).unwrap_err().contains("`..`"));
+        assert!(check(&index, &json!({"name": "demo", "file": 3})).unwrap_err().contains("must be a string"));
+    }
+
+    #[test]
+    fn check_carries_the_level_of_the_skill() {
+        let tmp = TempDir::new();
+        skill_folder(&tmp, "demo", DEMO);
+        let mut index = index_of(tmp.path());
+        index.apply_levels(SkillLevel::Auto, &[("demo".to_string(), SkillLevel::Ask)].into_iter().collect());
+        assert_eq!(check(&index, &json!({"name": "demo"})).unwrap().level, SkillLevel::Ask);
+        index.apply_levels(SkillLevel::Auto, &Default::default());
+        assert_eq!(check(&index, &json!({"name": "demo"})).unwrap().level, SkillLevel::Auto);
     }
 }

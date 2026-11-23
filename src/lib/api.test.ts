@@ -161,10 +161,12 @@ describe('api skills commands', () => {
     expect(invoke).toHaveBeenLastCalledWith('list_skills', { sessionId: 'main' });
   });
 
-  it('setSkillsSettings sends the folders (null for the defaults) and the switched-off names as one input', () => {
-    void api.setSkillsSettings({ folders: ['~/team/skills'], disabled: ['pdf'] });
-    expect(invoke).toHaveBeenLastCalledWith('set_skills_settings', { input: { folders: ['~/team/skills'], disabled: ['pdf'] } });
-    void api.setSkillsSettings({ folders: null, disabled: [] });
-    expect(invoke).toHaveBeenLastCalledWith('set_skills_settings', { input: { folders: null, disabled: [] } });
+  it('setSkillsSettings sends the folders (null for the defaults), the switched-off names and the approval levels as one input', () => {
+    void api.setSkillsSettings({ folders: ['~/team/skills'], disabled: ['pdf'], approval: 'ask', overrides: { pdf: 'auto' } });
+    expect(invoke).toHaveBeenLastCalledWith('set_skills_settings', {
+      input: { folders: ['~/team/skills'], disabled: ['pdf'], approval: 'ask', overrides: { pdf: 'auto' } },
+    });
+    void api.setSkillsSettings({ folders: null, disabled: [], approval: 'auto', overrides: {} });
+    expect(invoke).toHaveBeenLastCalledWith('set_skills_settings', { input: { folders: null, disabled: [], approval: 'auto', overrides: {} } });
   });
 });

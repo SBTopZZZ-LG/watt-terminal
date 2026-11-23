@@ -10,9 +10,9 @@ export function isFileWrite(name: string): boolean {
   return name === 'write_file' || name === 'edit_file';
 }
 
-/** Whether the card shows its `display` instead of the command: send_keys, an external tool, or a file write. */
+/** Whether the card shows its `display` instead of the command: send_keys, an external tool, a skill, or a file write. */
 export function showsDisplay(name: string, reason: ApprovalReasonCode | null): boolean {
-  return name === 'send_keys' || reason === 'external_tool' || isFileWrite(name);
+  return name === 'send_keys' || reason === 'external_tool' || reason === 'skill_read' || isFileWrite(name);
 }
 
 /**

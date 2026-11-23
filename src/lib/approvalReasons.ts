@@ -32,6 +32,7 @@ const ASK_CLAUSE: Record<Exclude<AskReasonCode, 'unintegrated_shell'>, string> =
   approve_all_suspended: `${BYPASS_LABEL} is off in this shell, because it was turned on in another shell.`,
   external_tool: 'this tool is not part of the terminal, so it needs your approval before it runs.',
   fs_write: 'writing a file changes it on disk, so each write needs your approval.',
+  skill_read: 'loading this skill asks first.',
 };
 
 /** Reasons that are a whole sentence on their own, so the card shows them as they are (no "Asked because"). */
