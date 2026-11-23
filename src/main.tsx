@@ -4,6 +4,7 @@ import "@fontsource/ibm-plex-mono/latin-400.css";
 import "@fontsource/ibm-plex-mono/latin-500.css";
 import "@fontsource/ibm-plex-mono/latin-600.css";
 import App from "./App";
+import { ImageViewerProvider } from "./components/ImageViewer";
 import { installDropGuard } from "./lib/dropGuard";
 import { installWebviewGuards } from "./lib/webviewGuards";
 
@@ -14,6 +15,8 @@ installWebviewGuards(document);
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
-    <App />
+    <ImageViewerProvider>
+      <App />
+    </ImageViewerProvider>
   </React.StrictMode>,
 );

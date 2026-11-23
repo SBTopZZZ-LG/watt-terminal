@@ -3609,6 +3609,139 @@ a {
   background: var(--scrim);
 }
 
+/* ---------- Image viewer: the open buttons on attachments, and the overlay ---------- */
+
+/* A chip's image (in the composer or a sent message) opens the viewer. The button is the thumbnail's frame. */
+.bar-attach-open,
+.msg-attach-open {
+  display: block;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  line-height: 0;
+  cursor: pointer;
+}
+
+.msg-attach-open {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  line-height: normal;
+}
+
+.bar-attach-open:hover,
+.msg-attach-open:hover {
+  outline: 1px solid var(--accent);
+}
+
+.bar-attach-open:focus-visible,
+.msg-attach-open:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* The overlay. Above the find bar and modals (10), below the tooltips (60); the toasts (40, 41) stay above it. */
+.image-viewer-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: var(--scrim);
+  animation: image-viewer-in 120ms ease-out;
+}
+
+@keyframes image-viewer-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .image-viewer-backdrop {
+    animation: none;
+  }
+}
+
+.image-viewer {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  max-height: 100%;
+  padding: 8px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  outline: none;
+}
+
+.image-viewer-close {
+  align-self: flex-end;
+  min-height: 24px;
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  background: var(--bg);
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.image-viewer-close:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.image-viewer-close:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.image-viewer-stage {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  min-height: 0;
+}
+
+.image-viewer-img {
+  display: block;
+  max-width: 100%;
+  object-fit: contain;
+  user-select: none;
+}
+
+.image-viewer-img.is-loading {
+  opacity: 0.55;
+}
+
+.image-viewer-status,
+.image-viewer-note {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.image-viewer-caption {
+  max-width: 90vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--muted);
+}
+
 /* ---------- AI settings dialog ---------- */
 
 /* The card. Its height is fixed (up to the window), so switching tabs does not resize it. The tab panel scrolls inside it, so

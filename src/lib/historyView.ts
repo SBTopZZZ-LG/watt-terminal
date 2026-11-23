@@ -79,9 +79,14 @@ function isTextPart(part: unknown): part is { type: 'text'; text: string } {
 /** A stored thumbnail is kept only as a PNG or JPEG data URL, the same check the backend makes. Anything else is no thumbnail. */
 const THUMB_URL = /^data:image\/(?:png|jpeg);base64,[A-Za-z0-9+/=]*$/;
 
+/** A stored image's content address (lowercase hex SHA-256) and the types it is stored as, as the backend checks them. */
+const STORED_SHA256 = /^[0-9a-f]{64}$/;
+const STORED_MIMES: ReadonlySet<string> = new Set(['image/png', 'image/jpeg']);
+
 /**
- * The attachments of a user message's array content: a watt_image (with its stored thumbnail, when it has one) or a watt_file.
- * Other parts are ignored. A missing name reads as "attachment"; a missing size as 0.
+ * The attachments of a user message's array content: a watt_image (with its stored thumbnail, when it has one, and its address
+ * and type when both are valid, so the full image can be opened) or a watt_file. Other parts are ignored. A missing name reads
+ * as "attachment"; a missing size as 0.
  */
 function attachmentsOf(content: unknown[]): UserAttachment[] {
   const out: UserAttachment[] = [];
@@ -94,7 +99,15 @@ function attachmentsOf(content: unknown[]): UserAttachment[] {
     const bytes = typeof p.bytes === 'number' && Number.isFinite(p.bytes) ? p.bytes : 0;
     if (p.type === 'watt_image') {
       const thumb = typeof p.thumb === 'string' && THUMB_URL.test(p.thumb) ? p.thumb : null;
-      out.push({ kind: 'image', name, bytes, ...(thumb !== null ? { thumb } : {}) });
+      const sha256 = typeof p.sha256 === 'string' && STORED_SHA256.test(p.sha256) ? p.sha256 : null;
+      const mime = typeof p.mime === 'string' && STORED_MIMES.has(p.mime) ? p.mime : null;
+      out.push({
+        kind: 'image',
+        name,
+        bytes,
+        ...(thumb !== null ? { thumb } : {}),
+        ...(sha256 !== null && mime !== null ? { sha256, mime } : {}),
+      });
     } else if (p.type === 'watt_file') {
       out.push({ kind: 'file', name, bytes });
     }

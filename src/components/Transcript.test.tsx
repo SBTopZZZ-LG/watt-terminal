@@ -378,6 +378,27 @@ describe('Transcript: attachments on a message the user sent', () => {
     expect(html).not.toContain('‮');
   });
 
+  it('a sent image with a thumbnail or a stored address opens the viewer; a placeholder with neither does not', () => {
+    const html = render([
+      {
+        type: 'user_sent',
+        clientId: 6,
+        text: 'x',
+        attachments: [
+          { kind: 'image', name: 'shot.png', bytes: 900, thumb: THUMB, sha256: 'a'.repeat(64), mime: 'image/png' },
+          { kind: 'image', name: 'stored.jpg', bytes: 900, sha256: 'b'.repeat(64), mime: 'image/jpeg' },
+          { kind: 'image', name: 'gone.png', bytes: 900 },
+          { kind: 'file', name: 'notes.md', bytes: 300 },
+        ],
+      },
+    ]);
+    expect(html).toContain('<button type="button" class="msg-attach-open" aria-label="View shot.png">');
+    expect(html).toContain('<button type="button" class="msg-attach-open" aria-label="View stored.jpg">');
+    expect(html).not.toContain('aria-label="View gone.png"');
+    expect(html).not.toContain('aria-label="View notes.md"');
+    expect(html.match(/msg-attach-open/g)).toHaveLength(2);
+  });
+
   it('a message with no attachments has no attachment row', () => {
     expect(render([{ type: 'user_sent', clientId: 5, text: 'plain' }])).not.toContain('msg-attachments');
   });

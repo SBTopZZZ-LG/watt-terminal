@@ -15,6 +15,7 @@ import {
   looksTruncated,
   loadOf,
   NO_LOAD,
+  sha256Hex,
   sniffDims,
   userAttachments,
 } from './attachments';
@@ -293,5 +294,30 @@ describe('userAttachments', () => {
       { kind: 'image', name: 'shot.png', bytes: 10, thumb: 'data:image/jpeg;base64,AAAA' },
       { kind: 'file', name: 'notes.md', bytes: 3, thumb: undefined },
     ]);
+  });
+
+  it('an image with a computed address keeps it and its type, for the full view', () => {
+    const sha = 'c'.repeat(64);
+    const out = userAttachments([{ name: 'shot.png', mime: 'image/png', kind: 'image', data_b64: bytesToBase64(new Uint8Array(4)), sha256: sha }]);
+    expect(out).toEqual([{ kind: 'image', name: 'shot.png', bytes: 4, thumb: undefined, sha256: sha, mime: 'image/png' }]);
+    expect(out?.[0]).toHaveProperty('sha256', sha);
+  });
+
+  it('an image without an address (the hash failed) has none, and a document never has one', () => {
+    const [image] = userAttachments([{ name: 'a.png', mime: 'image/png', kind: 'image', data_b64: bytesToBase64(new Uint8Array(4)) }]) ?? [];
+    expect(image).not.toHaveProperty('sha256');
+    expect(image).not.toHaveProperty('mime');
+    const [doc] = userAttachments([{ name: 'a.md', mime: 'text/plain', kind: 'text', data_b64: bytesToBase64(new Uint8Array(4)), sha256: 'd'.repeat(64) }]) ?? [];
+    expect(doc).not.toHaveProperty('sha256');
+  });
+});
+
+describe('sha256Hex', () => {
+  it('is the lowercase hex SHA-256 of the bytes (FIPS 180-2 test vector "abc")', async () => {
+    expect(await sha256Hex(new TextEncoder().encode('abc'))).toBe('ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
+  });
+
+  it('the empty input has its own digest', async () => {
+    expect(await sha256Hex(new Uint8Array(0))).toBe('e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855');
   });
 });
