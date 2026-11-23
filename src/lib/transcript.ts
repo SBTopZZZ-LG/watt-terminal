@@ -547,6 +547,9 @@ export function approvalTitle(name: string, reason: ApprovalReasonCode | null = 
       return 'The agent wants to write a file';
     case 'edit_file':
       return 'The agent wants to edit a file';
+    case 'skill':
+      // The card's display says which: `Load skill "x"`, or `Read "f" from skill "x"` for a file in a skill.
+      return display !== null && display.startsWith('Read ') ? 'The agent wants to read a file from a skill' : 'The agent wants to load a skill';
     default:
       return `The agent wants to use ${visibleEscapes(name)}`;
   }

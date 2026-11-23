@@ -133,7 +133,8 @@ function AddVariantForm({ modelId, off, onAdd }: { modelId: string; off: boolean
 }
 
 /**
- * The editor for one provider, drawn inline under its row. It holds no draft of its own: every edit is passed up. The only
+ * The editor for one provider, drawn in the editor sheet (its actions are ProviderEditorFoot, the sheet's footer). It holds no
+ * draft of its own: every edit is passed up. The only
  * state here is the text of the "add model" box. Secret inputs are plain controlled inputs: the typed value is in the draft,
  * and nothing is filled in from the store.
  */
@@ -161,7 +162,6 @@ export function ProviderEditor(p: ProviderEditorProps) {
   const keyInputShown = !draft.clearKey && (!draft.storedKey || draft.keyEditing);
   const newModelId = newModel.trim();
   const newModelTaken = draft.models.some((m) => m.id === newModelId);
-  const saveBlocked = off || !pending || hasProblems(p.problems);
   // A saved provider's key or secret headers would go to a changed host, so the editor says so. Never blocks a save.
   const hasStoredSecrets = p.saved !== null && (p.saved.storedKey || p.saved.storedHeaders.length > 0);
   const hostNotice = hostChangeNotice(p.saved, draft, hasStoredSecrets);
@@ -191,10 +191,11 @@ export function ProviderEditor(p: ProviderEditorProps) {
 
   return (
     <section className="settings-editor" aria-label={draft.isNew ? 'New provider' : `Provider ${draft.name}`}>
-      <div className="settings-editor-head">
-        <span className="settings-editor-title">{draft.isNew ? 'New provider' : draft.name}</span>
-        {dirty && <span className="settings-unsaved">Unsaved changes</span>}
-      </div>
+      {dirty && (
+        <div className="settings-editor-head">
+          <span className="settings-unsaved">Unsaved changes</span>
+        </div>
+      )}
 
       <div className="settings-fields">
         <div className="settings-field">
@@ -639,50 +640,65 @@ export function ProviderEditor(p: ProviderEditorProps) {
         </span>
       </div>
 
-      <div className="settings-editor-foot">
-        {p.saveError !== null && (
-          <div className="settings-error settings-error-block" role="alert">
-            {p.saveError}
-          </div>
-        )}
-        {hasProblems(p.problems) && <span className="settings-hint">Fix the fields marked above to save.</span>}
-        {p.askDiscard ? (
-          <div className="settings-inline">
-            <span className="settings-warn">Discard unsaved changes?</span>
-            <button type="button" className="settings-danger" onClick={p.onCancel}>
-              Discard
-            </button>
-            <button type="button" onClick={() => p.onAskDiscard(false)}>
-              Keep editing
-            </button>
-          </div>
-        ) : (
-          <div className="settings-inline">
-            <button type="button" className="settings-primary" disabled={saveBlocked} onClick={p.onSave}>
-              {p.saving ? 'Saving...' : 'Save provider'}
-            </button>
-            <button type="button" disabled={busy} onClick={() => (dirty ? p.onAskDiscard(true) : p.onCancel())}>
-              Cancel
-            </button>
-            {!draft.isNew &&
-              (p.askDelete ? (
-                <span className="settings-inline">
-                  <span className="settings-warn">Delete this provider and its stored keys?</span>
-                  <button type="button" className="settings-danger" disabled={off} onClick={p.onDelete}>
-                    Yes, delete
-                  </button>
-                  <button type="button" onClick={() => p.onAskDelete(false)}>
-                    No
-                  </button>
-                </span>
-              ) : (
-                <button type="button" className="settings-danger" disabled={off} onClick={() => p.onAskDelete(true)}>
-                  Delete provider
-                </button>
-              ))}
-          </div>
-        )}
-      </div>
     </section>
+  );
+}
+
+/**
+ * The provider editor's actions: Save, Cancel and Delete, with their inline confirms. It is the editor sheet's pinned footer,
+ * so it takes the same props as the editor and holds no state of its own.
+ */
+export function ProviderEditorFoot(p: ProviderEditorProps) {
+  const { draft } = p;
+  const dirty = isDirty(draft, p.saved);
+  const pending = draft.isNew || dirty;
+  const busy = p.saving || p.fetching;
+  const off = p.locked || busy;
+  const saveBlocked = off || !pending || hasProblems(p.problems);
+  return (
+    <div className="settings-editor-foot">
+      {p.saveError !== null && (
+        <div className="settings-error settings-error-block" role="alert">
+          {p.saveError}
+        </div>
+      )}
+      {hasProblems(p.problems) && <span className="settings-hint">Fix the fields marked above to save.</span>}
+      {p.askDiscard ? (
+        <div className="settings-inline">
+          <span className="settings-warn">Discard unsaved changes?</span>
+          <button type="button" className="settings-danger" onClick={p.onCancel}>
+            Discard
+          </button>
+          <button type="button" onClick={() => p.onAskDiscard(false)}>
+            Keep editing
+          </button>
+        </div>
+      ) : (
+        <div className="settings-inline">
+          <button type="button" className="settings-primary" disabled={saveBlocked} onClick={p.onSave}>
+            {p.saving ? 'Saving...' : 'Save provider'}
+          </button>
+          <button type="button" disabled={busy} onClick={() => (dirty ? p.onAskDiscard(true) : p.onCancel())}>
+            Cancel
+          </button>
+          {!draft.isNew &&
+            (p.askDelete ? (
+              <span className="settings-inline">
+                <span className="settings-warn">Delete this provider and its stored keys?</span>
+                <button type="button" className="settings-danger" disabled={off} onClick={p.onDelete}>
+                  Yes, delete
+                </button>
+                <button type="button" onClick={() => p.onAskDelete(false)}>
+                  No
+                </button>
+              </span>
+            ) : (
+              <button type="button" className="settings-danger" disabled={off} onClick={() => p.onAskDelete(true)}>
+                Delete provider
+              </button>
+            ))}
+        </div>
+      )}
+    </div>
   );
 }

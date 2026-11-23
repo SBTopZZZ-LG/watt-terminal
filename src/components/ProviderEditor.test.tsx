@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { ProviderEditor } from './ProviderEditor';
+import { ProviderEditor, ProviderEditorFoot } from './ProviderEditor';
 import type { ProviderEditorProps, TestState } from './ProviderEditor';
 import { draftFromPreset, draftFromProvider, draftNew, newHeaderDraft, renameHeader, toggleSecret } from '../lib/settingsForm';
 import type { DraftProblems, ProviderDraft, VariantDraft } from '../lib/settingsForm';
@@ -61,7 +61,14 @@ function props(over: Partial<ProviderEditorProps> = {}): ProviderEditorProps {
   };
 }
 
-const html = (over: Partial<ProviderEditorProps> = {}) => renderToStaticMarkup(<ProviderEditor {...props(over)} />);
+// The body and the footer (the editor sheet's pinned actions) together, as the sheet draws them.
+const html = (over: Partial<ProviderEditorProps> = {}) =>
+  renderToStaticMarkup(
+    <>
+      <ProviderEditor {...props(over)} />
+      <ProviderEditorFoot {...props(over)} />
+    </>,
+  );
 
 function escapeRe(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');

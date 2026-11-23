@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { SkillsSection, SKILL_DESCRIPTION_CHARS } from './SkillsSection';
+import { FolderSheet, SkillsSection, SKILL_DESCRIPTION_CHARS } from './SkillsSection';
 import type { SkillsSectionProps } from './SkillsSection';
 import type { SkillView, SkillsView } from '../lib/types';
 
@@ -53,12 +53,26 @@ describe('SkillsSection', () => {
     const html = render();
     expect(html).toContain('watt config');
     expect(html).toContain('C:/Users/me/AppData/Roaming/Watt/skills');
-    expect(html).toContain('found, locked');
-    expect(html).toContain('value="~/.claude/skills"');
-    expect(html).toContain('value="C:/Users/me/tools"');
+    expect(html).toContain('>found</span><span class="settings-tag settings-tag-muted">locked</span>');
+    expect(html).toContain('>~/.claude/skills</code>');
+    expect(html).toContain('>C:/Users/me/tools</code>');
     expect(html).toContain('not found');
     expect(html).toContain('blocked');
-    expect(html).toContain('aria-label="Skill folder 2"');
+    expect(html).toContain('aria-label="Edit C:/Users/me/tools"');
+  });
+
+  it('shows the resolved path under a folder only when it differs from the text as configured', () => {
+    const html = render();
+    // "~/.claude/skills" resolves to a different path: shown. "C:/Users/me/tools" is its own path: not repeated.
+    expect(html.split('class="settings-path"').length).toBe(2);
+    expect(html).toContain('class="settings-path">C:/Users/me/.claude/skills</span>');
+  });
+
+  it('a long folder or path is cut on one line with its full text in the title', () => {
+    const long = `C:/Users/someone/${'deeply-nested-folder/'.repeat(12)}skills`;
+    const html = render({ view: { ...VIEW, folders: [{ folder: long, path: long, status: 'found' }] } });
+    expect(html).toContain(`class="settings-truncate" title="${long}">${long}</code>`);
+    expect(html).toContain('settings-truncate');
   });
 
   it('lists each skill with its source, a switch, and the tag for a hidden one', () => {
@@ -75,7 +89,7 @@ describe('SkillsSection', () => {
 
   it('shows the global approval level and a level per skill in use, not for the shadowed one', () => {
     const html = render({ view: { ...VIEW, approval: 'ask', overrides: { 'watt-help': 'auto' }, skills: VIEW.skills.map((s): SkillView => (s.name === 'watt-help' ? { ...s, approval: 'auto', override: 'auto' } : { ...s, approval: 'ask' })) } });
-    expect(html).toContain('Loading skills');
+    expect(html).toContain('Loading a skill');
     expect(html).toContain('<option value="ask" selected="">Ask first</option>');
     expect(html).toContain('<option value="auto">Don&#x27;t ask</option>');
     // The global select, then one select per skill in use (three).
@@ -100,8 +114,34 @@ describe('SkillsSection', () => {
     const long = 'word '.repeat(100);
     const html = render({ view: { ...VIEW, skills: [{ ...VIEW.skills[0], description: long }] } });
     expect(html).toContain('…');
-    expect(html).not.toContain(long.trim());
+    // The text shown is cut; the full text is only in the title, for the hover.
+    expect(html).not.toContain(`>${long.trim()}<`);
+    expect(html).toContain(`title="${long.trim()}`);
+    expect(html).toContain('settings-clamp');
     expect(SKILL_DESCRIPTION_CHARS).toBe(200);
+  });
+
+  it('a shadowed skill is muted and has its note', () => {
+    const html = render();
+    expect(html).toContain('settings-card-muted');
+    expect(html).toContain('Hidden: the one in C:/skills is used instead.');
+  });
+
+  it('shows the approval hint in plain words', () => {
+    const html = render();
+    expect(html).toContain('Ask first: a card asks before a skill is loaded the first time in a turn.');
+  });
+
+  it('shows the folders searched when no skill is found', () => {
+    const html = render({ view: { ...VIEW, roots: [{ path: 'C:/cfg/skills', exists: false, source: 'watt' }], skills: [], warnings: [] } });
+    expect(html).toContain('Searched:');
+    expect(html).toContain('>C:/cfg/skills</code>');
+  });
+
+  it('a switched-off skill is dimmed and its approval select is off', () => {
+    const html = render();
+    expect(html).toContain('settings-card settings-skill is-off');
+    expect(html).toMatch(/<select aria-label="Loading deploy" disabled="">/);
   });
 
   it('says when no skills were found, and offers Refresh', () => {
@@ -131,5 +171,44 @@ describe('SkillsSection', () => {
 
   it('Refresh is off while a read runs', () => {
     expect(render({ loading: true })).toContain('Refreshing...');
+  });
+});
+
+describe('FolderSheet', () => {
+  const sheet = (index: number | null, draft: string, extra: Partial<{ submitted: boolean; saving: boolean; saveError: string | null }> = {}) =>
+    renderToStaticMarkup(
+      <FolderSheet
+        view={VIEW}
+        sheet={{ index, draft, submitted: extra.submitted ?? false }}
+        saving={extra.saving ?? false}
+        saveError={extra.saveError ?? null}
+        onDraft={NOOP}
+        onSubmit={NOOP}
+        onClose={NOOP}
+      />,
+    );
+
+  it('an add sheet is titled for adding, focuses its input, and cannot save an empty folder', () => {
+    const html = sheet(null, '');
+    expect(html).toContain('Add skill folder');
+    expect(html).toContain('data-autofocus');
+    expect(html).toContain('aria-label="Skill folder"');
+    expect(html).toMatch(/disabled=""[^>]*>Add folder<\/button>/);
+    expect(html).toContain('A folder that is not there yet is kept.');
+  });
+
+  it('an edit sheet is off Save until the folder changes', () => {
+    expect(sheet(0, '~/.claude/skills')).toMatch(/disabled=""[^>]*>Save folder<\/button>/);
+    expect(sheet(0, '~/other')).not.toMatch(/disabled=""[^>]*>Save folder<\/button>/);
+    expect(sheet(0, '~/other')).toContain('Skill folder</h3>');
+  });
+
+  it('shows why a folder cannot be kept, and a save error only after a save was sent', () => {
+    expect(sheet(null, '~/a')).not.toContain('role="alert"');
+    expect(sheet(null, 'a\0b')).toContain('A folder has a NUL character.');
+    expect(sheet(null, '~/.claude/skills')).toContain('That folder is already in the list.');
+    expect(sheet(1, '~/.claude/skills')).toContain('aria-invalid');
+    expect(sheet(null, '~/x', { submitted: true, saveError: 'boom' })).toContain('boom');
+    expect(sheet(null, '~/x', { saveError: 'boom' })).not.toContain('boom');
   });
 });
