@@ -122,6 +122,11 @@ describe('api MCP commands', () => {
     expect(invoke).toHaveBeenCalledWith('get_mcp', undefined);
   });
 
+  it('getMcpStatus takes no arguments', () => {
+    void api.getMcpStatus();
+    expect(invoke).toHaveBeenCalledWith('get_mcp_status', undefined);
+  });
+
   it('mcpImport sends the pasted text as text', () => {
     void api.mcpImport('{"mcpServers": {}}');
     expect(invoke).toHaveBeenCalledWith('mcp_import', { text: '{"mcpServers": {}}' });

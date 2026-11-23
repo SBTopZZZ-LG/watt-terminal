@@ -546,6 +546,22 @@ export interface McpImportResult {
   warnings: string[];
 }
 
+/** One server in the composer's MCP list (get_mcp_status). No URL, argument, env or header value. `id` is the name. */
+export interface McpServerStatus {
+  id: string;
+  name: string;
+  enabled: boolean;
+  state: McpStateView;
+  /** The tools listed when it connected; 0 in any other state. */
+  tools: number;
+}
+
+/** The composer's MCP view. `starting` is true while an enabled server is connecting. */
+export interface McpStatus {
+  servers: McpServerStatus[];
+  starting: boolean;
+}
+
 /** One server as the settings UI saves it. Values are sent once and never returned. An absent name keeps its stored value. */
 export interface McpServerInput {
   config: McpServerConfig;

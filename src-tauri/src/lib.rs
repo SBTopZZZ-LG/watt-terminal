@@ -59,7 +59,7 @@ use crate::core::settings::service::{
 };
 use crate::core::settings::{AgentRequests, ApprovalSettings, IntegrationSettings, LimitsSettings, ModelRef, Nested};
 use crate::core::mcp::config::McpLevel;
-use crate::core::mcp::service::{McpImportResult, McpServerInput, McpService, McpView, TurnMcp};
+use crate::core::mcp::service::{McpImportResult, McpServerInput, McpService, McpStatus, McpView, TurnMcp};
 use crate::core::skills::{self, Places, SkillsSettings, SkillsView};
 use crate::core::tools::SessionTools;
 
@@ -258,8 +258,8 @@ impl SettingsState {
     }
 }
 
-/// The MCP servers (core/mcp/service.rs). `None` when the app folders could not be found, as for `SettingsState`. Nothing
-/// starts here: the runtime starts on the first MCP command or model turn.
+/// The MCP servers (core/mcp/service.rs). `None` when the app folders could not be found, as for `SettingsState`. The
+/// enabled servers start in the background at launch (`setup`); otherwise the runtime starts on the first MCP command or turn.
 struct McpState(Option<Arc<McpService>>);
 
 impl McpState {
@@ -1639,6 +1639,13 @@ async fn get_mcp(mcp: State<'_, McpState>) -> Result<McpView, String> {
     blocking(move || service.view()).await
 }
 
+/// The composer's MCP view: names, switches, states and tool counts. Never starts the servers, so it is cheap to poll.
+#[tauri::command]
+async fn get_mcp_status(mcp: State<'_, McpState>) -> Result<McpStatus, String> {
+    let service = mcp.get()?;
+    blocking(move || Ok(service.status())).await
+}
+
 /// Adds the servers of a pasted `mcpServers` list. Refused as a whole, naming the servers, when a name already exists.
 #[tauri::command]
 async fn mcp_import(text: String, mcp: State<'_, McpState>) -> Result<McpImportResult, String> {
@@ -1781,10 +1788,16 @@ pub fn run() {
         .setup(|app| {
             let persist = resolve_persist(app.handle()).map(Arc::new);
             app.manage(PersistState(persist));
-            // Loads settings.json only. The secret store is read on first use, so startup never touches the Keychain.
+            // Loads settings.json only. The secret store is read on first use, or by the MCP warm-up below on its own thread.
             let settings = resolve_config_dir(app.handle())
                 .map(|dir| Arc::new(SettingsService::new(&dir, Arc::new(Secrets::from_env(&dir)))));
-            app.manage(McpState(settings.as_ref().map(|s| Arc::new(McpService::new(s.clone())))));
+            let mcp = settings.as_ref().map(|s| Arc::new(McpService::new(s.clone())));
+            // The enabled MCP servers start on their own thread, so they connect before the first turn; the window does not wait.
+            if let Some(mcp) = &mcp {
+                let warm = mcp.clone();
+                thread::spawn(move || warm.warm());
+            }
+            app.manage(McpState(mcp));
             app.manage(SettingsState(settings));
             Ok(())
         })
@@ -1837,6 +1850,7 @@ pub fn run() {
             fetch_models,
             test_connection,
             get_mcp,
+            get_mcp_status,
             mcp_import,
             mcp_save_server,
             mcp_remove_server,
