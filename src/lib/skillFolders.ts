@@ -7,6 +7,7 @@ export const MAX_SKILL_FOLDER_CHARS = 1024;
 
 /** The badge that says where a skill comes from. */
 export const SOURCE_LABEL: Record<SkillView['source'], string> = {
+  builtin: 'Built in',
   watt: 'watt config',
   user: 'your folder',
   project: 'this project',

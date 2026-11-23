@@ -128,3 +128,20 @@ describe('ToolRow: the summary', () => {
     expect(html).toContain(': ok</span>');
   });
 });
+
+describe('ToolRow: an unavailable call', () => {
+  it('its decision reads unavailable, and the error shows in the row without opening it', () => {
+    const message = 'unknown tool `ghost`: no tool with this name is available right now.';
+    const html = renderToStaticMarkup(
+      <ToolRow item={row({ name: 'ghost', status: 'failed', decision: 'unavailable', args: {}, result: { error: message } })} />,
+    );
+    expect(html).toContain('<span class="decision decision-unavailable"> unavailable</span>');
+    expect(html).toContain(`data-tip="${message}"`);
+    expect(html).toContain(`>${message}</span>`);
+  });
+
+  it('a row with no error text shows no error line', () => {
+    const html = renderToStaticMarkup(<ToolRow item={row({ name: 'get_cwd', args: {}, result: {} })} />);
+    expect(html).not.toContain('decision-unavailable');
+  });
+});

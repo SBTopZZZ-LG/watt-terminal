@@ -1113,7 +1113,8 @@ a {
 }
 
 .decision-denied,
-.decision-refused {
+.decision-refused,
+.decision-unavailable {
   color: var(--fail);
 }
 

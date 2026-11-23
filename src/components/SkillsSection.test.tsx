@@ -28,6 +28,19 @@ const VIEW: SkillsView = {
   ],
 };
 
+/** The built-in skill is listed first, as the app lists it. */
+const BUILTIN: SkillView = {
+  name: 'watt',
+  description: 'Cheatsheet for Watt itself',
+  source: 'builtin',
+  path: '<built in>',
+  model_invocable: true,
+  enabled: true,
+  approval: 'auto',
+  override: null,
+  shadowed_by: null,
+};
+
 const render = (over: Partial<SkillsSectionProps> = {}) =>
   renderToStaticMarkup(
     <SkillsSection
@@ -41,6 +54,24 @@ const render = (over: Partial<SkillsSectionProps> = {}) =>
       {...over}
     />,
   );
+
+describe('SkillsSection: the built-in skill', () => {
+  it('is listed as Built in, with no switch and no approval select, and says it is always available', () => {
+    const html = render({ view: { ...VIEW, skills: [BUILTIN, ...VIEW.skills] } });
+    const row = /<li class="[^"]*settings-skill[^"]*"[\s\S]*?<\/li>/.exec(html)?.[0] ?? '';
+    expect(row).toContain('>watt</span>');
+    expect(row).toContain('>Built in</span>');
+    expect(row).toContain('title="Always available"');
+    expect(row).not.toContain('type="checkbox"');
+    expect(row).not.toContain('<select');
+  });
+
+  it('the other skills keep their switch and select', () => {
+    const html = render({ view: { ...VIEW, skills: [BUILTIN, ...VIEW.skills] } });
+    expect(html).toContain('type="checkbox"');
+    expect(html).toContain('aria-label="Loading review-pr"');
+  });
+});
 
 describe('SkillsSection', () => {
   it('explains skills and where the folders are read from', () => {

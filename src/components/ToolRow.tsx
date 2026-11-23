@@ -11,6 +11,15 @@ type ToolItem = Extract<TranscriptItem, { kind: 'tool' }>;
 
 type ToolTab = 'io' | 'json';
 
+/** The message of an unavailable call (no tool of that name was offered), or null. Shown in the row, so the cause is visible. */
+function unavailableError(item: ToolItem): string | null {
+  if (item.decision !== 'unavailable' || typeof item.result !== 'object' || item.result === null) {
+    return null;
+  }
+  const error = (item.result as { error?: unknown }).error;
+  return typeof error === 'string' ? error : null;
+}
+
 const TABS: { id: ToolTab; label: string }[] = [
   { id: 'io', label: 'Input / Output' },
   { id: 'json', label: 'JSON' },
@@ -47,6 +56,7 @@ export function ToolRow({ item }: { item: ToolItem }) {
     e.currentTarget.querySelector<HTMLButtonElement>(`[data-tab="${next}"]`)?.focus();
   };
 
+  const unavailable = unavailableError(item);
   const output = toolOutput(item.name, item.result);
   const input = toolInput(item.name, item.args);
   const outputPlaceholder = item.status === 'running' && output === '' ? '…waiting for output' : output === '' ? '(no output)' : output;
@@ -65,6 +75,11 @@ export function ToolRow({ item }: { item: ToolItem }) {
             )}
             {`: ${duration ?? status}`}
           </span>
+          {unavailable !== null && (
+            <span className="tool-detail" data-tip={unavailable} data-tip-clip="">
+              {unavailable}
+            </span>
+          )}
           {head.detail !== null && (
             // Not cut in the row: the tip shows only where CSS clips it. Cut in the row: the tip always shows.
             <span className="tool-detail" data-tip={detailFull ?? undefined} data-tip-clip={detailFull === head.detail ? '' : undefined}>

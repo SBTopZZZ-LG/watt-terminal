@@ -195,7 +195,14 @@ export function SkillsSection({ view, loadError, loading, saving, saveError, onR
                       {displayText(skill.path)}
                     </span>
                   </div>
-                  {!hidden && (
+                  {skill.source === 'builtin' && (
+                    <div className="settings-skill-controls">
+                      <span className="settings-tag settings-tag-muted" title="Always available">
+                        locked
+                      </span>
+                    </div>
+                  )}
+                  {!hidden && skill.source !== 'builtin' && (
                     <div className="settings-skill-controls">
                       <label className="settings-check">
                         <input
