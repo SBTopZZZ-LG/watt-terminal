@@ -1,6 +1,6 @@
 import { useRef, useState } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from 'react';
-import { isSideDock, keyboardSize, nextSizeFromDrag, panelBounds } from '../lib/panelLayout';
+import { keyboardSize, nextSizeFromDrag, panelBounds } from '../lib/panelLayout';
 import type { Container, Dock } from '../lib/panelLayout';
 
 interface Props {
@@ -19,15 +19,12 @@ interface Props {
 /**
  * The divider between the agent panel and the terminal. A 6px hit area with a 1px dashed rule. Drag with the pointer
  * (captured, so a fast drag does not lose it), move with the arrow keys (Shift for a larger step, Home and End for the
- * limits), and double-click to reset. role="separator" with the panel's size as the value.
+ * limits), and double-click to reset. role="separator" with the panel's width as the value.
  */
 export function PanelDivider({ dock, container, valueNow, measure, onResize, onReset, onSettle }: Props) {
-  const side = isSideDock(dock);
-  const { min, max } = panelBounds(dock, container);
+  const { min, max } = panelBounds(container);
   const [dragging, setDragging] = useState(false);
   const drag = useRef<{ pointer: number; start: number } | null>(null);
-
-  const along = (e: { clientX: number; clientY: number }) => (side ? e.clientX : e.clientY);
 
   const onPointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
     if (e.button !== 0) {
@@ -36,7 +33,7 @@ export function PanelDivider({ dock, container, valueNow, measure, onResize, onR
     // No text selection while dragging.
     e.preventDefault();
     e.currentTarget.setPointerCapture(e.pointerId);
-    drag.current = { pointer: along(e), start: measure() };
+    drag.current = { pointer: e.clientX, start: measure() };
     setDragging(true);
   };
 
@@ -45,7 +42,7 @@ export function PanelDivider({ dock, container, valueNow, measure, onResize, onR
     if (d === null) {
       return;
     }
-    onResize(nextSizeFromDrag(dock, d.start, d.pointer, along(e), container));
+    onResize(nextSizeFromDrag(dock, d.start, d.pointer, e.clientX, container));
   };
 
   const endDrag = () => {
@@ -73,9 +70,6 @@ export function PanelDivider({ dock, container, valueNow, measure, onResize, onR
   };
 
   const classes = ['panel-divider'];
-  if (!side) {
-    classes.push('is-horizontal');
-  }
   if (dragging) {
     classes.push('is-active');
   }
@@ -84,7 +78,7 @@ export function PanelDivider({ dock, container, valueNow, measure, onResize, onR
     <div
       role="separator"
       tabIndex={0}
-      aria-orientation={side ? 'vertical' : 'horizontal'}
+      aria-orientation="vertical"
       aria-label="Resize the agent panel"
       aria-valuenow={Math.round(valueNow)}
       aria-valuemin={min}

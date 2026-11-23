@@ -41,7 +41,7 @@ interface Props {
   onNewConversation: () => void;
   /** The New button is blocked (the agent is busy, or a side command runs). Defaults to `busy`. Only the button reads it. */
   newBlocked?: boolean;
-  /** The dock the panel is in. With onDock, the header shows the four dock buttons, with this one marked. */
+  /** The dock the panel is in. With onDock, the header shows the two dock buttons, with this one marked. */
   dock?: Dock;
   onDock?: (dock: Dock) => void;
   /** Which view the panel body shows. History replaces the chat body (the header stays). Defaults to chat. */
@@ -233,6 +233,7 @@ export function Transcript({
         <button
           type="button"
           className="transcript-new"
+          aria-label="New conversation"
           aria-disabled={newOff ? true : undefined}
           onClick={() => {
             if (!newOff) {
@@ -241,7 +242,10 @@ export function Transcript({
           }}
           data-tip={newOff ? BUSY_TIP : 'Clears the agent conversation'}
         >
-          New conversation
+          <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.25" aria-hidden="true">
+            <path d="M7 2.5H4.2A1.7 1.7 0 0 0 2.5 4.2v7.6a1.7 1.7 0 0 0 1.7 1.7h7.6a1.7 1.7 0 0 0 1.7-1.7V9" />
+            <path d="M5.5 10.5l.7-2.5 4.4-4.4a1.1 1.1 0 0 1 1.6 1.6L7.8 9.8z" />
+          </svg>
         </button>
       </div>
       {open && view === 'history' && history}
@@ -817,9 +821,9 @@ function HistoryButton({ pressed, onClick }: { pressed: boolean; onClick: () => 
 }
 
 /** Where each dock button sends the panel, in the order the buttons show. */
-const DOCK_BUTTONS: Dock[] = ['left', 'top', 'bottom', 'right'];
+const DOCK_BUTTONS: Dock[] = ['left', 'right'];
 
-/** Four icon buttons. The current dock's button is pressed (aria-pressed), and drawn accented. */
+/** Two icon buttons. The current dock's button is pressed (aria-pressed), and drawn accented. */
 function DockButtons({ dock, onDock }: { dock: Dock; onDock: (dock: Dock) => void }) {
   return (
     <div className="dock-buttons" role="group" aria-label="Agent panel position">
@@ -844,8 +848,6 @@ function DockButtons({ dock, onDock }: { dock: Dock; onDock: (dock: Dock) => voi
 function DockIcon({ dock }: { dock: Dock }) {
   const fill: Record<Dock, string> = {
     left: 'M1.5 1.5h4v11h-4z',
-    top: 'M1.5 1.5h11v4h-11z',
-    bottom: 'M1.5 10.5h11v4h-11z',
     right: 'M10.5 1.5h4v11h-4z',
   };
   return (

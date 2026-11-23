@@ -39,7 +39,7 @@ Watt is a terminal for macOS and Windows 11 where the user and an AI agent share
 ## UI and layout work
 
 - The renderer is WKWebView (WebKit), not Chrome: use `-webkit-` prefixes where needed and check layout in WebKit as well as Chromium.
-- Docks are left, right, top, bottom; a side dock can collapse to a rail; only top and bottom can auto-size (`src/lib/panelLayout.ts`: side minimum 240px, terminal minimum 320px). The window minimum is 800x600. Check narrow and short sizes, banners on and off, and the font-size steps.
+- Docks are left and right; the panel can collapse to a rail (`src/lib/panelLayout.ts`: panel minimum 240px, terminal minimum 320px). The window minimum is 800x600. Check narrow and short sizes, banners on and off, and the font-size steps.
 - Prefer whole-pixel sizes: fractional heights on Retina round into phantom scrollbars. Keep overflow hidden until content really overflows.
 - Colours come from the tokens under `[data-theme="blueprint"]` in `App.css`. Animate only `transform`, `opacity` or `background-position`, and honour `prefers-reduced-motion`.
 - Look at screenshots of the extreme sizes before trusting geometry assertions.
