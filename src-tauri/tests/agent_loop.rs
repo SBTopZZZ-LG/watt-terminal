@@ -468,6 +468,64 @@ fn non_streamed_answer_emits_one_text() {
     assert!(matches!(events.last(), Some(AgentEvent::Done)));
 }
 
+/// The reasoning deltas of the events, in order.
+fn reasoning_deltas(events: &[AgentEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ReasoningDelta { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn streamed_reasoning_comes_before_the_answer_and_keeps_thinking_active() {
+    let sse = "\
+data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"Let me \"}}]}\n\n\
+data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"think.\"}}]}\n\n\
+data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"}}]}\n\n\
+data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"}}]}\n\n\
+data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n";
+    let provider = serve(vec![Script::sse(sse)]);
+    let conv = Conversation::new().unwrap();
+    let mut agent = agent_for(&settings(&provider.url, true), &conv, Arc::new(TurnCancel::new()));
+    let events = turn(&mut agent, &FakeTools::default(), &no_gate(), "hi");
+
+    assert_eq!(reasoning_deltas(&events), ["Let me ", "think."]);
+    assert_eq!(deltas(&events), ["Hel", "lo"]);
+    let last_reasoning = events.iter().rposition(|e| matches!(e, AgentEvent::ReasoningDelta { .. })).unwrap();
+    let first_text = events.iter().position(|e| matches!(e, AgentEvent::TextDelta { .. })).unwrap();
+    assert!(last_reasoning < first_text, "reasoning streams before the answer: {events:?}");
+    let thinking: Vec<bool> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Thinking { active } => Some(*active),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(thinking, [true, false], "reasoning does not end the thinking state early");
+    let msgs = stored(&conv.history());
+    assert_eq!(msgs, vec![json!({"role": "user", "content": "hi"}), json!({"role": "assistant", "content": "Hello"})]);
+}
+
+#[test]
+fn non_streamed_reasoning_is_one_event_before_the_text() {
+    let reply = json!({"choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "Hi there", "reasoning_content": "Greet back."}}]});
+    let provider = serve(vec![Script::json(reply)]);
+    let conv = Conversation::new().unwrap();
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
+    let events = turn(&mut agent, &FakeTools::default(), &no_gate(), "hi");
+
+    assert_eq!(reasoning_deltas(&events), ["Greet back."]);
+    let reasoning = events.iter().position(|e| matches!(e, AgentEvent::ReasoningDelta { .. })).unwrap();
+    let text = events.iter().position(|e| matches!(e, AgentEvent::Text { .. })).unwrap();
+    assert!(reasoning < text, "{events:?}");
+    assert_eq!(texts(&events), ["Hi there"]);
+    assert_eq!(stored(&conv.history()), vec![json!({"role": "user", "content": "hi"}), json!({"role": "assistant", "content": "Hi there"})]);
+}
+
 #[test]
 fn read_tool_result_goes_back_to_the_model_under_the_same_call_id() {
     let provider = serve(vec![

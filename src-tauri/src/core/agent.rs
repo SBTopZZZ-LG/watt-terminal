@@ -347,6 +347,9 @@ pub enum AgentEvent {
     QuestionRequest { call_id: String, questions: Vec<questions::Question> },
     /// Streamed assistant text. `Text` is still used for whole messages.
     TextDelta { text: String },
+    /// Streamed reasoning text of the model (shown, never stored). It does not change the "thinking" state.
+    /// The wire type is `reasoning_delta`.
+    ReasoningDelta { text: String },
     /// The model is working on a reply (true) or has produced its first output (false).
     Thinking { active: bool },
     /// The agent is in control of the shell: an approved `run_command` or `send_keys` is executing. Sent true before
@@ -1476,6 +1479,7 @@ mod tests {
             json!({"type": "tool_result", "call_id": "c1", "name": "run_command", "ok": true, "decision": "auto", "reason": "rule", "result": {"ok": true}})
         );
         assert_eq!(wire(AgentEvent::TextDelta { text: "Hel".into() }), json!({"type": "text_delta", "text": "Hel"}));
+        assert_eq!(wire(AgentEvent::ReasoningDelta { text: "Let me".into() }), json!({"type": "reasoning_delta", "text": "Let me"}));
         assert_eq!(wire(AgentEvent::Notice { text: "Using project instructions from /r/AGENTS.md".into() }), json!({"type": "notice", "text": "Using project instructions from /r/AGENTS.md"}));
         assert_eq!(wire(AgentEvent::Thinking { active: true }), json!({"type": "thinking", "active": true}));
         assert_eq!(wire(AgentEvent::Done), json!({"type": "done"}));
