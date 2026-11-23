@@ -639,7 +639,7 @@ a {
 /*
  * ---------- workspace: the terminal and the agent panel ----------
  * The DOM order is fixed (terminal, divider, panel). The dock only sets the direction, so the terminal is never remounted.
- * Left and top reverse the order on screen, so the panel comes first there. No overflow rule here: nothing between
+ * Left reverses the order on screen, so the panel comes first there. No overflow rule here: nothing between
  * .xterm-rows and the window may clip the glyph overflow (see the CLIPPING GUARD note at .term-host .xterm-rows).
  */
 .workspace {
@@ -656,14 +656,6 @@ a {
 
 .workspace.dock-left {
   flex-direction: row-reverse;
-}
-
-.workspace.dock-bottom {
-  flex-direction: column;
-}
-
-.workspace.dock-top {
-  flex-direction: column-reverse;
 }
 
 .agent-panel {
@@ -686,8 +678,7 @@ a {
 }
 
 /*
- * A fixed size (sized): the transcript takes what the bar, the todo list and the meter leave, and its body scrolls. Auto top
- * and bottom panels keep the 35vh cap on .transcript-body instead, so they grow with their content up to it.
+ * A fixed size (sized): the transcript takes what the bar, the todo list and the meter leave, and its body scrolls.
  * The transcript's size is the part above the body (--transcript-chrome, measured by Transcript.tsx) plus the body's floor, which is
  * min(64px, half the transcript) (--transcript-floor: 64px). Solved for the transcript, that is chrome + min(64px, chrome), which
  * is the least size below. It is also the basis, so the transcript only fills what the todo list leaves, and the todo keeps its
@@ -810,10 +801,6 @@ a {
   user-select: none;
 }
 
-.panel-divider.is-horizontal {
-  cursor: row-resize;
-}
-
 .panel-divider::before {
   content: "";
   position: absolute;
@@ -822,15 +809,6 @@ a {
   left: 2px;
   border-left: 1px dashed var(--rule);
   pointer-events: none;
-}
-
-.panel-divider.is-horizontal::before {
-  top: 2px;
-  bottom: auto;
-  left: 0;
-  right: 0;
-  border-left: 0;
-  border-top: 1px dashed var(--rule);
 }
 
 .panel-divider:hover::before,
@@ -870,7 +848,7 @@ a {
   cursor: pointer;
 }
 
-/* The header wraps in every dock: at a narrow width the buttons go to a further line, so New conversation is never clipped. */
+/* The header wraps: at a narrow width the buttons go to a further line, so New conversation is never clipped. */
 .transcript-header {
   display: flex;
   flex-wrap: wrap;
@@ -889,22 +867,29 @@ a {
   font-size: 11px;
 }
 
+/* The New conversation button: an icon, the same size and edge as the history and dock buttons. */
 .transcript-new {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   flex: 0 0 auto;
   margin-left: auto;
-  padding: 2px 8px;
-  border: 1px dashed var(--rule);
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px dashed transparent;
   border-radius: 2px;
-  background: var(--bg);
+  background: transparent;
   color: var(--muted);
-  font-size: 11px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
   cursor: pointer;
 }
 
+.transcript-new svg {
+  display: block;
+}
+
 .transcript-new:not(:disabled):not([aria-disabled="true"]):hover {
-  border-color: var(--accent);
+  border-color: var(--rule);
   color: var(--accent);
 }
 
@@ -4962,8 +4947,7 @@ a {
   cursor: pointer;
 }
 
-.agent-activity.dock-right,
-.agent-activity.dock-bottom {
+.agent-activity.dock-right {
   right: 12px;
   bottom: 12px;
 }
@@ -4971,12 +4955,6 @@ a {
 .agent-activity.dock-left {
   left: 12px;
   bottom: 12px;
-}
-
-/* Below the status strip, which stays on top. */
-.agent-activity.dock-top {
-  right: 12px;
-  top: 44px;
 }
 
 .agent-activity-title {
@@ -5036,8 +5014,7 @@ a {
   text-align: left;
 }
 
-.approval-toast.dock-right,
-.approval-toast.dock-bottom {
+.approval-toast.dock-right {
   right: 12px;
   bottom: 12px;
 }
@@ -5045,12 +5022,6 @@ a {
 .approval-toast.dock-left {
   left: 12px;
   bottom: 12px;
-}
-
-/* Below the status strip, which stays on top. */
-.approval-toast.dock-top {
-  right: 12px;
-  top: 44px;
 }
 
 .approval-toast-title {

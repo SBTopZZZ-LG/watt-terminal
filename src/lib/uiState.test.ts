@@ -24,19 +24,19 @@ import { defaultLayout } from './panelLayout';
 import type { PanelLayout } from './panelLayout';
 import type { PanelState, UiStatePatch } from './types';
 
-const LOCAL: PanelLayout = { dock: 'bottom', sizes: { left: 380, right: 380, top: null, bottom: 200 }, open: true };
-const REMOTE_PANEL: PanelState = { dock: 'left', sizes: { left: 300, right: null, top: null, bottom: null }, open: false };
+const LOCAL: PanelLayout = { dock: 'right', sizes: { left: 380, right: 200 }, open: true };
+const REMOTE_PANEL: PanelState = { dock: 'left', sizes: { left: 300, right: null }, open: false };
 
 describe('reconcilePanel', () => {
   it('a valid remote panel wins and is applied when it differs', () => {
     expect(reconcilePanel(LOCAL, REMOTE_PANEL)).toEqual({
-      apply: { dock: 'left', sizes: { left: 300, right: null, top: null, bottom: null }, open: false },
+      apply: { dock: 'left', sizes: { left: 300, right: null }, open: false },
       migrate: null,
     });
   });
 
   it('a valid remote panel equal to the local layout applies nothing', () => {
-    const same: PanelState = { dock: 'bottom', sizes: { left: 380, right: 380, top: null, bottom: 200 }, open: true };
+    const same: PanelState = { dock: 'right', sizes: { left: 380, right: 200 }, open: true };
     expect(reconcilePanel(LOCAL, same)).toEqual({ apply: null, migrate: null });
   });
 
@@ -161,7 +161,7 @@ describe('patch builders', () => {
   it('panelPatch carries the snake_case panel shape, with its own copy of the sizes', () => {
     const layout = defaultLayout();
     const patch = panelPatch(layout);
-    expect(patch).toEqual({ panel: { dock: 'bottom', sizes: { left: 380, right: 380, top: null, bottom: null }, open: true } });
+    expect(patch).toEqual({ panel: { dock: 'right', sizes: { left: 380, right: 380 }, open: true } });
     expect(patch.panel?.sizes).not.toBe(layout.sizes);
   });
 

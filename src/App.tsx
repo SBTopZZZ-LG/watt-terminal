@@ -33,7 +33,7 @@ import { agentControlAfter, borderActive, borderLevel, NO_CONTROL, settleControl
 import type { AgentControl, BorderLevel } from './lib/agentControl';
 import { EMPTY_TRANSCRIPT, firstPendingApproval, isBusy, transcriptReducer } from './lib/transcript';
 import type { TranscriptItem } from './lib/transcript';
-import { chatBodyShown, isSideDock, loadPanelLayout, panelReducer, panelView, savePanelLayout } from './lib/panelLayout';
+import { chatBodyShown, loadPanelLayout, panelReducer, panelView, savePanelLayout } from './lib/panelLayout';
 import type { Container } from './lib/panelLayout';
 import { defaultSizeStorage } from './lib/zoom';
 import { itemsFromMessages } from './lib/historyView';
@@ -630,8 +630,8 @@ export default function App() {
         e.stopPropagation();
         // A side panel collapsed to the rail opens first. Both state changes land in one render, so the input is
         // visible when the focus effect in InputBar runs.
-        const { dock, open } = layoutRef.current;
-        if (!open && isSideDock(dock)) {
+        const { open } = layoutRef.current;
+        if (!open) {
           dispatchPanel({ type: 'open', open: true });
         }
         const { bar } = routeRef.current;
@@ -1667,8 +1667,7 @@ export default function App() {
     if (!el) {
       return 0;
     }
-    const box = el.getBoundingClientRect();
-    return view.side ? box.width : box.height;
+    return el.getBoundingClientRect().width;
   };
   const activity = agentActivity(transcript.items, transcript.thinking, sideBusy);
 
@@ -1712,7 +1711,7 @@ export default function App() {
             <PanelDivider
               dock={panel.dock}
               container={workspace}
-              valueNow={view.side ? panelBox.width : panelBox.height}
+              valueNow={panelBox.width}
               measure={measurePanel}
               onResize={(size) => dispatchPanel({ type: 'size', dock: panel.dock, size })}
               onReset={() => dispatchPanel({ type: 'reset_size', dock: panel.dock })}

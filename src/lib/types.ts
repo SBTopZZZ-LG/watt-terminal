@@ -311,15 +311,13 @@ export interface DeleteResult {
   deleted_live: boolean;
 }
 
-export type Dock = 'left' | 'top' | 'right' | 'bottom';
+export type Dock = 'left' | 'right';
 export type HistoryGroupBy = 'date' | 'workspace';
 export type QueueMode = 'all' | 'one';
 
 export interface PanelSizes {
   left: number | null;
   right: number | null;
-  top: number | null;
-  bottom: number | null;
 }
 
 export interface PanelState {

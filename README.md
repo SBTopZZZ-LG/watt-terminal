@@ -81,7 +81,7 @@ The terminal is the main input: keys go to the shell, or to whatever program is 
 
 The table shows macOS keys. On Windows the in-app hints show Ctrl instead of Cmd (for example Ctrl+Shift+A and Ctrl+,).
 
-The agent panel docks left, right, top or bottom.
+The agent panel docks left or right.
 
 ### Slash commands
 
