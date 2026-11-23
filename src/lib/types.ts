@@ -453,6 +453,14 @@ export interface IntegrationSettings {
   agent_requests: AgentRequests;
 }
 
+/** `continue`: a denied tool call is an error result and the agent carries on. `stop`: the denial ends the turn. */
+export type OnDenied = 'continue' | 'stop';
+
+/** Agent behaviour settings (core/settings AgentSettings). Saved by their own command. */
+export interface AgentSettings {
+  on_denied: OnDenied;
+}
+
 /**
  * The per-turn caps of the agent (core/settings LimitsSettings). Saved by set_limits_settings. `max_model_calls` is a u32 with
  * no upper bound in the UI; `model_calls_unlimited` turns the cap off and keeps the number. The polling cap counts only the
@@ -482,6 +490,7 @@ export interface Settings {
   integration: IntegrationSettings;
   limits: LimitsSettings;
   mcp: McpSettings;
+  agent: AgentSettings;
 }
 
 /** The approval level of an MCP server or of one tool. `never` means the tool is not offered to the model. */

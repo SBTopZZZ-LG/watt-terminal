@@ -3,6 +3,7 @@
 
 import { Channel, invoke } from '@tauri-apps/api/core';
 import type {
+  AgentSettings,
   ApprovalPreview,
   ApprovalSettings,
   AttachmentInput,
@@ -225,6 +226,10 @@ export const api = {
   /** Saves whether the agent's integration requests ask the user or run at once. Refused while settings.json is broken. */
   setIntegrationSettings(input: IntegrationSettings) {
     return invoke<SettingsView>('set_integration_settings', { input });
+  },
+  /** Saves what a denied tool call does: the agent carries on, or the turn stops. Refused while settings.json is broken. */
+  setAgentSettings(input: AgentSettings) {
+    return invoke<SettingsView>('set_agent_settings', { input });
   },
   /** Saves the per-turn caps. Refused while settings.json is broken. A value out of range fails with its name in the message. */
   setLimitsSettings(input: LimitsSettings) {

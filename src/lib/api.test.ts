@@ -170,3 +170,14 @@ describe('api skills commands', () => {
     expect(invoke).toHaveBeenLastCalledWith('set_skills_settings', { input: { folders: null, disabled: [], approval: 'auto', overrides: {} } });
   });
 });
+
+describe('api.setAgentSettings', () => {
+  beforeEach(() => invoke.mockClear());
+
+  it('sends the setting as the input of set_agent_settings', () => {
+    void api.setAgentSettings({ on_denied: 'stop' });
+    expect(invoke).toHaveBeenCalledWith('set_agent_settings', { input: { on_denied: 'stop' } });
+    void api.setAgentSettings({ on_denied: 'continue' });
+    expect(invoke).toHaveBeenLastCalledWith('set_agent_settings', { input: { on_denied: 'continue' } });
+  });
+});

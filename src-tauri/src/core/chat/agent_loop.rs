@@ -70,6 +70,9 @@ const POLL_NAMES: [&str; 3] = ["wait", "get_screen", "send_keys"];
 const LIMIT_REASON: &str = "not run: the turn stopped after the model call limit";
 const POLL_LIMIT_REASON: &str = "not run: the turn stopped after the polling call limit";
 const DENIED_NOTICE: &str = "Stopped: the command was not approved. Tell me what you want to do next.";
+/// Added to a denied call's result when the turn goes on (`on_denied` = continue), so the model does not just retry it.
+const DECLINED_GUIDANCE: &str =
+    "The user declined this call. Do not repeat it unchanged; continue with another approach or ask the user how to proceed.";
 /// Said once, when a model turned out to refuse images and the retry without them worked.
 const NO_VISION_NOTICE: &str =
     "This model doesn't accept images, so they were left out of this reply. Switch to a vision model to use them.";
@@ -939,7 +942,7 @@ impl LlmAgent {
             if self.cancel.is_cancelled() {
                 return Some(Stop::Cancelled);
             }
-            if denied {
+            if denied && !ctx.continue_on_denied() {
                 return Some(Stop::Denied);
             }
         }
@@ -1014,6 +1017,9 @@ impl LlmAgent {
         let denied = matches!(&result, Err(e) if e.starts_with(DENIED));
         let content = match result {
             Ok(value) => project(name, true, &value, &self.redactor),
+            Err(e) if denied && ctx.continue_on_denied() => {
+                project(name, false, &Value::String(format!("{e}. {DECLINED_GUIDANCE}")), &self.redactor)
+            }
             Err(e) => project(name, false, &Value::String(e), &self.redactor),
         };
         (content, denied)

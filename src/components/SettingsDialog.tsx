@@ -21,7 +21,16 @@ import {
 } from '../lib/settingsForm';
 import type { ProviderDraft } from '../lib/settingsForm';
 import { RECOVERY_BUSY_LABEL, REVERT_CONFIRM, reasonText, recoveryExplanation, recoveryKind } from '../lib/settingsRecovery';
-import type { AgentRequests, ModelRef, ProviderPreset, QueueMode, RecoverAction, SettingsStateView, SettingsView } from '../lib/types';
+import type {
+  AgentRequests,
+  ModelRef,
+  OnDenied,
+  ProviderPreset,
+  QueueMode,
+  RecoverAction,
+  SettingsStateView,
+  SettingsView,
+} from '../lib/types';
 import { AboutSection } from './AboutSection';
 import { ApprovalSection } from './ApprovalSection';
 import { LimitsSection } from './LimitsSection';
@@ -551,6 +560,8 @@ export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded, h
   const [limitsError, setLimitsError] = useState<string | null>(null);
   // The agent integration setting is saved on each change (its own command), so it has its own busy and error state.
   const [integrationSave, setIntegrationSave] = useState<{ busy: boolean; error: string | null }>({ busy: false, error: null });
+  // The "when I deny a call" setting is saved on each change too, so it has its own busy and error state.
+  const [deniedSave, setDeniedSave] = useState<{ busy: boolean; error: string | null }>({ busy: false, error: null });
   // undefined while the built-in list loads; null when it could not be read.
   const [builtinDeny, setBuiltinDeny] = useState<string[] | null | undefined>(undefined);
   // The active tab. The dialog opens on the first one, and a closed dialog forgets it.
@@ -1017,6 +1028,21 @@ export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded, h
     );
   };
 
+  /** Saves what a denied call does as soon as it changes. A refused save shows its message; the choice shows the saved value. */
+  const setOnDenied = (value: OnDenied) => {
+    if (view === null || deniedSave.busy) {
+      return;
+    }
+    setDeniedSave({ busy: true, error: null });
+    api.setAgentSettings({ on_denied: value }).then(
+      (v) => {
+        applyView(v);
+        setDeniedSave({ busy: false, error: null });
+      },
+      (e: unknown) => setDeniedSave({ busy: false, error: errorText(e) }),
+    );
+  };
+
   /** Saves the Approvals draft. The backend checks the rules; a refused save shows its message and keeps the draft. */
   const saveApproval = () => {
     if (view === null || approvalDraft === null || approvalSaving) {
@@ -1151,6 +1177,10 @@ export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded, h
         integrationBusy={integrationSave.busy}
         integrationError={integrationSave.error}
         onIntegrationChange={setAgentRequests}
+        onDenied={view.settings.agent.on_denied}
+        deniedBusy={deniedSave.busy}
+        deniedError={deniedSave.error}
+        onDeniedChange={setOnDenied}
         onChange={(draft) => {
           setApprovalDraft(draft);
           setApprovalError(null);

@@ -16,6 +16,10 @@ const BASE: ApprovalSectionProps = {
   integrationBusy: false,
   integrationError: null,
   onIntegrationChange: NOOP,
+  onDenied: 'continue',
+  deniedBusy: false,
+  deniedError: null,
+  onDeniedChange: NOOP,
   onChange: NOOP,
   onSave: NOOP,
   onUndo: NOOP,
@@ -50,6 +54,37 @@ describe('ApprovalSection: mode', () => {
     expect(html).toContain('<legend>Mode</legend>');
     expect(html).toContain('Manual');
     expect(html).toContain('Regex rules');
+  });
+});
+
+describe('ApprovalSection: when I deny a call', () => {
+  it('has both options under the legend, with Keep working and Stop labels', () => {
+    const html = render();
+    expect(html).toContain('<legend>When I deny a call</legend>');
+    expect(html).toContain('Keep working');
+    expect(html).toContain('Stop');
+  });
+
+  it('checks Keep working for continue, and Stop for stop', () => {
+    const keep = render({ onDenied: 'continue' });
+    expect(tagHolding(keep, 'input', 'value="continue"')).toContain('checked=""');
+    expect(tagHolding(keep, 'input', 'value="stop"')).not.toContain('checked=""');
+    const stop = render({ onDenied: 'stop' });
+    expect(tagHolding(stop, 'input', 'value="stop"')).toContain('checked=""');
+    expect(tagHolding(stop, 'input', 'value="continue"')).not.toContain('checked=""');
+  });
+
+  it('says what each option does, in a hint each', () => {
+    const html = render();
+    expect(html).toContain('Keep working: the agent sees the denied call as an error and tries another way');
+    expect(html).toContain('Stop: the denial ends the turn at once');
+  });
+
+  it('is disabled while it saves and when the settings are locked, and shows a refused save as an alert', () => {
+    expect(tagHolding(render({ deniedBusy: true }), 'input', 'value="stop"')).toContain('disabled=""');
+    expect(tagHolding(render({ locked: true }), 'input', 'value="stop"')).toContain('disabled=""');
+    const failed = render({ deniedError: 'settings.json is broken; fix or revert it first' });
+    expect(failed).toContain('role="alert">settings.json is broken; fix or revert it first</p>');
   });
 });
 
