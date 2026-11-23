@@ -18,12 +18,17 @@ export type ApprovalState = 'pending' | 'answering' | 'resolved';
  */
 export type QuestionState = 'pending' | 'answering' | 'resolved' | 'failed' | 'closed';
 
-/** An attachment on a message the user sent. `kind` is 'file' for a text document. `thumb` is a data URL, for an image. */
+/**
+ * An attachment on a message the user sent. `kind` is 'file' for a text document. `thumb` is a data URL, for an image.
+ * `sha256` and `mime` are set for an image whose full file is stored (the image viewer asks the backend for it by these).
+ */
 export interface UserAttachment {
   kind: 'image' | 'file';
   name: string;
   bytes: number;
   thumb?: string;
+  sha256?: string;
+  mime?: string;
 }
 
 export type TranscriptItem =

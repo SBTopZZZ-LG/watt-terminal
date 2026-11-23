@@ -1,4 +1,5 @@
 import { formatSize } from '../lib/attachments';
+import { useImageViewer } from './ImageViewer';
 
 /** One attachment in the input bar. `bytes` is null while it is still being prepared (then it shows "processing..."). */
 export interface ChipItem {
@@ -8,6 +9,8 @@ export interface ChipItem {
   kind: 'image' | 'file';
   bytes: number | null;
   thumb?: string;
+  /** An image's full processed bytes, base64, with their mime type: the viewer shows them without a fetch. */
+  data?: { mime: string; b64: string };
   processing: boolean;
 }
 
@@ -18,6 +21,7 @@ interface Props {
 
 /** The attachments above the input field: a thumbnail for an image, a name and size for a file, a note while one is processed. */
 export function AttachmentChips({ items, onRemove }: Props) {
+  const openImage = useImageViewer();
   return (
     <div className="bar-attachments">
       {items.map((item) => {
@@ -39,7 +43,16 @@ export function AttachmentChips({ items, onRemove }: Props) {
         if (item.kind === 'image' && item.thumb !== undefined) {
           return (
             <div key={item.key} className="bar-attach is-image">
-              <img className="bar-attach-thumb" src={item.thumb} alt={item.name} title={item.name} draggable={false} />
+              <button
+                type="button"
+                className="bar-attach-open"
+                aria-label={`View ${item.name}`}
+                onClick={() =>
+                  openImage({ name: item.name, thumb: item.thumb, full: item.data && `data:${item.data.mime};base64,${item.data.b64}` })
+                }
+              >
+                <img className="bar-attach-thumb" src={item.thumb} alt={item.name} title={item.name} draggable={false} />
+              </button>
               {remove}
             </div>
           );

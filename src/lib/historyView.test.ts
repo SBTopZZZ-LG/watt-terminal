@@ -537,7 +537,7 @@ describe('itemsFromMessages: a user message with attachments (array content)', (
         clientId: 0,
         text: 'what is in these',
         attachments: [
-          { kind: 'image', name: 'shot.png', bytes: 2048, thumb: PNG_THUMB },
+          { kind: 'image', name: 'shot.png', bytes: 2048, thumb: PNG_THUMB, sha256: sha, mime: 'image/png' },
           { kind: 'file', name: 'notes.md', bytes: 300 },
         ],
       },
@@ -548,6 +548,21 @@ describe('itemsFromMessages: a user message with attachments (array content)', (
     const [item] = itemsFromMessages([{ role: 'user', content: [{ type: 'text', text: 'hello' }, { type: 'watt_file', name: 'a.txt', bytes: 1, text: 'x' }] }]);
     expect(item).toMatchObject({ kind: 'user', text: 'hello' });
     expect(JSON.stringify(item)).not.toContain('watt_file"}');
+  });
+
+  it('keeps an image address and type only when both are valid (the full image can be opened)', () => {
+    const attachmentsOf = (part: Record<string, unknown>) => {
+      const [item] = itemsFromMessages([{ role: 'user', content: [{ type: 'text', text: 'x' }, { type: 'watt_image', name: 'a.png', bytes: 1, ...part }] }]);
+      return item.kind === 'user' ? item.attachments : undefined;
+    };
+    expect(attachmentsOf({ sha256: sha, mime: 'image/jpeg' })).toEqual([{ kind: 'image', name: 'a.png', bytes: 1, sha256: sha, mime: 'image/jpeg' }]);
+    // A bad address: uppercase, or a path.
+    expect(attachmentsOf({ sha256: sha.toUpperCase(), mime: 'image/png' })).toEqual([{ kind: 'image', name: 'a.png', bytes: 1 }]);
+    expect(attachmentsOf({ sha256: '../../etc/passwd', mime: 'image/png' })).toEqual([{ kind: 'image', name: 'a.png', bytes: 1 }]);
+    // A type the store does not keep.
+    expect(attachmentsOf({ sha256: sha, mime: 'image/gif' })).toEqual([{ kind: 'image', name: 'a.png', bytes: 1 }]);
+    // An address with no type.
+    expect(attachmentsOf({ sha256: sha })).toEqual([{ kind: 'image', name: 'a.png', bytes: 1 }]);
   });
 
   it('an image without a stored thumbnail is an image attachment with no thumb', () => {

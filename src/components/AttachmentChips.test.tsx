@@ -42,6 +42,20 @@ describe('AttachmentChips', () => {
     expect(html).toContain('2 KB');
   });
 
+  it('an image thumbnail is a button that opens the viewer, and the remove button stays a separate button', () => {
+    const html = render([{ key: 6, name: 'shot.png', kind: 'image', bytes: 900, thumb: THUMB, data: { mime: 'image/png', b64: 'iVBORw0K' }, processing: false }]);
+    expect(html).toContain('<button type="button" class="bar-attach-open" aria-label="View shot.png">');
+    expect(html).toContain('aria-label="Remove shot.png"');
+    // Two buttons, neither inside the other.
+    expect(html.match(/<button/g)).toHaveLength(2);
+    expect(html.indexOf('</button>')).toBeLessThan(html.indexOf('aria-label="Remove shot.png"'));
+  });
+
+  it('a file chip and an image without a thumbnail do not open the viewer', () => {
+    expect(render([{ key: 7, name: 'notes.md', kind: 'file', bytes: 1, processing: false }])).not.toContain('bar-attach-open');
+    expect(render([{ key: 8, name: 'odd.png', kind: 'image', bytes: 2048, processing: false }])).not.toContain('bar-attach-open');
+  });
+
   it('a name is text, never markup', () => {
     const html = render([{ key: 5, name: '<img src=x onerror=alert(1)>', kind: 'file', bytes: 1, processing: false }]);
     expect(html).not.toContain('<img src=x');

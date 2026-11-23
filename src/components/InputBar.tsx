@@ -546,6 +546,7 @@ export function InputBar(props: Props) {
     kind: d.input?.kind === 'image' ? 'image' : 'file',
     bytes: d.input === null ? null : d.bytes,
     thumb: d.input?.thumb,
+    data: d.input?.kind === 'image' ? { mime: d.input.mime, b64: d.input.data_b64 } : undefined,
     processing: d.input === null,
   }));
 

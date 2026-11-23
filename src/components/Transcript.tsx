@@ -22,6 +22,7 @@ import { Markdown } from './Markdown';
 import { BrailleSpinner } from './BrailleSpinner';
 import { ThinkingBlock, ThinkingModeContext } from './ThinkingBlock';
 import { ApprovalCountdown } from './ApprovalCountdown';
+import { useImageViewer } from './ImageViewer';
 import { ToolRow } from './ToolRow';
 import { chatBodyShown } from '../lib/panelLayout';
 import { settleTight } from '../lib/panelTight';
@@ -362,26 +363,50 @@ function useNow(ticking: boolean): number {
 
 /**
  * The attachments of a message the user sent, under its text: a 48px thumbnail for an image that has one, otherwise a chip with
- * the name and size (a document, or an image whose thumbnail was not stored). Names are shown as text only.
+ * the name and size (a document, or an image whose thumbnail was not stored). An image with a thumbnail or a stored address
+ * opens in the image viewer; a document and an image with neither stay as they are. Names are shown as text only.
  */
 function MessageAttachments({ items }: { items: UserAttachment[] }) {
+  const openImage = useImageViewer();
   return (
     <div className="msg-attachments">
       {items.map((a, i) => {
         const name = safeText(a.name);
+        const open = a.kind === 'image' && (a.thumb !== undefined || a.sha256 !== undefined) ? () => openImage({ name, thumb: a.thumb, sha256: a.sha256, mime: a.mime }) : null;
         if (a.kind === 'image' && a.thumb !== undefined) {
+          const thumb = <img className="msg-attach-thumb" src={a.thumb} alt={name} title={name} draggable={false} />;
           return (
             <div key={i} className="msg-attach is-image">
-              <img className="msg-attach-thumb" src={a.thumb} alt={name} title={name} draggable={false} />
+              {open !== null ? (
+                <button type="button" className="msg-attach-open" aria-label={`View ${name}`} onClick={open}>
+                  {thumb}
+                </button>
+              ) : (
+                thumb
+              )}
+            </div>
+          );
+        }
+        const label = (
+          <>
+            <span className="msg-attach-name" data-tip={name} data-tip-clip="">
+              {name}
+            </span>
+            <span className="msg-attach-size">{formatSize(a.bytes)}</span>
+          </>
+        );
+        if (open !== null) {
+          return (
+            <div key={i} className="msg-attach is-placeholder">
+              <button type="button" className="msg-attach-open" aria-label={`View ${name}`} onClick={open}>
+                {label}
+              </button>
             </div>
           );
         }
         return (
           <div key={i} className={a.kind === 'image' ? 'msg-attach is-placeholder' : 'msg-attach is-file'}>
-            <span className="msg-attach-name" data-tip={name} data-tip-clip="">
-              {name}
-            </span>
-            <span className="msg-attach-size">{formatSize(a.bytes)}</span>
+            {label}
           </div>
         );
       })}

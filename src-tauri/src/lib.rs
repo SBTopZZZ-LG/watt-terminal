@@ -31,7 +31,7 @@ use crate::core::chat::commands::{self, CommandCatalog};
 use crate::core::chat::instructions;
 use crate::core::chat::questions;
 use crate::core::chat::side::{self, SideCall};
-use crate::core::chat::attachments::{AttachmentInput, ImageFile, prepare};
+use crate::core::chat::attachments::{AttachmentInput, ImageFile, prepare, stored_image_url};
 use crate::core::chat::context::ContextUsage;
 use crate::core::chat::export;
 use crate::core::chat::history::History;
@@ -1087,6 +1087,16 @@ async fn load_conversation(
     Ok(LoadedConversation { id, title, messages, todos, context })
 }
 
+/// One stored image of the session's open conversation, as a `data:` URL, for the image viewer. The conversation is the
+/// session's own, never the webview's choice; the address and type are checked before any file is read.
+#[tauri::command]
+async fn get_attachment(session_id: String, sha256: String, mime: String, reg: State<'_, Reg>, persist: State<'_, PersistState>) -> Result<String, String> {
+    let att = session(&reg, &session_id)?;
+    let store = persist.get()?;
+    let conversation_id = att.conversation.id();
+    blocking(move || stored_image_url(store.conversations.attachments(), &conversation_id, &sha256, &mime)).await
+}
+
 /// What a derived conversation (compact/fork) hands to `save_side`: its id, model-facing history, todo list, model
 /// and context usage.
 struct SideSave {
@@ -1842,6 +1852,7 @@ pub fn run() {
             integrate_shell,
             list_conversations,
             load_conversation,
+            get_attachment,
             delete_conversation,
             rename_conversation,
             delete_all_conversations,
