@@ -120,6 +120,7 @@ fn side_error(e: &LlmError) -> String {
         LlmError::Parse(detail) => format!("I could not read the provider's reply: {detail}"),
         LlmError::TooLarge(detail) => format!("The provider's reply is too large: {detail}"),
         LlmError::Cancelled => "The side request was cancelled.".to_string(),
+        LlmError::Interrupted => "The side request was interrupted.".to_string(),
     }
 }
 

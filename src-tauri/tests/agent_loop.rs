@@ -64,6 +64,11 @@ impl Script {
     fn stall() -> Self {
         Script { status: "200 OK", body: String::new(), sse: true, stall: true }
     }
+
+    /// Sends `body` as an SSE stream, then stalls: the reply stays open after its first deltas.
+    fn sse_stall(body: &str) -> Self {
+        Script { status: "200 OK", body: body.to_string(), sse: true, stall: true }
+    }
 }
 
 /// A fake provider: its chat URL and the raw requests it received, in order.
@@ -185,6 +190,11 @@ fn sse_text(parts: &[&str]) -> String {
     s
 }
 
+/// One SSE text delta with no end: the start of a reply that a test stops partway.
+fn sse_partial(text: &str) -> String {
+    format!("data: {}\n\n", json!({"choices": [{"index": 0, "delta": {"content": text}}]}))
+}
+
 /// A streamed tool call to `get_cwd` with the arguments split over two deltas, then the end of the reply.
 const SSE_CWD_CALL: &str = "\
 data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_s1\",\"type\":\"function\",\"function\":{\"name\":\"get_cwd\",\"arguments\":\"\"}}]}}]}\n\n\
@@ -268,6 +278,9 @@ impl AgentTools for FakeTools {
     }
     fn open_agent_records(&self) -> Vec<OpenAgentRecord> {
         self.open.lock().unwrap().clone()
+    }
+    fn open_record_ids(&self) -> Vec<u64> {
+        self.open.lock().unwrap().iter().map(|r| r.id).collect()
     }
     fn finished_summary(&self, id: u64) -> Option<RecordSummary> {
         self.finished.lock().unwrap().clone().filter(|r| r.id == id)
@@ -358,6 +371,20 @@ fn turn_message(agent: &mut LlmAgent, tools: &dyn AgentTools, gate: &ApprovalGat
     let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
     let ctx = AgentCtx::new(tools, gate, &emit);
     agent::run_turn(agent, message, &ctx);
+    log.into_inner().unwrap()
+}
+
+/// Runs one turn and hands each event to `hook` as it is emitted, so a test can change the fake shell during the turn (the
+/// open commands). Returns every event it emitted, `Done` included.
+fn turn_hooked(agent: &mut LlmAgent, tools: &dyn AgentTools, text: &str, hook: impl Fn(&AgentEvent)) -> Vec<AgentEvent> {
+    let gate = no_gate();
+    let log: Mutex<Vec<AgentEvent>> = Mutex::new(Vec::new());
+    let emit = |ev: AgentEvent| {
+        hook(&ev);
+        log.lock().unwrap().push(ev);
+    };
+    let ctx = AgentCtx::new(tools, &gate, &emit);
+    agent::run_turn(agent, &UserMessage::text(text), &ctx);
     log.into_inner().unwrap()
 }
 
@@ -863,6 +890,164 @@ fn cancel_during_a_tool_call_closes_the_rest_without_another_model_call() {
     assert_eq!(tool_content(&msgs, "call_1"), "box:/home/u");
     assert_eq!(tool_content(&msgs, "call_2"), "cancelled");
     assert_paired(&msgs);
+}
+
+/// A fake shell whose command 7 is open, and whose finished summary of 7 exits 0.
+fn shell_with_command_7() -> FakeTools {
+    FakeTools {
+        open: Mutex::new(vec![open_on_top(7)]),
+        finished: Mutex::new(Some(finished_record(7, 0))),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn a_command_finishing_mid_stream_discards_the_partial_reply_and_asks_again() {
+    let provider = serve(vec![Script::sse_stall(&sse_partial("Let me check")), Script::sse(&sse_text(&["Done."]))]);
+    let conv = Conversation::new().unwrap();
+    let mut agent = agent_for(&settings(&provider.url, true), &conv, Arc::new(TurnCancel::new()));
+    let tools = shell_with_command_7();
+    // Command 7 exits as soon as the first text is on screen.
+    let events = turn_hooked(&mut agent, &tools, "hi", |ev| {
+        if matches!(ev, AgentEvent::TextDelta { .. }) {
+            tools.open.lock().unwrap().clear();
+        }
+    });
+
+    let shown = events.iter().position(|e| matches!(e, AgentEvent::TextDelta { text } if text == "Let me check"));
+    let discard = events.iter().position(|e| matches!(e, AgentEvent::ReplyDiscarded));
+    let redone = events.iter().position(|e| matches!(e, AgentEvent::TextDelta { text } if text == "Done."));
+    let (shown, discard, redone) = (shown.unwrap(), discard.unwrap(), redone.unwrap());
+    assert!(shown < discard && discard < redone, "the discard comes between the two replies: {events:?}");
+    assert_eq!(
+        stored(&conv.history()),
+        vec![json!({"role": "user", "content": "hi"}), json!({"role": "assistant", "content": "Done."})],
+        "the discarded text is not in the history"
+    );
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        system_of(&requests[1]).contains("Command 7 finished (exit 0) while you were replying."),
+        "{}",
+        system_of(&requests[1])
+    );
+    assert!(!requests[1].contains("Let me check"), "the discarded text is not sent again");
+    assert!(matches!(events.last(), Some(AgentEvent::Done)));
+}
+
+#[test]
+fn a_command_finishing_after_the_stream_discards_the_reply_before_its_tool_calls_run() {
+    let provider = serve(vec![Script::sse(SSE_CWD_CALL), Script::sse(&sse_text(&["All set."]))]);
+    let conv = Conversation::new().unwrap();
+    let mut agent = agent_for(&settings(&provider.url, true), &conv, Arc::new(TurnCancel::new()));
+    let tools = shell_with_command_7();
+    // The streamed call is complete when the thinking state ends; command 7 exits then, before its call runs.
+    let events = turn_hooked(&mut agent, &tools, "where am I", |ev| {
+        if matches!(ev, AgentEvent::Thinking { active: false }) {
+            tools.open.lock().unwrap().clear();
+        }
+    });
+
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::ReplyDiscarded)), "{events:?}");
+    assert!(tools.reached().is_empty(), "the discarded call must not run: {:?}", tools.reached());
+    assert_eq!(provider.requests().len(), 2);
+    let msgs = stored(&conv.history());
+    assert_eq!(
+        msgs,
+        vec![json!({"role": "user", "content": "where am I"}), json!({"role": "assistant", "content": "All set."})]
+    );
+    assert_paired(&msgs);
+}
+
+#[test]
+fn a_command_finishing_during_a_non_streamed_reply_discards_it() {
+    let provider = serve(vec![Script::json(text_reply("Let me check")), Script::json(text_reply("Done."))]);
+    let conv = Conversation::new().unwrap();
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
+    let tools = shell_with_command_7();
+    let events = turn_hooked(&mut agent, &tools, "hi", |ev| {
+        if matches!(ev, AgentEvent::Thinking { active: false }) {
+            tools.open.lock().unwrap().clear();
+        }
+    });
+
+    let shown = events.iter().position(|e| matches!(e, AgentEvent::Text { text } if text == "Let me check"));
+    let discard = events.iter().position(|e| matches!(e, AgentEvent::ReplyDiscarded));
+    assert!(shown.unwrap() < discard.unwrap(), "{events:?}");
+    assert_eq!(texts(&events), ["Let me check", "Done."]);
+    assert_eq!(
+        stored(&conv.history()),
+        vec![json!({"role": "user", "content": "hi"}), json!({"role": "assistant", "content": "Done."})]
+    );
+    assert_eq!(provider.requests().len(), 2);
+}
+
+#[test]
+fn a_command_still_open_when_the_reply_ends_does_not_discard_it() {
+    let provider = serve(vec![Script::sse(&sse_text(&["Hel", "lo"]))]);
+    let conv = Conversation::new().unwrap();
+    let mut agent = agent_for(&settings(&provider.url, true), &conv, Arc::new(TurnCancel::new()));
+    let tools = FakeTools { open: Mutex::new(vec![open_on_top(7)]), ..Default::default() };
+    let events = turn_hooked(&mut agent, &tools, "hi", |_| {});
+
+    assert!(!events.iter().any(|e| matches!(e, AgentEvent::ReplyDiscarded)), "{events:?}");
+    assert_eq!(deltas(&events), ["Hel", "lo"]);
+    assert_eq!(provider.requests().len(), 1);
+}
+
+#[test]
+fn after_three_discards_the_next_reply_stands() {
+    let provider = serve(vec![
+        Script::sse(SSE_CWD_CALL),
+        Script::sse(SSE_CWD_CALL),
+        Script::sse(SSE_CWD_CALL),
+        Script::sse(SSE_CWD_CALL),
+        Script::sse(&sse_text(&["Done."])),
+    ]);
+    let conv = Conversation::new().unwrap();
+    let mut agent = agent_for(&settings(&provider.url, true), &conv, Arc::new(TurnCancel::new()));
+    let tools = shell_with_command_7();
+    // Each request starts with command 7 open, and it exits when the call is complete. A discard opens it again, so
+    // the next request starts the same way. The fourth reply is the one that stands.
+    let events = turn_hooked(&mut agent, &tools, "where am I", |ev| match ev {
+        AgentEvent::Thinking { active: false } => tools.open.lock().unwrap().clear(),
+        AgentEvent::ReplyDiscarded => tools.open.lock().unwrap().push(open_on_top(7)),
+        _ => {}
+    });
+
+    let discards = events.iter().filter(|e| matches!(e, AgentEvent::ReplyDiscarded)).count();
+    assert_eq!(discards, 3, "{events:?}");
+    assert_eq!(tools.reached(), ["get_cwd"], "the fourth reply's call runs");
+    assert_eq!(provider.requests().len(), 5);
+    assert_eq!(deltas(&events), ["Done."]);
+    assert_paired(&stored(&conv.history()));
+}
+
+#[test]
+fn a_cancel_with_a_finished_command_keeps_the_partial_reply_as_before() {
+    let provider = serve(vec![Script::sse_stall(&sse_partial("Let me check"))]);
+    let conv = Conversation::new().unwrap();
+    let cancel = Arc::new(TurnCancel::new());
+    let mut agent = agent_for(&settings(&provider.url, true), &conv, cancel.clone());
+    let tools = shell_with_command_7();
+    // The user cancels and command 7 exits in the same moment. The cancel wins: the partial reply is kept, as for a cancel.
+    let events = turn_hooked(&mut agent, &tools, "hi", |ev| {
+        if matches!(ev, AgentEvent::TextDelta { .. }) {
+            cancel.cancel();
+            tools.open.lock().unwrap().clear();
+        }
+    });
+
+    assert!(!events.iter().any(|e| matches!(e, AgentEvent::ReplyDiscarded)), "{events:?}");
+    assert_eq!(
+        stored(&conv.history()),
+        vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "Let me check\n\n[reply interrupted]"}),
+        ]
+    );
+    assert_eq!(provider.requests().len(), 1);
+    assert!(matches!(events.last(), Some(AgentEvent::Done)));
 }
 
 #[test]

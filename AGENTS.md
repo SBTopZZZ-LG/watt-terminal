@@ -35,6 +35,7 @@ Watt is a terminal for macOS and Windows 11 where the user and an AI agent share
 - Model variants are shallow request-body overlays saved per model (`Model.variants`, `ModelRef.variant`): auto-built from the provider model list (OpenRouter `reasoning.supported_efforts` → `reasoning.effort`; OpenCode `capabilities.reasoning.effort` → `reasoning_effort`) or manual JSON. Protected keys (`model`, `messages`, `stream`, `tools`, `stream_options`, `max_tokens`, `max_completion_tokens`, `models`) are rejected and skipped at merge. Side calls (`/btw`, `/compact`) never carry a variant.
 - The bundle id is `dev.watt.terminal`. Legacy `dev.agentterm.app` data and Keychain items are copied at first launch and never deleted or overwritten (`migrate.rs`, `settings/secrets.rs`).
 - CSP is strict (`tauri.conf.json`, `src/lib/csp.test.ts`): no inline scripts, no remote resources. Native file drop is off on purpose; drops are handled in the webview (`src/lib/dropGuard.ts`).
+- A reply is discarded, never stored, when a command open at its request start finishes before the reply is acted on (`respond` and `send` in `core/chat/agent_loop.rs`, `reply_discarded` in `src/lib/transcript.ts`). Keep it so: no partial reply in the history.
 
 ## UI and layout work
 
