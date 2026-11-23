@@ -119,7 +119,7 @@ export const EMPTY_TRANSCRIPT: Transcript = {
 export const REDO_NOTE = 'Command finished: redoing the reply.';
 
 /** The note shown once in a turn when older content was left out of a request. */
-export const TRIM_NOTE ='Older messages or tool output were left out of the request to fit the model\'s context window.';
+export const TRIM_NOTE = 'Older messages or tool output were left out of the request to fit the model\'s context window.';
 
 /** Keeps the transcript bounded; the oldest items go first. */
 export const MAX_ITEMS = 500;

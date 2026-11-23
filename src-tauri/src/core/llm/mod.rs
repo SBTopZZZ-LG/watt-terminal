@@ -978,7 +978,7 @@ mod tests {
         let client = http_client().unwrap();
         let cancel = TurnCancel::new();
         let mut ignore = |_d: Delta| {};
-        let err = block_on(run_stream(&client, &cfg(&url), &one_message(), &mut ignore, &cancel, NO_INTERRUPT,SMALL_BOUNDS))
+        let err = block_on(run_stream(&client, &cfg(&url), &one_message(), &mut ignore, &cancel, NO_INTERRUPT, SMALL_BOUNDS))
             .unwrap_err();
         assert!(matches!(err, LlmError::TooLarge(_)), "{err:?}");
     }
@@ -993,7 +993,7 @@ mod tests {
         let client = http_client().unwrap();
         let cancel = TurnCancel::new();
         let mut ignore = |_d: Delta| {};
-        let err = block_on(run_stream(&client, &cfg(&url), &one_message(), &mut ignore, &cancel, NO_INTERRUPT,SMALL_BOUNDS))
+        let err = block_on(run_stream(&client, &cfg(&url), &one_message(), &mut ignore, &cancel, NO_INTERRUPT, SMALL_BOUNDS))
             .unwrap_err();
         assert!(matches!(err, LlmError::TooLarge(_)), "{err:?}");
         assert!(err.to_string().contains("single line or event"), "{err}");
