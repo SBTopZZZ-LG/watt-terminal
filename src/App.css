@@ -3641,6 +3641,12 @@ a {
   overflow-wrap: anywhere;
 }
 
+/* A hint on a line of its own, under the one before it. */
+.settings-hint-block {
+  display: block;
+  margin-top: 4px;
+}
+
 .settings-error {
   display: block;
   color: var(--fail);
@@ -4285,6 +4291,20 @@ a {
   margin-left: auto;
 }
 
+/* A section's header row (Skill folders, Skills) sits above its cards with the same gap the cards use between each other. */
+.settings-section-block > .settings-card-head {
+  margin-bottom: 8px;
+}
+
+.settings-card-head > .settings-section-title {
+  margin: 0;
+}
+
+/* The approval card: its row and its hint are one block, so the hint sits under the row with the card's own gap. */
+.settings-approval > * {
+  margin: 0;
+}
+
 .settings-card-actions {
   display: flex;
   flex-wrap: wrap;
@@ -4380,7 +4400,7 @@ a {
 
 .settings-skill-controls {
   display: flex;
-  flex: 0 1 170px;
+  flex: 0 1 220px;
   flex-direction: column;
   gap: 6px;
   align-items: stretch;
@@ -4462,6 +4482,11 @@ a {
   overflow-x: hidden;
   overflow-y: auto;
   padding: 14px 16px;
+}
+
+/* A sheet's own input (the skill folder path) spans the sheet body. */
+.sheet-body > input {
+  width: 100%;
 }
 
 .sheet-foot {

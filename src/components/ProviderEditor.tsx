@@ -334,9 +334,9 @@ export function ProviderEditor(p: ProviderEditorProps) {
           </div>
         )}
         {!draft.storedKey && draft.apiKey.trim() === '' && !draft.clearKey && !keyLocal && (
-          <span className="settings-hint">No key stored. Requests to this provider fail until one is saved.</span>
+          <span className="settings-hint settings-hint-block">No key stored. Requests to this provider fail until one is saved.</span>
         )}
-        <span className="settings-hint">A typed key is never shown again, and a stored key is not read back into this form.</span>
+        <span className="settings-hint settings-hint-block">A typed key is never shown again, and a stored key is not read back into this form.</span>
       </div>
 
       <div className="settings-section-block">
