@@ -40,7 +40,8 @@ import { itemsFromMessages } from './lib/historyView';
 import { agentActivity } from './lib/agentActivity';
 import { userAttachments } from './lib/attachments';
 import { defaultModelVision } from './lib/modelVision';
-import { createPatchSaver, devtoolsPatch, fontPatch, hideMarksPatch, notificationsPatch, panelPatch, queueModePatch, reconcileDevtools, reconcileFont, reconcileGroupBy, reconcileHideMarks, reconcileNotifications, reconcilePanel, reconcileQueueMode, reconcileSuggestPrompts, shouldRestoreLast, suggestPromptsPatch } from './lib/uiState';
+import { createPatchSaver, devtoolsPatch, fontPatch, hideMarksPatch, notificationsPatch, panelPatch, queueModePatch, reconcileDevtools, reconcileFont, reconcileGroupBy, reconcileHideMarks, reconcileNotifications, reconcilePanel, reconcileQueueMode, reconcileSuggestPrompts, reconcileThinkingMode, shouldRestoreLast, suggestPromptsPatch, thinkingModePatch } from './lib/uiState';
+import { DEFAULT_THINKING_MODE } from './lib/thinking';
 import { decideAttention } from './lib/attention';
 import type { AttentionEvent } from './lib/attention';
 import { onNotificationClick, sendAttention, watchWindowFocus } from './lib/attentionClient';
@@ -49,7 +50,7 @@ import { NEW_DRAFT_KEY, forgetAllSuggestions, forgetConversation, forgetEverythi
 import { SEND_WHILE_SWITCHING_NOTICE, switchRefusal } from './lib/switchGuard';
 import { drainBatch, enqueue, QUEUE_SLOT_POLL_MS, QUEUE_SLOT_WAIT_MS, removeQueued, shouldDrain } from './lib/messageQueue';
 import type { QueuedMessage } from './lib/messageQueue';
-import type { AttachmentInput, Cwd, HistoryGroupBy, InputState, IntegrationStatus, LevelInfo, LlmStatus, LoadedConversation, ObserverStatus, QueueMode, QuestionAnswerInput, SettingsStateView, Status, UiState, UiStatePatch, WireEvent } from './lib/types';
+import type { AttachmentInput, Cwd, HistoryGroupBy, InputState, IntegrationStatus, LevelInfo, LlmStatus, LoadedConversation, ObserverStatus, QueueMode, QuestionAnswerInput, SettingsStateView, Status, ThinkingMode, UiState, UiStatePatch, WireEvent } from './lib/types';
 import { recoveryKind } from './lib/settingsRecovery';
 import { TerminalView } from './components/TerminalView';
 import { InputBar } from './components/InputBar';
@@ -164,6 +165,8 @@ export default function App() {
   const draining = useRef(false);
   const drainAgain = useRef(false);
   const [queueMode, setQueueMode] = useState<QueueMode>('all');
+  // How reasoning blocks show (the Reasoning setting). Auto until the file says otherwise.
+  const [thinkingMode, setThinkingMode] = useState<ThinkingMode>(DEFAULT_THINKING_MODE);
   // Bumped when the live conversation is renamed, so an open HistoryView remounts and refetches its rows.
   const [historyKey, setHistoryKey] = useState(0);
   const [historyGroupBy, setHistoryGroupBy] = useState<HistoryGroupBy>('date');
@@ -436,6 +439,10 @@ export default function App() {
       const queued = reconcileQueueMode(remote.queue_mode);
       if (queued !== null) {
         setQueueMode(queued);
+      }
+      const thinking = reconcileThinkingMode(remote.thinking_mode);
+      if (thinking !== null) {
+        setThinkingMode(thinking);
       }
       const marks = reconcileHideMarks(remote.hide_marks);
       if (marks !== null) {
@@ -936,6 +943,12 @@ export default function App() {
   const setQueueModeSetting = (mode: QueueMode) => {
     setQueueMode(mode);
     persist(queueModePatch(mode));
+  };
+
+  /** The reasoning setting is applied at once and saved with the UI state. */
+  const setThinkingModeSetting = (mode: ThinkingMode) => {
+    setThinkingMode(mode);
+    persist(thinkingModePatch(mode));
   };
 
   /** The suggest-prompts setting is applied at once and saved. Turning it off drops what is shown or in flight, and what was saved. */
@@ -1733,6 +1746,7 @@ export default function App() {
               items={transcript.items}
               busy={busy}
               thinking={transcript.thinking}
+              thinkingMode={thinkingMode}
               approvalPending={pendingApproval !== null}
               open={panel.open}
               onToggle={() => dispatchPanel({ type: 'toggle' })}
@@ -1847,6 +1861,8 @@ export default function App() {
           onHideMarksChange={setMarksHidden}
           queueMode={queueMode}
           onQueueModeChange={setQueueModeSetting}
+          thinkingMode={thinkingMode}
+          onThinkingModeChange={setThinkingModeSetting}
           suggestPrompts={suggestPrompts}
           onSuggestPromptsChange={setSuggestPromptsSetting}
           notifications={notifications}

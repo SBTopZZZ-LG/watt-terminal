@@ -24,6 +24,7 @@ An experimental terminal for macOS and Windows 11 where you and an AI agent shar
 - **Context meter.** A live estimate of how much of the model's context window is used, broken down by system instructions, tools, your messages, attachments, assistant replies and tool output. When the window fills, the oldest tool output, document text and whole turns are trimmed from what is sent, newest first kept; your stored conversation is never rewritten.
 - **Attachments.** Drop or paste images and text files onto the agent bar. Click an image (in the bar or a sent message) to view it in an overlay: it is scaled to fit the window, with no zoom.
 - **Todo panel.** The agent keeps a todo list for multi-step work, pinned above the context meter.
+- **Reasoning.** The model's reasoning streams into a block in the agent panel, with a loader at the bottom while the agent works. Settings, Terminal, Reasoning sets it to collapsed, auto (open while thinking) or expanded. Reasoning is not kept after a reload.
 - **Conversations are saved.** Browse past conversations in the history view and pick one back up.
 - **Terminal comforts.** Find (Cmd+F for the chat or the terminal, Cmd+Shift+F for the terminal), clear (Cmd+K), font zoom, a colour stripe per command showing its exit status, and a border that pulses while the agent works.
 

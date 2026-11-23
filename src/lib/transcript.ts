@@ -65,7 +65,12 @@ export type TranscriptItem =
    */
   | { id: number; kind: 'todo_set'; items: TodoItem[] }
   /** `muted` is a quiet note (the trim note), drawn in the muted colour rather than the warning one. */
-  | { id: number; kind: 'notice'; text: string; muted?: boolean };
+  | { id: number; kind: 'notice'; text: string; muted?: boolean }
+  /**
+   * The model's reasoning for one model call (live only: never stored, so a reloaded conversation has none). `streaming` is
+   * true while reasoning_delta events extend it. `startedAt` and `endedAt` are Unix ms, absent when the event had no time.
+   */
+  | { id: number; kind: 'thinking'; text: string; streaming: boolean; startedAt?: number; endedAt?: number };
 
 /** A transcript item before the reducer gives it an id. `Omit` over the union would lose the variants, so it is distributed. */
 export type NewItem = TranscriptItem extends infer T ? (T extends unknown ? Omit<T, 'id'> : never) : never;
@@ -226,6 +231,9 @@ export function transcriptReducer(t: Transcript, action: TranscriptAction): Tran
       return { ...t, inFlight: action.busy ? Math.max(1, t.inFlight) : 0 };
     case 'session_reset': {
       const items = t.items.map((i): TranscriptItem => {
+        if (i.kind === 'thinking' && i.streaming) {
+          return { ...i, streaming: false };
+        }
         if (i.kind === 'approval' && i.state !== 'resolved') {
           return { ...i, state: 'resolved' };
         }
@@ -304,8 +312,52 @@ function resultError(result: unknown): string | null {
   return null;
 }
 
-function applyAgentEvent(t: Transcript, ev: AgentEvent, at: number | undefined): Transcript {
+/**
+ * Whether an event ends an open reasoning block: the content that follows it, the end of the model call, or any other
+ * event that is not reasoning, the thinking start or shell and usage bookkeeping.
+ */
+function endsReasoning(ev: AgentEvent): boolean {
   switch (ev.type) {
+    case 'reasoning_delta':
+    case 'context_usage':
+    case 'agent_control':
+    case 'integration_request':
+      return false;
+    case 'thinking':
+      return !ev.active;
+    default:
+      return true;
+  }
+}
+
+/** Reasoning text extends the open reasoning block, or starts one. Whitespace alone starts none. */
+function appendReasoning(t: Transcript, text: string, at: number | undefined): Transcript {
+  const last = t.items[t.items.length - 1];
+  if (last && last.kind === 'thinking' && last.streaming) {
+    const items = [...t.items.slice(0, -1), { ...last, text: last.text + text }];
+    return { ...t, items };
+  }
+  const opening = text.replace(/^\s+/, '');
+  if (opening === '') {
+    return t;
+  }
+  return add(t, (id) => ({ id, kind: 'thinking', text: opening, streaming: true, startedAt: at }));
+}
+
+/** Closes the open reasoning block, if the last item is one. */
+function endReasoning(t: Transcript, at: number | undefined): Transcript {
+  const last = t.items[t.items.length - 1];
+  if (!last || last.kind !== 'thinking' || !last.streaming) {
+    return t;
+  }
+  return { ...t, items: [...t.items.slice(0, -1), { ...last, streaming: false, endedAt: at }] };
+}
+
+function applyAgentEvent(t0: Transcript, ev: AgentEvent, at: number | undefined): Transcript {
+  const t = endsReasoning(ev) ? endReasoning(t0, at) : t0;
+  switch (ev.type) {
+    case 'reasoning_delta':
+      return appendReasoning(t, ev.text, at);
     case 'text':
       return add(t, (id) => ({ id, kind: 'agent', text: ev.text, streaming: false }));
     case 'text_delta':
@@ -531,6 +583,25 @@ export function firstPendingApproval(t: Transcript): string | null {
 
 export function isBusy(t: Transcript): boolean {
   return t.inFlight > 0;
+}
+
+/** The longest tool name the activity line shows; a longer one (from the model) is cut with an ellipsis. */
+const ACTIVITY_NAME_MAX = 40;
+
+/**
+ * What the agent is doing, for the line at the bottom of the transcript while it is busy. A pending approval wins, then the
+ * running tool, then the model's thinking, else plain working.
+ */
+export function activityLabel(t: Pick<Transcript, 'items' | 'thinking'>): string {
+  if (t.items.some((i) => i.kind === 'approval' && i.state === 'pending')) {
+    return 'Waiting for your approval';
+  }
+  const running = t.items.find((i) => i.kind === 'tool' && i.status === 'running');
+  if (running && running.kind === 'tool') {
+    const name = running.name.length > ACTIVITY_NAME_MAX ? `${running.name.slice(0, ACTIVITY_NAME_MAX - 1)}…` : running.name;
+    return `Running ${name}`;
+  }
+  return t.thinking ? 'Thinking' : 'Working';
 }
 
 /**

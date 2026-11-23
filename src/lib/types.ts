@@ -123,6 +123,8 @@ export type AgentEvent =
   | { type: 'text'; text: string }
   /** Streamed assistant text. `text` events still carry whole messages. */
   | { type: 'text_delta'; text: string }
+  /** Streamed reasoning text of the model. Shown live only; never stored, so a reload does not have it. */
+  | { type: 'reasoning_delta'; text: string }
   /** The model is working on a reply (true) or has produced its first output (false). */
   | { type: 'thinking'; active: boolean }
   | { type: 'tool_call'; call_id: string; name: string; args: unknown }
@@ -314,6 +316,8 @@ export interface DeleteResult {
 export type Dock = 'left' | 'right';
 export type HistoryGroupBy = 'date' | 'workspace';
 export type QueueMode = 'all' | 'one';
+/** How reasoning blocks show: always collapsed, open while the model thinks then collapsed (auto), or always expanded. */
+export type ThinkingMode = 'collapsed' | 'auto' | 'expanded';
 
 export interface PanelSizes {
   left: number | null;
@@ -335,6 +339,8 @@ export interface UiState {
   history_group_by: HistoryGroupBy | null;
   /** How messages queued while the agent works are sent. Null when the file has no value (all together). */
   queue_mode: QueueMode | null;
+  /** How reasoning blocks show. Null when the file has no valid value (auto then applies). */
+  thinking_mode: ThinkingMode | null;
   /** Hides the terminal's command separators and agent labels. Always a boolean: true when the file has no value. */
   hide_marks: boolean;
   /** Suggests follow-up prompts after each reply (one extra model call per reply). Always a boolean: true when the file has no value. */
@@ -352,6 +358,7 @@ export interface UiStatePatch {
   last_conversation_id?: string | null;
   history_group_by?: HistoryGroupBy | null;
   queue_mode?: QueueMode | null;
+  thinking_mode?: ThinkingMode | null;
   /** A boolean cannot be cleared: the backend ignores `null`, like an absent field. */
   hide_marks?: boolean;
   /** As `hide_marks`: a boolean, so `null` is ignored too. */

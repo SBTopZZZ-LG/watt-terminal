@@ -865,16 +865,18 @@ impl LlmAgent {
         };
         self.emit_usage(ctx, before.clone());
         let result = if self.stream {
-            let mut on_delta = |delta: Delta| {
-                // Reasoning deltas are not shown yet, so they do not end the "thinking" state.
-                if let Delta::Text(text) = delta
-                    && !text.is_empty()
-                {
+            let mut on_delta = |delta: Delta| match delta {
+                // Reasoning is shown as it streams, but it does not end the "thinking" state.
+                Delta::Reasoning(text) if !text.is_empty() => {
+                    ctx.emit(AgentEvent::ReasoningDelta { text: redact_stream_fragment(&self.redactor, &text) });
+                }
+                Delta::Text(text) if !text.is_empty() => {
                     stop_thinking(ctx, &thinking);
                     streamed.set(true);
                     streamed_raw.push_str(&text);
                     ctx.emit(AgentEvent::TextDelta { text: redact_stream_fragment(&self.redactor, &text) });
                 }
+                _ => {}
             };
             block(llm::stream(&self.client, &self.cfg, &req, &mut on_delta, &self.cancel))
         } else {
@@ -907,6 +909,9 @@ impl LlmAgent {
     fn finish_call(&self, ctx: &AgentCtx<'_>, result: Result<AssistantReply, LlmError>) -> Option<AssistantReply> {
         match result {
             Ok(reply) => {
+                if !self.stream && !reply.reasoning.is_empty() {
+                    ctx.emit(AgentEvent::ReasoningDelta { text: self.redactor.redact(&reply.reasoning) });
+                }
                 if !self.stream && !reply.text.is_empty() {
                     ctx.say(self.redactor.redact(&reply.text));
                 }
