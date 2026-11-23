@@ -29,6 +29,8 @@ const DOCKS: [&str; 2] = ["left", "right"];
 const HISTORY_GROUPS: [&str; 2] = ["date", "workspace"];
 /// How queued agent messages are sent: all together, or one per turn.
 const QUEUE_MODES: [&str; 2] = ["all", "one"];
+/// How reasoning blocks are shown: always collapsed, open while thinking then collapsed, or always expanded.
+const THINKING_MODES: [&str; 3] = ["collapsed", "auto", "expanded"];
 const FONT_SIZES: RangeInclusive<u32> = 8..=32;
 /// The separators and agent labels are hidden unless the file says otherwise.
 const HIDE_MARKS_DEFAULT: bool = true;
@@ -66,6 +68,8 @@ pub struct UiState {
     pub history_group_by: Option<String>,
     /// `all` or `one`: how messages queued while the agent works are sent. Missing or invalid reads as `None` (all).
     pub queue_mode: Option<String>,
+    /// `collapsed`, `auto` or `expanded`: how reasoning blocks are shown. Missing or invalid reads as `None` (auto).
+    pub thinking_mode: Option<String>,
     /// Hides the terminal's command separators and agent labels (the exit-coloured stripes stay). Missing or invalid
     /// in the file reads as the default, `true`.
     #[serde(default = "hide_marks_default")]
@@ -109,6 +113,7 @@ impl Default for UiState {
             last_conversation_id: None,
             history_group_by: None,
             queue_mode: None,
+            thinking_mode: None,
             hide_marks: HIDE_MARKS_DEFAULT,
             suggest_prompts: SUGGEST_PROMPTS_DEFAULT,
             notifications: NOTIFICATIONS_DEFAULT,
@@ -131,6 +136,8 @@ pub struct UiStatePatch {
     pub history_group_by: Option<Option<String>>,
     #[serde(deserialize_with = "double_option")]
     pub queue_mode: Option<Option<String>>,
+    #[serde(deserialize_with = "double_option")]
+    pub thinking_mode: Option<Option<String>>,
     /// A boolean has no "clear", so `null` is the same as absent: the value is left alone.
     pub hide_marks: Option<bool>,
     /// As `hide_marks`: a boolean, so `null` leaves it alone.
@@ -189,6 +196,9 @@ impl UiStateStore {
         }
         if let Some(mode) = patch.queue_mode {
             state.queue_mode = mode;
+        }
+        if let Some(mode) = patch.thinking_mode {
+            state.thinking_mode = mode;
         }
         if let Some(hide) = patch.hide_marks {
             state.hide_marks = hide;
@@ -275,6 +285,11 @@ fn tolerant(value: &Value) -> UiState {
             .and_then(Value::as_str)
             .filter(|m| QUEUE_MODES.contains(m))
             .map(str::to_string),
+        thinking_mode: obj
+            .get("thinking_mode")
+            .and_then(Value::as_str)
+            .filter(|m| THINKING_MODES.contains(m))
+            .map(str::to_string),
         hide_marks: obj.get("hide_marks").and_then(Value::as_bool).unwrap_or(HIDE_MARKS_DEFAULT),
         suggest_prompts: obj.get("suggest_prompts").and_then(Value::as_bool).unwrap_or(SUGGEST_PROMPTS_DEFAULT),
         notifications: obj.get("notifications").and_then(Value::as_bool).unwrap_or(NOTIFICATIONS_DEFAULT),
@@ -332,6 +347,11 @@ fn validate_patch(patch: &UiStatePatch) -> Result<(), PersistError> {
         && !QUEUE_MODES.contains(&mode.as_str())
     {
         return Err(PersistError::Invalid("queue mode must be all or one".into()));
+    }
+    if let Some(Some(mode)) = &patch.thinking_mode
+        && !THINKING_MODES.contains(&mode.as_str())
+    {
+        return Err(PersistError::Invalid("thinking mode must be collapsed, auto or expanded".into()));
     }
     Ok(())
 }
@@ -397,6 +417,7 @@ mod tests {
             last_conversation_id: Some(Some(id(1))),
             history_group_by: Some(Some("workspace".into())),
             queue_mode: Some(Some("one".into())),
+            thinking_mode: Some(Some("expanded".into())),
             hide_marks: Some(false),
             suggest_prompts: Some(true),
             notifications: Some(false),
@@ -409,6 +430,7 @@ mod tests {
         assert_eq!(written.last_conversation_id, Some(id(1)));
         assert_eq!(written.history_group_by.as_deref(), Some("workspace"));
         assert_eq!(written.queue_mode.as_deref(), Some("one"));
+        assert_eq!(written.thinking_mode.as_deref(), Some("expanded"));
         assert!(!written.hide_marks);
         assert!(written.suggest_prompts);
         assert!(!written.notifications);
@@ -614,6 +636,7 @@ mod tests {
             json!({"last_conversation_id": "../etc"}),
             json!({"history_group_by": "month"}),
             json!({"queue_mode": "some"}),
+            json!({"thinking_mode": "open"}),
         ];
         for value in bad {
             let result = s.patch(patch_from(value.clone()));
@@ -698,6 +721,37 @@ mod tests {
         assert_eq!(read_text(&tmp, r#"{"queue_mode": true}"#).queue_mode, None);
         assert_eq!(read_text(&tmp, r#"{"font_size": 12}"#).queue_mode, None, "an old file has none");
         assert_eq!(UiState::default().queue_mode, None);
+    }
+
+    #[test]
+    fn thinking_mode_is_collapsed_auto_or_expanded_and_reads_as_none_otherwise() {
+        let tmp = TempDir::new();
+        for mode in ["collapsed", "auto", "expanded"] {
+            assert_eq!(read_text(&tmp, &format!(r#"{{"thinking_mode": "{mode}"}}"#)).thinking_mode.as_deref(), Some(mode));
+        }
+        assert_eq!(read_text(&tmp, r#"{"thinking_mode": "open"}"#).thinking_mode, None);
+        assert_eq!(read_text(&tmp, r#"{"thinking_mode": true}"#).thinking_mode, None);
+        let kept = read_text(&tmp, r#"{"thinking_mode": "open", "queue_mode": "one"}"#);
+        assert_eq!(kept.queue_mode.as_deref(), Some("one"), "an invalid thinking mode does not drop the rest");
+        assert_eq!(read_text(&tmp, r#"{"font_size": 12}"#).thinking_mode, None, "an old file has none");
+        assert_eq!(UiState::default().thinking_mode, None);
+    }
+
+    #[test]
+    fn thinking_mode_patch_sets_clears_and_absent_leaves_it_alone() {
+        let tmp = TempDir::new();
+        let s = store(&tmp);
+        let expanded = s.patch(patch_from(json!({"thinking_mode": "expanded"}))).unwrap();
+        assert_eq!(expanded.thinking_mode.as_deref(), Some("expanded"));
+        assert_eq!(s.load().unwrap().thinking_mode.as_deref(), Some("expanded"), "written to the file");
+
+        let untouched = s.patch(patch_from(json!({"font_size": 13}))).unwrap();
+        assert_eq!(untouched.thinking_mode.as_deref(), Some("expanded"), "an absent field leaves it alone");
+
+        let cleared = s.patch(patch_from(json!({"thinking_mode": null}))).unwrap();
+        assert_eq!(cleared.thinking_mode, None, "null clears it, back to the default");
+        assert_eq!(patch_from(json!({"thinking_mode": "collapsed"})).thinking_mode, Some(Some("collapsed".into())));
+        assert_eq!(UiStatePatch::default().thinking_mode, None);
     }
 
     #[test]

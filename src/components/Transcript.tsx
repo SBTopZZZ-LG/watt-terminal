@@ -3,9 +3,9 @@ import type { MouseEvent, ReactNode, UIEvent, WheelEvent } from 'react';
 import { isFileWrite, previewText } from '../lib/approvalCard';
 import { copyText } from '../lib/clipboard';
 import { isAtBottom, shouldFollowAfterSend } from '../lib/stickScroll';
-import { approvalTitle } from '../lib/transcript';
+import { activityLabel, approvalTitle } from '../lib/transcript';
 import type { TranscriptItem, UserAttachment } from '../lib/transcript';
-import type { QuestionAnswerInput, TodoItem } from '../lib/types';
+import type { QuestionAnswerInput, ThinkingMode, TodoItem } from '../lib/types';
 import { statusWord, todoRows } from '../lib/todoView';
 import { draftsFromAnswers, enterIntent, firstUnsettled, isComplete, newDrafts, payload, pickOption, setOther, settled, summary, toggleSkip } from '../lib/questions';
 import type { EnterIntent, QuestionDraft } from '../lib/questions';
@@ -19,6 +19,8 @@ import type { GroupItem, InteractiveGroup, TranscriptEntry } from '../lib/toolGr
 import { visibleEscapes } from '../lib/visibleEscapes';
 import { BUSY_TIP } from '../lib/switchGuard';
 import { Markdown } from './Markdown';
+import { BrailleSpinner } from './BrailleSpinner';
+import { ThinkingBlock, ThinkingModeContext } from './ThinkingBlock';
 import { ApprovalCountdown } from './ApprovalCountdown';
 import { ToolRow } from './ToolRow';
 import { chatBodyShown } from '../lib/panelLayout';
@@ -52,6 +54,8 @@ interface Props {
   history?: ReactNode;
   /** A notice shown above the chat body (the settings banner). Shown with the chat view only, and it never moves the body's scroll. */
   banner?: ReactNode;
+  /** How reasoning blocks show (the Reasoning setting). Defaults to auto. */
+  thinkingMode?: ThinkingMode;
 }
 
 /** The agent conversation, docked above the input bar. Collapsible, scrollable, and capped by CSS. */
@@ -72,6 +76,7 @@ export function Transcript({
   onToggleHistory,
   history,
   banner = null,
+  thinkingMode = 'auto',
 }: Props) {
   const bodyRef = useRef<HTMLDivElement>(null);
   const sectionRef = useRef<HTMLElement>(null);
@@ -223,7 +228,6 @@ export function Transcript({
           <img className="brand-mark" src={wattMark} width={212} height={256} alt="" aria-hidden="true" draggable={false} />
           <span>Agent</span>
           {busy && <span className="busy">working...</span>}
-          {thinking && <span className="thinking">thinking...</span>}
           {approvalPending && <span className="approval-needed">approval needed</span>}
           <span className="toggle">{open ? 'Hide' : 'Show'}</span>
         </button>
@@ -254,7 +258,14 @@ export function Transcript({
       {bodyShown && (
         <div className="transcript-body" ref={bodyRef} tabIndex={-1} onScroll={onScroll} onWheel={onWheel}>
           {items.length === 0 && <div className="empty">Ask the agent something, for example "what was the last command".</div>}
-          {renderEntries(entries, onApprove, onAnswerQuestions)}
+          <ThinkingModeContext.Provider value={thinkingMode}>{renderEntries(entries, onApprove, onAnswerQuestions)}</ThinkingModeContext.Provider>
+          {/* Last in the body, so the follow-scroll keeps it in view. Only while a turn is in flight. */}
+          {busy && (
+            <div className="agent-activity" role="status">
+              <BrailleSpinner />
+              <span>{activityLabel({ items, thinking })}</span>
+            </div>
+          )}
         </div>
       )}
       {bodyShown && showJump && <JumpToLatest busy={busy} onClick={jumpToLatest} />}
@@ -418,6 +429,8 @@ function Entry({ item, onApprove, onAnswerQuestions }: { item: TranscriptItem; o
       );
     case 'notice':
       return <div className={item.muted ? 'notice notice-muted' : 'notice'}>{item.text}</div>;
+    case 'thinking':
+      return <ThinkingBlock item={item} />;
     case 'todo_set':
       return <TodoSetLine items={item.items} />;
     // Closes an interactive group (see renderEntries); with no group open there is nothing to show.

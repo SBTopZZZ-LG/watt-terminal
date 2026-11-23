@@ -997,10 +997,93 @@ a {
   letter-spacing: 0.08em;
 }
 
+/* A model call's reasoning: a button header with a ▸/▾ marker (as a tool row), and a body that collapses. The body's
+   height animates with its grid rows. The collapsed body is inert (ThinkingBlock), so it is out of the tab order too. */
 .thinking {
+  margin: 4px 0;
   color: var(--muted);
-  font-size: 11px;
+  font-size: 12px;
+}
+
+.thinking-head {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
   font-style: italic;
+  text-align: left;
+  cursor: pointer;
+}
+
+.thinking-head::before {
+  content: "▸";
+  display: inline-block;
+  width: 12px;
+  font-size: 10px;
+  font-style: normal;
+}
+
+.thinking-head[aria-expanded="true"]::before {
+  content: "▾";
+}
+
+.thinking-head:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.thinking-collapse {
+  display: grid;
+  grid-template-rows: 1fr;
+  opacity: 1;
+  transition: grid-template-rows 200ms ease, opacity 200ms ease;
+}
+
+.thinking-collapse[inert] {
+  grid-template-rows: 0fr;
+  opacity: 0;
+}
+
+.thinking-clip {
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* Fixed height while it streams (it follows the newest text); taller once it has ended. Plain text, not markdown. */
+.thinking-text {
+  margin-left: 12px;
+  padding-left: 10px;
+  border-left: 1px dashed var(--rule);
+  max-height: 7.5em;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.thinking:not(.is-streaming) .thinking-text {
+  max-height: 16em;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .thinking-collapse {
+    transition: none;
+  }
+}
+
+/* The agent's activity line at the bottom of the transcript while a turn is in flight (role status). */
+.agent-activity {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 6px 0;
+  color: var(--muted);
+  font-size: 12px;
 }
 
 /* The header's approval badge: a small warning pill next to Agent/working while a card waits. Narrow-safe: it never grows or wraps. */

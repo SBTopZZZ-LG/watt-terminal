@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { approvalTitle, EMPTY_TRANSCRIPT, firstPendingApproval, isBusy, MAX_ITEMS, TRIM_NOTE, transcriptReducer } from './transcript';
+import { activityLabel, approvalTitle, EMPTY_TRANSCRIPT, firstPendingApproval, isBusy, MAX_ITEMS, TRIM_NOTE, transcriptReducer } from './transcript';
 import { APPROVAL_WINDOW_MS } from './approvalTime';
 import type { QuestionSpec } from './types';
 import type { Transcript, TranscriptAction } from './transcript';
@@ -918,5 +918,77 @@ describe('transcriptReducer: the context meter and the trim note', () => {
   it('a sent message clears the flag left by an earlier turn that did not end', () => {
     const t = run([{ type: 'user_sent', clientId: 1, text: 'one' }, usage({ trimmed: true }), { type: 'user_sent', clientId: 2, text: 'two' }]);
     expect(t.trimNoted).toBe(false);
+  });
+});
+
+describe('transcriptReducer: reasoning', () => {
+  const reasoning = (text: string, at?: number): TranscriptAction => ({ type: 'agent_event', event: { type: 'reasoning_delta', text }, at });
+  const textAt = (text: string, at: number): TranscriptAction => ({ type: 'agent_event', event: { type: 'text_delta', text }, at });
+
+  it('reasoning deltas accumulate into one open thinking block, timed from its first delta', () => {
+    const t = run([reasoning('Let me ', 100), reasoning('think.', 200)]);
+    expect(t.items).toHaveLength(1);
+    expect(t.items[0]).toMatchObject({ kind: 'thinking', text: 'Let me think.', streaming: true, startedAt: 100 });
+    expect(t.items[0]).not.toHaveProperty('endedAt');
+  });
+
+  it('leading whitespace is dropped, and whitespace alone starts no block', () => {
+    expect(run([reasoning('\n\n  Hmm')]).items[0]).toMatchObject({ text: 'Hmm' });
+    expect(run([reasoning(' \n ')]).items).toHaveLength(0);
+  });
+
+  it('answer text closes the block with its end time', () => {
+    const t = run([reasoning('Thinking it over.', 100), textAt('Hi', 900)]);
+    expect(t.items.map((i) => i.kind)).toEqual(['thinking', 'agent']);
+    expect(t.items[0]).toMatchObject({ streaming: false, startedAt: 100, endedAt: 900 });
+  });
+
+  it('a tool call closes the block, and the next call reasoning opens a second one', () => {
+    const t = run([reasoning('first'), toolCall('c1'), reasoning('second')]);
+    expect(t.items.map((i) => i.kind)).toEqual(['thinking', 'tool', 'thinking']);
+    expect(t.items[0]).toMatchObject({ text: 'first', streaming: false });
+    expect(t.items[2]).toMatchObject({ text: 'second', streaming: true });
+  });
+
+  it('the end of the model call (thinking false) and done close the block', () => {
+    expect(run([reasoning('a', 1), thinking(false)]).items[0]).toMatchObject({ streaming: false });
+    expect(run([reasoning('a'), done]).items[0]).toMatchObject({ streaming: false });
+  });
+
+  it('thinking true does not end the block, and reasoning does not touch the thinking flag or the in-flight count', () => {
+    const t = run([thinking(true), reasoning('a'), thinking(true), reasoning('b')]);
+    expect(t.items).toHaveLength(1);
+    expect(t.items[0]).toMatchObject({ text: 'ab', streaming: true });
+    expect(t.thinking).toBe(true);
+    expect(t.inFlight).toBe(0);
+  });
+
+  it('a session reset ends an open block', () => {
+    expect(run([reasoning('a'), { type: 'session_reset' }]).items[0]).toMatchObject({ kind: 'thinking', streaming: false });
+  });
+});
+
+describe('activityLabel', () => {
+  const approval: TranscriptAction = { type: 'agent_event', event: { type: 'approval_request', call_id: 'c1', name: 'run_command', text: 'ls' } };
+
+  it('says what the agent is doing, in order: approval, running tool, thinking, working', () => {
+    expect(activityLabel(EMPTY_TRANSCRIPT)).toBe('Working');
+    expect(activityLabel(run([thinking(true)]))).toBe('Thinking');
+    expect(activityLabel(run([thinking(true), toolCall('c1')]))).toBe('Running get_cwd');
+    expect(activityLabel(run([thinking(true), toolCall('c1'), approval]))).toBe('Waiting for your approval');
+  });
+
+  it('a finished tool is no longer running', () => {
+    const t = run([toolCall('c1'), { type: 'agent_event', event: { type: 'tool_result', call_id: 'c1', name: 'get_cwd', ok: true, decision: 'read', result: {} } }]);
+    expect(activityLabel(t)).toBe('Working');
+  });
+
+  it('a long tool name is cut with an ellipsis', () => {
+    const name = 'x'.repeat(60);
+    const t = run([{ type: 'agent_event', event: { type: 'tool_call', call_id: 'c2', name, args: {} } }]);
+    const label = activityLabel(t);
+    expect(label.startsWith('Running ')).toBe(true);
+    expect(label.endsWith('…')).toBe(true);
+    expect([...label.slice('Running '.length)]).toHaveLength(40);
   });
 });

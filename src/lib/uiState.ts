@@ -6,7 +6,7 @@
 import { layoutFromUnknown, sameLayout } from './panelLayout';
 import type { PanelLayout } from './panelLayout';
 import { FONT_SIZE_MAX, FONT_SIZE_MIN } from './zoom';
-import type { PanelState, QueueMode, UiStatePatch } from './types';
+import type { PanelState, QueueMode, ThinkingMode, UiStatePatch } from './types';
 
 /** What a reconcile step does: `apply` takes a remote value into the UI, `migrate` writes a local value to the file. */
 export interface Reconciled<T> {
@@ -42,6 +42,16 @@ export function reconcileGroupBy(remote: string | null | undefined): 'date' | 'w
 /** The queue mode from the file, or null when it has none (all together then applies). Nothing is migrated: it has no local copy. */
 export function reconcileQueueMode(remote: string | null | undefined): QueueMode | null {
   return remote === 'all' || remote === 'one' ? remote : null;
+}
+
+/** The thinking mode from the file, or null when it has none or an unknown one (auto then applies). Nothing is migrated. */
+export function reconcileThinkingMode(remote: string | null | undefined): ThinkingMode | null {
+  return remote === 'collapsed' || remote === 'auto' || remote === 'expanded' ? remote : null;
+}
+
+/** The patch that saves the thinking mode. */
+export function thinkingModePatch(mode: ThinkingMode): UiStatePatch {
+  return { thinking_mode: mode };
 }
 
 /** The marks setting from the file, or null when the file has no boolean for it (the default then applies). Nothing is migrated. */

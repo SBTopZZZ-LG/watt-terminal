@@ -27,6 +27,7 @@ import type {
   OnDenied,
   ProviderPreset,
   QueueMode,
+  ThinkingMode,
   RecoverAction,
   SettingsStateView,
   SettingsView,
@@ -40,6 +41,7 @@ import { SettingsTabs } from './SettingsTabs';
 import type { TabDef } from './SettingsTabs';
 import { TerminalSection } from './TerminalSection';
 import { QueueSection } from './QueueSection';
+import { ThinkingSection } from './ThinkingSection';
 import { NotifySection } from './NotifySection';
 import { DevtoolsSection } from './DevtoolsSection';
 import { McpTab } from './McpSection';
@@ -510,6 +512,9 @@ export interface SettingsDialogProps {
   /** The Terminal tab's queued-messages setting: how messages queued while the agent works are sent. Owned by the caller (UI state). */
   queueMode: QueueMode;
   onQueueModeChange(mode: QueueMode): void;
+  /** The Terminal tab's reasoning setting: how reasoning blocks show in the agent. Owned by the caller (UI state). */
+  thinkingMode: ThinkingMode;
+  onThinkingModeChange(mode: ThinkingMode): void;
   /** Whether the agent suggests follow-up prompts after each reply. Owned by the caller (UI state). */
   suggestPrompts: boolean;
   onSuggestPromptsChange(on: boolean): void;
@@ -528,7 +533,7 @@ export interface SettingsDialogProps {
  * and goes back to where it was on close. Esc closes; a click on the backdrop closes. Unsaved changes are asked about
  * before they are dropped.
  */
-export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded, hideMarks, onHideMarksChange, queueMode, onQueueModeChange, suggestPrompts, onSuggestPromptsChange, notifications, onNotificationsChange, devtools, onDevtoolsChange }: SettingsDialogProps) {
+export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded, hideMarks, onHideMarksChange, queueMode, onQueueModeChange, thinkingMode, onThinkingModeChange, suggestPrompts, onSuggestPromptsChange, notifications, onNotificationsChange, devtools, onDevtoolsChange }: SettingsDialogProps) {
   const titleId = useId();
   const dialogRef = useRef<HTMLDivElement | null>(null);
   // The card's element, kept as state as well: the sheets draw into it, so they render once it exists.
@@ -1217,6 +1222,7 @@ export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded, h
     <>
       <TerminalSection hideMarks={hideMarks} onHideMarksChange={onHideMarksChange} />
       <QueueSection queueMode={queueMode} onQueueModeChange={onQueueModeChange} />
+      <ThinkingSection thinkingMode={thinkingMode} onThinkingModeChange={onThinkingModeChange} />
       <SuggestSection suggestPrompts={suggestPrompts} onSuggestPromptsChange={onSuggestPromptsChange} />
       <NotifySection notifications={notifications} onNotificationsChange={onNotificationsChange} />
       <DevtoolsSection devtools={devtools} onDevtoolsChange={onDevtoolsChange} />

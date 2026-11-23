@@ -10,6 +10,8 @@ import {
   queueModePatch,
   reconcileHideMarks,
   reconcileQueueMode,
+  reconcileThinkingMode,
+  thinkingModePatch,
   reconcilePanel,
   reconcileSuggestPrompts,
   suggestPromptsPatch,
@@ -288,5 +290,20 @@ describe('shouldRestoreLast', () => {
   it('does not restore while a turn is in flight, on either side', () => {
     expect(shouldRestoreLast({ ...ready, transcriptBusy: true })).toBe(false);
     expect(shouldRestoreLast({ ...ready, statusBusy: true })).toBe(false);
+  });
+});
+
+describe('reconcileThinkingMode and thinkingModePatch', () => {
+  it('reads the three modes, and null for anything else (the default then applies)', () => {
+    expect(reconcileThinkingMode('collapsed')).toBe('collapsed');
+    expect(reconcileThinkingMode('auto')).toBe('auto');
+    expect(reconcileThinkingMode('expanded')).toBe('expanded');
+    expect(reconcileThinkingMode('open')).toBeNull();
+    expect(reconcileThinkingMode(null)).toBeNull();
+    expect(reconcileThinkingMode(undefined)).toBeNull();
+  });
+
+  it('thinkingModePatch carries the mode as thinking_mode', () => {
+    expect(thinkingModePatch('expanded')).toEqual({ thinking_mode: 'expanded' });
   });
 });
