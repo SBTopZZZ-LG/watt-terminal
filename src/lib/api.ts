@@ -289,6 +289,12 @@ export const api = {
   listSkills() {
     return invoke<SkillsView>('list_skills', { sessionId: SESSION_ID });
   },
+  /** Opens the native "choose a folder" dialog. Resolves with the chosen folder as a full path, or null when the user cancels. Rejects when the dialog cannot open. */
+  async pickFolder(defaultPath?: string): Promise<string | null> {
+    // Loaded on first use, so code that runs outside Tauri (tests, the Vite preview) does not need the plugin.
+    const { open } = await import('@tauri-apps/plugin-dialog');
+    return open({ directory: true, multiple: false, title: 'Choose a skill folder', defaultPath });
+  },
   mcpRestart(name: string) {
     return invoke<McpView>('mcp_restart', { name });
   },

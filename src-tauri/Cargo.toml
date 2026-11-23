@@ -59,6 +59,8 @@ tauri-plugin-window-state = "=2.5.0"
 # Desktop notifications for the agent going idle or asking something while the window is in the background (lib.rs run).
 # Latest release for tauri ^2.12 (MSRV 1.90).
 tauri-plugin-notification = "=2.8.1"
+# Native folder picker for the skill folder sheet (SkillsSection.tsx). Latest 2.x release (tauri ^2.12). Pairs with @tauri-apps/plugin-dialog.
+tauri-plugin-dialog = "=2.8.4"
 
 [target.'cfg(windows)'.dependencies]
 # Process creation flags for MCP stdio servers (core/mcp/client.rs): CREATE_NO_WINDOW keeps a console app from opening a

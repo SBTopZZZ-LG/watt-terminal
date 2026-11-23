@@ -344,6 +344,9 @@ export function FolderSheet({
   onClose(): void;
 }) {
   const uid = useId();
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [picking, setPicking] = useState(false);
+  const [pickError, setPickError] = useState<string | null>(null);
   const editing = sheet.index !== null;
   const rows = view.folders.map((f) => f.folder);
   const result = withFolder(rows, sheet.index, sheet.draft);
@@ -353,6 +356,23 @@ export function FolderSheet({
   const save = () => {
     if (canSave) {
       onSubmit(saveInput(result.rows, view.disabled, view));
+    }
+  };
+  // The native picker is modal, so the sheet just waits for it. Its input gets focus back once it closes, whatever it returned.
+  const browse = async () => {
+    const current = sheet.draft.trim();
+    setPicking(true);
+    setPickError(null);
+    try {
+      const picked = await api.pickFolder(current !== '' && !current.startsWith('~') ? current : undefined);
+      if (picked !== null) {
+        onDraft(picked);
+      }
+    } catch (e) {
+      setPickError(errorText(e));
+    } finally {
+      setPicking(false);
+      inputRef.current?.focus();
     }
   };
   return (
@@ -370,23 +390,34 @@ export function FolderSheet({
         </>
       }
     >
-      <input
-        data-autofocus
-        aria-label="Skill folder"
-        aria-invalid={result.error !== null || undefined}
-        aria-describedby={`${uid}-hint`}
-        placeholder="~/my-skills or a path"
-        value={sheet.draft}
-        readOnly={saving}
-        spellCheck={false}
-        onChange={(e) => onDraft(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter') {
-            e.preventDefault();
-            save();
-          }
-        }}
-      />
+      <div className="settings-inline">
+        <input
+          ref={inputRef}
+          data-autofocus
+          aria-label="Skill folder"
+          aria-invalid={result.error !== null || undefined}
+          aria-describedby={`${uid}-hint`}
+          placeholder="~/my-skills or a path"
+          value={sheet.draft}
+          readOnly={saving}
+          spellCheck={false}
+          onChange={(e) => onDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              save();
+            }
+          }}
+        />
+        <button type="button" disabled={saving || picking} onClick={browse}>
+          Browse…
+        </button>
+      </div>
+      {pickError !== null && (
+        <span className="settings-error" role="alert">
+          {pickError}
+        </span>
+      )}
       {result.error !== null && (
         <span className="settings-error" role="alert">
           {result.error}

@@ -3,6 +3,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 type Args = Record<string, unknown>;
 const invoke = vi.fn(async (_cmd: string, _args?: Args) => undefined);
 vi.mock('@tauri-apps/api/core', () => ({ invoke: (cmd: string, args?: Args) => invoke(cmd, args), Channel: class {} }));
+const open = vi.fn(async (_options?: unknown): Promise<string | null> => null);
+vi.mock('@tauri-apps/plugin-dialog', () => ({ open: (options?: unknown) => open(options) }));
 
 // Imported after the mock, so api.ts takes the mocked invoke.
 const { api } = await import('./api');
@@ -173,6 +175,28 @@ describe('api skills commands', () => {
     });
     void api.setSkillsSettings({ folders: null, disabled: [], approval: 'auto', overrides: {} });
     expect(invoke).toHaveBeenLastCalledWith('set_skills_settings', { input: { folders: null, disabled: [], approval: 'auto', overrides: {} } });
+  });
+});
+
+describe('api.pickFolder', () => {
+  beforeEach(() => open.mockClear());
+
+  it('opens a folder-only dialog with a title, starting at the given folder', async () => {
+    open.mockResolvedValueOnce('/home/me/skills');
+    await expect(api.pickFolder('/home/me')).resolves.toBe('/home/me/skills');
+    expect(open).toHaveBeenCalledWith({ directory: true, multiple: false, title: 'Choose a skill folder', defaultPath: '/home/me' });
+  });
+
+  it('resolves null when the user cancels', async () => {
+    open.mockResolvedValueOnce(null);
+    await expect(api.pickFolder()).resolves.toBeNull();
+    expect(open.mock.calls[0][0]).toMatchObject({ directory: true, multiple: false });
+    expect(open.mock.calls[0][0]).toHaveProperty('defaultPath', undefined);
+  });
+
+  it('rejects when the dialog cannot open, so the caller can show why', async () => {
+    open.mockRejectedValueOnce(new Error('dialog unavailable'));
+    await expect(api.pickFolder()).rejects.toThrow('dialog unavailable');
   });
 });
 
