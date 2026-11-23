@@ -67,6 +67,9 @@ const NAME_LIMIT: usize = 80;
 
 /// Tool names that count a reply as polling when they are all it asks for, while a command the agent started is running.
 const POLL_NAMES: [&str; 3] = ["wait", "get_screen", "send_keys"];
+/// Most model replies a turn discards and makes again because a command they were made with finished (see `respond`). The
+/// reply after the last one stands, so a shell that keeps exiting cannot hold the turn.
+const MAX_REDOS: u32 = 3;
 const LIMIT_REASON: &str = "not run: the turn stopped after the model call limit";
 const POLL_LIMIT_REASON: &str = "not run: the turn stopped after the polling call limit";
 const DENIED_NOTICE: &str = "Stopped: the command was not approved. Tell me what you want to do next.";
@@ -686,9 +689,10 @@ impl LlmAgent {
         system
     }
 
-    /// One model call. Streams text as it arrives, or waits for the whole reply. Returns None when the call was
-    /// cancelled or failed; a failure has already been shown to the user. `finished` is the turn's finished note (see
-    /// `finished_since_last_turn`), given to the first call only. Every request is fitted to the context limit first
+    /// One model call. Streams text as it arrives, or waits for the whole reply. `finished` is the note for the call (see
+    /// `finished_since_last_turn`, and `redo_note` for a call that makes a discarded reply again). `open` is the ids of the
+    /// open commands when the call starts (see `respond`). Returns `Asked::Ended` when the call was cancelled or failed; a
+    /// failure has already been shown to the user. Every request is fitted to the context limit first
     /// (see `fit`); one that does not fit is not sent, and the turn ends with its notice.
     ///
     /// Two kinds of retry are possible, each at most once, and only before any text was streamed. An overflow (see
@@ -697,7 +701,7 @@ impl LlmAgent {
     /// never taken for a refusal of images. The stored history is not changed. The retries are part of this one call: the
     /// caps count replies that ask for tools (see `charge`), so a failed attempt is never counted, and the reply that comes
     /// back is counted once, as any other reply.
-    fn ask_model(&self, ctx: &AgentCtx<'_>, finished: Option<&str>) -> Option<AssistantReply> {
+    fn ask_model(&self, ctx: &AgentCtx<'_>, finished: Option<&str>, open: &[u64]) -> Asked {
         let system = self.system_text(ctx, finished);
         // A model that refused images earlier in this conversation is not asked again: its images are replaced at once.
         let mut images = !lock_models(&self.no_vision).contains(&self.model);
@@ -715,26 +719,29 @@ impl LlmAgent {
             };
             // Built per request, so an external host's tools are the ones it offers now.
             let tools = request_tools(&self.tools, ctx.external_tools());
-            let request = self.fit_or_say(ctx, &tools, limit, &system, &mut resolver)?;
+            let Some(request) = self.fit_or_say(ctx, &tools, limit, &system, &mut resolver) else {
+                return Asked::Ended;
+            };
             let sent_images = has_image_part(&request.messages);
             let estimate = self.estimate(&request, &tools);
-            let (result, streamed) = self.send(ctx, request, &tools);
+            let (result, streamed) = self.send(ctx, request, &tools, open);
             match result {
                 Ok(reply) => {
                     if image_refused {
                         lock_models(&self.no_vision).insert(self.model.clone());
                         let reply = self.finish_call(ctx, Ok(reply));
                         ctx.say(NO_VISION_NOTICE);
-                        return reply;
+                        return asked(reply);
                     }
-                    return self.finish_call(ctx, Ok(reply));
+                    return asked(self.finish_call(ctx, Ok(reply)));
                 }
-                Err(LlmError::Cancelled) => return None,
+                Err(LlmError::Cancelled) => return Asked::Ended,
+                Err(LlmError::Interrupted) => return Asked::Interrupted,
                 Err(e) if overflow_retry && !streamed && context::is_context_overflow(&e) => {
                     overflow_retry = false;
                     asker_error = None;
                     let Some(smaller) = self.overflow_retry_limit(&e, estimate, limit) else {
-                        return self.finish_call(ctx, Err(e));
+                        return asked(self.finish_call(ctx, Err(e)));
                     };
                     // `smaller` is below the limit this request was fitted to, which is the effective one, so it only lowers it.
                     lock_learned(&self.learned_limits).insert(self.model.clone(), smaller);
@@ -752,7 +759,7 @@ impl LlmAgent {
                     image_refused = true;
                     asker_error = Some(e);
                 }
-                Err(e) => return self.finish_call(ctx, Err(asker_error.take().unwrap_or(e))),
+                Err(e) => return asked(self.finish_call(ctx, Err(asker_error.take().unwrap_or(e)))),
             }
         }
     }
@@ -843,8 +850,15 @@ impl LlmAgent {
     /// One request, streamed or waited for, with the "thinking" state around it. Returns the result and whether any
     /// text was streamed to the user during the call. The context usage of the request is emitted before it is sent, and
     /// again with the provider's count if the reply reports one (see core/chat/context). The usage says whether older
-    /// content was left out.
-    fn send(&self, ctx: &AgentCtx<'_>, request: WireRequest, tools: &[Value]) -> (Result<AssistantReply, LlmError>, bool) {
+    /// content was left out. A streamed reply ends early with `LlmError::Interrupted` once a command in `open` has
+    /// finished (see `finished_among`); a non-streamed one is not interrupted, and `respond` checks it after the call.
+    fn send(
+        &self,
+        ctx: &AgentCtx<'_>,
+        request: WireRequest,
+        tools: &[Value],
+        open: &[u64],
+    ) -> (Result<AssistantReply, LlmError>, bool) {
         let WireRequest { system, messages, trimmed } = request;
         let breakdown = context::breakdown(&system, tools, &messages);
         let req = ChatRequest {
@@ -878,14 +892,21 @@ impl LlmAgent {
                 }
                 _ => {}
             };
-            block(llm::stream(&self.client, &self.cfg, &req, &mut on_delta, &self.cancel))
+            if open.is_empty() {
+                block(llm::stream(&self.client, &self.cfg, &req, &mut on_delta, &self.cancel))
+            } else {
+                let interrupt = || !finished_among(open, ctx).is_empty();
+                block(llm::stream_until(&self.client, &self.cfg, &req, &mut on_delta, &self.cancel, interrupt))
+            }
         } else {
             block(llm::complete(&self.client, &self.cfg, &req, &self.cancel))
         };
         stop_thinking(ctx, &thinking);
         // A stream that failed after showing text leaves a partial reply: the next request must see what the
-        // user saw. Nothing is pushed when nothing streamed, when the stream finished, or when not streaming.
-        if result.is_err() && streamed.get() && !streamed_raw.is_empty() {
+        // user saw. Nothing is pushed when nothing streamed, when the stream finished, when not streaming, or when the
+        // stream was interrupted: that reply is discarded whole (see `respond`).
+        let interrupted = matches!(&result, Err(LlmError::Interrupted));
+        if result.is_err() && !interrupted && streamed.get() && !streamed_raw.is_empty() {
             lock(&self.history).push_assistant(interrupted_message(&self.redactor, &streamed_raw));
         }
         if let Ok(reply) = &result
@@ -1075,12 +1096,27 @@ impl Agent for LlmAgent {
         // The skills the user approved in this turn (see `AgentCtx::call_skill`). Never kept past the turn.
         let mut skills_granted = HashSet::new();
         let (mut general, mut polls) = (0, 0);
+        // The replies discarded so far this turn (see below). At `MAX_REDOS` the next reply stands.
+        let mut redos = 0;
         loop {
             if self.cancel.is_cancelled() {
                 return;
             }
-            let Some(reply) = self.ask_model(ctx, finished.take().as_deref()) else {
-                return;
+            // The open commands when this request starts. One that is no longer open when the reply is acted on finished
+            // while the reply was made. Empty once the redos are used up, so nothing can discard the reply then.
+            let open = if redos < MAX_REDOS { ctx.open_record_ids() } else { Vec::new() };
+            let reply = match self.ask_model(ctx, finished.take().as_deref(), &open) {
+                Asked::Reply(reply) if finished_among(&open, ctx).is_empty() => reply,
+                Asked::Reply(_) | Asked::Interrupted => {
+                    // Discarded whole: not pushed to the history, and what the transcript showed of it is removed. The
+                    // model is asked again on the same history, told which command finished (see `redo_note`).
+                    let ended = finished_among(&open, ctx);
+                    redos += 1;
+                    ctx.emit(AgentEvent::ReplyDiscarded);
+                    finished = Some(redo_note(ctx, &ended));
+                    continue;
+                }
+                Asked::Ended => return,
             };
             lock(&self.history).push_assistant(reply.raw);
             if reply.tool_calls.is_empty() {
@@ -1180,6 +1216,21 @@ impl Cap {
     }
 }
 
+/// What one model call came to (see `ask_model`).
+enum Asked {
+    /// The reply, ready to be acted on.
+    Reply(AssistantReply),
+    /// The call ended early because a command it was made with finished (see `send`). Its reply is discarded.
+    Interrupted,
+    /// No reply: the call was cancelled or failed, and the failure is already shown.
+    Ended,
+}
+
+/// The `Asked` of a call that may have no reply (see `finish_call`).
+fn asked(reply: Option<AssistantReply>) -> Asked {
+    reply.map_or(Asked::Ended, Asked::Reply)
+}
+
 /// Why a turn stopped before the model answered.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Stop {
@@ -1241,6 +1292,7 @@ fn error_text(e: &LlmError) -> String {
         LlmError::Parse(detail) => format!("I could not read the provider's reply: {detail}"),
         LlmError::TooLarge(detail) => format!("The provider's reply is too large: {detail}"),
         LlmError::Cancelled => "The request was cancelled.".to_string(),
+        LlmError::Interrupted => "The reply was interrupted.".to_string(),
     }
 }
 
@@ -1439,6 +1491,32 @@ pub fn finished_since_last_turn(messages: &[Value], ctx: &AgentCtx<'_>) -> Optio
         })
         .collect();
     (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+/// The ids in `open` that are no longer open now: the commands that finished since the list was taken.
+fn finished_among(open: &[u64], ctx: &AgentCtx<'_>) -> Vec<u64> {
+    if open.is_empty() {
+        return Vec::new();
+    }
+    let now = ctx.open_record_ids();
+    open.iter().copied().filter(|id| !now.contains(id)).collect()
+}
+
+/// The system note for the model call that makes a discarded reply again: which commands finished (the summary gives the
+/// exit code), and that the reply was not sent. No command text, so nothing a command printed is repeated here.
+fn redo_note(ctx: &AgentCtx<'_>, ended: &[u64]) -> String {
+    let lines: Vec<String> = ended
+        .iter()
+        .map(|&id| match ctx.finished_summary(id) {
+            Some(summary) => {
+                let exit = summary.exit_code.map_or_else(|| "unknown".to_string(), |code| code.to_string());
+                format!("Command {id} finished (exit {exit}) while you were replying.")
+            }
+            None => format!("Command {id} ended while you were replying."),
+        })
+        .collect();
+    let what = if lines.is_empty() { "A command ended while you were replying.".to_string() } else { lines.join(" ") };
+    format!("{what} Your unsent reply was discarded. Check the current state (get_screen or get_command) before sending anything.")
 }
 
 /// The run_command results in `messages` that gave a running command: each message index with the record id it carries.

@@ -307,6 +307,11 @@ pub trait AgentTools {
     fn open_agent_records(&self) -> Vec<OpenAgentRecord> {
         Vec::new()
     }
+    /// The ids of every open command, the user's and the agent's. Read per model call and while a reply streams, to see a
+    /// command finish (see `finished_since` in core/chat/agent_loop). Empty by default.
+    fn open_record_ids(&self) -> Vec<u64> {
+        Vec::new()
+    }
     /// The summary of a finished command, by id. None when there is no such finished command. Defaults to None.
     fn finished_summary(&self, _id: u64) -> Option<RecordSummary> {
         None
@@ -563,6 +568,10 @@ impl AgentTools for SessionTools<'_> {
 
     fn open_agent_records(&self) -> Vec<OpenAgentRecord> {
         self.session.open_agent_records()
+    }
+
+    fn open_record_ids(&self) -> Vec<u64> {
+        self.session.open_record_ids()
     }
 
     fn finished_summary(&self, id: u64) -> Option<RecordSummary> {

@@ -165,6 +165,8 @@ pub enum LlmError {
     /// The reply is over a size cap (see `MAX_BODY_BYTES` and `MAX_SSE_LINE_BYTES`). The text says which cap.
     TooLarge(String),
     Cancelled,
+    /// A streaming request ended early because its interrupt fired (see `stream_until`). The user did not cancel.
+    Interrupted,
 }
 
 impl fmt::Display for LlmError {
@@ -176,6 +178,7 @@ impl fmt::Display for LlmError {
             LlmError::Parse(detail) => write!(f, "could not parse the response: {detail}"),
             LlmError::TooLarge(detail) => write!(f, "the provider's reply is too large: {detail}"),
             LlmError::Cancelled => write!(f, "cancelled"),
+            LlmError::Interrupted => write!(f, "interrupted"),
         }
     }
 }
@@ -277,7 +280,7 @@ async fn complete_within(
         }
         parse_completion(&text)
     };
-    race(cancel, work).await.map_err(|e| scrub(e, &cfg.api_key))
+    race(cancel, NO_INTERRUPT, work).await.map_err(|e| scrub(e, &cfg.api_key))
 }
 
 /// One streaming request (`stream: true`). `on_delta` is called for each text or reasoning fragment as it
@@ -289,15 +292,35 @@ pub async fn stream(
     on_delta: &mut dyn FnMut(Delta),
     cancel: &TurnCancel,
 ) -> Result<AssistantReply, LlmError> {
-    run_stream(client, cfg, req, on_delta, cancel, DEFAULT_BOUNDS).await
+    run_stream(client, cfg, req, on_delta, cancel, NO_INTERRUPT, DEFAULT_BOUNDS).await
 }
 
-async fn run_stream(
+/// `stream`, that also ends when `interrupt` returns true. `interrupt` is polled every `INTERRUPT_POLL` while the reply
+/// streams. Then the connection is dropped and the call returns `Err(LlmError::Interrupted)`, with the text already passed
+/// to `on_delta`. A cancel that fires at the same time wins and returns `Err(LlmError::Cancelled)`. A reply that completes
+/// first is returned as usual.
+pub async fn stream_until<I: Fn() -> bool>(
     client: &reqwest::Client,
     cfg: &ProviderConfig,
     req: &ChatRequest,
     on_delta: &mut dyn FnMut(Delta),
     cancel: &TurnCancel,
+    interrupt: I,
+) -> Result<AssistantReply, LlmError> {
+    run_stream(client, cfg, req, on_delta, cancel, Some(interrupt), DEFAULT_BOUNDS).await
+}
+
+/// The interrupt of a stream that has none. Generic so the future stays `Send` (Tauri commands await these).
+type NoInterrupt = fn() -> bool;
+const NO_INTERRUPT: Option<NoInterrupt> = None;
+
+async fn run_stream<I: Fn() -> bool>(
+    client: &reqwest::Client,
+    cfg: &ProviderConfig,
+    req: &ChatRequest,
+    on_delta: &mut dyn FnMut(Delta),
+    cancel: &TurnCancel,
+    interrupt: Option<I>,
     bounds: Bounds,
 ) -> Result<AssistantReply, LlmError> {
     if cancel.is_cancelled() {
@@ -335,7 +358,7 @@ async fn run_stream(
         }
         acc.finish()
     };
-    race(cancel, work).await.map_err(|e| scrub(e, &cfg.api_key))
+    race(cancel, interrupt, work).await.map_err(|e| scrub(e, &cfg.api_key))
 }
 
 /// Feeds parsed SSE payloads to the accumulator. Each payload has the key redacted before it is parsed.
@@ -362,11 +385,32 @@ fn feed(
     Ok(false)
 }
 
-/// Runs `work` unless `cancel` fires first. Dropping `work` drops the connection.
-async fn race<T>(cancel: &TurnCancel, work: impl Future<Output = Result<T, LlmError>>) -> Result<T, LlmError> {
-    match select(pin!(work), pin!(cancel.cancelled())).await {
+/// How often a streaming request checks its interrupt (see `stream_until`).
+const INTERRUPT_POLL: Duration = Duration::from_millis(50);
+
+/// Runs `work` unless `cancel` fires first, or `interrupt` (when given) returns true first. Dropping `work` drops the
+/// connection. A cancel wins over an interrupt that is ready at the same time.
+async fn race<T, I: Fn() -> bool>(
+    cancel: &TurnCancel,
+    interrupt: Option<I>,
+    work: impl Future<Output = Result<T, LlmError>>,
+) -> Result<T, LlmError> {
+    let cancelled = pin!(cancel.cancelled());
+    let interrupt_fut = pin!(interrupted(interrupt));
+    match select(pin!(work), select(cancelled, interrupt_fut)).await {
         Either::Left((result, _)) => result,
-        Either::Right(((), _)) => Err(LlmError::Cancelled),
+        Either::Right((Either::Left(((), _)), _)) => Err(LlmError::Cancelled),
+        Either::Right((Either::Right(((), _)), _)) => Err(LlmError::Interrupted),
+    }
+}
+
+/// Resolves once `interrupt` returns true, checked every `INTERRUPT_POLL`. Never resolves without an interrupt.
+async fn interrupted<I: Fn() -> bool>(interrupt: Option<I>) {
+    let Some(check) = interrupt else {
+        return std::future::pending().await;
+    };
+    while !check() {
+        tokio::time::sleep(INTERRUPT_POLL).await;
     }
 }
 
@@ -546,6 +590,7 @@ fn scrub(err: LlmError, secret: &str) -> LlmError {
         LlmError::Parse(detail) => LlmError::Parse(clean(detail)),
         LlmError::TooLarge(detail) => LlmError::TooLarge(clean(detail)),
         LlmError::Cancelled => LlmError::Cancelled,
+        LlmError::Interrupted => LlmError::Interrupted,
     }
 }
 
@@ -815,7 +860,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap()
-            .block_on(run_stream(&client, &cfg(&url), &one_message(), &mut on_delta, &cancel, bounds));
+            .block_on(run_stream(&client, &cfg(&url), &one_message(), &mut on_delta, &cancel, NO_INTERRUPT, bounds));
         match result {
             Err(LlmError::Transport(detail)) => assert!(detail.contains("no data"), "{detail}"),
             other => panic!("expected an idle timeout, got {other:?}"),
@@ -835,7 +880,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap()
-            .block_on(run_stream(&client, &cfg(&url), &one_message(), &mut ignore, &cancel, bounds));
+            .block_on(run_stream(&client, &cfg(&url), &one_message(), &mut ignore, &cancel, NO_INTERRUPT, bounds));
         match result {
             // The detail names the 0.3 s headers limit; the 60 s idle limit would have said 60 s.
             Err(LlmError::Transport(detail)) => assert!(detail.contains("0.3 s"), "{detail}"),
@@ -933,7 +978,7 @@ mod tests {
         let client = http_client().unwrap();
         let cancel = TurnCancel::new();
         let mut ignore = |_d: Delta| {};
-        let err = block_on(run_stream(&client, &cfg(&url), &one_message(), &mut ignore, &cancel, SMALL_BOUNDS))
+        let err = block_on(run_stream(&client, &cfg(&url), &one_message(), &mut ignore, &cancel, NO_INTERRUPT,SMALL_BOUNDS))
             .unwrap_err();
         assert!(matches!(err, LlmError::TooLarge(_)), "{err:?}");
     }
@@ -948,7 +993,7 @@ mod tests {
         let client = http_client().unwrap();
         let cancel = TurnCancel::new();
         let mut ignore = |_d: Delta| {};
-        let err = block_on(run_stream(&client, &cfg(&url), &one_message(), &mut ignore, &cancel, SMALL_BOUNDS))
+        let err = block_on(run_stream(&client, &cfg(&url), &one_message(), &mut ignore, &cancel, NO_INTERRUPT,SMALL_BOUNDS))
             .unwrap_err();
         assert!(matches!(err, LlmError::TooLarge(_)), "{err:?}");
         assert!(err.to_string().contains("single line or event"), "{err}");

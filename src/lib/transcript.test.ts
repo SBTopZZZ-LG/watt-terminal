@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { activityLabel, approvalTitle, EMPTY_TRANSCRIPT, firstPendingApproval, isBusy, MAX_ITEMS, TRIM_NOTE, transcriptReducer } from './transcript';
+import { activityLabel, approvalTitle, EMPTY_TRANSCRIPT, firstPendingApproval, isBusy, MAX_ITEMS, REDO_NOTE, TRIM_NOTE, transcriptReducer } from './transcript';
 import { APPROVAL_WINDOW_MS } from './approvalTime';
 import type { QuestionSpec } from './types';
 import type { Transcript, TranscriptAction } from './transcript';
@@ -990,5 +990,40 @@ describe('activityLabel', () => {
     expect(label.startsWith('Running ')).toBe(true);
     expect(label.endsWith('…')).toBe(true);
     expect([...label.slice('Running '.length)]).toHaveLength(40);
+  });
+});
+
+describe('transcriptReducer: reply_discarded', () => {
+  const discarded: TranscriptAction = { type: 'agent_event', event: { type: 'reply_discarded' } };
+  const reply = (text: string): TranscriptAction => ({ type: 'agent_event', event: { type: 'text', text } });
+
+  it('removes the streamed text of the call on screen, adds the muted note, and clears thinking', () => {
+    const t = run([thinking(true), delta('Let me '), delta('check'), discarded]);
+    expect(t.items.some((i) => i.kind === 'agent')).toBe(false);
+    expect(t.items[t.items.length - 1]).toMatchObject({ kind: 'notice', text: REDO_NOTE, muted: true });
+    expect(t.thinking).toBe(false);
+  });
+
+  it('removes the thinking block of the call, and keeps the items from before it', () => {
+    const t = run([
+      reply('Earlier answer.'),
+      toolCall('c1'),
+      thinking(true),
+      { type: 'agent_event', event: { type: 'reasoning_delta', text: 'Checking the shell' } },
+      delta('Let me check'),
+      discarded,
+    ]);
+    expect(t.items.map((i) => i.kind)).toEqual(['agent', 'tool', 'notice']);
+    expect(t.items[0]).toMatchObject({ kind: 'agent', text: 'Earlier answer.' });
+  });
+
+  it('removes the call\'s thinking when the reply was not streamed', () => {
+    const t = run([thinking(true), { type: 'agent_event', event: { type: 'reasoning_delta', text: 'Hmm' } }, reply('Done.'), discarded]);
+    expect(t.items.map((i) => i.kind)).toEqual(['notice']);
+  });
+
+  it('a redone call shows only its own text', () => {
+    const t = run([thinking(true), delta('Let me'), discarded, thinking(true), delta('Done.'), done]);
+    expect(t.items.filter((i) => i.kind === 'agent').map((i) => (i.kind === 'agent' ? i.text : ''))).toEqual(['Done.']);
   });
 });

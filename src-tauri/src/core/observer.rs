@@ -1469,6 +1469,12 @@ impl Core {
         self.open_records().any(|(open, _)| open.record.id == id)
     }
 
+    /// The ids of every open record (any source, any level). The agent loop compares two of these lists to see a command
+    /// finish, so it needs no event.
+    pub fn open_record_ids(&self) -> Vec<u64> {
+        self.open_records().map(|(open, _)| open.record.id).collect()
+    }
+
     /// True once the record with this id has finished (and it is still kept).
     pub fn has_finished_record(&self, id: u64) -> bool {
         self.records.iter().any(|r| r.id == id)

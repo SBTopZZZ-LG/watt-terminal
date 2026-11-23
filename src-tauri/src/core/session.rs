@@ -601,6 +601,11 @@ impl Session {
         self.shared.lock().open_agent_records()
     }
 
+    /// The ids of every open command, the user's and the agent's (see `Core::open_record_ids`).
+    pub fn open_record_ids(&self) -> Vec<u64> {
+        self.shared.lock().open_record_ids()
+    }
+
     /// The early-return signals of one agent call's record, from one lock read (see `YieldSignals`).
     pub fn yield_signals(&self, call_id: &str) -> YieldSignals {
         self.shared.lock().yield_signals(call_id, Instant::now())

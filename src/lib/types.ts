@@ -155,6 +155,8 @@ export type AgentEvent =
   | ({ type: 'context_usage' } & ContextUsage)
   /** A quiet note for the transcript (the project instructions in use). Shown muted, never stored in history. */
   | { type: 'notice'; text: string }
+  /** The model call on screen was discarded: a command finished before its reply was acted on. The call is made again. */
+  | { type: 'reply_discarded' }
   | { type: 'done' };
 
 /** The context usage of one model request (core/chat/context). `used` is the estimate, or the provider's count once `calibrated`. */

@@ -364,6 +364,10 @@ pub enum AgentEvent {
     /// A quiet note for the transcript (the project instructions in use, the trim note's backend cousin).
     /// Shown muted, never stored in the history.
     Notice { text: String },
+    /// The model call that is on screen was discarded: a command it worked with finished before its reply was acted on, so
+    /// the reply is made again (see core/chat/agent_loop). The transcript removes what that call showed: its streamed text,
+    /// and its thinking block. Earlier items stay. The wire type is `reply_discarded`.
+    ReplyDiscarded,
     Done,
 }
 
@@ -487,6 +491,11 @@ impl<'a> AgentCtx<'a> {
     /// The agent's own open commands at this moment (see `AgentTools::open_agent_records`). Read per model call.
     pub fn open_agent_records(&self) -> Vec<OpenAgentRecord> {
         self.tools.open_agent_records()
+    }
+
+    /// The ids of every open command at this moment (see `AgentTools::open_record_ids`).
+    pub fn open_record_ids(&self) -> Vec<u64> {
+        self.tools.open_record_ids()
     }
 
     /// The session's live facts at this moment (see `AgentTools::session_facts`). Read per model call. None without a shell.
@@ -1482,6 +1491,7 @@ mod tests {
         assert_eq!(wire(AgentEvent::ReasoningDelta { text: "Let me".into() }), json!({"type": "reasoning_delta", "text": "Let me"}));
         assert_eq!(wire(AgentEvent::Notice { text: "Using project instructions from /r/AGENTS.md".into() }), json!({"type": "notice", "text": "Using project instructions from /r/AGENTS.md"}));
         assert_eq!(wire(AgentEvent::Thinking { active: true }), json!({"type": "thinking", "active": true}));
+        assert_eq!(wire(AgentEvent::ReplyDiscarded), json!({"type": "reply_discarded"}));
         assert_eq!(wire(AgentEvent::Done), json!({"type": "done"}));
         assert_eq!(
             wire(AgentEvent::TodoUpdate {

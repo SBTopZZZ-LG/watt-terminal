@@ -90,6 +90,11 @@ export interface Transcript {
   context: ContextUsage | null;
   /** A trim note was added in the current turn. Cleared by user_sent, so each turn shows at most one. */
   trimNoted: boolean;
+  /**
+   * The `nextId` when the current model call began (its thinking started). A `reply_discarded` event removes the agent and
+   * thinking items from here on, which are that call's. Null before the first call.
+   */
+  callStart: number | null;
 }
 
 export interface FinishedRecord {
@@ -107,10 +112,14 @@ export const EMPTY_TRANSCRIPT: Transcript = {
   depth: 1,
   context: null,
   trimNoted: false,
+  callStart: null,
 };
 
+/** The note shown when a reply is discarded because a command finished while it was made (see `reply_discarded`). */
+export const REDO_NOTE = 'Command finished: redoing the reply.';
+
 /** The note shown once in a turn when older content was left out of a request. */
-export const TRIM_NOTE = 'Older messages or tool output were left out of the request to fit the model\'s context window.';
+export const TRIM_NOTE ='Older messages or tool output were left out of the request to fit the model\'s context window.';
 
 /** Keeps the transcript bounded; the oldest items go first. */
 export const MAX_ITEMS = 500;
@@ -358,7 +367,8 @@ function applyAgentEvent(t0: Transcript, ev: AgentEvent, at: number | undefined)
     case 'text_delta':
       return appendDelta(t, ev.text);
     case 'thinking':
-      return { ...t, thinking: ev.active };
+      // A model call starts with thinking active. The items it adds from here on are its own (see `reply_discarded`).
+      return ev.active ? { ...t, thinking: true, callStart: t.nextId } : { ...t, thinking: false };
     case 'tool_call':
       // The todo tool's rows are not shown: the panel is the view of the list, so the call is not an item (or in flight).
       // The question tool's rows are not shown either: the card is the view of the question.
@@ -470,6 +480,13 @@ function applyAgentEvent(t0: Transcript, ev: AgentEvent, at: number | undefined)
     }
     case 'notice':
       return add(t, (id) => ({ id, kind: 'notice', text: ev.text, muted: true }));
+    case 'reply_discarded': {
+      // The model call on screen was discarded (see core/chat/agent_loop): its streamed text and its thinking block go. Tool
+      // rows, approvals, questions and notices stay, and so do the items from before the call.
+      const from = t.callStart ?? t.nextId;
+      const items = t.items.filter((i) => !((i.kind === 'agent' || i.kind === 'thinking') && i.id >= from));
+      return add({ ...t, items, thinking: false, callStart: null }, (id) => ({ id, kind: 'notice', text: REDO_NOTE, muted: true }));
+    }
     case 'context_usage':
       return contextUsage(t, ev);
   }
