@@ -57,7 +57,9 @@ use crate::core::settings::service::{
     FetchOutcome, RecoverAction, SaveProviderInput, SettingsService, SettingsStateView, SettingsView, TestResult,
     test_model,
 };
-use crate::core::settings::{AgentRequests, ApprovalSettings, IntegrationSettings, LimitsSettings, ModelRef, Nested};
+use crate::core::settings::{
+    AgentRequests, AgentSettings, ApprovalSettings, IntegrationSettings, LimitsSettings, ModelRef, Nested, OnDenied,
+};
 use crate::core::mcp::config::McpLevel;
 use crate::core::mcp::service::{McpImportResult, McpServerInput, McpService, McpStatus, McpView, TurnMcp};
 use crate::core::skills::{self, Places, SkillsSettings, SkillsView};
@@ -526,13 +528,17 @@ fn follows_local(service: Option<&SettingsService>) -> bool {
     service.and_then(|s| s.approval_settings().ok()).is_some_and(|approval| approval.nested == Nested::SameAsLocal)
 }
 
-/// The rules one turn decides by, from the settings in use (see `TurnRules`). Both are off when the settings cannot be used.
+/// The rules one turn decides by, from the settings in use (see `TurnRules`). All are off when the settings cannot be used,
+/// so a denied call stops the turn then.
 fn turn_rules(service: Option<&SettingsService>) -> TurnRules {
     TurnRules {
         follow_local_in_nested: follows_local(service),
         integrate_without_asking: service
             .and_then(|s| s.integration_settings().ok())
             .is_some_and(|integration| integration.agent_requests == AgentRequests::Auto),
+        continue_on_denied: service
+            .and_then(|s| s.agent_settings().ok())
+            .is_some_and(|agent| agent.on_denied == OnDenied::Continue),
     }
 }
 
@@ -1565,6 +1571,14 @@ async fn set_integration_settings(
     blocking(move || service.set_integration(input)).await
 }
 
+/// Saves the agent behaviour settings: whether a denied tool call stops the turn or lets the agent carry on. Refused while
+/// settings.json is broken or in last-good mode.
+#[tauri::command]
+async fn set_agent_settings(input: AgentSettings, settings: State<'_, SettingsState>) -> Result<SettingsView, String> {
+    let service = settings.get()?;
+    blocking(move || service.set_agent(input)).await
+}
+
 /// Saves the per-turn limits: the model-call cap (or unlimited), the polling cap, the commands cap and the wait minutes. Refused
 /// while settings.json is broken or in last-good mode.
 #[tauri::command]
@@ -1840,6 +1854,7 @@ pub fn run() {
             set_global_context_limit,
             set_approval_settings,
             set_integration_settings,
+            set_agent_settings,
             set_limits_settings,
             set_skills_settings,
             answer_integration,
