@@ -72,7 +72,9 @@ export const api = {
    * left out when there are none, so a text-only send is the same call as before.
    */
   agentMessage(text: string, attachments: AttachmentInput[] = []) {
-    return invoke<void>('agent_message', attachments.length > 0 ? { sessionId: SESSION_ID, text, attachments } : { sessionId: SESSION_ID, text });
+    // `sha256` is for the transcript only (see AttachmentInput), so it is not sent.
+    const wire = attachments.map(({ sha256: _sha256, ...rest }) => rest);
+    return invoke<void>('agent_message', wire.length > 0 ? { sessionId: SESSION_ID, text, attachments: wire } : { sessionId: SESSION_ID, text });
   },
   /** Cancels the running agent turn, if any. Harmless when none is running. */
   cancelAgent() {
@@ -168,6 +170,10 @@ export const api = {
   /** Opens a saved conversation as the live one. Refused while the agent is busy. */
   loadConversation(id: string) {
     return invoke<LoadedConversation>('load_conversation', { sessionId: SESSION_ID, id });
+  },
+  /** The full image of an attachment of the open conversation, as a PNG or JPEG data URL. Rejects when it is no longer stored. */
+  getAttachment(sha256: string, mime: string) {
+    return invoke<string>('get_attachment', { sessionId: SESSION_ID, sha256, mime });
   },
   /** Deletes a saved conversation. Refused while the agent is busy. `deleted_live` says the live conversation was reset. */
   deleteConversation(id: string) {

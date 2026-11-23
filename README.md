@@ -22,7 +22,7 @@ An experimental terminal for macOS and Windows 11 where you and an AI agent shar
 - **Agent with guard rails.** Read tools are always allowed. `run_command` needs your approval unless a rule or the session's bypass toggle allows it, and only runs at an idle prompt with shell integration live. `send_keys` can type into a command the agent started, and password prompts are refused. Secrets in tool output are redacted before they reach the model.
 - **Bring your own model.** Any OpenAI-compatible chat endpoint. Presets for OpenRouter and OpenCode Go, plus a custom endpoint. API keys live in the macOS Keychain or the Windows Credential Manager, not in the settings file.
 - **Context meter.** A live estimate of how much of the model's context window is used, broken down by system instructions, tools, your messages, attachments, assistant replies and tool output. When the window fills, the oldest tool output, document text and whole turns are trimmed from what is sent, newest first kept; your stored conversation is never rewritten.
-- **Attachments.** Drop or paste images and text files onto the agent bar.
+- **Attachments.** Drop or paste images and text files onto the agent bar. Click an image (in the bar or a sent message) to view it in an overlay: it is scaled to fit the window, with no zoom.
 - **Todo panel.** The agent keeps a todo list for multi-step work, pinned above the context meter.
 - **Conversations are saved.** Browse past conversations in the history view and pick one back up.
 - **Terminal comforts.** Find (Cmd+F for the chat or the terminal, Cmd+Shift+F for the terminal), clear (Cmd+K), font zoom, a colour stripe per command showing its exit status, and a border that pulses while the agent works.

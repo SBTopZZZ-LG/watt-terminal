@@ -749,6 +749,8 @@ export interface SkillsSettingsInput {
 /**
  * One attachment as agent_message takes it (src-tauri/src/core/chat/attachments.rs, AttachmentInput). An image is PNG or JPEG,
  * already re-encoded in the webview. A text document is its UTF-8 bytes. `thumb` is a PNG or JPEG data URL of at most 16 KB.
+ * `sha256` is the lowercase hex SHA-256 of an image's bytes, computed here for the transcript (the backend computes the same
+ * value). It is not sent: api.agentMessage leaves it out.
  */
 export interface AttachmentInput {
   name: string;
@@ -758,4 +760,5 @@ export interface AttachmentInput {
   thumb?: string;
   w?: number;
   h?: number;
+  sha256?: string;
 }

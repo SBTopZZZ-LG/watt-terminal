@@ -81,6 +81,19 @@ pub fn ext_for_mime(mime: &str) -> Option<&'static str> {
     }
 }
 
+/// The message for a stored image the viewer asks for that cannot be given: a bad address or type, or a file that is missing
+/// or does not match its address.
+pub const IMAGE_UNAVAILABLE: &str = "image is no longer available";
+
+/// The `data:` URL of one stored image of a conversation, for the image viewer. The address and the type are checked before
+/// anything is read; the file is read by the same resolver the model's images use, which re-hashes its bytes.
+pub fn stored_image_url(store: &AttachmentStore, conversation_id: &str, sha256: &str, mime: &str) -> Result<String, String> {
+    if !is_sha256_hex(sha256) || ext_for_mime(mime).is_none() {
+        return Err(IMAGE_UNAVAILABLE.into());
+    }
+    Resolver::new(Some(store), conversation_id).data_url(sha256, mime).ok_or_else(|| IMAGE_UNAVAILABLE.into())
+}
+
 /// Checks and decodes the attachments of one message. Nothing is written here. The first problem is returned as a
 /// message for the user, and then nothing about the message has changed.
 pub fn prepare(inputs: &[AttachmentInput]) -> Result<Prepared, String> {
@@ -445,6 +458,35 @@ mod tests {
             w: None,
             h: None,
         }
+    }
+
+    #[test]
+    fn a_stored_image_is_given_as_a_data_url_and_anything_else_is_unavailable() {
+        use crate::core::settings::test_support::TempDir;
+        let tmp = TempDir::new();
+        let store = AttachmentStore::new(tmp.path().join("attachments"));
+        let conv = format!("ses_{:032x}", 1u32);
+        let bytes = png(40);
+        let sha = sha256_hex(&bytes);
+        store.write(&conv, &sha, "png", &bytes).unwrap();
+
+        let url = stored_image_url(&store, &conv, &sha, "image/png").unwrap();
+        assert_eq!(url, format!("data:image/png;base64,{}", STANDARD.encode(&bytes)));
+
+        let gone = sha256_hex(b"not stored");
+        assert_eq!(stored_image_url(&store, &conv, &gone, "image/png"), Err(IMAGE_UNAVAILABLE.into()), "missing file");
+        assert_eq!(stored_image_url(&store, &conv, &sha, "image/gif"), Err(IMAGE_UNAVAILABLE.into()), "type not stored");
+        assert_eq!(stored_image_url(&store, &conv, &sha, "image/jpeg"), Err(IMAGE_UNAVAILABLE.into()), "wrong extension for the type");
+        let upper = sha.to_uppercase();
+        for bad in ["../../etc/passwd", "abc", upper.as_str()] {
+            assert_eq!(stored_image_url(&store, &conv, bad, "image/png"), Err(IMAGE_UNAVAILABLE.into()), "address {bad:?}");
+        }
+        assert!(stored_image_url(&store, "../ses_0", &sha, "image/png").is_err(), "a conversation id that is not valid");
+
+        // A file whose bytes do not match its address is not given.
+        let other = png(41);
+        store.write(&conv, &sha256_hex(b"renamed"), "png", &other).unwrap();
+        assert!(stored_image_url(&store, &conv, &sha256_hex(b"renamed"), "image/png").is_err(), "re-hash fails");
     }
 
     // prepare: what is accepted

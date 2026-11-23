@@ -393,9 +393,24 @@ async function convertImage(file: File, format: ImageFormat): Promise<{ input: A
       thumb: out.thumb,
       w: out.w,
       h: out.h,
+      sha256: await sha256Hex(out.bytes),
     },
     bytes: out.bytes.length,
   };
+}
+
+/**
+ * The lowercase hex SHA-256 of the bytes: the content address the backend gives a stored image (over the same bytes it decodes
+ * from data_b64). Undefined when the engine cannot hash, so the image just has no full view.
+ */
+export async function sha256Hex(bytes: Uint8Array): Promise<string | undefined> {
+  try {
+    // A copy: the digest takes an ArrayBuffer-backed view, and the bytes here may be typed as any buffer.
+    const digest = await crypto.subtle.digest('SHA-256', new Uint8Array(bytes));
+    return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('');
+  } catch {
+    return undefined;
+  }
 }
 
 interface Encoded {
@@ -529,5 +544,7 @@ export function userAttachments(inputs: AttachmentInput[]): UserAttachment[] | u
     name: input.name,
     bytes: decodedSize(input.data_b64),
     thumb: input.thumb,
+    // An image with a computed address keeps it, so the full image can be opened once it is stored.
+    ...(input.kind === 'image' && input.sha256 !== undefined ? { sha256: input.sha256, mime: input.mime } : {}),
   }));
 }

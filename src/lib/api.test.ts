@@ -30,6 +30,23 @@ describe('api.agentMessage', () => {
     void api.agentMessage('', [IMAGE]);
     expect(invoke).toHaveBeenCalledWith('agent_message', { sessionId: 'main', text: '', attachments: [IMAGE] });
   });
+
+  it('the transcript-only sha256 of an image is not sent', () => {
+    void api.agentMessage('', [{ ...IMAGE, sha256: 'e'.repeat(64) }]);
+    const args = invoke.mock.calls[0][1] as { attachments: Record<string, unknown>[] };
+    expect(args.attachments).toEqual([IMAGE]);
+    expect(args.attachments[0]).not.toHaveProperty('sha256');
+  });
+});
+
+describe('api.getAttachment', () => {
+  beforeEach(() => invoke.mockClear());
+
+  it('asks the session for the stored image by its address and type', () => {
+    const sha = 'f'.repeat(64);
+    void api.getAttachment(sha, 'image/png');
+    expect(invoke).toHaveBeenCalledWith('get_attachment', { sessionId: 'main', sha256: sha, mime: 'image/png' });
+  });
 });
 
 describe('api.listCommands', () => {
