@@ -105,6 +105,8 @@ pub enum Reason {
     ExternalTool,
     /// `write_file` or `edit_file` (core/fs_tools): every write asks, unless approve-all covers it.
     FsWrite,
+    /// A `skill` call (core/skills) on a skill set to ask: the user approves loading it, or one of its files, for the turn.
+    SkillRead,
 }
 
 impl Reason {
@@ -127,6 +129,7 @@ impl Reason {
             Reason::ApproveAllSuspended => "approve_all_suspended",
             Reason::ExternalTool => "external_tool",
             Reason::FsWrite => "fs_write",
+            Reason::SkillRead => "skill_read",
         }
     }
 }
@@ -887,6 +890,7 @@ mod tests {
             (Reason::UnintegratedShell, "unintegrated_shell"),
             (Reason::ExternalTool, "external_tool"),
             (Reason::FsWrite, "fs_write"),
+            (Reason::SkillRead, "skill_read"),
         ];
         for (reason, code) in codes {
             assert_eq!(reason.code(), code);

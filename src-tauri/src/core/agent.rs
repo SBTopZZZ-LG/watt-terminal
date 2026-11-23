@@ -6,7 +6,7 @@
 //! to each command and checks the line it types, and auto-approve starts off. Auto-approve only skips the approval step; it never lets a command run
 //! while the shell is busy.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -28,6 +28,8 @@ use crate::core::llm::TurnCancel;
 use crate::core::observer::OpenAgentRecord;
 use crate::core::record::RecordSummary;
 use crate::core::session::{Session, USER_TEXT_CODE};
+use crate::core::skills::SkillLevel;
+use crate::core::skills::tool::{self as skill_tool, Checked};
 use crate::core::tools::{AgentTools, SessionFacts, TopLevel, integration_result};
 
 pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -371,10 +373,11 @@ fn new_call_id() -> String {
 /// Tools that never change the shell. `read_tool` accepts only these. Must match `READ_NAMES` in core/chat/agent_loop.rs.
 const READ_TOOLS: [&str; 5] = ["list_commands", "get_command", "get_screen", "get_cwd", "wait"];
 
-/// Built-in tools that may run without a gate decision: the read tools, `todo_write`, `ask_user`, `skill` and the file tools
-/// (core/fs_tools). None of them touches the shell. Any other name needs a gate decision: a gated built-in, or a host tool
+/// Built-in tools that may run without a gate decision: the read tools, `todo_write`, `ask_user` and the file tools
+/// (core/fs_tools). None of them touches the shell. `skill` is not here: it has its own gate (`call_skill`), so a call that
+/// reaches this path is refused. Any other name needs a gate decision: a gated built-in, or a host tool
 /// (core/external_tools). Must match the names routed in core/chat/agent_loop.rs (`run_call`).
-const BUILTIN_UNGATED: [&str; 12] = [
+const BUILTIN_UNGATED: [&str; 11] = [
     "list_commands",
     "get_command",
     "get_screen",
@@ -382,7 +385,6 @@ const BUILTIN_UNGATED: [&str; 12] = [
     "wait",
     "todo_write",
     "ask_user",
-    "skill",
     "read_file",
     "list_dir",
     "glob",
@@ -580,6 +582,78 @@ impl<'a> AgentCtx<'a> {
                 ("manual", Some(reason.code()), apply().map(Value::String))
             }
         }
+    }
+
+    /// Calls the `skill` tool (core/skills): loads a skill's text or one of its files. `check` refuses what the tool refuses
+    /// (no card) and gives the card. `granted` holds the skills the user approved this turn: their calls run with no card.
+    pub fn call_skill(
+        &self,
+        args: &Value,
+        granted: &mut HashSet<String>,
+        check: impl FnOnce(&Value) -> Result<Checked, String>,
+        run: impl FnOnce(&Value) -> Result<Value, String>,
+    ) -> Result<Value, String> {
+        let call_id = new_call_id();
+        let name = skill_tool::TOOL_NAME;
+        self.emit(AgentEvent::ToolCall { call_id: call_id.clone(), name: name.to_string(), args: args.clone() });
+        let (decision, reason, result) = self.gate_skill(&call_id, args, granted, check, run);
+        let (ok, value) = match &result {
+            Ok(v) => (true, v.clone()),
+            Err(e) => (false, json!({"error": e})),
+        };
+        self.emit(AgentEvent::ToolResult { call_id, name: name.to_string(), ok, decision, reason, result: value });
+        result
+    }
+
+    /// Applies the gate to one skill call (see `call_skill`). Approve-all runs it without a card; a skill the user approved
+    /// earlier this turn runs without one; a skill set to `Auto` runs without one; otherwise the user is asked (`SkillRead`,
+    /// or `ApproveAllSuspended` when approve-all is on in another shell). A decline is an ordinary error, not `DENIED`, so
+    /// the turn goes on without the skill (as for a declined integration).
+    fn gate_skill(
+        &self,
+        call_id: &str,
+        args: &Value,
+        granted: &mut HashSet<String>,
+        check: impl FnOnce(&Value) -> Result<Checked, String>,
+        run: impl FnOnce(&Value) -> Result<Value, String>,
+    ) -> (&'static str, Option<&'static str>, Result<Value, String>) {
+        // A refusal here is the error the skill tool always gave: no card, and the "read" decision as before.
+        let checked = match check(args) {
+            Ok(checked) => checked,
+            Err(refusal) => return ("read", None, Err(refusal)),
+        };
+        let top = self.tools.top_level();
+        let reason = match self.approvals.auto_state_across(top.key, self.rules.follow_local_in_nested) {
+            AutoState::On => {
+                let result = run(args);
+                return (if result.is_ok() { "auto" } else { "refused" }, Some(Reason::ApproveAll.code()), result);
+            }
+            _ if granted.contains(&checked.name) => return ("read", None, run(args)),
+            AutoState::Suspended => Reason::ApproveAllSuspended,
+            AutoState::Off if checked.level == SkillLevel::Auto => return ("read", None, run(args)),
+            AutoState::Off => Reason::SkillRead,
+        };
+        let approved = self.approvals.ask(call_id, || {
+            self.emit(AgentEvent::ApprovalRequest {
+                call_id: call_id.to_string(),
+                name: skill_tool::TOOL_NAME.to_string(),
+                text: checked.text.clone(),
+                display: Some(checked.display.clone()),
+                reason: Some(reason.code()),
+                level: top.key,
+                location: top.location.clone(),
+            })
+        });
+        if !approved {
+            let err = format!(
+                "the user did not approve loading skill '{}' (declined, cancelled, or timed out); carry on without it",
+                checked.name
+            );
+            return ("denied", Some(reason.code()), Err(err));
+        }
+        // The user approved: this skill runs without a card for the rest of the turn. The decision stays "manual".
+        granted.insert(checked.name);
+        ("manual", Some(reason.code()), run(args))
     }
 
     /// Runs a tool the agent loop handles itself (`todo_write`): no approval, no shell, no backend. It reports the call
@@ -2900,5 +2974,150 @@ mod tests {
             assert!(BUILTIN_UNGATED.contains(&name), "{name} is not in BUILTIN_UNGATED");
         }
         assert!(!READ_TOOLS.contains(&"grep"), "file tools are not shell reads: read_tool must refuse them");
+    }
+
+    /// The `Checked` a skill call gets when its skill exists (what `skill_tool::check` gives).
+    fn skill_checked(name: &str, level: SkillLevel) -> Checked {
+        Checked {
+            name: name.to_string(),
+            level,
+            text: format!("A {name} skill.\nFrom a user skills folder.\nSKILL.md: /skills/{name}/SKILL.md"),
+            display: format!("Load skill \"{name}\""),
+        }
+    }
+
+    #[test]
+    fn a_skill_set_to_ask_shows_a_card_and_is_not_asked_again_in_the_turn() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let log = Mutex::new(Vec::new());
+        let emit = answering(&gate, &log, true);
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        let mut granted = HashSet::new();
+        let body = ctx
+            .call_skill(&json!({"name": "pdf"}), &mut granted, |_| Ok(skill_checked("pdf", SkillLevel::Ask)), |_| Ok(json!("Step one.")))
+            .expect("approved");
+        assert_eq!(body, json!("Step one."));
+        assert_eq!(reasons(&log), [("skill".to_string(), "manual", Some("skill_read"))]);
+        let card = cards(&log);
+        assert_eq!(card.len(), 1);
+        assert_eq!(card[0].0, "skill");
+        assert_eq!(card[0].2.as_deref(), Some("Load skill \"pdf\""));
+        assert!(card[0].1.contains("SKILL.md: /skills/pdf/SKILL.md"), "{}", card[0].1);
+
+        // The same skill again, and one of its files: no card, the turn's approval covers them.
+        let file = json!({"name": "pdf", "file": "scripts/a.sh"});
+        let text = ctx.call_skill(&file, &mut granted, |_| Ok(skill_checked("pdf", SkillLevel::Ask)), |_| Ok(json!("echo")));
+        assert!(text.is_ok());
+        ctx.call_skill(&json!({"name": "pdf"}), &mut granted, |_| Ok(skill_checked("pdf", SkillLevel::Ask)), |_| Ok(json!("again")))
+            .expect("runs");
+        assert_eq!(cards(&log).len(), 1, "no second card for the same skill in the turn");
+        assert_eq!(reasons(&log)[1], ("skill".to_string(), "read", None));
+
+        // Another skill asks again.
+        ctx.call_skill(&json!({"name": "git"}), &mut granted, |_| Ok(skill_checked("git", SkillLevel::Ask)), |_| Ok(json!("git")))
+            .expect("approved");
+        let asked = cards(&log);
+        assert_eq!(asked.len(), 2);
+        assert_eq!(asked[1].2.as_deref(), Some("Load skill \"git\""));
+    }
+
+    #[test]
+    fn a_declined_skill_is_not_run_and_is_not_a_denial_that_stops_the_turn() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let log = Mutex::new(Vec::new());
+        let emit = answering(&gate, &log, false);
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        let mut granted = HashSet::new();
+        let err = ctx
+            .call_skill(&json!({"name": "pdf"}), &mut granted, |_| Ok(skill_checked("pdf", SkillLevel::Ask)), |_| panic!("not loaded"))
+            .expect_err("declined");
+        assert!(!err.starts_with(DENIED), "a decline must not stop the turn: {err}");
+        assert_eq!(err, "the user did not approve loading skill 'pdf' (declined, cancelled, or timed out); carry on without it");
+        assert_eq!(decisions(&log), [named("skill", "denied", false)]);
+        assert!(granted.is_empty(), "a decline grants nothing");
+    }
+
+    #[test]
+    fn a_skill_set_to_auto_loads_without_a_card() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        let mut granted = HashSet::new();
+        let body = ctx
+            .call_skill(&json!({"name": "pdf"}), &mut granted, |_| Ok(skill_checked("pdf", SkillLevel::Auto)), |_| Ok(json!("Step one.")))
+            .expect("loads");
+        assert_eq!(body, json!("Step one."));
+        assert_eq!(decisions(&log), [named("skill", "read", true)]);
+        assert!(cards(&log).is_empty());
+        assert!(granted.is_empty());
+    }
+
+    #[test]
+    fn approve_all_loads_an_ask_skill_without_a_card() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        gate.set_auto_approve(true, 0);
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        let mut granted = HashSet::new();
+        ctx.call_skill(&json!({"name": "pdf"}), &mut granted, |_| Ok(skill_checked("pdf", SkillLevel::Ask)), |_| Ok(json!("x")))
+            .expect("approve-all runs it");
+        assert_eq!(reasons(&log), [("skill".to_string(), "auto", Some("approve_all"))]);
+        assert!(cards(&log).is_empty());
+    }
+
+    #[test]
+    fn approve_all_in_another_shell_makes_every_skill_ask_here() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        gate.set_auto_approve(true, 0);
+        tools.set_top(nested(1, "ssh h"));
+        let log = Mutex::new(Vec::new());
+        let emit = answering(&gate, &log, true);
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        let mut granted = HashSet::new();
+        ctx.call_skill(&json!({"name": "pdf"}), &mut granted, |_| Ok(skill_checked("pdf", SkillLevel::Auto)), |_| Ok(json!("x")))
+            .expect("approved here");
+        assert_eq!(reasons(&log), [("skill".to_string(), "manual", Some("approve_all_suspended"))]);
+        assert_eq!(cards(&log).len(), 1);
+    }
+
+    #[test]
+    fn a_skill_the_tool_refuses_asks_nobody() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        let mut granted = HashSet::new();
+        let err = ctx
+            .call_skill(
+                &json!({"name": "off"}),
+                &mut granted,
+                |_| Err("skill 'off' is switched off in Watt's settings, so it is not loaded.".to_string()),
+                |_| panic!("refused"),
+            )
+            .expect_err("refused");
+        assert!(err.contains("switched off"), "{err}");
+        assert_eq!(decisions(&log), [named("skill", "read", false)]);
+        assert!(cards(&log).is_empty());
+    }
+
+    #[test]
+    fn skill_is_not_an_ungated_builtin_so_no_other_path_runs_it() {
+        assert!(!BUILTIN_UNGATED.contains(&skill_tool::TOOL_NAME));
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        assert!(ctx.call_tool("skill", json!({"name": "pdf"})).is_err());
+        assert!(tools.reached().is_empty());
+        assert!(cards(&log).is_empty());
     }
 }

@@ -8,6 +8,7 @@ pub mod frontmatter;
 pub mod scan;
 pub mod tool;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -38,6 +39,21 @@ pub struct Root {
     pub source: Source,
 }
 
+/// Whether a skill's `skill` calls ask the user first. `Ask` shows a card, and approving it covers that skill for the rest of
+/// the turn. `Auto` loads the skill with no card, as skills always did. Switching a skill off is `skills.disabled`, not a level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SkillLevel {
+    Ask,
+    #[default]
+    Auto,
+}
+
+/// The longest per-skill approval name, in characters.
+pub const MAX_OVERRIDE_CHARS: usize = 256;
+/// The most per-skill approval settings.
+pub const MAX_OVERRIDES: usize = 512;
+
 /// The skill settings, saved in settings.json (`skills`). Missing in older files: the defaults.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -47,6 +63,12 @@ pub struct SkillsSettings {
     pub folders: Option<Vec<String>>,
     /// Names of skills the user switched off. Such a skill is not offered to the model and cannot be loaded.
     pub disabled: Vec<String>,
+    /// The approval level of every skill that has no override.
+    pub approval: SkillLevel,
+    /// The approval level of one skill, by name. A skill without an entry uses `approval`. A name that matches no skill is
+    /// kept: the skill may come back.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub overrides: BTreeMap<String, SkillLevel>,
 }
 
 impl SkillsSettings {
@@ -57,8 +79,33 @@ impl SkillsSettings {
             None => Vec::new(),
         };
         problems.extend(folders::validate_disabled(&self.disabled));
+        problems.extend(validate_overrides(&self.overrides));
         problems
     }
+}
+
+/// The problems with the per-skill approval settings: at most `MAX_OVERRIDES` entries, and each name non-empty, without a NUL
+/// character, and at most `MAX_OVERRIDE_CHARS` characters.
+pub fn validate_overrides(overrides: &BTreeMap<String, SkillLevel>) -> Vec<String> {
+    let mut problems = Vec::new();
+    if overrides.len() > MAX_OVERRIDES {
+        problems.push(format!("skills: at most {MAX_OVERRIDES} per-skill approval settings"));
+    }
+    for name in overrides.keys() {
+        if name.trim().is_empty() {
+            problems.push("skills: a per-skill approval setting has an empty skill name".to_string());
+        } else if name.contains('\0') {
+            problems.push("skills: a per-skill approval setting has a NUL character in its skill name".to_string());
+        } else if name.chars().count() > MAX_OVERRIDE_CHARS {
+            problems.push(format!("skills: a per-skill approval name is longer than {MAX_OVERRIDE_CHARS} characters"));
+        }
+    }
+    problems
+}
+
+/// The approval level of one skill: its own override when it has one, else the global level.
+pub fn effective_level(approval: SkillLevel, overrides: &BTreeMap<String, SkillLevel>, name: &str) -> SkillLevel {
+    overrides.get(name).copied().unwrap_or(approval)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +119,8 @@ pub struct Skill {
     pub model_invocable: bool,
     /// False when the user switched the skill off (see `SkillIndex::apply_disabled`).
     pub enabled: bool,
+    /// The approval level in use (see `SkillIndex::apply_levels`). A skill the settings have not reached asks.
+    pub level: SkillLevel,
 }
 
 /// A skill that a skill of the same name, in a folder earlier in the order, hides. It is listed to the user, not used.
@@ -100,14 +149,23 @@ impl SkillIndex {
             skill.enabled = !disabled.contains(&skill.name);
         }
     }
+
+    /// Sets the approval level of every skill (see `effective_level`). Applied after the scan, like `apply_disabled`.
+    pub fn apply_levels(&mut self, approval: SkillLevel, overrides: &BTreeMap<String, SkillLevel>) {
+        let shadowed = self.shadowed.iter_mut().map(|s| &mut s.skill);
+        for skill in self.skills.iter_mut().chain(shadowed) {
+            skill.level = effective_level(approval, overrides, &skill.name);
+        }
+    }
 }
 
 /// The skills of one session: the folders from the settings and the session's project root, scanned, with the switched-off
-/// skills marked. The folder warnings come first among the warnings.
+/// skills marked and the approval levels set. The folder warnings come first among the warnings.
 pub fn load(places: &Places, settings: &SkillsSettings) -> (SkillIndex, Layout) {
     let layout = folders::layout(places, &folders::configured(settings));
     let mut index = scan(&layout.roots);
     index.apply_disabled(&settings.disabled);
+    index.apply_levels(settings.approval, &settings.overrides);
     let mut warnings = layout.warnings.clone();
     warnings.append(&mut index.warnings);
     index.warnings = warnings;
@@ -160,6 +218,10 @@ pub struct SkillsView {
     pub using_defaults: bool,
     /// The skills the user switched off (saved), by name.
     pub disabled: Vec<String>,
+    /// The approval level of every skill that has no override (saved).
+    pub approval: SkillLevel,
+    /// The per-skill approval levels (saved), by name: kept even for a skill that is not found now, so a save never drops them.
+    pub overrides: BTreeMap<String, SkillLevel>,
 }
 
 #[derive(Debug, Serialize)]
@@ -179,14 +241,19 @@ pub struct SkillView {
     pub path: String,
     pub model_invocable: bool,
     pub enabled: bool,
+    /// The approval level in use for this skill (its override, else the global level).
+    pub approval: SkillLevel,
+    /// The skill's own approval level, when the user set one. None: the global level applies.
+    #[serde(rename = "override")]
+    pub override_level: Option<SkillLevel>,
     /// The folder of the skill that is used instead, for a shadowed skill. None for a skill in use.
     pub shadowed_by: Option<String>,
 }
 
 /// The settings view of a load (see `load`) and the settings it was made from.
 pub fn view(index: &SkillIndex, layout: &Layout, settings: &SkillsSettings) -> SkillsView {
-    let in_use = index.skills.iter().map(|s| skill_view(s, None));
-    let hidden = index.shadowed.iter().map(|s| skill_view(&s.skill, Some(s.by.display().to_string())));
+    let in_use = index.skills.iter().map(|s| skill_view(s, None, settings));
+    let hidden = index.shadowed.iter().map(|s| skill_view(&s.skill, Some(s.by.display().to_string()), settings));
     SkillsView {
         skills: in_use.chain(hidden).collect(),
         warnings: index.warnings.clone(),
@@ -198,10 +265,12 @@ pub fn view(index: &SkillIndex, layout: &Layout, settings: &SkillsSettings) -> S
         folders: layout.folders.clone(),
         using_defaults: settings.folders.is_none(),
         disabled: settings.disabled.clone(),
+        approval: settings.approval,
+        overrides: settings.overrides.clone(),
     }
 }
 
-fn skill_view(skill: &Skill, shadowed_by: Option<String>) -> SkillView {
+fn skill_view(skill: &Skill, shadowed_by: Option<String>, settings: &SkillsSettings) -> SkillView {
     SkillView {
         name: skill.name.clone(),
         description: skill.description.clone(),
@@ -209,6 +278,8 @@ fn skill_view(skill: &Skill, shadowed_by: Option<String>) -> SkillView {
         path: skill.dir.display().to_string(),
         model_invocable: skill.model_invocable,
         enabled: skill.enabled,
+        approval: skill.level,
+        override_level: settings.overrides.get(&skill.name).copied(),
         shadowed_by,
     }
 }
@@ -225,6 +296,7 @@ mod tests {
             dir: PathBuf::from("/skills").join(name),
             model_invocable,
             enabled: true,
+            level: SkillLevel::Auto,
         }
     }
 
@@ -336,6 +408,101 @@ mod tests {
     }
 
     #[test]
+    fn the_approval_settings_default_to_auto_and_no_overrides_and_are_skipped_when_empty() {
+        let settings: SkillsSettings = serde_json::from_str(r#"{"disabled":["pdf"]}"#).expect("an older file parses");
+        assert_eq!(settings.approval, SkillLevel::Auto);
+        assert!(settings.overrides.is_empty());
+        let json = serde_json::to_value(SkillsSettings::default()).expect("serializes");
+        assert_eq!(json["approval"], "auto");
+        assert!(json.get("overrides").is_none(), "{json}");
+    }
+
+    #[test]
+    fn the_approval_settings_round_trip_and_an_unknown_level_is_refused() {
+        let text = r#"{"approval":"ask","overrides":{"pdf":"auto","git":"ask"}}"#;
+        let settings: SkillsSettings = serde_json::from_str(text).expect("parses");
+        assert_eq!(settings.approval, SkillLevel::Ask);
+        assert_eq!(settings.overrides.get("pdf"), Some(&SkillLevel::Auto));
+        let back: SkillsSettings = serde_json::from_value(serde_json::to_value(&settings).unwrap()).unwrap();
+        assert_eq!(back, settings);
+        assert!(serde_json::from_str::<SkillsSettings>(r#"{"approval":"never"}"#).is_err());
+        assert!(serde_json::from_str::<SkillsSettings>(r#"{"overrides":{"pdf":"always"}}"#).is_err());
+    }
+
+    #[test]
+    fn overrides_are_validated_on_save() {
+        assert!(SkillsSettings::default().validate().is_empty());
+        let ok = SkillsSettings { overrides: [("pdf".to_string(), SkillLevel::Ask)].into_iter().collect(), ..Default::default() };
+        assert!(ok.validate().is_empty());
+        let blank = SkillsSettings { overrides: [(" ".to_string(), SkillLevel::Ask)].into_iter().collect(), ..Default::default() };
+        assert!(blank.validate()[0].contains("empty skill name"), "{:?}", blank.validate());
+        let nul = SkillsSettings { overrides: [("a\0b".to_string(), SkillLevel::Ask)].into_iter().collect(), ..Default::default() };
+        assert!(nul.validate()[0].contains("NUL"), "{:?}", nul.validate());
+        let long = SkillsSettings {
+            overrides: [("x".repeat(MAX_OVERRIDE_CHARS + 1), SkillLevel::Ask)].into_iter().collect(),
+            ..Default::default()
+        };
+        assert!(long.validate()[0].contains("longer than 256"), "{:?}", long.validate());
+        let many = SkillsSettings {
+            overrides: (0..=MAX_OVERRIDES).map(|i| (format!("s{i}"), SkillLevel::Ask)).collect(),
+            ..Default::default()
+        };
+        assert!(many.validate()[0].contains("at most 512"), "{:?}", many.validate());
+    }
+
+    #[test]
+    fn an_override_beats_the_global_level_in_both_directions() {
+        let mut overrides = BTreeMap::new();
+        overrides.insert("pdf".to_string(), SkillLevel::Auto);
+        overrides.insert("git".to_string(), SkillLevel::Ask);
+        assert_eq!(effective_level(SkillLevel::Ask, &overrides, "pdf"), SkillLevel::Auto);
+        assert_eq!(effective_level(SkillLevel::Auto, &overrides, "git"), SkillLevel::Ask);
+        assert_eq!(effective_level(SkillLevel::Ask, &overrides, "other"), SkillLevel::Ask);
+        assert_eq!(effective_level(SkillLevel::Auto, &overrides, "other"), SkillLevel::Auto);
+    }
+
+    #[test]
+    fn apply_levels_sets_the_level_of_every_skill_in_use_and_hidden() {
+        let mut index = SkillIndex {
+            skills: vec![skill("pdf", "Reads PDFs", true), skill("git", "Git help", true)],
+            shadowed: vec![Shadowed { skill: skill("old", "Old", true), by: PathBuf::from("/first") }],
+            ..SkillIndex::default()
+        };
+        let overrides: BTreeMap<String, SkillLevel> = [("pdf".to_string(), SkillLevel::Auto)].into_iter().collect();
+        index.apply_levels(SkillLevel::Ask, &overrides);
+        assert_eq!(index.skills[0].level, SkillLevel::Auto);
+        assert_eq!(index.skills[1].level, SkillLevel::Ask);
+        assert_eq!(index.shadowed[0].skill.level, SkillLevel::Ask);
+    }
+
+    #[test]
+    fn the_view_shows_the_global_level_and_each_skills_effective_level_and_override() {
+        let mut index = SkillIndex {
+            skills: vec![skill("pdf", "Reads PDFs", true), skill("git", "Git help", true)],
+            ..SkillIndex::default()
+        };
+        let layout = Layout { roots: Vec::new(), folders: Vec::new(), warnings: Vec::new() };
+        let settings = SkillsSettings {
+            approval: SkillLevel::Ask,
+            overrides: [("git".to_string(), SkillLevel::Auto)].into_iter().collect(),
+            ..SkillsSettings::default()
+        };
+        index.apply_levels(settings.approval, &settings.overrides);
+        let view = view(&index, &layout, &settings);
+        assert_eq!(view.approval, SkillLevel::Ask);
+        assert_eq!(view.skills[0].approval, SkillLevel::Ask);
+        assert_eq!(view.skills[0].override_level, None);
+        assert_eq!(view.skills[1].approval, SkillLevel::Auto);
+        assert_eq!(view.skills[1].override_level, Some(SkillLevel::Auto));
+        let json = serde_json::to_value(&view).expect("serializes");
+        assert_eq!(json["approval"], "ask");
+        assert_eq!(json["overrides"]["git"], "auto");
+        assert_eq!(json["skills"][0]["override"], serde_json::Value::Null);
+        assert_eq!(json["skills"][1]["override"], "auto");
+        assert_eq!(json["skills"][1]["approval"], "auto");
+    }
+
+    #[test]
     fn load_puts_the_folder_warnings_first_and_marks_the_disabled() {
         let tmp = crate::core::settings::test_support::TempDir::new();
         let skill_dir = tmp.path().join("ok");
@@ -345,6 +512,7 @@ mod tests {
         let settings = SkillsSettings {
             folders: Some(vec![tmp.path().display().to_string(), tmp.path().join(".ssh").display().to_string()]),
             disabled: vec!["ok".to_string()],
+            ..Default::default()
         };
         let (index, layout) = load(&places, &settings);
         assert_eq!(layout.roots.len(), 1);

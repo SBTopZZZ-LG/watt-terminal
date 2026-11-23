@@ -116,7 +116,8 @@ export type ApprovalReasonCode =
   | 'nested_level'
   | 'approve_all_suspended'
   | 'external_tool'
-  | 'fs_write';
+  | 'fs_write'
+  | 'skill_read';
 
 export type AgentEvent =
   | { type: 'text'; text: string }
@@ -669,8 +670,15 @@ export interface SkillView {
   path: string;
   model_invocable: boolean;
   enabled: boolean;
+  /** The approval level in use for this skill: its override, else the global level. */
+  approval: SkillLevel;
+  /** The skill's own level, when the user set one. null: the global level applies. */
+  override: SkillLevel | null;
   shadowed_by: string | null;
 }
+
+/** Whether a skill's `skill` calls ask first (`ask`) or load with no card (`auto`). Core/skills SkillLevel. */
+export type SkillLevel = 'ask' | 'auto';
 
 /** One folder scanned (core/skills RootView). `exists` is false for a folder that is not there yet. */
 export interface RootView {
@@ -701,12 +709,18 @@ export interface SkillsView {
   using_defaults: boolean;
   /** The skill names switched off (saved). */
   disabled: string[];
+  /** The approval level of every skill without an override (saved). */
+  approval: SkillLevel;
+  /** The per-skill approval levels, by name (saved). A name with no skill in the list is kept by the backend. */
+  overrides: Record<string, SkillLevel>;
 }
 
 /** What set_skills_settings saves. `folders: null` restores the defaults. */
 export interface SkillsSettingsInput {
   folders: string[] | null;
   disabled: string[];
+  approval: SkillLevel;
+  overrides: Record<string, SkillLevel>;
 }
 
 /**

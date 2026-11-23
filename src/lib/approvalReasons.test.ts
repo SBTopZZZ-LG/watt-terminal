@@ -15,6 +15,7 @@ const ASK_CODES: ApprovalReasonCode[] = [
   'approve_all_suspended',
   'external_tool',
   'fs_write',
+  'skill_read',
 ];
 
 describe('askedBecause', () => {

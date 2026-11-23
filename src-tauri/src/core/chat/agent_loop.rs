@@ -922,12 +922,19 @@ impl LlmAgent {
 
     /// Runs the tool calls of one reply in order and records each result. Returns why the turn must stop, if it must.
     /// The calls after a stop are not run; the caller closes them in the history.
-    fn run_calls(&self, calls: &[ToolCall], ctx: &AgentCtx<'_>, commands: &mut u32, writes: &mut u32) -> Option<Stop> {
+    fn run_calls(
+        &self,
+        calls: &[ToolCall],
+        ctx: &AgentCtx<'_>,
+        commands: &mut u32,
+        writes: &mut u32,
+        skills_granted: &mut HashSet<String>,
+    ) -> Option<Stop> {
         for call in calls {
             if self.cancel.is_cancelled() {
                 return Some(Stop::Cancelled);
             }
-            let (content, denied) = self.run_call(call, ctx, commands, writes);
+            let (content, denied) = self.run_call(call, ctx, commands, writes, skills_granted);
             lock(&self.history).push_tool_result(&call.id, &content);
             if self.cancel.is_cancelled() {
                 return Some(Stop::Cancelled);
@@ -940,7 +947,14 @@ impl LlmAgent {
     }
 
     /// Runs one call. Returns the model-facing text of its result and whether the user denied it.
-    fn run_call(&self, call: &ToolCall, ctx: &AgentCtx<'_>, commands: &mut u32, writes: &mut u32) -> (String, bool) {
+    fn run_call(
+        &self,
+        call: &ToolCall,
+        ctx: &AgentCtx<'_>,
+        commands: &mut u32,
+        writes: &mut u32,
+        skills_granted: &mut HashSet<String>,
+    ) -> (String, bool) {
         let name = call.name.as_str();
         let failed = |message: &str| (project(name, false, &Value::String(message.to_string()), &self.redactor), false);
         let Ok(args) = serde_json::from_str::<Value>(&call.arguments) else {
@@ -955,8 +969,17 @@ impl LlmAgent {
                 ctx.call_tool("run_command", args)
             }
             todo::TOOL_NAME => ctx.local_tool(name, &args, |args| self.write_todos(args, ctx)),
-            // Read-only like `todo_write`: the skill's text or file, from this turn's index (core/skills/tool).
-            skill_tool::TOOL_NAME => ctx.local_tool(name, &args, |args| self.run_skill(args)),
+            // The skill's text or file, from this turn's index (core/skills/tool). Its own gate: a skill set to ask needs the
+            // user's approval, once per skill per turn (`skills_granted`).
+            skill_tool::TOOL_NAME => {
+                let index = self.skill_index();
+                ctx.call_skill(
+                    &args,
+                    skills_granted,
+                    |args| skill_tool::check(&index, args),
+                    |args| skill_tool::run(&index, args).map(Value::String),
+                )
+            }
             // The write tools (core/fs_tools): gated like run_command, with a preview on the card. Capped per turn.
             _ if fs_tools::is_write(name) => {
                 if *writes >= fs_tools::FS_WRITES_PER_TURN {
@@ -973,7 +996,7 @@ impl LlmAgent {
                     || fs_tools::run_write(self.fs_place(ctx), name, &args),
                 )
             }
-            // Read-only like `skill`: the file tools (core/fs_tools), on this machine only, inside this turn's folder.
+            // Read-only like `todo_write`: the file tools (core/fs_tools), on this machine only, inside this turn's folder.
             _ if fs_tools::is_tool(name) => ctx.local_tool(name, &args, |args| self.run_fs(name, args, ctx)),
             // Chat-local like `todo_write`: answered by the user, never by the shell or an approval card. It counts
             // against neither the command cap nor the read names, and its result never stops the turn.
@@ -1013,11 +1036,9 @@ impl LlmAgent {
         }
     }
 
-    /// Runs a `skill` call against this turn's index. Without an index no skill exists, so any name is unknown.
-    fn run_skill(&self, args: &Value) -> Result<Value, String> {
-        let empty = SkillIndex::default();
-        let index = self.skills.as_deref().unwrap_or(&empty);
-        skill_tool::run(index, args).map(Value::String)
+    /// This turn's skill index. Without one no skill exists, so any name is unknown.
+    fn skill_index(&self) -> Arc<SkillIndex> {
+        self.skills.clone().unwrap_or_default()
     }
 
     /// Validates a `todo_write` call and, when it is valid, replaces the conversation's list and reports it. A refused
@@ -1040,6 +1061,8 @@ impl Agent for LlmAgent {
         let mut finished = finished_since_last_turn(&lock(&self.history).snapshot(), ctx);
         let mut commands = 0;
         let mut writes = 0;
+        // The skills the user approved in this turn (see `AgentCtx::call_skill`). Never kept past the turn.
+        let mut skills_granted = HashSet::new();
         let (mut general, mut polls) = (0, 0);
         loop {
             if self.cancel.is_cancelled() {
@@ -1062,7 +1085,7 @@ impl Agent for LlmAgent {
                 ctx.say(cap.notice());
                 return;
             }
-            if let Some(stop) = self.run_calls(&reply.tool_calls, ctx, &mut commands, &mut writes) {
+            if let Some(stop) = self.run_calls(&reply.tool_calls, ctx, &mut commands, &mut writes, &mut skills_granted) {
                 lock(&self.history).close_pending(stop.reason());
                 if stop == Stop::Denied {
                     ctx.say(DENIED_NOTICE);

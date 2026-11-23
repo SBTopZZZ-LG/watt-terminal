@@ -1,4 +1,4 @@
-import type { FolderStatus, SkillView, SkillsSettingsInput } from './types';
+import type { FolderStatus, SkillLevel, SkillView, SkillsSettingsInput } from './types';
 
 /** Most folders the settings may hold (core/skills/folders.rs MAX_FOLDERS). */
 export const MAX_SKILL_FOLDERS = 64;
@@ -65,9 +65,31 @@ export function setSwitch(disabled: string[], name: string, on: boolean): string
   return disabled.includes(name) ? disabled : [...disabled, name];
 }
 
-/** What to send for the rows and switches. Folders are trimmed; null (the defaults) when `rows` is null. */
-export function saveInput(rows: string[] | null, disabled: string[]): SkillsSettingsInput {
-  return { folders: rows === null ? null : rows.map((row) => row.trim()), disabled };
+/** The approval settings a save sends. A save of folders or switches passes the view's, so it keeps them unchanged. */
+export type Approvals = Pick<SkillsSettingsInput, 'approval' | 'overrides'>;
+
+/** The labels of the approval levels, for the global setting and the per-skill setting. */
+export const LEVEL_LABEL: Record<SkillLevel, string> = { ask: 'Ask first', auto: "Don't ask" };
+
+/** What to send for the rows, the switches and the approvals. Folders are trimmed; null (the defaults) when `rows` is null. */
+export function saveInput(rows: string[] | null, disabled: string[], approvals: Approvals): SkillsSettingsInput {
+  return {
+    folders: rows === null ? null : rows.map((row) => row.trim()),
+    disabled,
+    approval: approvals.approval,
+    overrides: approvals.overrides,
+  };
+}
+
+/** The per-skill levels with `name` set to `level`. null removes its entry: the global level applies again. */
+export function setOverride(overrides: Record<string, SkillLevel>, name: string, level: SkillLevel | null): Record<string, SkillLevel> {
+  const next = { ...overrides };
+  if (level === null) {
+    delete next[name];
+  } else {
+    next[name] = level;
+  }
+  return next;
 }
 
 /** The note on a shadowed skill: the folder of the one in use. */

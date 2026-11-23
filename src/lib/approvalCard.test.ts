@@ -16,6 +16,7 @@ describe('showsDisplay', () => {
     expect(showsDisplay('mcp__a__b', 'external_tool')).toBe(true);
     expect(showsDisplay('write_file', 'fs_write')).toBe(true);
     expect(showsDisplay('edit_file', 'fs_write')).toBe(true);
+    expect(showsDisplay('skill', 'skill_read')).toBe(true);
   });
 
   it('shows the command for run_command', () => {

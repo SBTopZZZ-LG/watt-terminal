@@ -80,6 +80,12 @@ describe('ApprovalToast', () => {
     expect(html).not.toContain('approval-toast-command');
   });
 
+  it('shows a skill card as its one-line display, not the skill text', () => {
+    const html = render({ ...RUN, name: 'skill', text: 'A pdf skill.', display: 'Load skill pdf', reason: 'skill_read' });
+    expect(html).toContain('<code class="approval-toast-command" data-tip="Load skill pdf" data-tip-clip="">Load skill pdf</code>');
+    expect(html).not.toContain('A pdf skill.');
+  });
+
   it('shows the countdown line when the approval has an expiry', () => {
     const html = render({ ...RUN, expiresAt: Date.now() + 120_000 });
     expect(html).toContain('approval-countdown');

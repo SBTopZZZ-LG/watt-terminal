@@ -3,16 +3,18 @@ import { api, errorText } from '../lib/api';
 import { capDisplay, displayText } from '../lib/keysDisplay';
 import {
   FOLDER_STATUS_LABEL,
+  LEVEL_LABEL,
   SOURCE_LABEL,
   addFolder,
   removeFolder,
   rowsProblem,
   saveInput,
   setFolder,
+  setOverride,
   setSwitch,
   shadowNote,
 } from '../lib/skillFolders';
-import type { SkillsSettingsInput, SkillsView } from '../lib/types';
+import type { SkillLevel, SkillsSettingsInput, SkillsView } from '../lib/types';
 
 /** The most characters of a skill's description the list shows. The whole text is in its SKILL.md. */
 export const SKILL_DESCRIPTION_CHARS = 200;
@@ -35,6 +37,11 @@ function savedFolders(view: SkillsView): string[] | null {
   return view.using_defaults ? null : view.folders.map((f) => f.folder);
 }
 
+/** The level a select's value names; null for anything else (the per-skill "global default"). */
+function levelOf(value: string): SkillLevel | null {
+  return value === 'ask' || value === 'auto' ? value : null;
+}
+
 /**
  * The Skills tab: how skills work, the folders Watt reads them from (the Watt folder is locked, the others are edited here),
  * the skills found with a switch each, and the warnings. A skill marked hidden is in the list but never offered to the model.
@@ -54,6 +61,23 @@ export function SkillsSection({ view, loadError, loading, saving, saveError, onR
         Folders starting with ~ are in your home folder, absolute paths are used as they are, and other relative paths are read from the folder of the
         current terminal session. A folder that is not there yet is kept.
       </p>
+
+      {view !== null && (
+        <div className="settings-inline">
+          <label className="settings-label" htmlFor={`${uid}-approval`}>
+            Loading skills
+          </label>
+          <select
+            id={`${uid}-approval`}
+            value={view.approval}
+            disabled={saving}
+            onChange={(e) => onSave(saveInput(savedFolders(view), view.disabled, { approval: levelOf(e.target.value) ?? view.approval, overrides: view.overrides }))}
+          >
+            <option value="ask">{LEVEL_LABEL.ask}</option>
+            <option value="auto">{LEVEL_LABEL.auto}</option>
+          </select>
+        </div>
+      )}
 
       {view !== null && <FolderEditor view={view} saving={saving} onSave={onSave} />}
 
@@ -91,10 +115,24 @@ export function SkillsSection({ view, loadError, loading, saving, saveError, onR
                         type="checkbox"
                         checked={skill.enabled}
                         disabled={saving}
-                        onChange={(e) => onSave({ folders: savedFolders(view), disabled: setSwitch(view.disabled, skill.name, e.target.checked) })}
+                        onChange={(e) => onSave(saveInput(savedFolders(view), setSwitch(view.disabled, skill.name, e.target.checked), view))}
                       />
                       Use
                     </label>
+                  )}
+                  {!hidden && (
+                    <select
+                      aria-label={`Loading ${displayText(skill.name)}`}
+                      value={skill.override ?? 'global'}
+                      disabled={saving}
+                      onChange={(e) =>
+                        onSave(saveInput(savedFolders(view), view.disabled, { approval: view.approval, overrides: setOverride(view.overrides, skill.name, levelOf(e.target.value)) }))
+                      }
+                    >
+                      <option value="global">Global default ({LEVEL_LABEL[view.approval]})</option>
+                      <option value="ask">{LEVEL_LABEL.ask}</option>
+                      <option value="auto">{LEVEL_LABEL.auto}</option>
+                    </select>
                   )}
                   <span className="settings-row-name">{displayText(skill.name)}</span>
                   <span className="settings-tag settings-tag-muted">{SOURCE_LABEL[skill.source]}</span>
@@ -159,7 +197,7 @@ function FolderEditor({ view, saving, onSave }: { view: SkillsView; saving: bool
       setError(problem);
       return;
     }
-    onSave(saveInput(rows, view.disabled));
+    onSave(saveInput(rows, view.disabled, view));
   };
 
   return (
@@ -222,7 +260,7 @@ function FolderEditor({ view, saving, onSave }: { view: SkillsView; saving: bool
         <button type="button" disabled={saving || !dirty} onClick={save}>
           Save folders
         </button>
-        <button type="button" disabled={saving || (view.using_defaults && !dirty)} onClick={() => onSave(saveInput(null, view.disabled))}>
+        <button type="button" disabled={saving || (view.using_defaults && !dirty)} onClick={() => onSave(saveInput(null, view.disabled, view))}>
           Reset to defaults
         </button>
       </div>
