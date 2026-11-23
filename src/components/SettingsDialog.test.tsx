@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { NO_RECOVERY, SETTINGS_TABS, SettingsBody, SettingsDialog, SettingsNotices, storeNote } from './SettingsDialog';
+import { NO_RECOVERY, PresetPicker, SETTINGS_TABS, SettingsBody, SettingsDialog, SettingsNotices, storeNote } from './SettingsDialog';
 import type { LoadState, SettingsBodyProps, SettingsNoticesProps } from './SettingsDialog';
 import { modelRefKey } from '../lib/settingsForm';
 import type { Provider, ProviderPreset, Settings, SettingsView } from '../lib/types';
@@ -70,11 +70,10 @@ function props(over: Partial<SettingsBodyProps> = {}): SettingsBodyProps {
   return {
     load,
     locked: false,
-    presets: [PRESET],
     defaults: { busy: false, error: null },
     limit: { text: '8000', error: null, busy: false },
     notice: null,
-    editor: null,
+    openId: null,
     onRetry: NOOP,
     onDefault: NOOP,
     onVariant: NOOP,
@@ -154,7 +153,6 @@ describe('SettingsBody: broken settings file', () => {
     const out = html({ load: { kind: 'ready', view: broken }, locked: true });
     expect(out).toMatch(/<select[^>]*id="[^"]*-default"[^>]*disabled=""/);
     expect(out).toMatch(/<input[^>]*id="[^"]*-limit"[^>]*disabled=""/);
-    expect(out).toMatch(/<select[^>]*id="[^"]*-preset"[^>]*disabled=""/);
     expect(out).toMatch(/<button[^>]*disabled=""[^>]*>Add provider<\/button>/);
   });
 
@@ -304,20 +302,11 @@ describe('SettingsBody: providers', () => {
     expect(out.indexOf('>default<')).toBeLessThan(out.indexOf('Local box'));
   });
 
-  it('the open provider has its row expanded, and its editor sits under that row', () => {
-    const out = html({
-      editor: { forId: 'acme', node: <p>EDITOR-FOR-ACME</p> },
-    });
+  it('the open provider has its row expanded; its editor is in a sheet, not in the list', () => {
+    const out = html({ openId: 'acme' });
     expect(out).toContain('aria-expanded="true"');
-    const editorAt = out.indexOf('EDITOR-FOR-ACME');
-    expect(editorAt).toBeGreaterThan(out.indexOf('api.acme.test'));
-    expect(editorAt).toBeLessThan(out.indexOf('Local box'));
-  });
-
-  it('a new provider is shown at the end of the list, after the add control', () => {
-    const out = html({ editor: { forId: null, node: <p>EDITOR-NEW</p> } });
-    const at = out.indexOf('EDITOR-NEW');
-    expect(at).toBeGreaterThan(out.indexOf('Add provider'));
+    expect(out.split('aria-expanded="true"').length).toBe(2);
+    expect(out).not.toContain('settings-editor');
   });
 
   it('a notice about the open editor is shown as a status line', () => {
@@ -326,11 +315,10 @@ describe('SettingsBody: providers', () => {
     expect(out).toContain('Save or cancel the open provider first.');
   });
 
-  it('the add control offers the presets and a blank provider', () => {
+  it('the add control is one button, with no preset select: it opens the picker', () => {
     const out = html();
-    expect(out).toContain('Blank provider');
-    expect(out).toContain('OpenRouter');
     expect(out).toContain('>Add provider</button>');
+    expect(out).not.toContain('-preset');
   });
 
   it('a provider name is shown as text, not markup', () => {
@@ -338,6 +326,29 @@ describe('SettingsBody: providers', () => {
     const out = html({ load: { kind: 'ready', view: view({ settings: { ...SETTINGS, providers: [named] } }) } });
     expect(out).not.toContain('<img src=x>');
     expect(out).toContain('&lt;img src=x&gt;');
+  });
+});
+
+describe('PresetPicker', () => {
+  const picker = (presets: ProviderPreset[] = [PRESET]) => renderToStaticMarkup(<PresetPicker presets={presets} onPick={NOOP} />);
+
+  it('offers the blank provider first, then each preset with its chat host and whether it needs a key', () => {
+    const out = picker();
+    expect(out.indexOf('Blank provider')).toBeLessThan(out.indexOf('OpenRouter'));
+    expect(out).toContain('openrouter.ai');
+    expect(out).toContain('needs a key');
+  });
+
+  it('each choice is a button, and the blank provider takes the focus when the picker opens', () => {
+    const out = picker();
+    expect(out.split('class="settings-preset"').length).toBe(3);
+    expect(out.split('data-autofocus').length).toBe(2);
+    expect(out.indexOf('data-autofocus')).toBeLessThan(out.indexOf('Blank provider'));
+  });
+
+  it('a preset with a note shows it, and one without shows none', () => {
+    expect(picker([{ ...PRESET, note: 'Free tier only.' }])).toContain('Free tier only.');
+    expect(picker()).not.toContain('Free tier only.');
   });
 });
 

@@ -1,5 +1,5 @@
-import { useEffect, useId, useRef, useState } from 'react';
-import type { KeyboardEvent, ReactNode } from 'react';
+import { useCallback, useEffect, useId, useRef, useState } from 'react';
+import type { KeyboardEvent } from 'react';
 import { api, errorText } from '../lib/api';
 import { approvalInput, draftFromApproval, isApprovalDirty } from '../lib/approvalForm';
 import type { ApprovalDraft } from '../lib/approvalForm';
@@ -25,8 +25,8 @@ import type { AgentRequests, ModelRef, ProviderPreset, QueueMode, RecoverAction,
 import { AboutSection } from './AboutSection';
 import { ApprovalSection } from './ApprovalSection';
 import { LimitsSection } from './LimitsSection';
-import { ProviderEditor } from './ProviderEditor';
-import type { TestState } from './ProviderEditor';
+import { ProviderEditor, ProviderEditorFoot } from './ProviderEditor';
+import type { ProviderEditorProps, TestState } from './ProviderEditor';
 import { SettingsTabs } from './SettingsTabs';
 import type { TabDef } from './SettingsTabs';
 import { TerminalSection } from './TerminalSection';
@@ -35,6 +35,7 @@ import { NotifySection } from './NotifySection';
 import { DevtoolsSection } from './DevtoolsSection';
 import { McpTab } from './McpSection';
 import { SkillsTab } from './SkillsSection';
+import { Sheet, SheetHostContext } from './Sheet';
 import { SuggestSection } from './SuggestSection';
 import { secretStoreName } from '../lib/platform';
 
@@ -249,13 +250,12 @@ export interface SettingsBodyProps {
    * list. A normal open leaves focus alone. One-shot: later saves and re-renders never steal focus back.
    */
   focusModel?: boolean;
-  presets: ProviderPreset[];
   defaults: { busy: boolean; error: string | null };
   limit: { text: string; error: string | null; busy: boolean };
   /** A message about the providers, such as "Save or cancel the open provider first." */
   notice: string | null;
-  /** The open editor, drawn under its row, or at the end of the list when `forId` is null. */
-  editor: { forId: string | null; node: ReactNode } | null;
+  /** The provider whose editor sheet is open: its row shows as open. Null when no saved provider is being edited. */
+  openId: string | null;
   onRetry(): void;
   onDefault(key: string): void;
   /** A variant id, or "" for the base model. Ignored with no default model. */
@@ -264,17 +264,17 @@ export interface SettingsBodyProps {
   onLimitCommit(): void;
   onLimitClear(): void;
   onOpenProvider(id: string): void;
-  /** A preset key, or the blank provider (an empty key). */
-  onAddProvider(key: string): void;
+  /** Opens the provider picker (the presets and a blank provider) in a sheet. */
+  onAddProvider(): void;
 }
 
 /**
  * The settings' body: the default model, the global context limit and the providers, or the loading and error states. It
- * holds nothing but the choice in the "add provider" select, so it renders the same in a test as in the dialog.
+ * holds no state of its own, so it renders the same in a test as in the dialog. The provider editor and the picker are sheets
+ * the dialog draws, not part of the body.
  */
 export function SettingsBody(p: SettingsBodyProps) {
   const uid = useId();
-  const [preset, setPreset] = useState(BLANK_PRESET);
   // Bare `/model` focuses the default-model select. The ref guards the one shot; the effect fires only once the
   // view is ready (the first render is still loading, after the dialog's own mount focus), and never again.
   const modelRef = useRef<HTMLSelectElement>(null);
@@ -416,7 +416,7 @@ export function SettingsBody(p: SettingsBodyProps) {
         <ul className="settings-providers">
           {settings.providers.map((provider) => {
             const present = view.secrets[provider.id];
-            const open = p.editor !== null && p.editor.forId === provider.id;
+            const open = p.openId === provider.id;
             const isDefault = defaultProviderId === provider.id;
             return (
               <li key={provider.id} className="settings-provider">
@@ -434,7 +434,6 @@ export function SettingsBody(p: SettingsBodyProps) {
                   <span className="settings-dim">{`${provider.models.length} ${provider.models.length === 1 ? 'model' : 'models'}`}</span>
                   {isDefault && <span className="settings-tag settings-tag-accent">default</span>}
                 </button>
-                {open && p.editor?.node}
               </li>
             );
           })}
@@ -447,22 +446,40 @@ export function SettingsBody(p: SettingsBodyProps) {
         )}
 
         <div className="settings-inline">
-          <label htmlFor={`${uid}-preset`}>Preset</label>
-          <select id={`${uid}-preset`} value={preset} disabled={off} onChange={(e) => setPreset(e.target.value)}>
-            <option value={BLANK_PRESET}>Blank provider</option>
-            {p.presets.map((pr) => (
-              <option key={pr.key} value={pr.key}>
-                {pr.label}
-              </option>
-            ))}
-          </select>
-          <button type="button" disabled={off} onClick={() => p.onAddProvider(preset)}>
+          <button type="button" disabled={off} onClick={p.onAddProvider}>
             Add provider
           </button>
         </div>
-
-        {p.editor !== null && p.editor.forId === null && <div className="settings-editor-slot">{p.editor.node}</div>}
       </section>
+    </>
+  );
+}
+
+/**
+ * The picker's body: the blank provider, then each preset with its chat host. Choosing one starts a new provider from it.
+ * Each choice is a button, so the list is keyboard-navigable with Tab.
+ */
+export function PresetPicker({ presets, onPick }: { presets: ProviderPreset[]; onPick(key: string): void }) {
+  return (
+    <>
+      <p className="settings-hint">Start from a preset, which fills in its chat URL, models and headers, or start with a blank provider.</p>
+      <ul className="settings-presets">
+        <li>
+          <button type="button" className="settings-preset" data-autofocus onClick={() => onPick(BLANK_PRESET)}>
+            <span className="settings-row-name">Blank provider</span>
+            <span className="settings-dim">Fill in every field yourself.</span>
+          </button>
+        </li>
+        {presets.map((pr) => (
+          <li key={pr.key}>
+            <button type="button" className="settings-preset" onClick={() => onPick(pr.key)}>
+              <span className="settings-row-name">{pr.label}</span>
+              <span className="settings-dim">{[chatHost(pr.provider.chat_url), pr.needs_key ? 'needs a key' : null].filter(Boolean).join(' · ')}</span>
+              {pr.note !== '' && <span className="settings-hint">{pr.note}</span>}
+            </button>
+          </li>
+        ))}
+      </ul>
     </>
   );
 }
@@ -504,7 +521,13 @@ export interface SettingsDialogProps {
  */
 export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded, hideMarks, onHideMarksChange, queueMode, onQueueModeChange, suggestPrompts, onSuggestPromptsChange, notifications, onNotificationsChange, devtools, onDevtoolsChange }: SettingsDialogProps) {
   const titleId = useId();
-  const dialogRef = useRef<HTMLDivElement>(null);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  // The card's element, kept as state as well: the sheets draw into it, so they render once it exists.
+  const [sheetHost, setSheetHost] = useState<HTMLDivElement | null>(null);
+  const setDialogNode = useCallback((el: HTMLDivElement | null) => {
+    dialogRef.current = el;
+    setSheetHost(el);
+  }, []);
   const backdropPressed = useRef(false);
   const [opener] = useState<Element | null>(() => document.activeElement);
   const [attempt, setAttempt] = useState(0);
@@ -514,6 +537,8 @@ export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded, h
   const [limit, setLimit] = useState<{ text: string; error: string | null; busy: boolean }>({ text: '', error: null, busy: false });
   const [notice, setNotice] = useState<string | null>(null);
   const [editor, setEditor] = useState<EditorState | null>(null);
+  // The add-provider picker sheet is open.
+  const [picking, setPicking] = useState(false);
   const [askClose, setAskClose] = useState(false);
   const [recovery, setRecovery] = useState<RecoveryState>(NO_RECOVERY);
   // The Approvals section's edit, or null when it shows the saved settings. Its baseline is the view's approval settings.
@@ -825,6 +850,37 @@ export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded, h
     setNotice(null);
   };
 
+  // Esc, the close button and a backdrop click on the editor sheet. A question already showing is dismissed first. A draft with
+  // unsaved changes asks before it is dropped (the sheet stays open until then). A saving editor does not close.
+  const closeEditor = () => {
+    if (editor === null || editor.saving) {
+      return;
+    }
+    if (editor.askDelete || editor.askDiscard) {
+      setEditor({ ...editor, askDelete: false, askDiscard: false });
+      return;
+    }
+    if (dirty) {
+      setEditor({ ...editor, askDiscard: true });
+      return;
+    }
+    cancelEditor();
+  };
+
+  // The picker sheet: Add provider opens it, and a preset (or the blank provider) starts the editor. Refused while a provider
+  // has unsaved changes, as opening one is.
+  const openPicker = () => {
+    if (view === null || !mayReplaceEditor()) {
+      return;
+    }
+    setPicking(true);
+  };
+
+  const pickPreset = (key: string) => {
+    setPicking(false);
+    addProvider(key);
+  };
+
   // The save button is disabled while saving. This ref guard holds for any other call (a second click or key) that lands before
   // that render, since the state read by the handler is the one from the render the click came from.
   const saveInFlight = useRef(false);
@@ -1012,41 +1068,35 @@ export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded, h
   const limitsLocked = approvalLocked;
   const takenIds = view === null ? [] : view.settings.providers.filter((p) => p.id !== editor?.forId).map((p) => p.id);
 
-  let editorSlot: { forId: string | null; node: ReactNode } | null = null;
+  // The editor's props, for its body and its footer (both drawn in the editor sheet). Null when no editor is open.
+  let editorProps: ProviderEditorProps | null = null;
   if (editor !== null && view !== null) {
     const defaultModel = view.settings.default_model;
-    editorSlot = {
-      forId: editor.forId,
-      node: (
-        <ProviderEditor
-          key={editor.forId ?? 'new'}
-          draft={editor.draft}
-          saved={editor.saved}
-          problems={validateDraft(editor.draft, takenIds)}
-          takenIds={takenIds}
-          locked={locked}
-          saving={editor.saving}
-          saveError={editor.saveError}
-            defaultModelId={defaultModel && defaultModel.provider_id === editor.forId ? defaultModel.model_id : null}
-            defaultVariantId={
-              defaultModel && defaultModel.provider_id === editor.forId ? (defaultModel.variant ?? null) : null
-            }
-          fetching={editor.fetching}
-          fetchNote={editor.fetchNote}
-          fetchError={editor.fetchError}
-          tests={editor.tests}
-          askDelete={editor.askDelete}
-          askDiscard={editor.askDiscard}
-          onChange={(draft) => setEditor((cur) => (cur ? { ...cur, draft } : cur))}
-          onSave={save}
-          onAskDelete={(ask) => setEditor((cur) => (cur ? { ...cur, askDelete: ask } : cur))}
-          onDelete={deleteProvider}
-          onAskDiscard={(ask) => setEditor((cur) => (cur ? { ...cur, askDiscard: ask } : cur))}
-          onCancel={cancelEditor}
-          onFetch={fetchModels}
-          onTest={testModel}
-        />
-      ),
+    const ownsDefault = defaultModel !== null && defaultModel.provider_id === editor.forId;
+    editorProps = {
+      draft: editor.draft,
+      saved: editor.saved,
+      problems: validateDraft(editor.draft, takenIds),
+      takenIds,
+      locked,
+      saving: editor.saving,
+      saveError: editor.saveError,
+      defaultModelId: ownsDefault ? defaultModel.model_id : null,
+      defaultVariantId: ownsDefault ? (defaultModel.variant ?? null) : null,
+      fetching: editor.fetching,
+      fetchNote: editor.fetchNote,
+      fetchError: editor.fetchError,
+      tests: editor.tests,
+      askDelete: editor.askDelete,
+      askDiscard: editor.askDiscard,
+      onChange: (draft) => setEditor((cur) => (cur ? { ...cur, draft } : cur)),
+      onSave: save,
+      onAskDelete: (ask) => setEditor((cur) => (cur ? { ...cur, askDelete: ask } : cur)),
+      onDelete: deleteProvider,
+      onAskDiscard: (ask) => setEditor((cur) => (cur ? { ...cur, askDiscard: ask } : cur)),
+      onCancel: cancelEditor,
+      onFetch: fetchModels,
+      onTest: testModel,
     };
   }
 
@@ -1067,11 +1117,10 @@ export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded, h
       load={load}
       locked={locked}
       focusModel={focusModel}
-      presets={presets}
       defaults={defaults}
       limit={limit}
       notice={notice}
-      editor={editorSlot}
+      openId={editor?.forId ?? null}
       onRetry={() => {
         setLoad({ kind: 'loading' });
         setAttempt((a) => a + 1);
@@ -1085,7 +1134,7 @@ export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded, h
         commitLimit('');
       }}
       onOpenProvider={openProvider}
-      onAddProvider={addProvider}
+      onAddProvider={openPicker}
     />
   );
 
@@ -1164,7 +1213,7 @@ export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded, h
       }}
     >
       <div
-        ref={dialogRef}
+        ref={setDialogNode}
         className="settings-dialog"
         role="dialog"
         aria-modal="true"
@@ -1172,61 +1221,88 @@ export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded, h
         tabIndex={-1}
         onKeyDown={onKeyDown}
       >
-        <header className="settings-head">
-          <h2 className="settings-title" id={titleId}>
-            AI settings
-          </h2>
-        </header>
-        <SettingsNotices
-          view={view}
-          recovery={recovery}
-          onCheckAgain={() => {
-            setLoad({ kind: 'loading' });
-            setAttempt((a) => a + 1);
-          }}
-          onAskRevert={(ask) => setRecovery((r) => ({ ...r, confirming: ask, error: null }))}
-          onRecover={runRecovery}
-          onReload={() => runRecovery('reload')}
-        />
-        <SettingsTabs
-          label="AI settings sections"
-          tabs={SETTINGS_TABS}
-          selected={tab}
-          dirty={dirtyTabs}
-          onSelect={setTab}
-          panel={(id) =>
-            id === 'approvals'
-              ? approvalsPanel
-              : id === 'mcp'
-                ? mcpPanel
-                : id === 'skills'
-                  ? skillsPanel
-                  : id === 'limits'
-                    ? limitsPanel
-                    : id === 'terminal'
-                      ? terminalPanel
-                      : id === 'about'
-                        ? aboutPanel
-                        : modelsPanel
-          }
-        />
-        <footer className="settings-foot">
-          {askClose ? (
-            <>
-              <span className="settings-warn">{discardQuestion}</span>
-              <button type="button" className="settings-danger" onClick={discardAndClose}>
-                Discard and close
+        <SheetHostContext.Provider value={sheetHost}>
+          <header className="settings-head">
+            <h2 className="settings-title" id={titleId}>
+              AI settings
+            </h2>
+          </header>
+          <SettingsNotices
+            view={view}
+            recovery={recovery}
+            onCheckAgain={() => {
+              setLoad({ kind: 'loading' });
+              setAttempt((a) => a + 1);
+            }}
+            onAskRevert={(ask) => setRecovery((r) => ({ ...r, confirming: ask, error: null }))}
+            onRecover={runRecovery}
+            onReload={() => runRecovery('reload')}
+          />
+          <SettingsTabs
+            label="AI settings sections"
+            tabs={SETTINGS_TABS}
+            selected={tab}
+            dirty={dirtyTabs}
+            onSelect={setTab}
+            panel={(id) =>
+              id === 'approvals'
+                ? approvalsPanel
+                : id === 'mcp'
+                  ? mcpPanel
+                  : id === 'skills'
+                    ? skillsPanel
+                    : id === 'limits'
+                      ? limitsPanel
+                      : id === 'terminal'
+                        ? terminalPanel
+                        : id === 'about'
+                          ? aboutPanel
+                          : modelsPanel
+            }
+          />
+          <footer className="settings-foot">
+            {askClose ? (
+              <>
+                <span className="settings-warn">{discardQuestion}</span>
+                <button type="button" className="settings-danger" onClick={discardAndClose}>
+                  Discard and close
+                </button>
+                <button type="button" onClick={() => setAskClose(false)}>
+                  Keep editing
+                </button>
+              </>
+            ) : (
+              <button type="button" disabled={saving} onClick={requestClose}>
+                Close
               </button>
-              <button type="button" onClick={() => setAskClose(false)}>
-                Keep editing
-              </button>
-            </>
-          ) : (
-            <button type="button" disabled={saving} onClick={requestClose}>
-              Close
-            </button>
+            )}
+          </footer>
+          {editorProps !== null && editor !== null && (
+            <Sheet
+              key="editor"
+              title={editor.forId === null ? 'New provider' : `Edit provider · ${editor.draft.name}`}
+              wide
+              onClose={closeEditor}
+              footer={<ProviderEditorFoot {...editorProps} />}
+            >
+              <ProviderEditor key={editor.forId ?? 'new'} {...editorProps} />
+            </Sheet>
           )}
-        </footer>
+          {picking && editor === null && (
+            <Sheet
+              key="picker"
+              title="Add a provider"
+              onClose={() => setPicking(false)}
+              footer={
+                <button type="button" onClick={() => setPicking(false)}>
+                  Cancel
+                </button>
+              }
+            >
+              <PresetPicker presets={presets} onPick={pickPreset} />
+            </Sheet>
+          )}
+        </SheetHostContext.Provider>
       </div>
     </div>
   );

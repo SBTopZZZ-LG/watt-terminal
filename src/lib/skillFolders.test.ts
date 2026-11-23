@@ -12,6 +12,7 @@ import {
   setOverride,
   setSwitch,
   shadowNote,
+  withFolder,
 } from './skillFolders';
 
 describe('skill folder rows', () => {
@@ -38,6 +39,30 @@ describe('skill folder rows', () => {
     expect(rowsProblem(['~/a', '/b'])).toBeNull();
     expect(rowsProblem(['~/a', ' '])).toBe('A folder is empty.');
     expect(folderProblem('a\0b')).toBe('A folder has a NUL character.');
+  });
+});
+
+describe('a folder sheet (add or edit one row)', () => {
+  it('adds a trimmed folder at the end, or replaces the row at an index', () => {
+    expect(withFolder(['~/a'], null, '  ~/b  ')).toEqual({ rows: ['~/a', '~/b'], error: null });
+    expect(withFolder(['~/a', '/b'], 1, ' /c ')).toEqual({ rows: ['~/a', '/c'], error: null });
+  });
+
+  it('an empty folder is not an error yet, and nothing changes', () => {
+    expect(withFolder(['~/a'], null, '   ')).toEqual({ rows: ['~/a'], error: null });
+  });
+
+  it('refuses a folder that is already listed in another row, but not the row being edited', () => {
+    expect(withFolder(['~/a', '/b'], null, '~/a').error).toBe('That folder is already in the list.');
+    expect(withFolder(['~/a', '/b'], 0, '~/a')).toEqual({ rows: ['~/a', '/b'], error: null });
+    expect(withFolder(['~/a', '/b'], 1, '~/a').error).toBe('That folder is already in the list.');
+  });
+
+  it('refuses a bad folder or one past the count, with the rows as they were', () => {
+    const bad = withFolder(['~/a'], 0, 'a\0b');
+    expect(bad).toEqual({ rows: ['~/a'], error: 'A folder has a NUL character.' });
+    const full = Array.from({ length: MAX_SKILL_FOLDERS }, (_, i) => `/f${i}`);
+    expect(withFolder(full, null, '/one-more')).toEqual({ rows: full, error: `At most ${MAX_SKILL_FOLDERS} folders.` });
   });
 });
 

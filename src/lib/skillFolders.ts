@@ -49,6 +49,21 @@ export function addFolder(rows: string[], raw: string): { rows: string[]; error:
   return { rows: [...rows, folder], error: null };
 }
 
+/**
+ * The rows with the folder at `index` replaced by `raw` (trimmed), or with `raw` added at the end when `index` is null. The
+ * error says why it cannot be kept; an empty folder is not an error yet, it just cannot be saved.
+ */
+export function withFolder(rows: string[], index: number | null, raw: string): { rows: string[]; error: string | null } {
+  const folder = raw.trim();
+  if (folder === '') return { rows, error: null };
+  const problem = folderProblem(folder);
+  if (problem !== null) return { rows, error: problem };
+  if (rows.some((row, i) => i !== index && row === folder)) return { rows, error: 'That folder is already in the list.' };
+  const next = index === null ? [...rows, folder] : setFolder(rows, index, folder);
+  const limit = rowsProblem(next);
+  return limit === null ? { rows: next, error: null } : { rows, error: limit };
+}
+
 /** The rows without the one at `index`. */
 export function removeFolder(rows: string[], index: number): string[] {
   return rows.filter((_, i) => i !== index);

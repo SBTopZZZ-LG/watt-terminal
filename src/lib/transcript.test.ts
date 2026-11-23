@@ -547,6 +547,12 @@ describe('approvalTitle', () => {
     expect(approvalTitle('send_keys')).toBe('The agent wants to type into a running command');
   });
 
+  it('names a skill load, and a file read from a skill, from the card display', () => {
+    expect(approvalTitle('skill', 'skill_read', 'Load skill "demo"')).toBe('The agent wants to load a skill');
+    expect(approvalTitle('skill', 'skill_read', 'Read "scripts/check.sh" from skill "demo"')).toBe('The agent wants to read a file from a skill');
+    expect(approvalTitle('skill')).toBe('The agent wants to load a skill');
+  });
+
   it('names any other tool, escaping the name', () => {
     expect(approvalTitle('fetch_url')).toBe('The agent wants to use fetch_url');
     expect(approvalTitle('x‮y')).toBe('The agent wants to use x\\u{202E}y');
