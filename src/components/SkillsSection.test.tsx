@@ -197,6 +197,12 @@ describe('FolderSheet', () => {
     expect(html).toContain('A folder that is not there yet is kept.');
   });
 
+  it('offers Browse beside the path in both sheets, and holds it off while a save runs', () => {
+    expect(sheet(null, '')).toMatch(/<button type="button"[^>]*>Browse…<\/button>/);
+    expect(sheet(0, '~/.claude/skills')).toMatch(/<button type="button"[^>]*>Browse…<\/button>/);
+    expect(sheet(0, '~/.claude/skills', { saving: true })).toMatch(/disabled=""[^>]*>Browse…<\/button>/);
+  });
+
   it('an edit sheet is off Save until the folder changes', () => {
     expect(sheet(0, '~/.claude/skills')).toMatch(/disabled=""[^>]*>Save folder<\/button>/);
     expect(sheet(0, '~/other')).not.toMatch(/disabled=""[^>]*>Save folder<\/button>/);

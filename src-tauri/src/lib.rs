@@ -1770,6 +1770,8 @@ pub fn run() {
         }))
         // Desktop notifications (the frontend sends them and handles clicks). Registered after single-instance.
         .plugin(tauri_plugin_notification::init())
+        // Native folder picker (api.ts pickFolder). The capability grants only dialog:allow-open.
+        .plugin(tauri_plugin_dialog::init())
         // Saves the window's size, position and maximized state on exit and restores them at launch.
         // Visibility, decorations and fullscreen are not tracked: Tauri shows the window itself.
         .plugin(

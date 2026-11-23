@@ -4489,6 +4489,12 @@ a {
   width: 100%;
 }
 
+/* The skill folder path with its Browse button on one row: the input takes the room the button leaves. */
+.sheet-body > .settings-inline > input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
 .sheet-foot {
   display: flex;
   flex: 0 0 auto;
