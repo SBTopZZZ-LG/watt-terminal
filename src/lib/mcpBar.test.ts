@@ -1,5 +1,23 @@
 import { describe, expect, it } from 'vitest';
-import { barTone, loaderText, OPEN_POLL_MS, pollDelay, readyCount, RETRY_POLL_MS, serverTone, STARTING_POLL_MS, stateLabel, stateMessage, toggleTip, withEnabled } from './mcpBar';
+import {
+  barTone,
+  IDLE_POLL_MS,
+  loaderText,
+  NO_SETTLED,
+  OPEN_POLL_MS,
+  pollDelay,
+  readyCount,
+  RETRY_POLL_MS,
+  serverTone,
+  settleServers,
+  showsLoader,
+  STARTING_POLL_MS,
+  stateLabel,
+  stateMessage,
+  toggleTip,
+  unsettleServer,
+  withEnabled,
+} from './mcpBar';
 import type { McpServerStatus, McpStateView, McpStatus } from './types';
 
 const server = (name: string, state: McpStateView, enabled = true, tools = 0): McpServerStatus => ({ id: name, name, enabled, state, tools });
@@ -51,6 +69,56 @@ describe('readyCount and loaderText', () => {
     expect(loaderText(three)).toBe('Starting MCP servers… (2/3 ready)');
     expect(loaderText([server('a', { kind: 'connecting' })])).toBe('Starting MCP servers…');
   });
+
+  it('initial startup: a server that settled counts as ready, a connecting one does not', () => {
+    const startup = [server('a', { kind: 'connected', tools: 1 }), server('b', { kind: 'connecting' })];
+    const settled = settleServers(NO_SETTLED, startup);
+    expect(showsLoader(startup, settled)).toBe(true);
+    expect(loaderText(startup, settled)).toBe('Starting MCP servers… (1/2 ready)');
+  });
+});
+
+describe('settleServers, unsettleServer and showsLoader', () => {
+  const connecting = server('docs', { kind: 'connecting' });
+  const failed = server('docs', { kind: 'failed', message: 'spawn ENOENT' });
+
+  it('records enabled servers that connected, failed or need sign-in, and returns the same set when nothing is new', () => {
+    const once = settleServers(NO_SETTLED, [failed, server('fetch', { kind: 'connected', tools: 1 }), server('x', { kind: 'needs_auth', message: 'm' })]);
+    expect([...once].sort()).toEqual(['docs', 'fetch', 'x']);
+    expect(settleServers(once, [failed])).toBe(once);
+  });
+
+  it('does not record connecting, disabled or off servers', () => {
+    const next = settleServers(NO_SETTLED, [connecting, server('ctx', { kind: 'disabled' }, false), server('y', { kind: 'failed', message: 'x' }, false)]);
+    expect(next.size).toBe(0);
+  });
+
+  it('initial startup shows the loader while an unsettled server connects', () => {
+    expect(showsLoader([connecting])).toBe(true);
+    expect(showsLoader([connecting], NO_SETTLED)).toBe(true);
+  });
+
+  it('a settled server that retries (failed, then connecting again) does not bring the loader back', () => {
+    const settled = settleServers(NO_SETTLED, [failed]);
+    expect(showsLoader([connecting], settled)).toBe(false);
+  });
+
+  it('a user switch-on removes the server, so its connect shows the loader once', () => {
+    const settled = settleServers(NO_SETTLED, [failed]);
+    const reenabled = unsettleServer(settled, 'docs');
+    expect(reenabled).not.toBe(settled);
+    expect(showsLoader([connecting], reenabled)).toBe(true);
+    // Once it settles again, a later retry is quiet.
+    expect(showsLoader([failed], settleServers(reenabled, [failed]))).toBe(false);
+  });
+
+  it('unsettling a server that is not in the set keeps the same set', () => {
+    expect(unsettleServer(NO_SETTLED, 'docs')).toBe(NO_SETTLED);
+  });
+
+  it('ignores a connecting server that is disabled', () => {
+    expect(showsLoader([server('docs', { kind: 'connecting' }, false)])).toBe(false);
+  });
 });
 
 describe('stateLabel and stateMessage', () => {
@@ -98,17 +166,18 @@ describe('pollDelay', () => {
     expect(pollDelay(starting, true)).toBe(STARTING_POLL_MS);
   });
 
-  it('stops once nothing is starting and the panel is closed', () => {
+  it('polls slowly once nothing is starting and the panel is closed, so outside changes reach the dot', () => {
     const settled = status([server('a', { kind: 'connected', tools: 1 })]);
-    expect(pollDelay(settled, false)).toBeNull();
+    expect(pollDelay(settled, false)).toBe(IDLE_POLL_MS);
+    expect(IDLE_POLL_MS).toBe(5000);
   });
 
   it('polls at the open rate while the panel is open with servers', () => {
     expect(pollDelay(status([server('a', { kind: 'connected', tools: 1 })]), true)).toBe(OPEN_POLL_MS);
   });
 
-  it('does not poll when no servers are configured', () => {
-    expect(pollDelay(status([]), true)).toBeNull();
-    expect(pollDelay(status([]), false)).toBeNull();
+  it('re-checks slowly when no servers are configured, so a first server added in Settings shows up', () => {
+    expect(pollDelay(status([]), true)).toBe(IDLE_POLL_MS);
+    expect(pollDelay(status([]), false)).toBe(IDLE_POLL_MS);
   });
 });

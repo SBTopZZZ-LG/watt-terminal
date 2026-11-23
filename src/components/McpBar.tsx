@@ -1,24 +1,47 @@
 import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import type { KeyboardEvent } from 'react';
 import { api, errorText } from '../lib/api';
-import { barTone, loaderText, pollDelay, serverTone, stateLabel, stateMessage, toggleTip, withEnabled } from '../lib/mcpBar';
+import {
+  barTone,
+  loaderText,
+  NO_SETTLED,
+  pollDelay,
+  serverTone,
+  settleServers,
+  showsLoader,
+  stateLabel,
+  stateMessage,
+  toggleTip,
+  unsettleServer,
+  withEnabled,
+} from '../lib/mcpBar';
+import type { Settled } from '../lib/mcpBar';
 import type { McpServerStatus, McpStatus } from '../lib/types';
 import { BrailleSpinner } from './BrailleSpinner';
 
 /**
- * The status, read now and again on the poll delay (see pollDelay). A failed read keeps the last status. `setStatus` is for an
- * optimistic change; the next read replaces it.
+ * The status, read now and again on the poll delay (see pollDelay). It is not read while the tab is hidden; it is read once
+ * when the tab becomes visible again. A failed read keeps the last status. `setStatus` is for an optimistic change; the next
+ * read replaces it. `settled` holds the servers that have settled this session; `forget` removes one (the user switched it on).
  */
 export function useMcpStatus(open: boolean) {
   const [status, setStatus] = useState<McpStatus | null>(null);
+  const [settled, setSettled] = useState<Settled>(NO_SETTLED);
   // Bumped when a read ends, ok or not, so the poll timer is set again after each one.
   const [reads, setReads] = useState(0);
   const refresh = useCallback(() => {
     api
       .getMcpStatus()
-      .then(setStatus, () => undefined)
+      .then(
+        (next) => {
+          setStatus(next);
+          setSettled((s) => settleServers(s, next.servers));
+        },
+        () => undefined,
+      )
       .finally(() => setReads((n) => n + 1));
   }, []);
+  const forget = useCallback((name: string) => setSettled((s) => unsettleServer(s, name)), []);
   useEffect(() => {
     refresh();
   }, [refresh]);
@@ -27,21 +50,35 @@ export function useMcpStatus(open: boolean) {
     if (delay === null) {
       return;
     }
-    const timer = setTimeout(refresh, delay);
+    const timer = setTimeout(() => {
+      // A hidden tab stops here; the visibility listener reads again when it shows.
+      if (!document.hidden) {
+        refresh();
+      }
+    }, delay);
     return () => clearTimeout(timer);
   }, [reads, delay, refresh]);
-  return { status, setStatus, refresh };
+  useEffect(() => {
+    const onVisible = () => {
+      if (!document.hidden) {
+        refresh();
+      }
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => document.removeEventListener('visibilitychange', onVisible);
+  }, [refresh]);
+  return { status, setStatus, refresh, settled, forget };
 }
 
 /** The loader row above the composer, while an enabled server is connecting. Nothing otherwise. */
-export function McpLoader({ starting, servers }: { starting: boolean; servers: McpServerStatus[] }) {
+export function McpLoader({ starting, servers, settled = NO_SETTLED }: { starting: boolean; servers: McpServerStatus[]; settled?: Settled }) {
   if (!starting) {
     return null;
   }
   return (
     <div className="bar-mcp-loader" role="status" aria-live="polite">
       <BrailleSpinner />
-      <span>{loaderText(servers)}</span>
+      <span>{loaderText(servers, settled)}</span>
     </div>
   );
 }
@@ -109,7 +146,7 @@ export function McpBar() {
   const [open, setOpen] = useState(false);
   const [pending, setPending] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const { status, setStatus, refresh } = useMcpStatus(open);
+  const { status, setStatus, refresh, settled, forget } = useMcpStatus(open);
   const wrapRef = useRef<HTMLDivElement>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
   const panelId = useId();
@@ -149,6 +186,10 @@ export function McpBar() {
     const next = !server.enabled;
     setPending(server.name);
     setError(null);
+    if (next) {
+      // Switching on shows the loader once for this connect, even if the server settled earlier this session.
+      forget(server.name);
+    }
     setStatus((s) => s && withEnabled(s, server.name, next));
     try {
       await api.mcpSetEnabled(server.name, next);
@@ -163,7 +204,7 @@ export function McpBar() {
 
   return (
     <div ref={wrapRef} className="bar-mcp" onKeyDown={onKeyDown}>
-      <McpLoader starting={status?.starting ?? false} servers={servers} />
+      <McpLoader starting={showsLoader(servers, settled)} servers={servers} settled={settled} />
       <McpPanel id={panelId} open={open} servers={servers} pending={pending} error={error} onToggle={toggle} />
       <button
         ref={buttonRef}

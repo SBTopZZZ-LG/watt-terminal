@@ -3,6 +3,11 @@ import type { McpServerStatus, McpStatus } from './types';
 /** The status dot's colour: off (nothing enabled, or a disabled server), connecting, connected (ok), or failed. */
 export type McpTone = 'off' | 'connecting' | 'ok' | 'fail';
 
+/** The names of the servers that have settled this session (connected, failed or needs sign-in while enabled). */
+export type Settled = ReadonlySet<string>;
+
+export const NO_SETTLED: Settled = new Set();
+
 /** One server's dot: off when disabled, red when it failed or needs sign-in, amber while it connects, green when connected. */
 export function serverTone(server: McpServerStatus): McpTone {
   if (!server.enabled) {
@@ -33,15 +38,42 @@ export function barTone(servers: McpServerStatus[]): McpTone {
   return tones.includes('ok') ? 'ok' : 'off';
 }
 
-/** The enabled servers that are not connecting yet (connected or failed), and how many are enabled. */
-export function readyCount(servers: McpServerStatus[]): { ready: number; total: number } {
+/**
+ * Adds each enabled server that has settled to the set. Returns the same set when nothing is new. A settled server that
+ * connects again (the backend retries failed servers) is already in the set, so it does not bring the loader back.
+ */
+export function settleServers(settled: Settled, servers: McpServerStatus[]): Settled {
+  const fresh = servers
+    .filter((s) => s.enabled && (s.state.kind === 'connected' || s.state.kind === 'failed' || s.state.kind === 'needs_auth'))
+    .map((s) => s.name)
+    .filter((name) => !settled.has(name));
+  return fresh.length === 0 ? settled : new Set([...settled, ...fresh]);
+}
+
+/** Removes one server from the settled set, so its next connect shows the loader once (the user switched it on). */
+export function unsettleServer(settled: Settled, name: string): Settled {
+  if (!settled.has(name)) {
+    return settled;
+  }
+  const next = new Set(settled);
+  next.delete(name);
+  return next;
+}
+
+/** True while an enabled server that has not settled this session is connecting. Retries of settled servers do not count. */
+export function showsLoader(servers: McpServerStatus[], settled: Settled = NO_SETTLED): boolean {
+  return servers.some((s) => s.enabled && s.state.kind === 'connecting' && !settled.has(s.name));
+}
+
+/** The enabled servers that are not connecting (connected, failed, or settled this session), and how many are enabled. */
+export function readyCount(servers: McpServerStatus[], settled: Settled = NO_SETTLED): { ready: number; total: number } {
   const enabled = servers.filter((s) => s.enabled);
-  return { ready: enabled.filter((s) => s.state.kind !== 'connecting').length, total: enabled.length };
+  return { ready: enabled.filter((s) => s.state.kind !== 'connecting' || settled.has(s.name)).length, total: enabled.length };
 }
 
 /** The loader row's text. The count is shown only when more than one server is enabled. */
-export function loaderText(servers: McpServerStatus[]): string {
-  const { ready, total } = readyCount(servers);
+export function loaderText(servers: McpServerStatus[], settled: Settled = NO_SETTLED): string {
+  const { ready, total } = readyCount(servers, settled);
   return total > 1 ? `Starting MCP servers… (${ready}/${total} ready)` : 'Starting MCP servers…';
 }
 
@@ -79,12 +111,13 @@ export function toggleTip(enabled: boolean): string {
 
 export const STARTING_POLL_MS = 1000;
 export const OPEN_POLL_MS = 2000;
+export const IDLE_POLL_MS = 5000;
 export const RETRY_POLL_MS = 2000;
 
 /**
- * When to read the status again, in ms, or null to stop. Nothing to read on a fresh mount means a retry (a failed read keeps
- * the last status). Starting polls fast. With servers and the panel open, it polls at the open rate. Otherwise it stops: no
- * servers means one read only.
+ * When to read the status again, in ms. Nothing to read on a fresh mount means a retry (a failed read keeps the last status).
+ * Starting polls fast. With servers and the panel open, it polls at the open rate. Otherwise it polls at the idle rate, so
+ * changes made elsewhere (Settings, a failed server's retry) reach the dot, and the first server added in Settings shows up.
  */
 export function pollDelay(status: McpStatus | null, open: boolean): number | null {
   if (status === null) {
@@ -93,8 +126,5 @@ export function pollDelay(status: McpStatus | null, open: boolean): number | nul
   if (status.starting) {
     return STARTING_POLL_MS;
   }
-  if (status.servers.length === 0) {
-    return null;
-  }
-  return open ? OPEN_POLL_MS : null;
+  return open && status.servers.length > 0 ? OPEN_POLL_MS : IDLE_POLL_MS;
 }
