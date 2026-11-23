@@ -19,6 +19,7 @@ import type {
   McpImportResult,
   McpLevel,
   McpServerInput,
+  McpStatus,
   McpView,
   ModelRef,
   ProviderPreset,
@@ -258,6 +259,10 @@ export const api = {
   /** The MCP servers as saved, with their live state and tools. Starts the servers on first use. */
   getMcp() {
     return invoke<McpView>('get_mcp');
+  },
+  /** The composer's MCP view: names, switches, states and tool counts. Never starts the servers, so it is cheap to poll. */
+  getMcpStatus() {
+    return invoke<McpStatus>('get_mcp_status');
   },
   /** Adds the servers of a pasted `mcpServers` list. Refused as a whole when a name already exists. */
   mcpImport(text: string) {

@@ -2503,8 +2503,9 @@ a {
   color: var(--fail);
 }
 
-/* Attach files: the same size and frame as Send, on the field's left. */
-.bar-attach-button {
+/* Attach files: the same size and frame as Send, on the field's left. The MCP button shares the frame. */
+.bar-attach-button,
+.bar-mcp-button {
   flex: 0 0 30px;
   align-self: flex-end;
   display: inline-flex;
@@ -2520,17 +2521,191 @@ a {
   cursor: pointer;
 }
 
-.bar-attach-button:hover {
+.bar-attach-button:hover,
+.bar-mcp-button:hover,
+.bar-mcp-button[aria-expanded="true"] {
   border-color: var(--accent);
   color: var(--accent);
 }
 
-.bar-attach-button:focus-visible {
+.bar-attach-button:focus-visible,
+.bar-mcp-button:focus-visible {
   outline: 1px solid var(--accent);
   outline-offset: 2px;
 }
 
 .bar-attach-button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* The MCP servers: a loader row above the composer, the icon button (its dot is the status), and the panel above the button. */
+.bar-mcp {
+  display: contents;
+}
+
+.bar-mcp-button {
+  position: relative;
+}
+
+.bar-mcp-button .mcp-dot {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+}
+
+.bar-mcp-loader {
+  flex-basis: 100%;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.braille-spinner {
+  color: var(--accent);
+  font-family: var(--mono);
+}
+
+.mcp-panel {
+  flex-basis: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 240px;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  font-size: 12px;
+}
+
+.mcp-panel[hidden] {
+  display: none;
+}
+
+.mcp-panel-head,
+.mcp-panel-empty,
+.mcp-panel-error,
+.mcp-panel-foot {
+  margin: 0;
+}
+
+.mcp-panel-head {
+  color: var(--ink-strong);
+}
+
+.mcp-panel-empty,
+.mcp-panel-foot,
+.mcp-row-state {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.mcp-panel-error {
+  color: var(--fail);
+  font-size: 11px;
+}
+
+.mcp-panel-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.mcp-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.mcp-row-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink);
+}
+
+.mcp-row-state {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mcp-dot {
+  flex: 0 0 6px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--rule-strong);
+}
+
+.mcp-dot[data-tone="ok"] {
+  background: var(--ok);
+}
+
+.mcp-dot[data-tone="connecting"] {
+  background: var(--warn);
+}
+
+.mcp-dot[data-tone="fail"] {
+  background: var(--fail);
+}
+
+/* A pill switch: on is the accent, off is the muted knob at the left. */
+.mcp-switch {
+  position: relative;
+  flex: 0 0 28px;
+  width: 28px;
+  height: 16px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+  cursor: pointer;
+}
+
+.mcp-switch[aria-checked="true"] {
+  border-color: var(--accent);
+  background: var(--tint);
+}
+
+.mcp-switch-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--muted);
+  transition: transform 120ms;
+}
+
+.mcp-switch[aria-checked="true"] .mcp-switch-knob {
+  transform: translateX(12px);
+  background: var(--accent);
+}
+
+.mcp-switch:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.mcp-switch:disabled {
   opacity: 0.5;
   cursor: default;
 }

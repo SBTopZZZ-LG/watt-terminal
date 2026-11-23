@@ -1,9 +1,9 @@
 //! The MCP settings as the app uses them: the saved servers, their secret values, and the running servers. Nothing here
 //! touches Tauri; lib.rs has the thin command wrappers.
 //!
-//! Lazy start: nothing runs at launch. The runtime starts, and the saved servers are applied, on the first MCP command or
-//! the first model turn (`ensure_applied`). A change applies at once. A server that has no names declared never reads
-//! the secret store.
+//! Start: at launch, in the background, when a saved server is enabled (`warm`). Otherwise the runtime starts on the first
+//! MCP command or model turn (`running`). A change applies at once. A server that has no names declared never reads the
+//! secret store. `status` never starts the runtime and never reads the secret store.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -79,6 +79,25 @@ pub struct McpImportResult {
     /// The names of the servers added.
     pub added: Vec<String>,
     pub warnings: Vec<String>,
+}
+
+/// What the chat composer shows (see `McpService::status`). Holds no URL, argument, env or header value, and no secret name.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct McpStatus {
+    pub servers: Vec<McpServerStatus>,
+    /// Some enabled server is connecting.
+    pub starting: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct McpServerStatus {
+    /// The server's name, which is unique.
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub state: McpStateView,
+    /// The tools the server listed when it connected. 0 in any other state.
+    pub tools: usize,
 }
 
 /// One server as the settings UI saves it. `config` holds names only; `env_values` and `header_values` are keyed by the
@@ -285,6 +304,45 @@ impl McpService {
             Vec::new()
         };
         Ok(TurnMcp { manager, secret_values })
+    }
+
+    /// Starts the enabled servers at launch, so they connect before the first turn. Does nothing when no saved server is
+    /// enabled. An error is dropped here: the view or a turn reports it when it matters.
+    pub fn warm(&self) {
+        let Ok(settings) = self.settings.mcp_settings() else {
+            return;
+        };
+        if settings.servers.iter().any(|server| server.enabled) {
+            let _ = self.running(&settings);
+        }
+    }
+
+    /// The composer's view: each saved server's state, and whether an enabled one is connecting. It never starts the runtime
+    /// and never reads the secret store, so it is cheap to poll. Settings that cannot be used show as no servers. Before the
+    /// runtime starts, an enabled server is `Connecting`, since `warm` or the first use is about to start it.
+    pub fn status(&self) -> McpStatus {
+        let Ok(settings) = self.settings.mcp_settings() else {
+            return McpStatus::default();
+        };
+        let manager = lock(&self.started).manager.clone();
+        let live = manager.as_ref().map(|m| m.status()).unwrap_or_default();
+        let servers: Vec<McpServerStatus> = settings
+            .servers
+            .into_iter()
+            .map(|config| {
+                let state = match (&manager, config.enabled) {
+                    (None, true) => McpStateView::Connecting,
+                    _ => state_view(config.enabled, live.iter().find(|s| s.name == config.name)),
+                };
+                let tools = match &state {
+                    McpStateView::Connected { tools } => *tools,
+                    _ => 0,
+                };
+                McpServerStatus { id: config.name.clone(), name: config.name, enabled: config.enabled, state, tools }
+            })
+            .collect();
+        let starting = servers.iter().any(|s| s.enabled && s.state == McpStateView::Connecting);
+        McpStatus { servers, starting }
     }
 
     /// Stops the servers and the runtime thread, if it was started. Safe to call twice.
@@ -844,6 +902,69 @@ mod tests {
         assert!(mcp.remove_server("fetch").unwrap_err().contains("unchanged"));
         assert!(mcp.logs("fetch").is_err());
         assert_eq!(fs::read(settings_path(dir.path())).unwrap(), broken, "the broken file was overwritten");
+    }
+
+    #[test]
+    fn status_before_the_runtime_starts_shows_enabled_as_connecting_and_reads_no_secret() {
+        let f = fixture();
+        f.mcp.import(&paste("fetch")).unwrap();
+        let mut off = stdio("ctx", &[]);
+        off.enabled = false;
+        f.mcp.save_server(input(off, &[], &[])).unwrap();
+        // A store that fails every read: the status must not need it, and must not start the runtime.
+        let store = MemoryStore::default();
+        store.set_fail_loads(true);
+        let mcp = service_on(&f.dir, &store);
+        let status = mcp.status();
+        assert!(lock(&mcp.started).manager.is_none(), "status started the runtime");
+        assert_eq!(store.loads(), 0, "status read the secret store");
+        assert_eq!(status.servers.len(), 2, "{status:?}");
+        assert_eq!(status.servers[0].name, "fetch");
+        assert_eq!(status.servers[0].id, "fetch");
+        assert!(status.servers[0].enabled);
+        assert_eq!(status.servers[0].state, McpStateView::Connecting);
+        assert_eq!(status.servers[1].state, McpStateView::Disabled);
+        assert_eq!(status.servers[1].tools, 0);
+        assert!(status.starting);
+        let shown = serde_json::to_string(&status).unwrap();
+        assert!(!shown.contains("command") && !shown.contains("TOKEN") && !shown.contains(TOKEN), "{shown}");
+        f.mcp.shutdown();
+    }
+
+    #[test]
+    fn status_of_a_broken_settings_file_is_empty_and_not_an_error() {
+        let dir = TempDir::new();
+        fs::create_dir_all(dir.path()).unwrap();
+        fs::write(settings_path(dir.path()), b"{ not settings").unwrap();
+        let status = service_on(&dir, &MemoryStore::default()).status();
+        assert!(status.servers.is_empty());
+        assert!(!status.starting);
+    }
+
+    #[test]
+    fn status_is_starting_while_an_enabled_server_connects() {
+        let f = fixture();
+        let (_listener, url) = silent_server_url();
+        f.mcp.save_server(input(http("slow", &url, &[]), &[], &[])).unwrap();
+        let status = f.mcp.status();
+        assert_eq!(status.servers[0].state, McpStateView::Connecting, "{status:?}");
+        assert!(status.starting);
+        f.mcp.shutdown();
+    }
+
+    #[test]
+    fn warm_starts_the_runtime_only_when_a_server_is_enabled() {
+        let f = fixture();
+        f.mcp.import(&paste("fetch")).unwrap();
+        let mcp = cold(&f);
+        mcp.warm();
+        assert!(lock(&mcp.started).manager.is_some(), "warm did not start the runtime for an enabled server");
+        mcp.shutdown();
+        f.mcp.set_enabled("fetch", false).unwrap();
+        let mcp = cold(&f);
+        mcp.warm();
+        assert!(lock(&mcp.started).manager.is_none(), "warm started the runtime with no server enabled");
+        f.mcp.shutdown();
     }
 
     fn node_available() -> bool {

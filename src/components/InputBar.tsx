@@ -19,6 +19,7 @@ import type { AttachmentInput, CommandCatalog, QueueMode } from '../lib/types';
 import { AttachmentChips } from './AttachmentChips';
 import type { ChipItem } from './AttachmentChips';
 import { CommandMenu, commandMenuItemId, COMMAND_MENU_ID } from './CommandMenu';
+import { McpBar } from './McpBar';
 import { clearDraftIfSame, draftOnKeyChange, loadDraft, NEW_DRAFT_KEY, readCache, saveDraft } from '../lib/conversationCache';
 import { defaultSizeStorage } from '../lib/zoom';
 
@@ -695,6 +696,7 @@ export function InputBar(props: Props) {
       {showsVisionWarning(props.modelVision, drafts.filter((d) => d.input?.kind === 'image').length) && (
         <div className="bar-vision">This model may not accept images; they'd be left out.</div>
       )}
+      {mode === 'chat' && <McpBar />}
       {/* mousedown keeps focus in the input, as for Send. The picker opens on the hidden file input. */}
       <button
         type="button"
