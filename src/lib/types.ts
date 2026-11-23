@@ -92,8 +92,9 @@ export type SessionEvent =
 /**
  * How a tool call was allowed or stopped. read: a read tool, no approval. manual: the user approved. auto: auto-approve
  * skipped the card. denied: not approved (denied, cancelled or timed out). refused: refused before it ran, without asking.
+ * unavailable: no tool of that name is offered in this turn, so nothing ran and nobody was asked.
  */
-export type ToolDecision = 'read' | 'manual' | 'auto' | 'denied' | 'refused';
+export type ToolDecision = 'read' | 'manual' | 'auto' | 'denied' | 'refused' | 'unavailable';
 
 /**
  * Why a call asked or ran without asking (core/approval). Wire codes, as sent in `reason`. "approve_all", "rule", "interrupt"
@@ -696,9 +697,9 @@ export interface CommandCatalog {
 export interface SkillView {
   name: string;
   description: string;
-  /** `watt`: the Watt config folder. `user`: a folder set by an absolute path or `~`. `project`: a folder set relative to the workspace. */
-  source: 'watt' | 'user' | 'project';
-  /** The skill's folder. */
+  /** `builtin`: the skill compiled into Watt (no folder; locked on). `watt`: the Watt config folder. `user`: a folder set by an absolute path or `~`. `project`: a folder set relative to the workspace. */
+  source: 'builtin' | 'watt' | 'user' | 'project';
+  /** The skill's folder. The built-in skill has none: `<built in>`. */
   path: string;
   model_invocable: boolean;
   enabled: boolean;

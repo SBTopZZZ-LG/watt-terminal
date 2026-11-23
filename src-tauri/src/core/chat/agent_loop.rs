@@ -485,6 +485,8 @@ pub struct LlmAgent {
     project_rules: Option<String>,
     /// The skills this turn can load (see `with_skills`). None: no skill is listed or loadable.
     skills: Option<Arc<SkillIndex>>,
+    /// The live text of the built-in skill's `state` file (see `with_state`). None: the file says it is not available.
+    state: Option<skill_tool::StateProvider>,
     /// The folder the file tools read in this turn (see `with_fs_scope`). None: no folder is known, so they refuse.
     fs_scope: Option<Scope>,
     /// Saves the conversation at each checkpoint (see `with_checkpoint`).
@@ -532,6 +534,7 @@ impl LlmAgent {
             resume_note: None,
             project_rules: None,
             skills: None,
+            state: None,
             fs_scope: None,
             checkpoint: None,
             limits: LimitsSettings::default(),
@@ -613,6 +616,13 @@ impl LlmAgent {
     /// message after the project rules, and the `skill` tool loads from them. Never stored in the history.
     pub fn with_skills(mut self, index: Arc<SkillIndex>) -> Self {
         self.skills = Some(index);
+        self
+    }
+
+    /// The live text of the built-in skill's `state` file, read at each `state` call of this turn (core/skills/state). Never
+    /// stored in the history. Without it, the file says it is not available.
+    pub fn with_state(mut self, provider: skill_tool::StateProvider) -> Self {
+        self.state = Some(provider);
         self
     }
 
@@ -1002,11 +1012,15 @@ impl LlmAgent {
             // user's approval, once per skill per turn (`skills_granted`).
             skill_tool::TOOL_NAME => {
                 let index = self.skill_index();
+                let state = self.state.clone();
                 ctx.call_skill(
                     &args,
                     skills_granted,
                     |args| skill_tool::check(&index, args),
-                    |args| skill_tool::run(&index, args).map(Value::String),
+                    |args| {
+                        let live = || state.as_ref().map_or_else(|| skill_tool::NO_STATE.to_string(), |provider| provider());
+                        skill_tool::run_with_state(&index, args, &live).map(Value::String)
+                    },
                 )
             }
             // The write tools (core/fs_tools): gated like run_command, with a preview on the card. Capped per turn.
@@ -1037,7 +1051,7 @@ impl LlmAgent {
             _ if ctx.owns_external_tool(name) => ctx.call_tool(name, args),
             _ => {
                 let shown: String = name.chars().take(NAME_LIMIT).collect();
-                return failed(&format!("unknown tool `{shown}`"));
+                ctx.unavailable_tool(&shown, &args, unknown_tool_text(&shown))
             }
         };
         let denied = matches!(&result, Err(e) if e.starts_with(DENIED));
@@ -1068,9 +1082,9 @@ impl LlmAgent {
         }
     }
 
-    /// This turn's skill index. Without one no skill exists, so any name is unknown.
+    /// This turn's skill index. Without one, only the built-in skill exists.
     fn skill_index(&self) -> Arc<SkillIndex> {
-        self.skills.clone().unwrap_or_default()
+        self.skills.clone().unwrap_or_else(|| Arc::new(skills::builtin_index()))
     }
 
     /// Validates a `todo_write` call and, when it is valid, replaces the conversation's list and reports it. A refused
@@ -1162,6 +1176,16 @@ impl LlmAgent {
 /// except the ones the host disables and the ones whose name is already taken. The first name wins, so a built-in always
 /// wins over a host tool, and a host tool is listed once. Rebuilt for each request, so the host's list may change between
 /// requests.
+/// The error a model gets for a tool name that no tool of this turn offers. The name may never have existed, or it may be an
+/// MCP tool whose server is off or not connected, so both are named, with where the user turns servers on.
+fn unknown_tool_text(shown: &str) -> String {
+    format!(
+        "unknown tool `{shown}`: no tool with this name is available right now. It may never have existed, or it may be an MCP \
+         tool whose server is disabled or not connected. Tell the user to check Settings > MCP, or the MCP servers button next to \
+         the message box. Load the `watt` skill for how to fix it."
+    )
+}
+
 fn request_tools(builtins: &[Value], host: Option<&dyn ExternalToolHost>) -> Vec<Value> {
     let mut tools = builtins.to_vec();
     let Some(host) = host else {

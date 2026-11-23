@@ -642,6 +642,10 @@ impl<'a> AgentCtx<'a> {
             Ok(checked) => checked,
             Err(refusal) => return ("read", None, Err(refusal)),
         };
+        // The built-in skill is Watt's own documentation, like the system prompt: no card, whatever the approval settings say.
+        if checked.builtin {
+            return ("read", None, run(args));
+        }
         let top = self.tools.top_level();
         let reason = match self.approvals.auto_state_across(top.key, self.rules.follow_local_in_nested) {
             AutoState::On => {
@@ -674,6 +678,22 @@ impl<'a> AgentCtx<'a> {
         // The user approved: this skill runs without a card for the rest of the turn. The decision stays "manual".
         granted.insert(checked.name);
         ("manual", Some(reason.code()), run(args))
+    }
+
+    /// A call to a tool that no tool of this turn offers (an unknown name, or an MCP tool whose server is off). It is reported
+    /// like any call, with the "unavailable" decision and the error. Nothing runs and nobody is asked.
+    pub fn unavailable_tool(&self, name: &str, args: &Value, message: String) -> Result<Value, String> {
+        let call_id = new_call_id();
+        self.emit(AgentEvent::ToolCall { call_id: call_id.clone(), name: name.to_string(), args: args.clone() });
+        self.emit(AgentEvent::ToolResult {
+            call_id,
+            name: name.to_string(),
+            ok: false,
+            decision: "unavailable",
+            reason: None,
+            result: json!({"error": message.clone()}),
+        });
+        Err(message)
     }
 
     /// Runs a tool the agent loop handles itself (`todo_write`): no approval, no shell, no backend. It reports the call
@@ -1024,7 +1044,11 @@ impl<'a> AgentCtx<'a> {
         };
         let approval = host.approval(name);
         if approval == ExternalApproval::Never {
-            return ("refused", None, Err(format!("tool disabled: `{name}` is turned off")));
+            return (
+                "refused",
+                None,
+                Err(format!("tool disabled: `{name}` is turned off (Settings > MCP, or the MCP servers button next to the message box)")),
+            );
         }
         let verdict = match self.approvals.auto_state_across(top.key, self.rules.follow_local_in_nested) {
             AutoState::On => Verdict::Auto(Reason::ApproveAll),
@@ -3003,9 +3027,62 @@ mod tests {
         Checked {
             name: name.to_string(),
             level,
+            builtin: false,
             text: format!("A {name} skill.\nFrom a user skills folder.\nSKILL.md: /skills/{name}/SKILL.md"),
             display: format!("Load skill \"{name}\""),
         }
+    }
+
+    /// The built-in skill loads without a card in every approval state, including suspended approve-all.
+    #[test]
+    fn the_built_in_skill_never_gets_a_card() {
+        let checked = |_: &Value| Ok(Checked { builtin: true, ..skill_checked("watt", SkillLevel::Ask) });
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        gate.set_auto_approve(true, 0);
+        tools.set_top(nested(1, "ssh h"));
+        let log = Mutex::new(Vec::new());
+        let emit = answering(&gate, &log, false);
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        let mut granted = HashSet::new();
+        let body = ctx.call_skill(&json!({"name": "watt"}), &mut granted, checked, |_| Ok(json!("cheatsheet"))).expect("loads");
+        assert_eq!(body, json!("cheatsheet"));
+        assert!(cards(&log).is_empty(), "no card for the built-in skill");
+        assert_eq!(decisions(&log), [named("skill", "read", true)]);
+        assert!(granted.is_empty());
+    }
+
+    #[test]
+    fn the_built_in_skill_never_gets_a_card_when_it_is_set_to_ask() {
+        let checked = |_: &Value| Ok(Checked { builtin: true, ..skill_checked("watt", SkillLevel::Ask) });
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let log = Mutex::new(Vec::new());
+        let emit = answering(&gate, &log, false);
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        let mut granted = HashSet::new();
+        ctx.call_skill(&json!({"name": "watt", "file": "state"}), &mut granted, checked, |_| Ok(json!("live")))
+            .expect("loads without asking");
+        assert!(cards(&log).is_empty());
+    }
+
+    /// A call to a tool no tool of this turn offers: the transcript shows it as unavailable, with its error, and nothing runs.
+    #[test]
+    fn an_unavailable_tool_is_shown_with_its_error_and_nothing_runs() {
+        let tools = Recorder::default();
+        let gate = ApprovalGate::with_timeout(Duration::from_millis(50));
+        let log = Mutex::new(Vec::new());
+        let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+        let ctx = AgentCtx::new(&tools, &gate, &emit);
+        let err = ctx.unavailable_tool("ghost", &json!({"x": 1}), "unknown tool `ghost`: gone".to_string()).expect_err("unavailable");
+        assert_eq!(err, "unknown tool `ghost`: gone");
+        assert_eq!(decisions(&log), [named("ghost", "unavailable", false)]);
+        let result = log.lock().unwrap().iter().find_map(|ev| match ev {
+            AgentEvent::ToolResult { result, .. } => Some(result.clone()),
+            _ => None,
+        });
+        assert_eq!(result, Some(json!({"error": "unknown tool `ghost`: gone"})));
+        assert!(tools.reached().is_empty());
     }
 
     #[test]

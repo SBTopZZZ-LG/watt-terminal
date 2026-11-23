@@ -646,12 +646,14 @@ async fn agent_message(
                 }
                 // The skills of this turn (core/skills), read from the folders on the blocking pool. A scan never fails the turn.
                 let setup = skill_setup(&app, project_root);
-                let skill_index = blocking(move || Ok(setup.load().0)).await.unwrap_or_default();
+                let skill_index = Arc::new(blocking(move || Ok(setup.load().0)).await.unwrap_or_else(|_| skills::builtin_index()));
+                let live_state = state_provider(&app, skill_index.clone());
                 let mut agent = LlmAgent::new(client, llm_settings, &conversation_id, history, todos, cancel.clone())
                     // The note is taken only by a turn that calls the model: a turn that fails to start keeps it.
                     .with_resume_note(att.conversation.take_resume_note())
                     .with_project_rules(project_rules)
-                    .with_skills(Arc::new(skill_index))
+                    .with_skills(skill_index)
+                    .with_state(live_state)
                     .with_fs_scope(fs_scope)
                     .with_checkpoint(checkpoint)
                     .with_limits(limits)
@@ -941,6 +943,31 @@ fn skill_setup(app: &tauri::AppHandle, project_root: Option<PathBuf>) -> SkillSe
         Err(e) => (SkillsSettings::default(), Some(format!("skill folder settings are not used ({e}); the default folders are read"))),
     };
     SkillSetup { places: skill_places(app, project_root), settings, warning }
+}
+
+/// The live `state` file of the built-in skill (core/skills/state): the settings as they are when the file is read, the MCP
+/// servers' status, and the skills of the turn. It reads the settings and the MCP status only (no server starts, no secret
+/// value is read; the settings view checks which keys are set). Called on the agent's thread, once per `state` read.
+fn state_provider(app: &tauri::AppHandle, index: Arc<skills::SkillIndex>) -> skills::tool::StateProvider {
+    let settings = app.state::<SettingsState>().0.clone();
+    let mcp = app.state::<McpState>().0.clone();
+    let config_dir = resolve_config_dir(app);
+    let data_dir = resolve_data_dir(app);
+    let home = home_dir();
+    Arc::new(move || {
+        let view = settings.as_ref().and_then(|s| s.view().ok());
+        let mcp_status = mcp.as_ref().map(|m| m.status()).unwrap_or_default();
+        skills::state::render(&skills::state::Input {
+            settings: view.as_ref(),
+            mcp: &mcp_status,
+            skills: &index,
+            app_version: env!("CARGO_PKG_VERSION"),
+            os: std::env::consts::OS,
+            config_dir: config_dir.as_deref(),
+            data_dir: data_dir.as_deref(),
+            home: home.as_deref(),
+        })
+    })
 }
 
 /// The places skill folders resolve against and are refused against. Watt's config, data and secrets folders are guarded

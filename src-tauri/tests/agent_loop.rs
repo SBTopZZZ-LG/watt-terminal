@@ -815,12 +815,21 @@ fn unknown_tool_is_an_error_and_send_keys_goes_to_the_gate() {
     let conv = Conversation::new().unwrap();
     let tools = FakeTools::default();
     let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
-    turn(&mut agent, &tools, &no_gate(), "do things");
+    let events = turn(&mut agent, &tools, &no_gate(), "do things");
 
     assert!(tools.reached().is_empty(), "neither call reached the tools: {:?}", tools.reached());
     assert_eq!(provider.requests().len(), 2);
     let msgs = stored(&conv.history());
-    assert_eq!(tool_content(&msgs, "call_1"), "error: unknown tool `frobnicate`");
+    assert!(
+        tool_content(&msgs, "call_1").starts_with("error: unknown tool `frobnicate`: no tool with this name is available right now."),
+        "{}",
+        tool_content(&msgs, "call_1")
+    );
+    // The transcript shows the unknown call as unavailable, with its error (not as a missing row).
+    assert!(
+        events.iter().any(|ev| matches!(ev, AgentEvent::ToolResult { name, ok: false, decision, .. } if name == "frobnicate" && *decision == "unavailable")),
+        "{events:?}"
+    );
     assert_eq!(tool_content(&msgs, "call_2"), "error: send_keys is not available here");
     assert_paired(&msgs);
 }
