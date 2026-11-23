@@ -25,7 +25,7 @@ describe('AgentActivityToast', () => {
   });
 
   it('shows the activity text', () => {
-    const html = renderToStaticMarkup(<AgentActivityToast dock="bottom" text="run_command · List files" onOpen={() => {}} />);
+    const html = renderToStaticMarkup(<AgentActivityToast dock="left" text="run_command · List files" onOpen={() => {}} />);
     expect(html).toContain('run_command · List files');
   });
 });

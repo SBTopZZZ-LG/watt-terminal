@@ -65,13 +65,14 @@ describe('AgentPanel', () => {
     expect(side).toContain('class="agent-panel dock-right is-sized"');
     expect(side).toContain('width:380px');
 
-    const top = renderToStaticMarkup(
-      <AgentPanel view={panelView(layoutFor('top'), BIG)} onExpand={() => {}}>
+    const left = renderToStaticMarkup(
+      <AgentPanel view={panelView(layoutFor('left'), BIG)} onExpand={() => {}}>
         <span />
       </AgentPanel>,
     );
-    expect(top).toContain('class="agent-panel dock-top"');
-    expect(top).not.toContain('height:');
+    expect(left).toContain('class="agent-panel dock-left is-sized"');
+    expect(left).toContain('width:380px');
+    expect(left).not.toContain('height:');
   });
 
   it('marks the rail button with its label', () => {
@@ -143,16 +144,11 @@ describe('PanelDivider', () => {
       />,
     );
 
-  it('is a focusable separator, vertical for side docks and horizontal for top and bottom', () => {
-    const side = render('left', 380);
-    expect(side).toContain('role="separator"');
-    expect(side).toContain('tabindex="0"');
-    expect(side).toContain('aria-orientation="vertical"');
-    expect(side).not.toContain('is-horizontal');
-
-    const bottom = render('bottom', 200);
-    expect(bottom).toContain('aria-orientation="horizontal"');
-    expect(bottom).toContain('is-horizontal');
+  it('is a focusable vertical separator', () => {
+    const html = render('left', 380);
+    expect(html).toContain('role="separator"');
+    expect(html).toContain('tabindex="0"');
+    expect(html).toContain('aria-orientation="vertical"');
   });
 
   it('reports the value and the bounds of the panel', () => {
@@ -160,8 +156,5 @@ describe('PanelDivider', () => {
     expect(html).toContain('aria-valuenow="380"');
     expect(html).toContain('aria-valuemin="240"');
     expect(html).toContain(`aria-valuemax="${1600 - 326}"`);
-    const vertical = render('top', 200);
-    expect(vertical).toContain('aria-valuemin="140"');
-    expect(vertical).toContain(`aria-valuemax="${1000 - 126}"`);
   });
 });

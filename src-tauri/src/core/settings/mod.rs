@@ -80,6 +80,9 @@ pub struct Settings {
     /// The skill folders and the switched-off skills (core/skills). Missing in older files: the defaults.
     #[serde(default)]
     pub skills: SkillsSettings,
+    /// Agent behaviour that is not about approval or shells (`AgentSettings`). Missing in older files: the defaults.
+    #[serde(default)]
+    pub agent: AgentSettings,
 }
 
 fn current_version() -> u32 {
@@ -98,8 +101,26 @@ impl Default for Settings {
             limits: LimitsSettings::default(),
             mcp: McpSettings::default(),
             skills: SkillsSettings::default(),
+            agent: AgentSettings::default(),
         }
     }
+}
+
+/// Agent behaviour settings. Generic on purpose: more agent-behaviour settings may join it later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct AgentSettings {
+    #[serde(default)]
+    pub on_denied: OnDenied,
+}
+
+/// What the agent does when the user denies a tool call. `continue`: the denied call is an error result and the agent carries
+/// on (another approach, or ask the user). `stop`: the turn ends, as it did before this setting existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnDenied {
+    #[default]
+    Continue,
+    Stop,
 }
 
 /// The per-turn caps of the agent (core/chat/agent_loop, core/tools). Missing fields take their defaults. A saved number out
@@ -835,6 +856,7 @@ mod tests {
             limits: LimitsSettings::default(),
             mcp: McpSettings::default(),
             skills: SkillsSettings::default(),
+            agent: AgentSettings::default(),
         }
     }
 
@@ -1277,6 +1299,37 @@ mod tests {
             fs::write(settings_path(dir.path()), json).unwrap();
             assert!(matches!(load(dir.path()), Err(SettingsError::Invalid(_))));
         }
+    }
+
+    #[test]
+    fn on_denied_round_trips_and_defaults_to_continue() {
+        let dir = TempDir::new();
+        let mut settings = valid();
+        settings.agent.on_denied = OnDenied::Stop;
+        save(dir.path(), &settings).unwrap();
+        let text = fs::read_to_string(settings_path(dir.path())).unwrap();
+        assert!(text.contains(r#""on_denied": "stop""#), "{text}");
+        assert_eq!(load(dir.path()).unwrap(), settings);
+
+        assert_eq!(Settings::default().agent.on_denied, OnDenied::Continue);
+    }
+
+    #[test]
+    fn an_older_file_loads_with_on_denied_at_continue() {
+        let dir = TempDir::new();
+        fs::create_dir_all(dir.path()).unwrap();
+        fs::write(settings_path(dir.path()), br#"{"version":1,"integration":{"agent_requests":"auto"}}"#).unwrap();
+        let loaded = load(dir.path()).unwrap();
+        assert_eq!(loaded.agent, AgentSettings::default());
+        assert_eq!(loaded.agent.on_denied, OnDenied::Continue);
+    }
+
+    #[test]
+    fn an_unknown_on_denied_value_makes_the_file_invalid() {
+        let dir = TempDir::new();
+        fs::create_dir_all(dir.path()).unwrap();
+        fs::write(settings_path(dir.path()), br#"{"version":1,"agent":{"on_denied":"retry"}}"#).unwrap();
+        assert!(matches!(load(dir.path()), Err(SettingsError::Invalid(_))));
     }
 
     #[test]

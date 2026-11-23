@@ -81,7 +81,7 @@ The terminal is the main input: keys go to the shell, or to whatever program is 
 
 The table shows macOS keys. On Windows the in-app hints show Ctrl instead of Cmd (for example Ctrl+Shift+A and Ctrl+,).
 
-The agent panel docks left, right, top or bottom.
+The agent panel docks left or right.
 
 ### Slash commands
 
@@ -91,7 +91,7 @@ Typing `/` opens an autocomplete menu: ArrowUp/Down moves, Enter or Tab accepts,
 
 ## Approvals
 
-Approval mode is set in Settings, under **Approvals**. **Manual** (the default) asks before every `run_command` and the first `send_keys` into a command. **Regex rules** lets you allow or deny commands by pattern, with a built-in deny list and a cap on automatic approvals per turn. **Bypass** is a separate, session-only switch that resets when the app restarts. While it is on, the approval chip above the input turns orange and its tooltip says so.
+Approval mode is set in Settings, under **Approvals**. **Manual** (the default) asks before every `run_command` and the first `send_keys` into a command. **Regex rules** lets you allow or deny commands by pattern, with a built-in deny list and a cap on automatic approvals per turn. **Bypass** is a separate, session-only switch that resets when the app restarts. While it is on, the approval chip above the input turns orange and its tooltip says so. Under **When I deny a call**, **Keep working** (the default) lets the agent try another way after a denied call, and **Stop** ends the turn.
 
 ## Configuration and data
 

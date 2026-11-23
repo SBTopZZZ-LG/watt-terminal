@@ -4,7 +4,7 @@ import { api, errorText } from '../lib/api';
 import { overRuleLimit, ruleCountText } from '../lib/approvalForm';
 import type { ApprovalDraft } from '../lib/approvalForm';
 import { AUTO_PER_TURN, previewText } from '../lib/approvalReasons';
-import type { AgentRequests, ApprovalMode } from '../lib/types';
+import type { AgentRequests, ApprovalMode, OnDenied } from '../lib/types';
 
 export interface ApprovalSectionProps {
   draft: ApprovalDraft;
@@ -22,6 +22,12 @@ export interface ApprovalSectionProps {
   integrationBusy: boolean;
   integrationError: string | null;
   onIntegrationChange(value: AgentRequests): void;
+  /** The saved "when I deny a call" setting. It is saved as soon as it changes, not by Save approvals. */
+  onDenied: OnDenied;
+  /** The denied-call setting is being saved. */
+  deniedBusy: boolean;
+  deniedError: string | null;
+  onDeniedChange(value: OnDenied): void;
   onChange(draft: ApprovalDraft): void;
   onSave(): void;
   onUndo(): void;
@@ -30,6 +36,11 @@ export interface ApprovalSectionProps {
 const MODES: { value: ApprovalMode; label: string }[] = [
   { value: 'manual', label: 'Manual' },
   { value: 'regex', label: 'Regex rules' },
+];
+
+const ON_DENIED: { value: OnDenied; label: string }[] = [
+  { value: 'continue', label: 'Keep working' },
+  { value: 'stop', label: 'Stop' },
 ];
 
 /**
@@ -79,6 +90,36 @@ export function ApprovalSection(p: ApprovalSectionProps) {
       <p className="settings-hint">
         Changes apply from the next message; a running turn keeps the policy it started with.
       </p>
+
+      <fieldset className="settings-modes" disabled={off || p.deniedBusy}>
+        <legend>When I deny a call</legend>
+        <div className="settings-inline">
+          {ON_DENIED.map((o) => (
+            <label key={o.value} className="settings-check">
+              <input
+                type="radio"
+                name={`${uid}-denied`}
+                value={o.value}
+                checked={p.onDenied === o.value}
+                disabled={off || p.deniedBusy}
+                onChange={() => p.onDeniedChange(o.value)}
+              />
+              {o.label}
+            </label>
+          ))}
+        </div>
+      </fieldset>
+      <p className="settings-hint">
+        Keep working: the agent sees the denied call as an error and tries another way, or asks you how to proceed. Saved as soon
+        as you change it.
+      </p>
+      <p className="settings-hint">Stop: the denial ends the turn at once, as it did before this setting existed.</p>
+      {p.deniedBusy && <span className="settings-hint">Saving...</span>}
+      {p.deniedError !== null && (
+        <p className="settings-error" role="alert">
+          {p.deniedError}
+        </p>
+      )}
 
       <div className="settings-field settings-field-wide">
         <label htmlFor={`${uid}-allow`}>Allow rules</label>

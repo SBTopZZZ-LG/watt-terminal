@@ -35,8 +35,8 @@ use super::models::{FetchedModel, merge_fetched, models_url_for};
 use super::resolve::{self, api_key_for, headers_for};
 use super::secrets::{SecretMap, Secrets, api_key_name, header_secret_name, provider_prefix};
 use super::{
-    ApprovalSettings, IntegrationSettings, LimitsSettings, ModelRef, ModelSource, Provider, SETTINGS_FILE, Settings,
-    SettingsError, last_good_path, read_checked, save, settings_path, write_private_atomic,
+    AgentSettings, ApprovalSettings, IntegrationSettings, LimitsSettings, ModelRef, ModelSource, Provider, SETTINGS_FILE,
+    Settings, SettingsError, last_good_path, read_checked, save, settings_path, write_private_atomic,
 };
 use crate::core::chat::agent_loop::{LlmSettings, USER_AGENT, new_conversation_id};
 use crate::core::mcp::config::McpSettings;
@@ -616,6 +616,17 @@ impl SettingsService {
         Ok(self.usable()?.integration)
     }
 
+    /// Saves the agent behaviour settings (what a denied call does). Refused while settings.json is broken or in last-good mode, like every change.
+    pub fn set_agent(&self, agent: AgentSettings) -> Result<SettingsView, String> {
+        self.change_settings(|settings| settings.agent = agent)
+    }
+
+    /// The agent behaviour settings in use (the saved ones, or the last working copy's in last-good mode). Fails while
+    /// settings.json is broken, so the caller falls back to stopping on a denial.
+    pub fn agent_settings(&self) -> Result<AgentSettings, String> {
+        Ok(self.usable()?.agent)
+    }
+
     /// Saves the per-turn limits. Refused while settings.json is broken or in last-good mode, like every change.
     pub fn set_limits(&self, limits: LimitsSettings) -> Result<SettingsView, String> {
         self.change_settings(|settings| settings.limits = limits)
@@ -851,8 +862,8 @@ mod tests {
     use super::super::secrets::MemoryStore;
     use super::super::test_support::TempDir;
     use super::super::{
-        AgentRequests, ApprovalMode, ApprovalSettings, HeaderEntry, IntegrationSettings, Model, ModelVariant, Nested,
-        VariantSource, last_good_path, load, save as save_file,
+        AgentRequests, AgentSettings, ApprovalMode, ApprovalSettings, HeaderEntry, IntegrationSettings, Model, ModelVariant,
+        Nested, OnDenied, VariantSource, last_good_path, load, save as save_file,
     };
     use super::*;
     use crate::core::skills::SkillLevel;
@@ -1218,6 +1229,25 @@ mod tests {
         service.use_last_good().unwrap();
         assert_eq!(service.limits_settings(), Ok(saved), "last-good mode runs the last working limits");
         assert!(service.set_limits(LimitsSettings::default()).unwrap_err().contains("broken"));
+    }
+
+    #[test]
+    fn agent_settings_are_saved_read_back_and_refused_while_broken() {
+        let f = fixture();
+        assert_eq!(f.service.agent_settings(), Ok(AgentSettings::default()), "no file: continue on a denial");
+        let stop = AgentSettings { on_denied: OnDenied::Stop };
+        let view = f.service.set_agent(stop).unwrap();
+        assert_eq!(view.settings.agent, stop);
+        assert_eq!(service_on(&f.dir, &f.store).agent_settings(), Ok(stop), "a new service reads it back");
+
+        break_settings(&f);
+        let service = service_on(&f.dir, &f.store);
+        assert!(service.agent_settings().is_err(), "a broken file runs no agent settings of its own");
+        assert!(service.set_agent(AgentSettings::default()).is_err(), "a broken file saves nothing");
+        service.use_last_good().unwrap();
+        assert_eq!(service.agent_settings(), Ok(stop), "last-good mode runs the last working setting");
+        assert!(service.set_agent(AgentSettings::default()).unwrap_err().contains("broken"));
+        assert_eq!(service.agent_settings(), Ok(stop), "a refused change saved nothing");
     }
 
     #[test]

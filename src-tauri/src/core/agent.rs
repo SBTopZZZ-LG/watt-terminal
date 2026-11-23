@@ -392,13 +392,16 @@ const BUILTIN_UNGATED: [&str; 11] = [
 ];
 
 /// What a turn reads from the saved settings when it decides. lib.rs builds one per user message. The defaults are the
-/// cautious ones: a nested shell is approved as before (its allow rules ask), and `request_integration` asks the user.
+/// cautious ones: a nested shell is approved as before (its allow rules ask), `request_integration` asks the user, and a
+/// denied call stops the turn.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TurnRules {
     /// Approval nested = same as local: allow rules and approve-all apply in nested shells too.
     pub follow_local_in_nested: bool,
     /// Integration requests = auto: `request_integration` integrates the shell without a dialog.
     pub integrate_without_asking: bool,
+    /// On denied = continue: a denied call is an error result and the turn goes on. Off: the denial stops the turn.
+    pub continue_on_denied: bool,
 }
 
 /// What an agent may use during one turn: the approval gate, the approval policy, the turn's rules, and a way to report
@@ -448,6 +451,11 @@ impl<'a> AgentCtx<'a> {
     pub fn with_rules(mut self, rules: TurnRules) -> Self {
         self.rules = rules;
         self
+    }
+
+    /// Whether a denied call lets the turn go on (`TurnRules::continue_on_denied`).
+    pub fn continue_on_denied(&self) -> bool {
+        self.rules.continue_on_denied
     }
 
     pub fn emit(&self, ev: AgentEvent) {

@@ -25,7 +25,7 @@ use crate::core::settings::write_private_atomic;
 
 pub const UI_STATE_VERSION: u32 = 1;
 pub const UI_STATE_FILE: &str = "ui-state.json";
-const DOCKS: [&str; 4] = ["left", "top", "right", "bottom"];
+const DOCKS: [&str; 2] = ["left", "right"];
 const HISTORY_GROUPS: [&str; 2] = ["date", "workspace"];
 /// How queued agent messages are sent: all together, or one per turn.
 const QUEUE_MODES: [&str; 2] = ["all", "one"];
@@ -45,13 +45,11 @@ const MAX_PANEL_SIZE: f64 = 20_000.0;
 pub struct PanelSizes {
     pub left: Option<f64>,
     pub right: Option<f64>,
-    pub top: Option<f64>,
-    pub bottom: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PanelState {
-    /// One of `left`, `top`, `right`, `bottom`.
+    /// One of `left`, `right`.
     pub dock: String,
     #[serde(default)]
     pub sizes: PanelSizes,
@@ -284,18 +282,16 @@ fn tolerant(value: &Value) -> UiState {
     }
 }
 
-/// A panel with a known dock and a boolean `open`. Each size is kept only when it is a valid size.
+/// A panel with a known dock and a boolean `open`. Each size is kept only when it is a valid size. A panel stored with
+/// a dock that is no longer offered (top or bottom, before those were removed) is dropped whole, so it reads as absent
+/// and the default layout applies.
 fn parse_panel(value: &Value) -> Option<PanelState> {
     let obj = value.as_object()?;
     let dock = obj.get("dock")?.as_str().filter(|d| DOCKS.contains(d))?.to_string();
     let open = obj.get("open")?.as_bool()?;
     let sizes = obj.get("sizes").and_then(Value::as_object);
     let size = |key: &str| sizes.and_then(|s| s.get(key)).and_then(Value::as_f64).filter(|n| valid_size(*n));
-    Some(PanelState {
-        dock,
-        sizes: PanelSizes { left: size("left"), right: size("right"), top: size("top"), bottom: size("bottom") },
-        open,
-    })
+    Some(PanelState { dock, sizes: PanelSizes { left: size("left"), right: size("right") }, open })
 }
 
 fn valid_size(n: f64) -> bool {
@@ -306,9 +302,9 @@ fn valid_size(n: f64) -> bool {
 fn validate_patch(patch: &UiStatePatch) -> Result<(), PersistError> {
     if let Some(Some(panel)) = &patch.panel {
         if !DOCKS.contains(&panel.dock.as_str()) {
-            return Err(PersistError::Invalid("panel dock must be left, top, right or bottom".into()));
+            return Err(PersistError::Invalid("panel dock must be left or right".into()));
         }
-        let sizes = [panel.sizes.left, panel.sizes.right, panel.sizes.top, panel.sizes.bottom];
+        let sizes = [panel.sizes.left, panel.sizes.right];
         if sizes.iter().flatten().any(|n| !valid_size(*n)) {
             return Err(PersistError::Invalid(format!("panel sizes must be above 0 and at most {MAX_PANEL_SIZE}")));
         }
@@ -365,7 +361,7 @@ mod tests {
     fn panel(dock: &str, open: bool) -> PanelState {
         PanelState {
             dock: dock.into(),
-            sizes: PanelSizes { left: Some(300.0), right: None, top: None, bottom: Some(220.5) },
+            sizes: PanelSizes { left: Some(300.0), right: Some(220.5) },
             open,
         }
     }
@@ -396,7 +392,7 @@ mod tests {
         let tmp = TempDir::new();
         let s = store(&tmp);
         let patch = UiStatePatch {
-            panel: Some(Some(panel("bottom", true))),
+            panel: Some(Some(panel("right", true))),
             font_size: Some(Some(14)),
             last_conversation_id: Some(Some(id(1))),
             history_group_by: Some(Some("workspace".into())),
@@ -408,7 +404,7 @@ mod tests {
         };
         let written = s.patch(patch).unwrap();
         assert_eq!(s.load().unwrap(), written);
-        assert_eq!(written.panel, Some(panel("bottom", true)));
+        assert_eq!(written.panel, Some(panel("right", true)));
         assert_eq!(written.font_size, Some(14));
         assert_eq!(written.last_conversation_id, Some(id(1)));
         assert_eq!(written.history_group_by.as_deref(), Some("workspace"));
@@ -439,13 +435,13 @@ mod tests {
         let state = read_text(
             &tmp,
             r#"{"font_size": "big", "last_conversation_id": 5, "history_group_by": true,
-                "panel": {"dock": "top", "open": true, "sizes": "wide"}}"#,
+                "panel": {"dock": "right", "open": true, "sizes": "wide"}}"#,
         );
         assert_eq!(state.font_size, None);
         assert_eq!(state.last_conversation_id, None);
         assert_eq!(state.history_group_by, None);
         let p = state.panel.expect("the panel is valid apart from its sizes");
-        assert_eq!(p.dock, "top");
+        assert_eq!(p.dock, "right");
         assert_eq!(p.sizes, PanelSizes::default());
     }
 
@@ -457,9 +453,24 @@ mod tests {
         assert!(read_text(&tmp, r#"{"panel": {"dock": "left"}}"#).panel.is_none());
         assert!(read_text(&tmp, r#"{"panel": {"dock": 1, "open": true}}"#).panel.is_none());
         assert!(read_text(&tmp, r#"{"panel": "left"}"#).panel.is_none());
-        for dock in ["left", "top", "right", "bottom"] {
+        for dock in ["left", "right"] {
             let text = format!(r#"{{"panel": {{"dock": "{dock}", "open": false}}}}"#);
             assert_eq!(read_text(&tmp, &text).panel.unwrap().dock, dock);
+        }
+    }
+
+    #[test]
+    fn a_stored_top_or_bottom_dock_is_dropped_on_load() {
+        // Old top and bottom docks are gone: the panel is dropped whole, so the default layout applies. The rest of the
+        // file is kept.
+        let tmp = TempDir::new();
+        for dock in ["top", "bottom"] {
+            let text = format!(
+                r#"{{"font_size": 12, "panel": {{"dock": "{dock}", "open": true, "sizes": {{"left": 300, "{dock}": 200}}}}}}"#
+            );
+            let state = read_text(&tmp, &text);
+            assert!(state.panel.is_none(), "dock {dock} must be dropped");
+            assert_eq!(state.font_size, Some(12));
         }
     }
 
@@ -469,13 +480,16 @@ mod tests {
         let state = read_text(
             &tmp,
             r#"{"panel": {"dock": "left", "open": true, "sizes": {
-                "left": 0, "right": -5, "top": 20001, "bottom": 20000}}}"#,
+                "left": 0, "right": 20001}}}"#,
         );
         let sizes = state.panel.unwrap().sizes;
         assert_eq!(sizes.left, None);
         assert_eq!(sizes.right, None);
-        assert_eq!(sizes.top, None);
-        assert_eq!(sizes.bottom, Some(20_000.0));
+
+        let state = read_text(&tmp, r#"{"panel": {"dock": "right", "open": true, "sizes": {"right": -5, "left": 20000}}}"#);
+        let sizes = state.panel.unwrap().sizes;
+        assert_eq!(sizes.left, Some(20_000.0));
+        assert_eq!(sizes.right, None);
 
         let state = read_text(&tmp, r#"{"panel": {"dock": "left", "open": true, "sizes": {"left": 0.5}}}"#);
         assert_eq!(state.panel.unwrap().sizes.left, Some(0.5));
@@ -577,9 +591,9 @@ mod tests {
         let tmp = TempDir::new();
         let s = store(&tmp);
         let state = s
-            .patch(patch_from(json!({"panel": {"dock": "top", "open": false, "sizes": {}}})))
+            .patch(patch_from(json!({"panel": {"dock": "right", "open": false, "sizes": {}}})))
             .unwrap();
-        assert_eq!(state.panel, Some(PanelState { dock: "top".into(), sizes: PanelSizes::default(), open: false }));
+        assert_eq!(state.panel, Some(PanelState { dock: "right".into(), sizes: PanelSizes::default(), open: false }));
     }
 
     #[test]
@@ -592,7 +606,9 @@ mod tests {
         let bad = [
             json!({"panel": {"dock": "middle", "open": true}}),
             json!({"panel": {"dock": "left", "open": true, "sizes": {"left": 0}}}),
-            json!({"panel": {"dock": "left", "open": true, "sizes": {"bottom": 25000}}}),
+            json!({"panel": {"dock": "left", "open": true, "sizes": {"right": 25000}}}),
+            json!({"panel": {"dock": "top", "open": true}}),
+            json!({"panel": {"dock": "bottom", "open": true}}),
             json!({"font_size": 40}),
             json!({"font_size": 7}),
             json!({"last_conversation_id": "../etc"}),

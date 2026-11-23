@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use watt_terminal_lib::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate, UserMessage};
+use watt_terminal_lib::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate, TurnRules, UserMessage};
 use watt_terminal_lib::core::chat::agent_loop::{agent_record_note, Conversation, LlmAgent, LlmSettings};
 use watt_terminal_lib::core::chat::attachments::{Attachment, Resolver};
 use watt_terminal_lib::core::chat::context::{self, ContextUsage};
@@ -342,6 +342,16 @@ fn turn(agent: &mut LlmAgent, tools: &dyn AgentTools, gate: &ApprovalGate, text:
     turn_message(agent, tools, gate, &UserMessage::text(text))
 }
 
+/// Runs one turn with `on_denied` = continue (the setting's saved value, passed as the turn's rules).
+fn turn_continuing(agent: &mut LlmAgent, tools: &dyn AgentTools, gate: &ApprovalGate, text: &str) -> Vec<AgentEvent> {
+    let log: Mutex<Vec<AgentEvent>> = Mutex::new(Vec::new());
+    let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+    let rules = TurnRules { continue_on_denied: true, ..TurnRules::default() };
+    let ctx = AgentCtx::new(tools, gate, &emit).with_rules(rules);
+    agent::run_turn(agent, &UserMessage::text(text), &ctx);
+    log.into_inner().unwrap()
+}
+
 /// Runs one turn with a whole user message (text and attachments) and returns every event it emitted.
 fn turn_message(agent: &mut LlmAgent, tools: &dyn AgentTools, gate: &ApprovalGate, message: &UserMessage) -> Vec<AgentEvent> {
     let log: Mutex<Vec<AgentEvent>> = Mutex::new(Vec::new());
@@ -567,6 +577,71 @@ fn denied_run_command_ends_the_turn_and_closes_the_rest() {
     assert!(tool_content(&msgs, "call_a").starts_with("error: not_approved"), "{msgs:?}");
     assert_eq!(tool_content(&msgs, "call_b"), "denied by the user");
     assert_paired(&msgs);
+}
+
+/// With `on_denied` = continue, a denied run_command is an error result and the turn goes on: the model is called again with
+/// the guidance, the next call of the same reply runs, and the final reply is the turn's answer.
+#[test]
+fn a_denied_command_lets_the_turn_go_on_when_continuing() {
+    let provider = serve(vec![
+        Script::json(tool_reply(&[("call_a", "run_command", "{\"command\":\"pwd\"}"), ("call_b", "get_cwd", "{}")])),
+        Script::json(text_reply("I will work from the screen instead.")),
+    ]);
+    let conv = Conversation::new().unwrap();
+    let tools = FakeTools::default();
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
+    let events = turn_continuing(&mut agent, &tools, &no_gate(), "run pwd");
+
+    assert_eq!(provider.requests().len(), 2, "the model is called again after a denial");
+    assert!(provider.requests()[1].contains("Do not repeat it unchanged"), "the guidance reaches the model");
+    assert_eq!(tools.reached(), ["get_cwd"], "the denied command did not run; the next call of the reply did");
+    assert_eq!(decisions(&events), [("run_command".to_string(), "denied", false), ("get_cwd".to_string(), "read", true)]);
+    assert_eq!(texts(&events), ["I will work from the screen instead."], "no 'stopped' notice");
+    let msgs = stored(&conv.history());
+    let denied = tool_content(&msgs, "call_a");
+    assert!(denied.starts_with("error: not_approved"), "{msgs:?}");
+    let guidance = "The user declined this call. Do not repeat it unchanged; continue with another approach or ask the user how to proceed.";
+    assert!(denied.ends_with(guidance), "{denied}");
+    assert_eq!(tool_content(&msgs, "call_b"), "box:/home/u");
+    assert_paired(&msgs);
+}
+
+/// A cancel of the whole turn still stops it when continuing: no further model call after the cancelled tool call.
+#[test]
+fn cancel_during_a_tool_call_still_stops_when_continuing() {
+    let provider = serve(vec![Script::json(tool_reply(&[("call_1", "get_cwd", "{}"), ("call_2", "get_cwd", "{}")]))]);
+    let conv = Conversation::new().unwrap();
+    let cancel = Arc::new(TurnCancel::new());
+    let tools = FakeTools { cancel_on_cwd: Some(cancel.clone()), ..Default::default() };
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, cancel);
+    let events = turn_continuing(&mut agent, &tools, &no_gate(), "where am I");
+
+    assert_eq!(tools.reached(), ["get_cwd"], "the second call must not run after the cancel");
+    assert_eq!(provider.requests().len(), 1);
+    assert!(texts(&events).is_empty(), "a cancel says nothing in the chat: {events:?}");
+    assert_paired(&stored(&conv.history()));
+}
+
+/// Denials repeated every reply when continuing are still bounded: the model-call cap ends the turn, and the denied calls
+/// never reach the tools.
+#[test]
+fn repeated_denials_when_continuing_end_at_the_model_call_cap() {
+    let scripts: Vec<Script> = (1..=(MAX_MODEL_CALLS + 1))
+        .map(|n| Script::json(tool_reply(&[(&format!("call_{n}"), "run_command", "{\"command\":\"pwd\"}")])))
+        .collect();
+    let provider = serve(scripts);
+    let conv = Conversation::new().unwrap();
+    let tools = FakeTools::default();
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
+    let events = turn_continuing(&mut agent, &tools, &no_gate(), "keep trying");
+
+    assert_eq!(provider.requests().len(), MAX_MODEL_CALLS + 1, "the cap lets MAX_MODEL_CALLS replies run");
+    assert!(tools.reached().is_empty(), "no denied command ran: {:?}", tools.reached());
+    assert_eq!(
+        texts(&events),
+        [format!("I stopped after {MAX_MODEL_CALLS} model calls in one turn. The limit can be changed in Settings > Limits.")]
+    );
+    assert_paired(&stored(&conv.history()));
 }
 
 /// The user declines `request_integration`: the handshake does not run, the error goes back to the model, and the turn

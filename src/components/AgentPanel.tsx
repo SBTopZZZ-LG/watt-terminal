@@ -14,8 +14,8 @@ interface WorkspaceProps {
 /**
  * The terminal and the agent panel side by side (or stacked). The children always come in this order, terminal first, so
  * changing the dock never moves the terminal in the React tree: TerminalView stays mounted and its xterm is not
- * recreated. The dock only sets the class, and App.css turns it into the flex direction (row-reverse for left, column-reverse
- * for top), so the panel sits before the terminal on screen for left and top.
+ * recreated. The dock only sets the class, and App.css turns it into the flex direction (row for right, row-reverse for
+ * left), so the panel sits before the terminal on screen for left.
  */
 export function Workspace({ ref, dock, terminal, divider, panel }: WorkspaceProps) {
   return (
