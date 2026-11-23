@@ -8,12 +8,19 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
+use std::sync::Arc;
+
+use super::builtin;
 use super::frontmatter;
 use super::scan::{SKILL_FILE, MAX_SKILL_FILE, read_skill_md};
 use super::{Skill, SkillIndex, SkillLevel, Source};
 use crate::core::tools::ToolSchema;
 
 pub const TOOL_NAME: &str = "skill";
+/// The live text of the built-in skill's `state` file (see `StateProvider`). Given when the turn has no provider.
+pub const NO_STATE: &str = "The live Watt setup (file \"state\") is not available in this turn.";
+/// The provider of the built-in skill's live `state` file: called on each read, on the agent's thread.
+pub type StateProvider = Arc<dyn Fn() -> String + Send + Sync>;
 /// The most text a skill body or a file is shown with. Longer text is cut at a character boundary, with a notice.
 pub const TEXT_LIMIT: usize = 32 * 1024;
 /// The most of the skill's description the approval card shows.
@@ -50,12 +57,18 @@ pub fn schema() -> ToolSchema {
 }
 
 /// Runs one `skill` call against the turn's index. The text is what the model reads back. An unknown name, or a skill the
-/// model may not load, is an error that names the skills it may load.
+/// model may not load, is an error that names the skills it may load. Without a live provider, the built-in `state` file
+/// says it is not available (see `run_with_state`).
 pub fn run(index: &SkillIndex, args: &Value) -> Result<String, String> {
+    run_with_state(index, args, &|| NO_STATE.to_string())
+}
+
+/// `run`, with the live text of the built-in skill's `state` file from `live`.
+pub fn run_with_state(index: &SkillIndex, args: &Value, live: &dyn Fn() -> String) -> Result<String, String> {
     let request = request(index, args)?;
     match &request.file {
         None => body(request.skill),
-        Some(file) => file_text(request.skill, file),
+        Some(file) => file_text(request.skill, file, live),
     }
 }
 
@@ -64,6 +77,8 @@ pub fn run(index: &SkillIndex, args: &Value) -> Result<String, String> {
 pub struct Checked {
     pub name: String,
     pub level: SkillLevel,
+    /// The built-in skill. It never gets a card: it is Watt's own documentation, like the system prompt.
+    pub builtin: bool,
     /// The card's text: the description, where the skill lives, and the file read, if any.
     pub text: String,
     /// The card's one-line summary, such as `Load skill "pdf"`.
@@ -76,15 +91,16 @@ pub fn check(index: &SkillIndex, args: &Value) -> Result<Checked, String> {
     let request = request(index, args)?;
     let skill = request.skill;
     let source = match skill.source {
+        Source::Builtin => "Watt itself",
         Source::Watt => "Watt's skills folder",
         Source::User => "a user skills folder",
         Source::Project => "the project's skills folder",
     };
-    let mut text = format!(
-        "{}\nFrom {source}.\nSKILL.md: {}",
-        cap_text(&skill.description, CARD_TEXT_LIMIT),
-        skill.dir.join(SKILL_FILE).display()
-    );
+    let location = match skill.source {
+        Source::Builtin => "Built into Watt, not stored on disk.".to_string(),
+        _ => format!("SKILL.md: {}", skill.dir.join(SKILL_FILE).display()),
+    };
+    let mut text = format!("{}\nFrom {source}.\n{location}", cap_text(&skill.description, CARD_TEXT_LIMIT));
     let display = match &request.file {
         None => format!("Load skill \"{}\"", skill.name),
         Some(file) => {
@@ -92,7 +108,7 @@ pub fn check(index: &SkillIndex, args: &Value) -> Result<Checked, String> {
             format!("Read \"{}\" from skill \"{}\"", echo(file), skill.name)
         }
     };
-    Ok(Checked { name: skill.name.clone(), level: skill.level, text, display })
+    Ok(Checked { name: skill.name.clone(), level: skill.level, builtin: skill.source == Source::Builtin, text, display })
 }
 
 /// A `skill` call that names a skill the model may load, and the file in its folder it asks for (None: the instructions).
@@ -154,8 +170,20 @@ fn unknown(index: &SkillIndex, name: &str) -> String {
     format!("unknown skill '{shown}'. Available: {}", cap_text(&names.join(", "), AVAILABLE_LIMIT))
 }
 
-/// The instructions of a skill (frontmatter stripped, read fresh), then its folder and the files in it.
+/// The instructions of a skill (frontmatter stripped, read fresh), then its folder and the files in it. The built-in skill
+/// has no folder: its instructions are the compiled-in text, and its files are the built-in ones plus `state`.
 fn body(skill: &Skill) -> Result<String, String> {
+    if skill.source == Source::Builtin {
+        let mut files = vec![builtin::STATE_FILE.to_string()];
+        files.extend(builtin::FILES.iter().map(|(name, _)| name.to_string()));
+        return Ok(format!(
+            "{}\n\nSkill folder: {}\nFiles: {}\nRelative paths in these instructions are relative to the skill folder. Read a file \
+             with the skill tool's `file` argument. This skill runs nothing and grants nothing.",
+            cap_text(builtin::body().trim(), TEXT_LIMIT),
+            builtin::DIR,
+            files.join(", "),
+        ));
+    }
     let text = read_skill_md(&skill.dir)?;
     let parsed = frontmatter::parse(&text)?;
     let files = list_files(&skill.dir);
@@ -169,9 +197,18 @@ fn body(skill: &Skill) -> Result<String, String> {
 }
 
 /// The text of one file in the skill folder. Only text is shown: a file that is not UTF-8 gives its size instead.
-fn file_text(skill: &Skill, file: &str) -> Result<String, String> {
+fn file_text(skill: &Skill, file: &str, live: &dyn Fn() -> String) -> Result<String, String> {
     let shown = echo(file);
     let rel = relative_path(file)?;
+    if skill.source == Source::Builtin {
+        if rel == Path::new(builtin::STATE_FILE) {
+            return Ok(live());
+        }
+        return match builtin::FILES.iter().find(|(name, _)| Path::new(name) == rel) {
+            Some((_, text)) => Ok(cap_text(text, TEXT_LIMIT)),
+            None => Err(format!("no file `{shown}` in the skill folder")),
+        };
+    }
     let base = fs::canonicalize(&skill.dir).map_err(|e| format!("cannot open the skill folder ({e})"))?;
     let target = fs::canonicalize(skill.dir.join(&rel)).map_err(|_| format!("no file `{shown}` in the skill folder"))?;
     // A link inside the folder that points outside it resolves outside, and is refused here.
@@ -445,6 +482,39 @@ mod tests {
         let capped = cap_text(&"ab".repeat(100), 100);
         assert!(capped.len() <= 100, "{}", capped.len());
         assert!(capped.ends_with(" bytes]"), "{capped}");
+    }
+
+    #[test]
+    fn the_built_in_skill_serves_its_instructions_its_files_and_the_live_state() {
+        let index = crate::core::skills::builtin_index();
+        let body = run(&index, &json!({"name": "watt"})).expect("loads");
+        assert!(body.contains("Files: state, ui.md, troubleshooting.md"), "{body}");
+        assert!(body.contains("Skill folder: <built in>"), "{body}");
+        assert!(!body.contains("name: watt"), "frontmatter is stripped: {body}");
+        assert_eq!(run(&index, &json!({"name": "watt", "file": "ui.md"})).unwrap(), cap_text(builtin::FILES[0].1, TEXT_LIMIT));
+        let live = run_with_state(&index, &json!({"name": "watt", "file": "state"}), &|| "LIVE".to_string()).unwrap();
+        assert_eq!(live, "LIVE");
+        assert!(run(&index, &json!({"name": "watt", "file": "state"})).unwrap().starts_with("The live Watt setup"));
+        assert!(run(&index, &json!({"name": "watt", "file": "nope.md"})).unwrap_err().contains("no file `nope.md`"));
+        assert!(run(&index, &json!({"name": "watt", "file": "../ui.md"})).unwrap_err().contains("`..`"));
+        assert!(run(&index, &json!({"name": "pdf"})).unwrap_err().starts_with("unknown skill 'pdf'"));
+    }
+
+    #[test]
+    fn the_built_in_skill_has_no_card_text_from_disk() {
+        let card = check(&crate::core::skills::builtin_index(), &json!({"name": "watt"})).expect("checked");
+        assert!(card.builtin);
+        assert!(card.text.contains("Built into Watt, not stored on disk."), "{}", card.text);
+        assert!(!card.text.contains("SKILL.md:"), "{}", card.text);
+        assert_eq!(card.level, SkillLevel::Auto);
+    }
+
+    #[test]
+    fn a_folder_skill_gives_a_card_that_is_not_builtin() {
+        let tmp = TempDir::new();
+        skill_folder(&tmp, "demo", DEMO);
+        let card = check(&index_of(tmp.path()), &json!({"name": "demo"})).expect("checked");
+        assert!(!card.builtin);
     }
 
     #[test]
