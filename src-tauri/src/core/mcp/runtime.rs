@@ -580,12 +580,17 @@ impl Runtime {
         scrub(text, &self.redactor)
     }
 
-    /// Closes a client on a reaper task (bounded), then drops it there.
+    /// Closes a client on a reaper task (bounded), then drops it there. A close that times out kills the server's process
+    /// group here, on the reaper: the reaper finishes before shutdown returns, so the kill does not depend on rmcp's own
+    /// escalation (which runs in the serve task and may be dropped first).
     fn close(&mut self, live: Live) {
-        let Live { mut service, .. } = live;
+        let Live { mut service, group, .. } = live;
         self.reapers.retain(|h| !h.is_finished());
         self.reapers.push(tokio::spawn(async move {
-            let _ = service.close_with_timeout(CLOSE_TIMEOUT).await;
+            let closed = service.close_with_timeout(CLOSE_TIMEOUT).await;
+            if let (Ok(None), Some(group)) = (closed, group) {
+                client::kill_group(group);
+            }
             drop(service);
         }));
     }
