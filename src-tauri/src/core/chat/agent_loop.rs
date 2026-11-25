@@ -427,6 +427,8 @@ impl Conversation {
     /// Another attached session continues this conversation: the id is copied and the history, todo list,
     /// no-vision memo, calibration, learned limits, last usage and offered tools are shared, so both conversations see the
     /// same live state. The resume note is copied, so a note no turn has taken yet is still taken once.
+    /// Not used by the app since the conversation moved to `Chat` (lib.rs): a restart keeps the chat's own conversation.
+    /// Kept as public API (tests/persistence.rs uses it).
     pub fn follow(&self) -> Self {
         Conversation {
             id: Mutex::new(lock_string(&self.id).clone()),
