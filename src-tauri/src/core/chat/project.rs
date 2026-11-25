@@ -113,8 +113,8 @@ fn finished_text(record: Option<&Value>, r: &Redactor) -> String {
     if record.get("output_truncated").and_then(Value::as_bool) == Some(true) {
         fields.insert("output_truncated".into(), json!(true));
     }
-    if is_approximate(record) {
-        fields.insert("note".into(), json!(APPROXIMATE_NOTE));
+    if let Some(note) = output_note(record) {
+        fields.insert("note".into(), json!(note));
     }
     fields.insert("output".into(), json!(window_output(output, RUN_OUTPUT_LIMIT, &id, r)));
     Value::Object(fields).to_string()
@@ -160,13 +160,51 @@ fn get_command_text(v: &Value, r: &Redactor) -> String {
         scalar(v.get("truncated")),
     );
     let output = v.get("output").and_then(Value::as_str).unwrap_or("");
-    let note = if is_approximate(v) { format!("\n{APPROXIMATE_NOTE}") } else { String::new() };
+    let note = output_note(v).map_or(String::new(), |note| format!("\n{note}"));
     format!("{header}{note}\n{}", window_output(output, GET_OUTPUT_LIMIT, &id, r))
 }
 
 /// Whether a finished record (JSON as the tools give it) has the approximate status.
 fn is_approximate(record: &Value) -> bool {
     record.get("status").and_then(Value::as_str) == Some("approximate")
+}
+
+/// The caveat on a record's output. A record that was really resized gets only the resize note, which names the sizes
+/// (on Windows a resize repaints the screen and can also trip the clear or scroll marker). The generic note is for a
+/// record that is approximate without a resize.
+fn output_note(record: &Value) -> Option<String> {
+    if let Some(resize) = resized_note(record) {
+        return Some(resize);
+    }
+    is_approximate(record).then(|| APPROXIMATE_NOTE.to_string())
+}
+
+/// The note for a record the terminal was really resized during (`Record::resized`), with the sizes as rows x columns.
+/// A record that ended at the size it started at was resized and back, so it names that size instead.
+fn resized_note(record: &Value) -> Option<String> {
+    let resized = record.get("resized").filter(|r| !r.is_null())?;
+    let (from, to) = (resized.get("from"), resized.get("to"));
+    let advice = "Misaligned, wrapped, duplicated or \
+         partial lines in its output may come from that, not from the program. If it matters, rerun the command or use get_screen.";
+    if from == to {
+        return Some(format!(
+            "The terminal was resized while this command ran (it ended at the same size {}). {advice}",
+            size_text(to),
+        ));
+    }
+    Some(format!(
+        "The terminal was resized from {} to {} (rows x columns) while this command ran. {advice}",
+        size_text(from),
+        size_text(to),
+    ))
+}
+
+/// A `[rows, cols]` pair as `rowsxcols`, or `?` when it is not one.
+fn size_text(v: Option<&Value>) -> String {
+    match v.and_then(Value::as_array) {
+        Some(pair) if pair.len() == 2 => format!("{}x{}", scalar(pair.first()), scalar(pair.get(1))),
+        _ => "?".to_string(),
+    }
 }
 
 fn get_screen_text(v: &Value, r: &Redactor) -> String {
@@ -213,8 +251,8 @@ fn wait_text(v: &Value, r: &Redactor) -> String {
     lines.push(format!("{}\n{body}", screen_header(screen, r)));
     if let (Some(rec), Some(output)) = (record, output) {
         lines.push(command_header(rec, r));
-        if is_approximate(rec) {
-            lines.push(APPROXIMATE_NOTE.to_string());
+        if let Some(note) = output_note(rec) {
+            lines.push(note);
         }
         let screen_rows: Vec<&str> = body.lines().map(str::trim_end).collect();
         let shown = output.lines().all(|line| screen_rows.contains(&line.trim_end()));
@@ -1229,6 +1267,57 @@ mod tests {
         assert!(text.ends_with(&format!("approximate ids 5: {APPROXIMATE_NOTE}")), "{text}");
         let plain = json!([{"id": 4, "command": "a", "exit_code": 0, "output_bytes": 1, "status": "complete", "source": {"kind": "agent"}}]);
         assert!(!project("list_commands", true, &plain, &none()).contains("approximate"));
+    }
+
+    #[test]
+    fn a_resized_record_names_the_sizes_in_each_view_instead_of_the_generic_note() {
+        let mut resized = finished("hello");
+        resized["record"]["status"] = json!("approximate");
+        resized["record"]["resized"] = json!({"from": [24, 80], "to": [30, 100]});
+        let out = run(&resized);
+        let note = out["note"].as_str().expect("a note");
+        assert!(note.starts_with("The terminal was resized from 24x80 to 30x100 (rows x columns) while this command ran."), "{note}");
+        assert!(!note.contains(APPROXIMATE_NOTE), "the generic note is replaced: {note}");
+
+        let view = json!({"id": 3, "exit_code": 0, "status": "approximate", "cwd": null, "offset": 0, "total_bytes": 2,
+            "truncated": false, "output": "ok", "resized": {"from": [24, 80], "to": [30, 100]}});
+        let text = project("get_command", true, &view, &none());
+        assert!(text.lines().nth(1).is_some_and(|line| line.starts_with("The terminal was resized from 24x80 to 30x100")), "{text}");
+        assert!(!text.contains(APPROXIMATE_NOTE), "{text}");
+
+        let waited = json!({"reason": "command_finished", "waited_ms": 9, "state": "prompt", "screen": screen(&["$ x"]),
+            "record": resized["record"].clone()});
+        let text = project("wait", true, &waited, &none());
+        assert!(text.contains("resized from 24x80 to 30x100") && !text.contains(APPROXIMATE_NOTE), "{text}");
+    }
+
+    #[test]
+    fn a_resize_replaces_the_generic_note_even_when_a_clear_also_happened() {
+        let mut both = finished("hello");
+        both["record"]["status"] = json!("approximate");
+        both["record"]["approximate_other"] = json!(true);
+        both["record"]["resized"] = json!({"from": [24, 80], "to": [30, 100]});
+        let note = run(&both)["note"].as_str().expect("a note").to_string();
+        assert!(note.starts_with("The terminal was resized from 24x80 to 30x100") && !note.contains(APPROXIMATE_NOTE), "{note}");
+
+        let mut cleared = finished("hello");
+        cleared["record"]["status"] = json!("approximate");
+        cleared["record"]["approximate_other"] = json!(true);
+        assert_eq!(run(&cleared)["note"], APPROXIMATE_NOTE);
+        assert!(!run(&finished("hello")).to_string().contains("resized"), "a complete record says nothing about a resize");
+    }
+
+    #[test]
+    fn a_resize_and_back_to_the_same_size_names_that_size() {
+        let mut back = finished("hello");
+        back["record"]["status"] = json!("approximate");
+        back["record"]["resized"] = json!({"from": [24, 80], "to": [24, 80]});
+        let note = run(&back)["note"].as_str().expect("a note").to_string();
+        assert_eq!(
+            note,
+            "The terminal was resized while this command ran (it ended at the same size 24x80). Misaligned, wrapped, duplicated or \
+             partial lines in its output may come from that, not from the program. If it matters, rerun the command or use get_screen.",
+        );
     }
 
     #[test]

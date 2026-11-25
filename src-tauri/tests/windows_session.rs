@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 use watt_terminal_lib::core::observer::{InputState, IntegrationStatus, ObserverStatus};
 use watt_terminal_lib::core::pty::OutputSink;
-use watt_terminal_lib::core::record::{Record, RecordStatus, Source};
+use watt_terminal_lib::core::record::{Record, RecordStatus, Resize, Source};
 use watt_terminal_lib::core::session::{Session, SpawnConfig, SubmitError, USER_TEXT_CODE};
 use watt_terminal_lib::core::tools::{AgentTools, DEFAULT_RUN_WAIT, NotRunReason, RunOutcome, SessionTools, WaitReason};
 
@@ -891,4 +891,40 @@ fn agent_clear_host_keeps_the_output_after_it() {
         panic!("the Clear-Host command did not finish; state={:?}", s.state());
     };
     assert!(record.output.contains("after-clear"), "output={:?} status={:?}", record.output, record.status);
+}
+
+/// A real resize while a command runs is on its record: the size it started at and the size it ended at. The record is
+/// approximate, since the resize may have reflowed its output.
+#[test]
+fn a_resize_while_a_command_runs_is_on_its_record() {
+    let _g = serial();
+    let s = start("win-resize-hint");
+    wait_prompt(&s);
+    let cmd = "Start-Sleep -Seconds 2; Write-Output after-resize";
+    s.submit(Source::User, cmd).expect("submit at an idle prompt");
+    wait_state(&s, InputState::Running);
+    s.resize(40, 100).expect("resize");
+    let id = wait_finished(&s, cmd);
+    wait_prompt(&s);
+    let r = s.get_record(id).expect("record by id");
+    assert_eq!(r.resized, Some(Resize { from: (30, 120), to: (40, 100) }));
+    assert_eq!(r.status, RecordStatus::Approximate);
+}
+
+/// A resize to the size the terminal already has is not a change, so the record has none.
+#[test]
+fn a_resize_to_the_same_size_is_not_recorded() {
+    let _g = serial();
+    let s = start("win-resize-same");
+    wait_prompt(&s);
+    let cmd = "Start-Sleep -Seconds 2; Write-Output same-size";
+    s.submit(Source::User, cmd).expect("submit at an idle prompt");
+    wait_state(&s, InputState::Running);
+    s.resize(30, 120).expect("resize");
+    let id = wait_finished(&s, cmd);
+    wait_prompt(&s);
+    let r = s.get_record(id).expect("record by id");
+    // Not asserted: `status`. ConPTY repaints on any PTY resize call, even at the same size, and that repaint can mark the
+    // record approximate for a reason other than a resize. The observer's own no-op is what `resized` checks here.
+    assert_eq!(r.resized, None);
 }

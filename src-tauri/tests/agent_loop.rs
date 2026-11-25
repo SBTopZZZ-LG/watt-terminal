@@ -274,6 +274,8 @@ fn finished_record(id: u64, exit: i32) -> RecordSummary {
         status: RecordStatus::Complete,
         used_alt_screen: false,
         output_bytes: 0,
+        resized: None,
+        approximate_other: false,
     }
 }
 

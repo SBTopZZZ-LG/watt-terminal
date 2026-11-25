@@ -17,7 +17,7 @@ use vt100::capture::{basic_formatted_to_plain, BasicFormattedCaptureState, RowCo
 use vt100::{Callbacks, Parser};
 
 use crate::core::foreground::{self, Foreground, ForegroundKind};
-use crate::core::record::{Cwd, OutputBuilder, RawCapture, Record, RecordStatus, RecordSummary, Source};
+use crate::core::record::{Cwd, OutputBuilder, RawCapture, Record, RecordStatus, RecordSummary, Resize, Source};
 use crate::core::scanner::{Event, Found, Scanner};
 
 /// Bytes the observer may hold before it desyncs. Matches the design in plan.md.
@@ -508,7 +508,10 @@ struct OpenRecord {
     /// Absolute index of the row where the command started (scrolled rows + cursor row at C).
     start_abs: u64,
     used_alt: bool,
+    /// A clear, a scroll region, or a nested shell left while it ran: the output may be missing rows.
     approximate: bool,
+    /// The size before the first real resize while the record was open. Later resizes keep it.
+    resized_from: Option<(u16, u16)>,
     /// When C started the command. The age in the notes is read from it.
     started: Instant,
 }
@@ -1196,9 +1199,13 @@ impl Core {
 
     fn resize(&mut self, rows: u16, cols: u16) {
         let size = (rows.max(1), cols.max(1));
+        if size == self.size {
+            return;
+        }
         if let Some(open) = self.parser.callbacks_mut().open.as_mut() {
-            // vt100 may push rows through on_scroll or reflow the cursor during a resize; the output is then approximate.
-            open.approximate = true;
+            // vt100 may push rows through on_scroll or reflow the cursor during a resize, so the record is approximate when
+            // it finishes (`finish_record`). The first size is kept: it is where the command's output started.
+            open.resized_from.get_or_insert(self.size);
         }
         self.sync_history();
         self.parser.set_size(nz(size.0), nz(size.1));
@@ -1271,12 +1278,15 @@ impl Core {
                 raw_head: Vec::new(),
                 raw_tail: Vec::new(),
                 raw_truncated: false,
+                resized: None,
+                approximate_other: false,
             },
             builder: OutputBuilder::default(),
             raw: RawCapture::default(),
             start_abs,
             used_alt: alt,
             approximate: false,
+            resized_from: None,
             started: Instant::now(),
         });
     }
@@ -1290,7 +1300,8 @@ impl Core {
 
     /// Adds the rows still on screen (from the command's first row to the cursor) and stores the record.
     fn finish_record(&mut self, open: OpenRecord, exit: Option<i32>, pipestatus: Vec<i32>, status: RecordStatus) {
-        let OpenRecord { mut record, mut builder, raw, start_abs, used_alt, approximate, .. } = open;
+        let OpenRecord { mut record, mut builder, raw, start_abs, used_alt, approximate, resized_from, .. } = open;
+        let to = self.size;
         if matches!(record.source, Source::Agent { .. }) {
             self.settling_history = true;
         }
@@ -1313,9 +1324,11 @@ impl Core {
         record.exit_code = exit;
         record.pipestatus = pipestatus;
         record.used_alt_screen = used_alt;
+        record.approximate_other = approximate;
+        record.resized = resized_from.map(|from| Resize { from, to });
         record.status = match status {
             RecordStatus::Incomplete => RecordStatus::Incomplete,
-            _ if approximate => RecordStatus::Approximate,
+            _ if approximate || record.resized.is_some() => RecordStatus::Approximate,
             _ => status,
         };
         record.raw_head = raw_head;
@@ -2254,6 +2267,70 @@ mod tests {
         let mut idle = core();
         idle.handle(Event::ScreenClear);
         assert!(idle.records().is_empty());
+    }
+
+    /// A resize to the size the terminal already has is not a change: nothing is marked.
+    #[test]
+    fn a_resize_to_the_same_size_changes_nothing() {
+        let mut c = running("sleep 1");
+        c.resize(24, 80);
+        c.handle(Event::CommandEnd { exit: 0, pipestatus: vec![0] });
+        let rec = c.get_record(1).expect("the record");
+        assert_eq!(rec.status, RecordStatus::Complete);
+        assert_eq!(rec.resized, None);
+        assert!(!rec.approximate_other);
+    }
+
+    /// A real resize while a record is open marks it approximate and keeps the size it started at.
+    #[test]
+    fn a_real_resize_marks_the_open_record_with_its_first_size() {
+        let mut c = running("sleep 1");
+        c.resize(30, 100);
+        c.handle(Event::CommandEnd { exit: 0, pipestatus: vec![0] });
+        let rec = c.get_record(1).expect("the record");
+        assert_eq!(rec.status, RecordStatus::Approximate);
+        assert_eq!(rec.resized, Some(Resize { from: (24, 80), to: (30, 100) }));
+        assert!(!rec.approximate_other, "a resize alone is not another reason");
+        assert_eq!(c.record_summary(1).expect("summary").resized, rec.resized);
+    }
+
+    /// Several resizes keep the first `from`, and `to` is the size when the record finished.
+    #[test]
+    fn several_resizes_keep_the_first_from_and_the_last_to() {
+        let mut c = running("sleep 1");
+        c.resize(30, 100);
+        c.resize(20, 60);
+        c.resize(20, 60);
+        c.handle(Event::CommandEnd { exit: 0, pipestatus: vec![0] });
+        let rec = c.get_record(1).expect("the record");
+        assert_eq!(rec.resized, Some(Resize { from: (24, 80), to: (20, 60) }));
+    }
+
+    /// A resize with no record open does not reach the records that open later.
+    #[test]
+    fn a_resize_with_no_open_record_leaves_later_records_alone() {
+        let mut c = core();
+        c.resize(30, 100);
+        c.lifecycle = Lifecycle::Prompt;
+        c.handle(Event::CommandLine("sleep 1".into()));
+        c.handle(Event::CommandStart);
+        c.handle(Event::CommandEnd { exit: 0, pipestatus: vec![0] });
+        let rec = c.get_record(1).expect("the record");
+        assert_eq!(rec.status, RecordStatus::Complete);
+        assert_eq!(rec.resized, None);
+    }
+
+    /// A clear and a resize during one record are both kept: the record is approximate for two reasons.
+    #[test]
+    fn a_clear_and_a_resize_during_one_record_keep_both() {
+        let mut c = running("sleep 1");
+        c.handle(Event::ScreenClear);
+        c.resize(30, 100);
+        c.handle(Event::CommandEnd { exit: 0, pipestatus: vec![0] });
+        let rec = c.get_record(1).expect("the record");
+        assert_eq!(rec.status, RecordStatus::Approximate);
+        assert!(rec.approximate_other);
+        assert_eq!(rec.resized, Some(Resize { from: (24, 80), to: (30, 100) }));
     }
 
     /// A pwsh or zsh command record opened below 40 lines of output, with the cursor on row 14 (mid-screen, rows below
