@@ -890,7 +890,7 @@ mod tests {
     }
 
     fn model(id: &str, source: ModelSource) -> Model {
-        Model { id: id.into(), context_limit: None, provider_context: None, vision: None, source, variants: Vec::new() }
+        Model { id: id.into(), context_limit: None, provider_context: None, vision: None, source, variants: Vec::new() , sampling: Default::default() }
     }
 
     fn provider(id: &str) -> Provider {
@@ -1308,6 +1308,25 @@ mod tests {
         assert!(f.service.test_plan("acme", "missing").unwrap_err().contains("does not list"));
     }
 
+    /// The connection test runs the model with its sampling parameters, the same overlay the chat sends.
+    #[test]
+    fn test_plan_carries_the_model_sampling() {
+        let f = fixture();
+        let mut p = provider("acme");
+        p.models = vec![Model {
+            id: "big".into(),
+            context_limit: None,
+            provider_context: None,
+            vision: None,
+            source: ModelSource::Custom,
+            variants: Vec::new(),
+            sampling: super::super::Sampling { temperature: Some(0.7), ..Default::default() },
+        }];
+        f.service.save_provider(with_key(p, KEY)).unwrap();
+        let plan = f.service.test_plan("acme", "big").unwrap();
+        assert_eq!(plan.extra, Some(serde_json::from_str(r#"{"temperature":0.7}"#).unwrap()));
+    }
+
     const BROKEN: &[u8] = b"{ not settings";
 
     fn dir_names(dir: &TempDir) -> Vec<String> {
@@ -1676,6 +1695,7 @@ mod tests {
             vision: None,
             source: ModelSource::Fetched,
             variants: vec![manual_variant("mine"), auto_variant("fast")],
+            sampling: Default::default(),
         }];
         f.service.save_provider(with_key(p, KEY)).unwrap();
         f.service
@@ -1718,6 +1738,7 @@ mod tests {
             vision: None,
             source: ModelSource::Fetched,
             variants: vec![manual_variant("mine"), auto_variant("fast")],
+            sampling: Default::default(),
         }];
         f.service.save_provider(with_key(p, KEY)).unwrap();
         f.service
@@ -1746,6 +1767,7 @@ mod tests {
             vision: None,
             source: ModelSource::Fetched,
             variants: vec![auto_variant("fast")],
+            sampling: Default::default(),
         }];
         f.service.save_provider(with_key(p, KEY)).unwrap();
         f.service

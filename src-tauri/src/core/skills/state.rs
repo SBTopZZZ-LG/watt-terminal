@@ -362,6 +362,7 @@ mod tests {
                 vision: None,
                 source: ModelSource::Custom,
                 variants: Vec::new(),
+                sampling: Default::default(),
             }],
         };
         let http = McpServerConfig {

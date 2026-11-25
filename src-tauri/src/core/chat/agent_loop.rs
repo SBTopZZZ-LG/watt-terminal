@@ -115,7 +115,8 @@ pub struct LlmSettings {
     /// reports it with the context usage (core/chat/context), and trims the wire copy of a request to fit it
     /// (core/chat/trim). Without a known limit, nothing is trimmed.
     pub context_limit: Option<u32>,
-    /// The selected model variant's request overlay (see `ModelVariant::body`), or None for the base model.
+    /// The request overlay: the model's set sampling parameters, with the selected variant's body over them (see
+    /// core/settings `resolve`), or None when there is neither.
     /// Carried into every `ChatRequest` this turn sends (see `LlmAgent::send`).
     pub extra: Option<serde_json::Map<String, Value>>,
 }

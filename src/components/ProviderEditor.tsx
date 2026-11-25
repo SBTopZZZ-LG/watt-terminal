@@ -2,6 +2,9 @@ import { useId, useState } from 'react';
 import type { TestResult } from '../lib/types';
 import { secretStoreShortName } from '../lib/platform';
 import {
+  SAMPLING_KEYS,
+  SAMPLING_LABELS,
+  emptySampling,
   hasProblems,
   hostChangeNotice,
   isAutoTicked,
@@ -58,7 +61,10 @@ export interface ProviderEditorProps {
   onTest(modelId: string): void;
 }
 
-const NEEDS_SAVE_FIRST = 'Save the provider first. Fetching and testing use the saved provider.';
+/** Shown in each model's Parameters section. Providers decide what they accept, so an unsupported value may be refused. */
+const SAMPLING_NOTE =
+  "Providers may ignore or reject parameters their model doesn't support. Leave a field empty to use the model's default.";
+const NEEDS_SAVE_FIRST ='Save the provider first. Fetching and testing use the saved provider.';
 const NEEDS_SAVE_CHANGES = 'Save your changes first. Fetching and testing use the saved provider.';
 
 function TestLine({ state }: { state: TestState }) {
@@ -176,7 +182,12 @@ export function ProviderEditor(p: ProviderEditorProps) {
     if (newModelId === '' || newModelTaken) {
       return;
     }
-    set({ models: [...draft.models, { id: newModelId, source: 'custom', context_limit: '', provider_context: null, variants: [] }] });
+    set({
+      models: [
+        ...draft.models,
+        { id: newModelId, source: 'custom', context_limit: '', provider_context: null, variants: [], sampling: emptySampling() },
+      ],
+    });
     setNewModel('');
   };
 
@@ -503,6 +514,29 @@ export function ProviderEditor(p: ProviderEditorProps) {
                 </div>
                 {error && <span className="settings-error">{error}</span>}
                 {p.tests[m.id] && <TestLine state={p.tests[m.id]} />}
+                <details className="settings-params">
+                  <summary>Parameters</summary>
+                  <p className="settings-hint">{SAMPLING_NOTE}</p>
+                  <div className="settings-params-fields">
+                    {SAMPLING_KEYS.map((key) => (
+                      <label key={key} className="settings-inline-label">
+                        {SAMPLING_LABELS[key]}
+                        <input
+                          type="text"
+                          inputMode="decimal"
+                          aria-label={`${SAMPLING_LABELS[key]} for ${m.id}`}
+                          placeholder="default"
+                          value={m.sampling[key]}
+                          disabled={off}
+                          spellCheck={false}
+                          onChange={(e) =>
+                            setModel(m.id, (x) => ({ ...x, sampling: { ...x.sampling, [key]: e.target.value } }))
+                          }
+                        />
+                      </label>
+                    ))}
+                  </div>
+                </details>
                 <details className="settings-variants">
                   <summary>{`Variants (${m.variants.length})`}</summary>
                   {m.variants.length === 0 ? (

@@ -356,6 +356,7 @@ pub fn merge_fetched(provider: &mut Provider, fetched: Vec<FetchedModel>) {
                 vision: new.vision,
                 source: ModelSource::Fetched,
                 variants,
+                sampling: Default::default(),
             });
         }
     }
@@ -541,6 +542,7 @@ mod tests {
                 vision: None,
                 source: ModelSource::Custom,
                 variants: Vec::new(),
+                sampling: Default::default(),
             },
             Model {
                 id: "kept".into(),
@@ -549,6 +551,7 @@ mod tests {
                 vision: None,
                 source: ModelSource::Fetched,
                 variants: Vec::new(),
+                sampling: Default::default(),
             },
             Model {
                 id: "gone".into(),
@@ -557,6 +560,7 @@ mod tests {
                 vision: None,
                 source: ModelSource::Fetched,
                 variants: Vec::new(),
+                sampling: Default::default(),
             },
         ]);
         merge_fetched(
@@ -611,12 +615,30 @@ mod tests {
         );
     }
 
+    /// A refresh keeps a fetched model's sampling parameters, as it keeps its context override.
+    #[test]
+    fn a_refresh_keeps_the_sampling_of_a_fetched_model() {
+        let sampling = super::super::Sampling { temperature: Some(0.7), top_k: Some(40), ..Default::default() };
+        let mut provider = provider_with(vec![Model {
+            id: "kept".into(),
+            context_limit: None,
+            provider_context: None,
+            vision: None,
+            source: ModelSource::Fetched,
+            variants: Vec::new(),
+            sampling,
+        }]);
+        merge_fetched(&mut provider, vec![fetched("kept", Some(8000))]);
+        assert_eq!(provider.models[0].sampling, sampling);
+        assert_eq!(provider.models[0].provider_context, Some(8000));
+    }
+
     /// A refresh sets the modality of fetched models (kept and new), and never touches a custom model's.
     #[test]
     fn merge_carries_the_modality_and_leaves_custom_models_alone() {
         let mut provider = provider_with(vec![
-            Model { id: "mine".into(), context_limit: None, provider_context: None, vision: None, source: ModelSource::Custom, variants: Vec::new() },
-            Model { id: "kept".into(), context_limit: None, provider_context: None, vision: Some(true), source: ModelSource::Fetched, variants: Vec::new() },
+            Model { id: "mine".into(), context_limit: None, provider_context: None, vision: None, source: ModelSource::Custom, variants: Vec::new(), sampling: Default::default() },
+            Model { id: "kept".into(), context_limit: None, provider_context: None, vision: Some(true), source: ModelSource::Fetched, variants: Vec::new(), sampling: Default::default() },
         ]);
         let fresh =
             |id: &str, vision| FetchedModel { id: id.into(), context: None, vision, variants: Vec::new() };
@@ -629,8 +651,8 @@ mod tests {
     #[test]
     fn merge_with_an_empty_list_removes_fetched_models_only() {
         let mut provider = provider_with(vec![
-            Model { id: "c".into(), context_limit: None, provider_context: None, vision: None, source: ModelSource::Custom, variants: Vec::new() },
-            Model { id: "f".into(), context_limit: None, provider_context: None, vision: None, source: ModelSource::Fetched, variants: Vec::new() },
+            Model { id: "c".into(), context_limit: None, provider_context: None, vision: None, source: ModelSource::Custom, variants: Vec::new(), sampling: Default::default() },
+            Model { id: "f".into(), context_limit: None, provider_context: None, vision: None, source: ModelSource::Fetched, variants: Vec::new(), sampling: Default::default() },
         ]);
         merge_fetched(&mut provider, Vec::new());
         assert_eq!(provider.models.len(), 1);
@@ -747,6 +769,7 @@ mod tests {
                 vision: None,
                 source: ModelSource::Custom,
                 variants: vec![manual_variant("custom")],
+                sampling: Default::default(),
             },
             Model {
                 id: "kept".into(),
@@ -755,6 +778,7 @@ mod tests {
                 vision: None,
                 source: ModelSource::Fetched,
                 variants: vec![manual_variant("mine"), auto_variant("old")],
+                sampling: Default::default(),
             },
         ]);
         merge_fetched(
@@ -792,6 +816,7 @@ mod tests {
             vision: None,
             source: ModelSource::Fetched,
             variants: vec![manual_variant("mine"), auto_variant("old")],
+            sampling: Default::default(),
         }]);
         merge_fetched(&mut provider, vec![fetched("kept", None)]);
         assert_eq!(provider.model("kept").unwrap().variants, vec![manual_variant("mine")]);
@@ -807,6 +832,7 @@ mod tests {
             vision: None,
             source: ModelSource::Fetched,
             variants: manuals.clone(),
+            sampling: Default::default(),
         }]);
         let incoming: Vec<ModelVariant> = (0..20).map(|i| auto_variant(&format!("v{i:02}"))).collect();
         merge_fetched(&mut provider, vec![fetched_with("kept", incoming)]);
@@ -833,6 +859,7 @@ mod tests {
             vision: None,
             source: ModelSource::Fetched,
             variants: vec![manual_variant("m0")],
+            sampling: Default::default(),
         }]);
         let many: Vec<ModelVariant> = (0..20).map(|i| auto_variant(&format!("v{i:02}"))).collect();
         let fresh_many: Vec<ModelVariant> = (0..20).map(|i| auto_variant(&format!("n{i:02}"))).collect();
@@ -873,6 +900,7 @@ mod tests {
             vision: None,
             source: ModelSource::Fetched,
             variants: manuals.clone(),
+            sampling: Default::default(),
         }]);
         // Two manuals leave room for 14 autos: v00..v13 survive, v14.. are dropped.
         let incoming: Vec<ModelVariant> = (0..20).map(|i| auto_variant(&format!("v{i:02}"))).collect();

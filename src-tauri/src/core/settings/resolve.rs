@@ -56,17 +56,18 @@ pub fn resolve(settings: &Settings, secrets: &Secrets, model: &ModelRef) -> Resu
     let entry = provider.model(&model.model_id).ok_or_else(|| {
         ResolveError::UnknownModel { provider: provider.id.clone(), model: model.model_id.clone() }
     })?;
-    let extra = match &model.variant {
-        None => None,
-        Some(variant) => {
-            let found = entry.variant(variant).ok_or_else(|| ResolveError::UnknownVariant {
-                provider: provider.id.clone(),
-                model: entry.id.clone(),
-                variant: variant.clone(),
-            })?;
-            Some(found.body.clone())
-        }
-    };
+    // The request overlay: the model's set sampling parameters, then the selected variant's body over them, so a variant
+    // key wins. Empty means no overlay.
+    let mut overlay = entry.sampling.overlay();
+    if let Some(variant) = &model.variant {
+        let found = entry.variant(variant).ok_or_else(|| ResolveError::UnknownVariant {
+            provider: provider.id.clone(),
+            model: entry.id.clone(),
+            variant: variant.clone(),
+        })?;
+        overlay.extend(found.body.clone());
+    }
+    let extra = (!overlay.is_empty()).then_some(overlay);
 
     Ok(LlmSettings {
         chat_url: provider.chat_url.clone(),
@@ -163,6 +164,7 @@ mod tests {
                 vision: None,
                 source: ModelSource::Fetched,
                 variants: Vec::new(),
+                sampling: Default::default(),
             }],
         }
     }
@@ -271,6 +273,37 @@ mod tests {
         );
         let text = err.to_string();
         assert!(text.contains("acme") && text.contains("big") && text.contains("missing"), "{text}");
+    }
+
+    /// The model's set sampling parameters are the overlay, and a selected variant's body wins on a shared key.
+    #[test]
+    fn sampling_is_the_overlay_and_a_variant_body_wins_over_it() {
+        use super::super::{ModelVariant, Sampling, VariantSource};
+        let mut settings = settings_for(REMOTE);
+        settings.providers[0].models[0].sampling = Sampling { temperature: Some(0.7), top_k: Some(40), ..Sampling::default() };
+        settings.providers[0].models[0].variants = vec![ModelVariant {
+            id: "cool".into(),
+            label: "Cool".into(),
+            body: serde_json::from_str(r#"{"temperature":0.2,"reasoning":{"effort":"low"}}"#).unwrap(),
+            source: VariantSource::Manual,
+        }];
+
+        let base = resolve(&settings, &full_secrets(), &model_ref("acme", "big")).unwrap();
+        assert_eq!(
+            serde_json::Value::Object(base.extra.expect("the sampling overlay")),
+            serde_json::json!({"temperature": 0.7, "top_k": 40})
+        );
+
+        let with_variant = resolve(
+            &settings,
+            &full_secrets(),
+            &ModelRef { provider_id: "acme".into(), model_id: "big".into(), variant: Some("cool".into()) },
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::Value::Object(with_variant.extra.expect("sampling and the variant body")),
+            serde_json::json!({"temperature": 0.2, "top_k": 40, "reasoning": {"effort": "low"}})
+        );
     }
 
     #[test]

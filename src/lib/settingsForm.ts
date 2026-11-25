@@ -15,6 +15,7 @@ import type {
   ModelVariant,
   Provider,
   ProviderPreset,
+  Sampling,
   SaveProviderInput,
   SecretsPresent,
   Settings,
@@ -93,6 +94,8 @@ export interface ModelDraft {
   /** What the provider reported when the list was fetched. Shown, never edited. */
   provider_context: number | null;
   variants: VariantDraft[];
+  /** The typed sampling parameters, as text. Blank means not set. */
+  sampling: SamplingDraft;
 }
 
 /** One variant row. `body` is the typed JSON text; the parsed object is what is saved. */
@@ -212,6 +215,92 @@ export function limitCommit(text: string, saved: number | null): LimitCommit {
   return value === saved ? { kind: 'unchanged' } : { kind: 'send', value };
 }
 
+/** The sampling parameter names, in form order. Each is the body key of the same name. */
+export const SAMPLING_KEYS = ['temperature', 'top_p', 'top_k', 'frequency_penalty', 'presence_penalty', 'seed'] as const;
+export type SamplingKey = (typeof SAMPLING_KEYS)[number];
+/** The typed text of each sampling input. Blank means not set. */
+export type SamplingDraft = Record<SamplingKey, string>;
+
+/** The label of each sampling input, also used in its problem message. */
+export const SAMPLING_LABELS: Record<SamplingKey, string> = {
+  temperature: 'Temperature',
+  top_p: 'Top P',
+  top_k: 'Top K',
+  frequency_penalty: 'Frequency penalty',
+  presence_penalty: 'Presence penalty',
+  seed: 'Seed',
+};
+
+/** The range each parameter accepts, as the backend checks it. Whole numbers are integers within the JS-safe range. */
+const SAMPLING_RULES: Record<SamplingKey, { min: number; max: number; integer: boolean }> = {
+  temperature: { min: 0, max: 2, integer: false },
+  top_p: { min: 0, max: 1, integer: false },
+  top_k: { min: 0, max: Number.MAX_SAFE_INTEGER, integer: true },
+  frequency_penalty: { min: -2, max: 2, integer: false },
+  presence_penalty: { min: -2, max: 2, integer: false },
+  seed: { min: -Number.MAX_SAFE_INTEGER, max: Number.MAX_SAFE_INTEGER, integer: true },
+};
+const DECIMAL_RE = /^[+-]?(\d+\.?\d*|\.\d+)$/;
+const WHOLE_RE = /^[+-]?\d+$/;
+
+/** Sampling inputs with every field blank. */
+export function emptySampling(): SamplingDraft {
+  return { temperature: '', top_p: '', top_k: '', frequency_penalty: '', presence_penalty: '', seed: '' };
+}
+
+/** A saved model's sampling as input text. An unset field is blank. */
+function samplingDraft(s: Sampling | undefined): SamplingDraft {
+  const out = emptySampling();
+  for (const key of SAMPLING_KEYS) {
+    const value = s?.[key];
+    if (value !== undefined) {
+      out[key] = String(value);
+    }
+  }
+  return out;
+}
+
+/** The problem with one sampling input's text, or null when it is blank or valid. Non-numeric text is a problem. */
+export function samplingProblem(key: SamplingKey, text: string): string | null {
+  const t = text.trim();
+  if (t === '') {
+    return null;
+  }
+  const rule = SAMPLING_RULES[key];
+  const kind = rule.integer ? 'whole number' : 'number';
+  if (!(rule.integer ? WHOLE_RE : DECIMAL_RE).test(t)) {
+    return `${SAMPLING_LABELS[key]} must be a ${kind}.`;
+  }
+  const n = Number(t);
+  if (!Number.isFinite(n) || n < rule.min || n > rule.max || (rule.integer && !Number.isSafeInteger(n))) {
+    return `${SAMPLING_LABELS[key]} must be a ${kind} from ${rule.min} to ${rule.max}.`;
+  }
+  return null;
+}
+
+/** The first problem among a model's sampling inputs, or undefined when all are blank or valid. */
+function firstSamplingProblem(s: SamplingDraft): string | undefined {
+  for (const key of SAMPLING_KEYS) {
+    const problem = samplingProblem(key, s[key]);
+    if (problem !== null) {
+      return problem;
+    }
+  }
+  return undefined;
+}
+
+/** The sampling a save sends: each set input as its number. Null when none is set, so nothing is written. */
+function samplingFrom(s: SamplingDraft): Sampling | null {
+  const out: Sampling = {};
+  for (const key of SAMPLING_KEYS) {
+    const text = s[key].trim();
+    if (text !== '' && samplingProblem(key, text) === null) {
+      out[key] = Number(text);
+    }
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
 /** A slug for a provider id from its name: lower case, a-z 0-9 and '-', at most 40 characters, unique among takenIds. */
 export function slugify(name: string, takenIds: readonly string[]): string {
   const base = name
@@ -276,6 +365,7 @@ export function draftFromProvider(provider: Provider, present?: SecretsPresent):
       context_limit: m.context_limit === null ? '' : String(m.context_limit),
       provider_context: m.provider_context,
       variants: (m.variants ?? []).map(variantDraft),
+      sampling: samplingDraft(m.sampling),
     })),
     apiKey: '',
     clearKey: false,
@@ -416,6 +506,7 @@ export function buildSaveInput(draft: ProviderDraft): SaveProviderInput {
       body: parseVariantBody(v.body),
       source: v.source,
     }));
+    const sampling = samplingFrom(m.sampling);
     return {
       id: m.id.trim(),
       context_limit: parsePositiveInt(m.context_limit),
@@ -423,6 +514,8 @@ export function buildSaveInput(draft: ProviderDraft): SaveProviderInput {
       source: m.source,
       // Left out when empty, so a file from before variants round-trips byte-identical.
       ...(variants.length > 0 ? { variants } : {}),
+      // Left out when no parameter is set, so a model without them is written as before.
+      ...(sampling !== null ? { sampling } : {}),
     };
   });
   const modelsUrl = draft.models_url.trim();
@@ -623,6 +716,9 @@ export function validateDraft(draft: ProviderDraft, takenIds: readonly string[])
       message = `Model "${id}" is listed more than once.`;
     } else if (m.context_limit.trim() !== '' && parsePositiveInt(m.context_limit) === null) {
       message = 'Context limit must be a whole number of at least 1, or blank.';
+    }
+    if (message === undefined) {
+      message = firstSamplingProblem(m.sampling);
     }
     seenModels.add(id);
     if (message !== undefined) {
