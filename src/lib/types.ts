@@ -124,7 +124,7 @@ export type AgentEvent =
   | { type: 'text'; text: string }
   /** Streamed assistant text. `text` events still carry whole messages. */
   | { type: 'text_delta'; text: string }
-  /** Streamed reasoning text of the model. Shown live only; never stored, so a reload does not have it. */
+  /** Streamed reasoning text of the model. Shown live, and stored (redacted) with the reply for the transcript only; never sent back. */
   | { type: 'reasoning_delta'; text: string }
   /** The model is working on a reply (true) or has produced its first output (false). */
   | { type: 'thinking'; active: boolean }

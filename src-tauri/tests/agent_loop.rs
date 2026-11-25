@@ -18,7 +18,7 @@ use watt_terminal_lib::core::chat::trim::{OLD_OUTPUT_NOTE, OMITTED_TURNS_NOTE, T
 use watt_terminal_lib::core::persist::attachments::{sha256_hex, AttachmentStore};
 use watt_terminal_lib::core::settings::LimitsSettings;
 use watt_terminal_lib::core::skills::{self, Root};
-use watt_terminal_lib::core::chat::history::{History, STEER_SKIPPED};
+use watt_terminal_lib::core::chat::history::{History, REASONING_KEY, STEER_SKIPPED};
 use watt_terminal_lib::core::chat::prompt;
 use watt_terminal_lib::core::chat::questions;
 use watt_terminal_lib::core::chat::redact::Redactor;
@@ -427,6 +427,11 @@ fn turn_hooked(agent: &mut LlmAgent, tools: &dyn AgentTools, text: &str, hook: i
 /// The stored history without the system message.
 fn stored(history: &Arc<Mutex<History>>) -> Vec<Value> {
     history.lock().unwrap().messages("", &mut Resolver::none())[1..].to_vec()
+}
+
+/// The stored messages as they are kept, meta keys included (`stored` shows the wire view, which drops them).
+fn stored_raw(history: &Arc<Mutex<History>>) -> Vec<Value> {
+    history.lock().unwrap().snapshot()
 }
 
 fn texts(events: &[AgentEvent]) -> Vec<String> {
@@ -1093,6 +1098,82 @@ fn a_cancel_with_a_finished_command_keeps_the_partial_reply_as_before() {
     );
     assert_eq!(provider.requests().len(), 1);
     assert!(matches!(events.last(), Some(AgentEvent::Done)));
+}
+
+/// One SSE reasoning delta with no end: the start of a reply that a test stops during its reasoning.
+fn sse_reasoning(text: &str) -> String {
+    format!("data: {}\n\n", json!({"choices": [{"index": 0, "delta": {"reasoning_content": text}}]}))
+}
+
+#[test]
+fn a_cancel_during_reasoning_keeps_the_reasoning_with_the_marker_and_never_sends_it() {
+    let provider = serve(vec![Script::sse_stall(&sse_reasoning("Let me think")), Script::sse(&sse_text(&["Ok"]))]);
+    let conv = Conversation::new().unwrap();
+    let cancel = Arc::new(TurnCancel::new());
+    let mut agent = agent_for(&settings(&provider.url, true), &conv, cancel.clone());
+    let events = turn_hooked(&mut agent, &FakeTools::default(), "hi", |ev| {
+        if matches!(ev, AgentEvent::ReasoningDelta { .. }) {
+            cancel.cancel();
+        }
+    });
+
+    assert!(texts(&events).is_empty() && deltas(&events).is_empty(), "{events:?}");
+    assert_eq!(
+        stored_raw(&conv.history()),
+        vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "[reply interrupted]", (REASONING_KEY): "Let me think"}),
+        ]
+    );
+    // The next request has the marker and not the reasoning.
+    let mut next = agent_for(&settings(&provider.url, true), &conv, Arc::new(TurnCancel::new()));
+    turn(&mut next, &FakeTools::default(), &no_gate(), "again");
+    let body = &provider.requests()[1];
+    assert!(body.contains("[reply interrupted]"), "{body}");
+    assert!(!body.contains("Let me think") && !body.contains(REASONING_KEY), "{body}");
+}
+
+#[test]
+fn a_cancel_after_text_keeps_the_reasoning_with_the_partial_text() {
+    let body = format!("{}{}", sse_reasoning("Let me check"), sse_partial("Checking"));
+    let provider = serve(vec![Script::sse_stall(&body)]);
+    let conv = Conversation::new().unwrap();
+    let cancel = Arc::new(TurnCancel::new());
+    let mut agent = agent_for(&settings(&provider.url, true), &conv, cancel.clone());
+    turn_hooked(&mut agent, &FakeTools::default(), "hi", |ev| {
+        if matches!(ev, AgentEvent::TextDelta { .. }) {
+            cancel.cancel();
+        }
+    });
+
+    assert_eq!(
+        stored_raw(&conv.history()),
+        vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "Checking\n\n[reply interrupted]", (REASONING_KEY): "Let me check"}),
+        ]
+    );
+}
+
+#[test]
+fn a_completed_reply_keeps_its_reasoning_in_the_history_but_not_on_the_wire() {
+    let sse = "\
+data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"Let me think.\"}}]}\n\n\
+data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Done\"}}]}\n\n\
+data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n";
+    let provider = serve(vec![Script::sse(sse), Script::sse(&sse_text(&["Next"]))]);
+    let conv = Conversation::new().unwrap();
+    let mut agent = agent_for(&settings(&provider.url, true), &conv, Arc::new(TurnCancel::new()));
+    turn(&mut agent, &FakeTools::default(), &no_gate(), "hi");
+    assert_eq!(
+        stored_raw(&conv.history())[1],
+        json!({"role": "assistant", "content": "Done", (REASONING_KEY): "Let me think."})
+    );
+    turn(&mut agent, &FakeTools::default(), &no_gate(), "again");
+    let body = &provider.requests()[1];
+    assert!(!body.contains("Let me think") && !body.contains(REASONING_KEY), "{body}");
+    assert!(body.contains("Done"), "{body}");
 }
 
 #[test]

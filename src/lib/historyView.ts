@@ -2,9 +2,10 @@
 // history list's grouping, filtering and time labels. Pure, so the rules are tested without the DOM. Times are Unix
 // seconds. Dates are local: "today" and the day boundaries are the machine's time zone.
 //
-// What a reopened conversation shows: user text, assistant text (markdown), and tool rows built from the assistant's
-// tool calls (name and arguments) joined with their tool messages. Not shown, because they are not stored: approval
-// cards, decision labels, UI notices, and raw tool results (only the projected text is kept).
+// What a reopened conversation shows: user text, assistant reasoning (a thinking block, when stored), assistant text
+// (markdown), and tool rows built from the assistant's tool calls (name and arguments) joined with their tool messages.
+// Not shown, because they are not stored: approval cards, decision labels, UI notices, and raw tool results (only the
+// projected text is kept).
 
 import type { ChatMessage, ConversationMeta, TodoItem } from './types';
 import type { NewItem, ToolStatus, UserAttachment } from './transcript';
@@ -21,6 +22,12 @@ const TODO_ERROR_PREFIX = 'error:';
  * also covers a tool message that carries the bare text.
  */
 export const DENIED_PREFIX = 'not_approved';
+
+/**
+ * The stored assistant message key for the model's reasoning, redacted (`REASONING_KEY` in src-tauri/src/core/chat/history.rs).
+ * It is not sent back to the model, so it only shows as a thinking block when the conversation is reopened.
+ */
+export const REASONING_KEY = 'watt_reasoning';
 
 /** The start of the synthetic close text the backend stores for a call with no result. See isFailure. */
 export const SKIPPED_PREFIX = 'skipped:';
@@ -193,8 +200,8 @@ function callsOf(toolCalls: unknown): ToolCall[] {
 /**
  * The transcript items for a saved conversation's messages, in order. A user message is a user item, with its attachments when
  * its content has any (see attachmentsOf), except a compacted summary seed (see COMPACT_SUMMARY_PREFIX), which is a muted
- * notice item with the text kept. An assistant message
- * gives an agent item (when it has text), then one tool item per tool call. Each tool item takes the content of the tool
+ * notice item with the text kept. An assistant message gives a thinking item first (when it has stored reasoning, see
+ * REASONING_KEY), then an agent item (when it has text), then one tool item per tool call. Each tool item takes the content of the tool
  * message with the same tool_call_id: failed when that content starts with `error:`, the DENIED prefix or `skipped:`, ok otherwise.
  * A call with no tool message is failed, with NO_RESULT_TEXT. Tool messages that answer no call are dropped. Empty
  * assistant text is skipped. A todo_write call gets no tool item (nor its tool message). It gives a todo_set item when it changes
@@ -226,6 +233,11 @@ export function itemsFromMessages(messages: ChatMessage[]): NewItem[] {
         items.push({ kind: 'user', clientId: 0, text, ...(attachments.length > 0 ? { attachments } : {}) });
       }
     } else if (m.role === 'assistant') {
+      // Stored reasoning has no times: ThinkingBlock labels it "Thought". The thinking_mode setting applies as it does live.
+      const reasoning = m[REASONING_KEY];
+      if (typeof reasoning === 'string' && reasoning.trim() !== '') {
+        items.push({ kind: 'thinking', text: reasoning, streaming: false });
+      }
       const text = textOf(m.content);
       if (text.trim() !== '') {
         items.push({ kind: 'agent', text, streaming: false });

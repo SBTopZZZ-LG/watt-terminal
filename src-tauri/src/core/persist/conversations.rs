@@ -28,6 +28,7 @@ use super::PersistError;
 use super::attachments::{AttachmentStore, SWEEP_GRACE};
 use super::workspace::{Workspace, is_hidden_or_control};
 use crate::core::chat::context::ContextUsage;
+use crate::core::chat::history::REASONING_KEY;
 use crate::core::chat::redact::Redactor;
 use crate::core::chat::todo::{self, Todo};
 use crate::core::settings::write_private_atomic;
@@ -555,9 +556,9 @@ fn truncate_title(line: String) -> String {
 }
 
 /// A copy of `messages` with the redactor applied to the text that could carry a secret: the `content` of every
-/// message, the text parts and document text of a message with attachments, and the `function.arguments` of every tool
-/// call. Ids, roles, names and structure are unchanged, and so are image thumbnails and every base64 value, which the
-/// redactor's patterns could otherwise corrupt.
+/// message, the text parts and document text of a message with attachments, the `function.arguments` of every tool
+/// call, and the stored reasoning (`REASONING_KEY`). Ids, roles, names and structure are unchanged, and so are image
+/// thumbnails and every base64 value, which the redactor's patterns could otherwise corrupt.
 pub fn redact_messages(messages: &[Value], redactor: &Redactor) -> Vec<Value> {
     messages
         .iter()
@@ -572,6 +573,9 @@ pub fn redact_messages(messages: &[Value], redactor: &Redactor) -> Vec<Value> {
                         }
                     }
                     _ => {}
+                }
+                if let Some(Value::String(reasoning)) = obj.get_mut(REASONING_KEY) {
+                    *reasoning = redactor.redact(reasoning);
                 }
                 if let Some(Value::Array(calls)) = obj.get_mut("tool_calls") {
                     for call in calls.iter_mut() {
@@ -881,6 +885,14 @@ mod tests {
         assert_eq!(out[0]["content"], "use [REDACTED] please");
         assert_eq!(out[1]["content"], "the key is [REDACTED]");
         assert_eq!(out[1]["tool_calls"][0]["function"]["arguments"], "{\"cmd\":\"echo [REDACTED]\"}");
+    }
+
+    #[test]
+    fn redaction_covers_the_stored_reasoning() {
+        let messages = vec![json!({"role": "assistant", "content": "ok", (REASONING_KEY): format!("I will use {SECRET}")})];
+        let out = redact_messages(&messages, &redactor());
+        assert_eq!(out[0][REASONING_KEY], "I will use [REDACTED]");
+        assert_eq!(out[0]["content"], "ok");
     }
 
     #[test]
