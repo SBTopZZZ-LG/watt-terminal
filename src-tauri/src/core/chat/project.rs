@@ -184,8 +184,8 @@ fn output_note(record: &Value) -> Option<String> {
 fn resized_note(record: &Value) -> Option<String> {
     let resized = record.get("resized").filter(|r| !r.is_null())?;
     let (from, to) = (resized.get("from"), resized.get("to"));
-    let advice = "Misaligned, wrapped, duplicated or \
-         partial lines in its output may come from that, not from the program. If it matters, rerun the command or use get_screen.";
+    let advice = "Misaligned, wrapped, duplicated, partial or \
+         missing lines in its output may come from that, not from the program. If it matters, rerun the command or use get_screen.";
     if from == to {
         return Some(format!(
             "The terminal was resized while this command ran (it ended at the same size {}). {advice}",
@@ -1315,8 +1315,8 @@ mod tests {
         let note = run(&back)["note"].as_str().expect("a note").to_string();
         assert_eq!(
             note,
-            "The terminal was resized while this command ran (it ended at the same size 24x80). Misaligned, wrapped, duplicated or \
-             partial lines in its output may come from that, not from the program. If it matters, rerun the command or use get_screen.",
+            "The terminal was resized while this command ran (it ended at the same size 24x80). Misaligned, wrapped, duplicated, partial or \
+             missing lines in its output may come from that, not from the program. If it matters, rerun the command or use get_screen.",
         );
     }
 
