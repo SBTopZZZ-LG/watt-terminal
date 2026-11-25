@@ -36,6 +36,15 @@ pub enum RecordStatus {
     Approximate,
 }
 
+/// The terminal was really resized (rows or columns changed) while the command ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Resize {
+    /// (rows, cols) before the first change during the command.
+    pub from: (u16, u16),
+    /// (rows, cols) when the command finished.
+    pub to: (u16, u16),
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Record {
     pub id: u64,
@@ -60,6 +69,12 @@ pub struct Record {
     #[serde(skip)]
     pub raw_tail: Vec<u8>,
     pub raw_truncated: bool,
+    /// Set when the terminal was really resized while the command ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resized: Option<Resize>,
+    /// True when the record is approximate for a reason besides a resize (a clear, a scroll region, or a nested shell
+    /// that was left while it ran).
+    pub approximate_other: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -73,6 +88,9 @@ pub struct RecordSummary {
     pub status: RecordStatus,
     pub used_alt_screen: bool,
     pub output_bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resized: Option<Resize>,
+    pub approximate_other: bool,
 }
 
 impl From<&Record> for RecordSummary {
@@ -87,6 +105,8 @@ impl From<&Record> for RecordSummary {
             status: r.status,
             used_alt_screen: r.used_alt_screen,
             output_bytes: r.output.len(),
+            resized: r.resized,
+            approximate_other: r.approximate_other,
         }
     }
 }

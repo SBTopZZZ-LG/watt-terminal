@@ -1790,6 +1790,8 @@ mod tests {
                 raw_head: Vec::new(),
                 raw_tail: Vec::new(),
                 raw_truncated: false,
+                resized: None,
+                approximate_other: false,
             },
         }
     }
