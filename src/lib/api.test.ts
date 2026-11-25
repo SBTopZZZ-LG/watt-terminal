@@ -49,6 +49,33 @@ describe('api.getAttachment', () => {
   });
 });
 
+describe('api.steerMessage and api.withdrawSteer', () => {
+  beforeEach(() => invoke.mockClear());
+
+  it('a text-only steer sends the id, the text and the queue mode, with no attachments field', () => {
+    void api.steerMessage(4, 'hello', [], 'one');
+    expect(invoke).toHaveBeenCalledWith('steer_message', { sessionId: 'main', id: 4, text: 'hello', mode: 'one' });
+    expect(invoke.mock.calls[0][1]).not.toHaveProperty('attachments');
+  });
+
+  it('the mode defaults to all', () => {
+    void api.steerMessage(4, 'hello');
+    expect(invoke.mock.calls[0][1]).toMatchObject({ mode: 'all' });
+  });
+
+  it('attachments are sent as given, and the transcript-only sha256 is not', () => {
+    void api.steerMessage(5, '', [{ ...IMAGE, sha256: 'e'.repeat(64) }], 'all');
+    const args = invoke.mock.calls[0][1] as { attachments: Record<string, unknown>[] };
+    expect(args.attachments).toEqual([IMAGE]);
+    expect(args.attachments[0]).not.toHaveProperty('sha256');
+  });
+
+  it('withdrawSteer asks the session to take the message back by its id', () => {
+    void api.withdrawSteer(6);
+    expect(invoke).toHaveBeenCalledWith('withdraw_steer', { sessionId: 'main', id: 6 });
+  });
+});
+
 describe('api.listCommands', () => {
   beforeEach(() => invoke.mockClear());
 

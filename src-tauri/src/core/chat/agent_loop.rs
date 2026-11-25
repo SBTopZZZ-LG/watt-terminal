@@ -27,13 +27,13 @@ use std::time::Duration;
 use reqwest::header::{HeaderName, HeaderValue};
 use serde_json::{Value, json};
 
-use crate::core::agent::{Agent, AgentCtx, AgentEvent, RunApproval, DENIED, UserMessage};
+use crate::core::agent::{Agent, AgentCtx, AgentEvent, RunApproval, Steer, SteerItem, DENIED, UserMessage};
 use crate::core::env::env_setting;
 use crate::core::external_tools::{ExternalApproval, ExternalToolHost};
 use crate::core::foreground::{Foreground, ForegroundKind};
-use crate::core::chat::attachments::{Resolver, user_content};
+use crate::core::chat::attachments::{Attachment, Resolver, transcript_view, user_content};
 use crate::core::chat::context::{self, Calibrator, ContextUsage};
-use crate::core::chat::history::History;
+use crate::core::chat::history::{History, STEER_SKIPPED};
 use crate::core::chat::instructions;
 use crate::core::chat::project::project;
 use crate::core::chat::prompt;
@@ -960,7 +960,9 @@ impl LlmAgent {
     }
 
     /// Runs the tool calls of one reply in order and records each result. Returns why the turn must stop, if it must.
-    /// The calls after a stop are not run; the caller closes them in the history.
+    /// The calls after a stop are not run; the caller closes them in the history. `Stop::Steered` is not a stop of the turn:
+    /// a steer waits after a finished call, so the calls after it are skipped and the steer goes in at the next step (see
+    /// `respond`). A running call is never interrupted: the steer is looked at only between calls.
     fn run_calls(
         &self,
         calls: &[ToolCall],
@@ -969,7 +971,7 @@ impl LlmAgent {
         writes: &mut u32,
         skills_granted: &mut HashSet<String>,
     ) -> Option<Stop> {
-        for call in calls {
+        for (index, call) in calls.iter().enumerate() {
             if self.cancel.is_cancelled() {
                 return Some(Stop::Cancelled);
             }
@@ -981,8 +983,31 @@ impl LlmAgent {
             if denied && !ctx.continue_on_denied() {
                 return Some(Stop::Denied);
             }
+            if index + 1 < calls.len() && ctx.steer().is_some_and(Steer::pending) {
+                return Some(Stop::Steered);
+            }
         }
         None
+    }
+
+    /// Takes the waiting steers into the history as one user message, and tells the transcript. `batch` is never empty.
+    /// The text is the steers' texts joined by a blank line (empty texts left out), and the attachments are all of them, in
+    /// order: the same join as the queue's drain.
+    fn inject(&self, batch: Vec<SteerItem>, ctx: &AgentCtx<'_>) {
+        let ids: Vec<u64> = batch.iter().map(|item| item.id).collect();
+        let text = batch.iter().map(|item| item.text.as_str()).filter(|t| !t.is_empty()).collect::<Vec<_>>().join("\n\n");
+        let attachments: Vec<Attachment> = batch.into_iter().flat_map(|item| item.attachments).collect();
+        let content = user_content(&text, &attachments, &self.redactor);
+        lock(&self.history).push_steer_content(content);
+        ctx.emit(AgentEvent::SteerInjected { ids, text, attachments: transcript_view(&attachments) });
+    }
+
+    /// Injects what the mailbox holds now, if anything. The mailbox stays open: the turn goes on.
+    fn inject_waiting(&self, ctx: &AgentCtx<'_>) {
+        let batch = ctx.steer().map(Steer::take).unwrap_or_default();
+        if !batch.is_empty() {
+            self.inject(batch, ctx);
+        }
     }
 
     /// Runs one call. Returns the model-facing text of its result and whether the user denied it.
@@ -1134,7 +1159,16 @@ impl Agent for LlmAgent {
             };
             lock(&self.history).push_assistant(reply.raw);
             if reply.tool_calls.is_empty() {
-                return;
+                // A steer that is waiting continues the turn: it goes in, and the model is asked again. Otherwise the mailbox
+                // closes in the same step as this check, so no steer can land after it and be lost (see `Steer::take_or_close`).
+                match ctx.steer().and_then(Steer::take_or_close) {
+                    Some(batch) => {
+                        self.inject(batch, ctx);
+                        self.save_checkpoint();
+                        continue;
+                    }
+                    None => return,
+                }
             }
             // The calls are on record but not yet run: a restart from this checkpoint loads the unanswered call, and
             // the repair closes it (see `History::from_messages`). The post-run checkpoint below still saves the results.
@@ -1151,8 +1185,12 @@ impl Agent for LlmAgent {
                 if stop == Stop::Denied {
                     ctx.say(DENIED_NOTICE);
                 }
-                return;
+                if stop != Stop::Steered {
+                    return;
+                }
             }
+            // The steers that arrived during the calls go in after their results, before the next model call.
+            self.inject_waiting(ctx);
             self.save_checkpoint();
         }
     }
@@ -1255,11 +1293,13 @@ fn asked(reply: Option<AssistantReply>) -> Asked {
     reply.map_or(Asked::Ended, Asked::Reply)
 }
 
-/// Why a turn stopped before the model answered.
+/// Why the calls of a reply stopped before all ran. `Steered` does not end the turn: the calls after it are closed and the
+/// steer goes in (see `run_calls`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Stop {
     Denied,
     Cancelled,
+    Steered,
 }
 
 impl Stop {
@@ -1267,6 +1307,7 @@ impl Stop {
         match self {
             Stop::Denied => "denied by the user",
             Stop::Cancelled => "cancelled",
+            Stop::Steered => STEER_SKIPPED,
         }
     }
 }

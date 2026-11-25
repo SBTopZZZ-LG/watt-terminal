@@ -333,6 +333,12 @@ describe('InputBar: the queue', () => {
     expect(render({ queue: QUEUED, queueMode: 'one' })).toContain('Queued · sent one at a time when the agent finishes');
   });
 
+  it('a steered row changes the header to the next-step wording, by mode', () => {
+    const steered: QueuedMessage[] = [{ ...QUEUED[0], steered: true }, QUEUED[1]];
+    expect(render({ queue: steered, queueMode: 'all' })).toContain('class="bar-queue-head">Will be sent at the agent&#x27;s next step</span>');
+    expect(render({ queue: steered, queueMode: 'one' })).toContain("Will be sent one at a time at the agent&#x27;s next step");
+  });
+
   it('the remove buttons are disabled while the bar is locked', () => {
     const html = render({ queue: QUEUED, queueMode: 'all', locked: true });
     expect(tagHolding(html, 'button', 'bar-queue-remove')).toContain('disabled=""');

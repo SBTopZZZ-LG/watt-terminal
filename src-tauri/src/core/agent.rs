@@ -375,7 +375,129 @@ pub enum AgentEvent {
     /// the reply is made again (see core/chat/agent_loop). The transcript removes what that call showed: its streamed text,
     /// and its thinking block. Earlier items stay. The wire type is `reply_discarded`.
     ReplyDiscarded,
+    /// Steered messages were taken into the running turn at a step boundary (see `Steer`). Their user message goes into the
+    /// transcript here. `text` is the joined text of `ids`, and `attachments` is their transcript view (see
+    /// `attachments::transcript_view`). The wire type is `steer_injected`.
+    SteerInjected { ids: Vec<u64>, text: String, attachments: Vec<Value> },
+    /// Steered messages that did not reach the turn (it ended, or was cancelled) are given back. The frontend queues them as
+    /// ordinary queued messages. The wire type is `steer_returned`.
+    SteerReturned { ids: Vec<u64> },
     Done,
+}
+
+/// How many waiting steers one injection takes: `All` takes them all, as one message; `One` takes the first alone.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SteerMode {
+    #[default]
+    All,
+    One,
+}
+
+impl SteerMode {
+    /// The mode named by the frontend: "all" or "one".
+    pub fn parse(text: &str) -> Result<Self, String> {
+        match text {
+            "all" => Ok(SteerMode::All),
+            "one" => Ok(SteerMode::One),
+            other => Err(format!("unknown queue mode {other}")),
+        }
+    }
+}
+
+/// A user message sent while a turn runs, waiting for the turn's next step. `id` is the frontend's id for it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SteerItem {
+    pub id: u64,
+    pub text: String,
+    pub attachments: Vec<Attachment>,
+}
+
+/// The steer mailbox of a turn: the messages sent while it runs, taken at its step boundaries (core/chat/agent_loop). It is
+/// open from the start of a turn until the turn's end, and a message is accepted only while it is open. Closing it and
+/// finding it empty happen under one lock (`take_or_close`), so no message can land between the last check and the end.
+#[derive(Debug, Default)]
+pub struct Steer {
+    state: Mutex<SteerState>,
+}
+
+#[derive(Debug, Default)]
+struct SteerState {
+    open: bool,
+    items: Vec<SteerItem>,
+    /// The mode of the latest accepted message. It decides how many items a take gives.
+    mode: SteerMode,
+}
+
+impl Steer {
+    fn state(&self) -> MutexGuard<'_, SteerState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Opens the mailbox for a turn that is starting.
+    pub fn open(&self) {
+        self.state().open = true;
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.state().open
+    }
+
+    /// Accepts a message, with the mode it was sent under. False when the mailbox is closed: no turn is running, the turn is
+    /// ending, or a side command holds the slot (its mailbox is never opened).
+    pub fn accept(&self, item: SteerItem, mode: SteerMode) -> bool {
+        let mut state = self.state();
+        if !state.open {
+            return false;
+        }
+        state.mode = mode;
+        state.items.push(item);
+        true
+    }
+
+    /// Removes a waiting message. True when it was still waiting; false when it was already taken (or never accepted).
+    pub fn withdraw(&self, id: u64) -> bool {
+        let mut state = self.state();
+        let before = state.items.len();
+        state.items.retain(|item| item.id != id);
+        state.items.len() != before
+    }
+
+    /// Whether a message is waiting.
+    pub fn pending(&self) -> bool {
+        !self.state().items.is_empty()
+    }
+
+    /// Takes what the mode gives from the waiting messages (none when nothing waits). The mailbox stays open.
+    pub fn take(&self) -> Vec<SteerItem> {
+        take_by_mode(&mut self.state())
+    }
+
+    /// The loop's last check at the end of a reply with no tool calls: takes what the mode gives, or, when nothing waits,
+    /// closes the mailbox and returns None. One step under the lock, so nothing can be accepted in between.
+    pub fn take_or_close(&self) -> Option<Vec<SteerItem>> {
+        let mut state = self.state();
+        if state.items.is_empty() {
+            state.open = false;
+            return None;
+        }
+        Some(take_by_mode(&mut state))
+    }
+
+    /// Closes the mailbox and returns everything still in it: the turn's end, or a cancel. Nothing is accepted afterwards.
+    pub fn close_and_take(&self) -> Vec<SteerItem> {
+        let mut state = self.state();
+        state.open = false;
+        std::mem::take(&mut state.items)
+    }
+}
+
+/// The items the state's mode takes from the front of the waiting list.
+fn take_by_mode(state: &mut SteerState) -> Vec<SteerItem> {
+    let count = match state.mode {
+        SteerMode::All => state.items.len(),
+        SteerMode::One => state.items.len().min(1),
+    };
+    state.items.drain(..count).collect()
 }
 
 static NEXT_CALL: AtomicU64 = AtomicU64::new(1);
@@ -427,6 +549,8 @@ pub struct AgentCtx<'a> {
     rules: TurnRules,
     /// The host of tools the app does not own, and the turn's cancel token it is given (see `with_external_tools`).
     external: Option<(&'a dyn ExternalToolHost, &'a TurnCancel)>,
+    /// The turn's steer mailbox (see `with_steer`). None: no message can be steered into this turn.
+    steer: Option<&'a Steer>,
     emit: &'a dyn Fn(AgentEvent),
 }
 
@@ -435,7 +559,18 @@ static MANUAL: ManualPolicy = ManualPolicy;
 
 impl<'a> AgentCtx<'a> {
     pub fn new(tools: &'a dyn AgentTools, approvals: &'a ApprovalGate, emit: &'a dyn Fn(AgentEvent)) -> Self {
-        AgentCtx { tools, approvals, policy: &MANUAL, rules: TurnRules::default(), external: None, emit }
+        AgentCtx { tools, approvals, policy: &MANUAL, rules: TurnRules::default(), external: None, steer: None, emit }
+    }
+
+    /// Uses `steer` as the turn's mailbox: the messages steered into it are taken at the turn's step boundaries.
+    pub fn with_steer(mut self, steer: &'a Steer) -> Self {
+        self.steer = Some(steer);
+        self
+    }
+
+    /// The turn's steer mailbox, if one is attached (see `with_steer`).
+    pub fn steer(&self) -> Option<&'a Steer> {
+        self.steer
     }
 
     /// Offers the tools of `host` (core/external_tools) to the model and gates their calls. `cancel` is the turn's token,
@@ -1463,6 +1598,79 @@ mod tests {
 
     fn named(name: &str, decision: &'static str, ok: bool) -> (String, &'static str, bool) {
         (name.to_string(), decision, ok)
+    }
+
+    fn steer_item(id: u64, text: &str) -> SteerItem {
+        SteerItem { id, text: text.into(), attachments: Vec::new() }
+    }
+
+    #[test]
+    fn a_steer_is_accepted_only_while_the_mailbox_is_open() {
+        let steer = Steer::default();
+        assert!(!steer.accept(steer_item(1, "too early"), SteerMode::All), "no turn yet");
+        steer.open();
+        assert!(steer.accept(steer_item(2, "during"), SteerMode::All));
+        assert!(steer.pending());
+        // The loop's last check: the waiting steer is taken and the mailbox stays open for the next one.
+        assert_eq!(steer.take_or_close().map(|batch| batch.len()), Some(1));
+        assert!(steer.is_open());
+        // Nothing waits: the check closes the mailbox, and a later message is refused.
+        assert_eq!(steer.take_or_close(), None);
+        assert!(!steer.is_open());
+        assert!(!steer.accept(steer_item(3, "after the end"), SteerMode::All));
+    }
+
+    #[test]
+    fn closing_returns_what_is_still_waiting_and_refuses_the_rest() {
+        let steer = Steer::default();
+        steer.open();
+        steer.accept(steer_item(1, "a"), SteerMode::All);
+        steer.accept(steer_item(2, "b"), SteerMode::All);
+        let left: Vec<u64> = steer.close_and_take().iter().map(|item| item.id).collect();
+        assert_eq!(left, vec![1, 2]);
+        assert!(!steer.is_open());
+        assert!(steer.close_and_take().is_empty(), "a second close finds nothing");
+        assert!(!steer.accept(steer_item(3, "late"), SteerMode::All));
+    }
+
+    #[test]
+    fn withdraw_is_true_only_while_the_message_still_waits() {
+        let steer = Steer::default();
+        steer.open();
+        steer.accept(steer_item(1, "a"), SteerMode::All);
+        assert!(steer.withdraw(1));
+        assert!(!steer.withdraw(1), "already withdrawn");
+        steer.accept(steer_item(2, "b"), SteerMode::All);
+        assert_eq!(steer.take().iter().map(|item| item.id).collect::<Vec<_>>(), vec![2]);
+        assert!(!steer.withdraw(2), "already taken into the turn");
+    }
+
+    #[test]
+    fn mode_one_takes_the_first_message_and_all_takes_every_one() {
+        let steer = Steer::default();
+        steer.open();
+        steer.accept(steer_item(1, "a"), SteerMode::One);
+        steer.accept(steer_item(2, "b"), SteerMode::One);
+        assert_eq!(steer.take().iter().map(|item| item.id).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(steer.take().iter().map(|item| item.id).collect::<Vec<_>>(), vec![2]);
+        assert!(steer.take().is_empty());
+        // The latest accepted message sets the mode.
+        steer.accept(steer_item(3, "c"), SteerMode::One);
+        steer.accept(steer_item(4, "d"), SteerMode::All);
+        assert_eq!(steer.take().iter().map(|item| item.id).collect::<Vec<_>>(), vec![3, 4]);
+        assert_eq!(SteerMode::parse("one"), Ok(SteerMode::One));
+        assert_eq!(SteerMode::parse("all"), Ok(SteerMode::All));
+        assert!(SteerMode::parse("some").is_err());
+    }
+
+    #[test]
+    fn steer_events_use_the_wire_names() {
+        let wire = |e: AgentEvent| serde_json::to_value(&e).unwrap();
+        assert_eq!(
+            wire(AgentEvent::SteerInjected { ids: vec![4, 5], text: "a\n\nb".into(), attachments: vec![json!({"kind": "file", "name": "n.txt", "bytes": 3})] }),
+            json!({"type": "steer_injected", "ids": [4, 5], "text": "a\n\nb", "attachments": [{"kind": "file", "name": "n.txt", "bytes": 3}]})
+        );
+        assert_eq!(wire(AgentEvent::SteerReturned { ids: vec![4] }), json!({"type": "steer_returned", "ids": [4]}));
     }
 
     #[test]

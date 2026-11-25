@@ -24,6 +24,7 @@ import type {
   ModelRef,
   ProviderPreset,
   QuestionAnswerInput,
+  QueueMode,
   RecoverAction,
   SaveProviderInput,
   SettingsView,
@@ -75,6 +76,21 @@ export const api = {
     // `sha256` is for the transcript only (see AttachmentInput), so it is not sent.
     const wire = attachments.map(({ sha256: _sha256, ...rest }) => rest);
     return invoke<void>('agent_message', wire.length > 0 ? { sessionId: SESSION_ID, text, attachments: wire } : { sessionId: SESSION_ID, text });
+  },
+  /**
+   * Steers a message into the running agent turn: it goes in at the turn's next step. Resolves true when accepted, false when
+   * not (no agent turn running, the turn ending, or a side command running): the caller then queues it as before. `mode` is
+   * the queue mode: `all` sends every waiting message together, `one` the first alone.
+   */
+  steerMessage(id: number, text: string, attachments: AttachmentInput[] = [], mode: QueueMode = 'all') {
+    // As for agentMessage, `sha256` is for the transcript only, so it is not sent.
+    const wire = attachments.map(({ sha256: _sha256, ...rest }) => rest);
+    const args = wire.length > 0 ? { sessionId: SESSION_ID, id, text, attachments: wire, mode } : { sessionId: SESSION_ID, id, text, mode };
+    return invoke<boolean>('steer_message', args);
+  },
+  /** Takes a steered message back. True when it was still waiting, false when the turn had already taken it. */
+  withdrawSteer(id: number) {
+    return invoke<boolean>('withdraw_steer', { sessionId: SESSION_ID, id });
   },
   /** Cancels the running agent turn, if any. Harmless when none is running. */
   cancelAgent() {

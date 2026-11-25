@@ -3,7 +3,7 @@ import type { ChangeEvent, ClipboardEvent as ReactClipboardEvent, DragEvent as R
 import { barKeyIntent } from '../lib/inputState';
 import type { BarMode } from '../lib/inputState';
 import { agentPlaceholder, History, historyKeyTakesLine, messageFor, sendButtonFor } from '../lib/barInput';
-import { queuedAttachmentNote, queueHeader, restoreText } from '../lib/messageQueue';
+import { isSteering, queuedAttachmentNote, queueHeader, restoreText } from '../lib/messageQueue';
 import type { QueuedMessage } from '../lib/messageQueue';
 import { BYPASS_LABEL } from '../lib/approvalReasons';
 import { acceptMenuItem, commandMenuItems, filterCommandMenu, menuAcceptRuns, menuKeyIntent, menuQuery, moveMenuIndex } from '../lib/commandMenu';
@@ -79,7 +79,10 @@ interface Props {
   queueMode: QueueMode;
   /** A send now is queued rather than sent (the agent is mid-turn, and no side command runs). Only sets the placeholder. */
   queueable: boolean;
-  /** Takes a queued message back: returns it, or null when it is gone. Its text goes back into the input, selected. */
+  /**
+   * Takes a queued message back: returns it, or null when it is gone. Its text goes back into the input, selected. Null too
+   * for a steered message: the app asks the turn first and restores it itself (through the same restore as Stop).
+   */
   onUnqueue: (id: number) => QueuedMessage | null;
   /**
    * Queued messages the app took back without a click (a Stop, or a restart): they come into the input as an unqueue
@@ -695,7 +698,7 @@ export function InputBar(props: Props) {
       {mode === 'chat' && approvalChip(false)}
       {mode === 'chat' && props.queue.length > 0 && (
         <div className="bar-queue">
-          <span className="bar-queue-head">{queueHeader(props.queueMode)}</span>
+          <span className="bar-queue-head">{queueHeader(props.queueMode, isSteering(props.queue))}</span>
           {props.queue.map((q) => (
             <div key={q.id} className="bar-queue-item">
               <span className="bar-queue-text" data-tip={q.text === '' ? 'Attachments only' : q.text} data-tip-clip="">

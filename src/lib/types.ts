@@ -158,7 +158,24 @@ export type AgentEvent =
   | { type: 'notice'; text: string }
   /** The model call on screen was discarded: a command finished before its reply was acted on. The call is made again. */
   | { type: 'reply_discarded' }
+  /**
+   * Steered messages went into the running turn at its next step (after the running tool call). `ids` are the frontend ids
+   * taken, `text` their joined text, `attachments` their transcript view (the UserAttachment shape: no document text).
+   */
+  | { type: 'steer_injected'; ids: number[]; text: string; attachments: SteerAttachmentView[] }
+  /** Steered messages that did not reach the turn (the turn ended or was cancelled) are given back; they are queued again. */
+  | { type: 'steer_returned'; ids: number[] }
   | { type: 'done' };
+
+/** A steered message's attachment as the transcript shows it (src-tauri/src/core/chat/attachments.rs, transcript_view). */
+export interface SteerAttachmentView {
+  kind: 'image' | 'file';
+  name: string;
+  bytes: number;
+  thumb?: string;
+  sha256?: string;
+  mime?: string;
+}
 
 /** The context usage of one model request (core/chat/context). `used` is the estimate, or the provider's count once `calibrated`. */
 export interface ContextUsage {

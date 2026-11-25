@@ -1,5 +1,18 @@
 import { describe, expect, it } from 'vitest';
-import { drainBatch, enqueue, queueHeader, queuedAttachmentNote, removeQueued, restoreText, shouldDrain } from './messageQueue';
+import {
+  drainBatch,
+  enqueue,
+  isSteering,
+  markSteered,
+  queueHeader,
+  queuedAttachmentNote,
+  removeInjected,
+  removeQueued,
+  restoreText,
+  shouldDrain,
+  takeWithdrawn,
+  unsteer,
+} from './messageQueue';
 import type { QueuedMessage } from './messageQueue';
 import type { AttachmentInput } from './types';
 
@@ -96,10 +109,67 @@ describe('shouldDrain', () => {
   });
 });
 
+describe('steering rows', () => {
+  const steered = (id: number, text: string): QueuedMessage => ({ ...q(id, text), steered: true });
+
+  it('markSteered marks only the row with the id', () => {
+    expect(markSteered([q(1, 'a'), q(2, 'b')], 2)).toEqual([q(1, 'a'), steered(2, 'b')]);
+  });
+
+  it('markSteered on a row that is gone changes nothing', () => {
+    const queue = [q(1, 'a')];
+    expect(markSteered(queue, 9)).toEqual([q(1, 'a')]);
+  });
+
+  it('unsteer turns the named rows back into plain queued messages, in place', () => {
+    const queue = [steered(1, 'a'), steered(2, 'b'), q(3, 'c')];
+    expect(unsteer(queue, [2])).toEqual([steered(1, 'a'), { ...q(2, 'b'), steered: false }, q(3, 'c')]);
+    expect(unsteer(queue, [2])[1].steered).toBe(false);
+  });
+
+  it('removeInjected drops the taken rows and keeps the rest in order', () => {
+    const queue = [steered(1, 'a'), q(2, 'b'), steered(3, 'c')];
+    expect(removeInjected(queue, [1, 3])).toEqual([q(2, 'b')]);
+  });
+
+  it('removeInjected with ids that have no row (restored by Stop) changes nothing', () => {
+    const queue = [q(2, 'b')];
+    expect(removeInjected(queue, [7])).toEqual([q(2, 'b')]);
+    expect(removeInjected([], [7])).toEqual([]);
+  });
+
+  it('isSteering is true while any row is steered', () => {
+    expect(isSteering([q(1, 'a'), steered(2, 'b')])).toBe(true);
+    expect(isSteering([q(1, 'a')])).toBe(false);
+    expect(isSteering([])).toBe(false);
+  });
+});
+
+describe('takeWithdrawn', () => {
+  it('a message the turn had not taken is removed and returned', () => {
+    const queue = [q(1, 'a'), { ...q(2, 'b'), steered: true }];
+    expect(takeWithdrawn(queue, 2, true)).toEqual({ queue: [q(1, 'a')], removed: { ...q(2, 'b'), steered: true } });
+  });
+
+  it('a message the turn already took stays as it is: nothing is removed here', () => {
+    const queue = [{ ...q(2, 'b'), steered: true }];
+    expect(takeWithdrawn(queue, 2, false)).toEqual({ queue, removed: null });
+  });
+
+  it('a row that is gone stays gone, whatever the answer', () => {
+    expect(takeWithdrawn([], 2, true)).toEqual({ queue: [], removed: null });
+  });
+});
+
 describe('labels', () => {
-  it('the header names the mode', () => {
-    expect(queueHeader('all')).toBe('Queued · sent together when the agent finishes');
-    expect(queueHeader('one')).toBe('Queued · sent one at a time when the agent finishes');
+  it('the header names the mode, for queued rows', () => {
+    expect(queueHeader('all', false)).toBe('Queued · sent together when the agent finishes');
+    expect(queueHeader('one', false)).toBe('Queued · sent one at a time when the agent finishes');
+  });
+
+  it('the header says the messages go in at the next step, for steered rows', () => {
+    expect(queueHeader('all', true)).toBe("Will be sent at the agent's next step");
+    expect(queueHeader('one', true)).toBe("Will be sent one at a time at the agent's next step");
   });
 
   it('the attachment note is singular for one', () => {

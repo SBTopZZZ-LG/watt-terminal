@@ -231,6 +231,24 @@ pub fn user_content(text: &str, attachments: &[Attachment], redactor: &Redactor)
     Value::Array(parts)
 }
 
+/// What the transcript shows of a message's attachments, in the shape the UI keeps for a sent message: an image with its
+/// size, thumbnail and stored address, a document with its name and size. A document's text is not included.
+pub fn transcript_view(attachments: &[Attachment]) -> Vec<Value> {
+    attachments
+        .iter()
+        .map(|attachment| match attachment {
+            Attachment::Image { sha256, mime, name, bytes, thumb, .. } => {
+                let mut view = json!({"kind": "image", "name": name, "bytes": bytes, "sha256": sha256, "mime": mime});
+                if let Some(thumb) = thumb {
+                    view["thumb"] = json!(thumb);
+                }
+                view
+            }
+            Attachment::File { name, bytes, .. } => json!({"kind": "file", "name": name, "bytes": bytes}),
+        })
+        .collect()
+}
+
 /// True for a part this build knows, with the fields it needs. `repair_part` keeps those and drops the rest.
 pub fn repair_part(part: &Value) -> Option<Value> {
     match part.get("type")?.as_str()? {
