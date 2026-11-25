@@ -1,7 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
 import type { KeyboardEvent, MouseEvent, ReactNode } from 'react';
 import { createPortal } from 'react-dom';
-import { api } from '../lib/api';
+import { api, CHAT_ID } from '../lib/api';
 import { fitImage } from '../lib/imageViewer';
 import type { Size } from '../lib/imageViewer';
 
@@ -102,7 +102,8 @@ export function ImageViewer({ image, onClose, host }: { image: ViewerImage; onCl
       return;
     }
     let live = true;
-    api.getAttachment(sha256, mime).then(
+    // TODO(multi-chat D2): the chat the image's conversation belongs to. The default chat until then.
+    api.getAttachment(CHAT_ID, sha256, mime).then(
       (url) => {
         if (live) {
           setFull(url);

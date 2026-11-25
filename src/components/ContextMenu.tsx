@@ -1,7 +1,7 @@
 import { useContext, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { flushSync } from 'react-dom';
 import type { Ref } from 'react';
-import { api, CHAT_ID } from '../lib/api';
+import { api } from '../lib/api';
 import { copyText, readClipboardText } from '../lib/clipboard';
 import { edgeIndex, menuFor, menuKey, menuPlacement, stepIndex, typeaheadIndex, withLayoutInspector } from '../lib/contextMenu';
 import type { MenuItem } from '../lib/contextMenu';
@@ -37,6 +37,8 @@ export interface ContextMenuProps {
   devtools: boolean;
   /** Restarts a terminal's shell, as the strip's tab menu asks (App runs the chat's restart steps). */
   onRestartTab: (id: string) => void;
+  /** The active chat: the tab items say whether the terminal is visible to it, and the visibility item assigns to it. */
+  chatId: string;
 }
 
 interface OpenMenu {
@@ -60,12 +62,12 @@ function terminalFacts(t: ContextMenuProps['terminal'], term: Terminal | null): 
 }
 
 /** What the tab registry says about a terminal, for its tab items. Null for an id with no terminal. */
-function tabFactsOf(id: string): TabFacts | null {
+function tabFactsOf(id: string, chatId: string): TabFacts | null {
   const tab = tabs.get(id);
   if (tab === undefined) {
     return null;
   }
-  return { visible: isOwnedByChat(tab.getSnapshot().owner, CHAT_ID), canClose: tabs.getSnapshot().ids.length > 1 };
+  return { visible: isOwnedByChat(tab.getSnapshot().owner, chatId), canClose: tabs.getSnapshot().ids.length > 1 };
 }
 
 /** Shift+F10 and the Menu key open the menu from the keyboard. */
@@ -191,7 +193,7 @@ async function runAction(id: MenuItem['id'], snap: MenuSnapshot, props: ContextM
     case 'tab-visibility':
       // The registry shows a refusal (a busy chat that would lose the terminal) and re-reads the owners.
       if (snap.tabId !== null) {
-        await tabs.assign(snap.tabId, !snap.ctx.tabVisible);
+        await tabs.assign(snap.tabId, !snap.ctx.tabVisible, props.chatId);
       }
       return;
     case 'tab-restart':
@@ -358,7 +360,7 @@ export function ContextMenu(props: ContextMenuProps) {
       if (!e.shiftKey && target.closest('.xterm') !== null && (latestTerm.current?.modes.mouseTrackingMode ?? 'none') !== 'none') {
         return;
       }
-      const snap = resolveMenu(target, terminalFacts(latest.current.terminal, latestTerm.current), origin, tabFactsOf);
+      const snap = resolveMenu(target, terminalFacts(latest.current.terminal, latestTerm.current), origin, (id) => tabFactsOf(id, latest.current.chatId));
       if (snap !== null) {
         show(snap, { x: e.clientX, y: e.clientY }, false);
       }
@@ -378,7 +380,7 @@ export function ContextMenu(props: ContextMenuProps) {
         if (!(el instanceof HTMLElement)) {
           return;
         }
-        const snap = resolveMenu(el, terminalFacts(latest.current.terminal, latestTerm.current), el, tabFactsOf);
+        const snap = resolveMenu(el, terminalFacts(latest.current.terminal, latestTerm.current), el, (id) => tabFactsOf(id, latest.current.chatId));
         if (snap !== null) {
           show(snap, pointBelow(el), true);
         }

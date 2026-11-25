@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState } from 'react';
-import { api, errorText } from '../lib/api';
+import { api, CHAT_ID, errorText } from '../lib/api';
 import { capDisplay, displayText } from '../lib/keysDisplay';
 import {
   FOLDER_STATUS_LABEL,
@@ -461,7 +461,8 @@ export function SkillsTab({ active }: { active: boolean }) {
   const read = () => {
     const my = ++seq.current;
     setLoading(true);
-    api.listSkills().then(
+    // TODO(multi-chat D2): the chat whose skills these are. The default chat until then.
+    api.listSkills(CHAT_ID).then(
       (v) => {
         if (my > applied.current) {
           applied.current = my;

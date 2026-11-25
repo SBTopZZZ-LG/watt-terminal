@@ -15,24 +15,24 @@ describe('api.agentMessage', () => {
   beforeEach(() => invoke.mockClear());
 
   it('a text-only send is the same call as before: no attachments field', () => {
-    void api.agentMessage('hello');
+    void api.agentMessage('main', 'hello');
     expect(invoke).toHaveBeenCalledWith('agent_message', { chatId: 'main', text: 'hello' });
     const args = invoke.mock.calls[0][1] ?? {};
     expect(args).not.toHaveProperty('attachments');
   });
 
   it('an empty attachments list leaves the field out too', () => {
-    void api.agentMessage('hello', []);
+    void api.agentMessage('main', 'hello', []);
     expect(invoke.mock.calls[0][1]).toEqual({ chatId: 'main', text: 'hello' });
   });
 
   it('attachments are sent as given, with the text (which may be empty)', () => {
-    void api.agentMessage('', [IMAGE]);
+    void api.agentMessage('main', '', [IMAGE]);
     expect(invoke).toHaveBeenCalledWith('agent_message', { chatId: 'main', text: '', attachments: [IMAGE] });
   });
 
   it('the transcript-only sha256 of an image is not sent', () => {
-    void api.agentMessage('', [{ ...IMAGE, sha256: 'e'.repeat(64) }]);
+    void api.agentMessage('main', '', [{ ...IMAGE, sha256: 'e'.repeat(64) }]);
     const args = invoke.mock.calls[0][1] as { attachments: Record<string, unknown>[] };
     expect(args.attachments).toEqual([IMAGE]);
     expect(args.attachments[0]).not.toHaveProperty('sha256');
@@ -44,7 +44,7 @@ describe('api.getAttachment', () => {
 
   it('asks the session for the stored image by its address and type', () => {
     const sha = 'f'.repeat(64);
-    void api.getAttachment(sha, 'image/png');
+    void api.getAttachment('main', sha, 'image/png');
     expect(invoke).toHaveBeenCalledWith('get_attachment', { chatId: 'main', sha256: sha, mime: 'image/png' });
   });
 });
@@ -53,25 +53,25 @@ describe('api.steerMessage and api.withdrawSteer', () => {
   beforeEach(() => invoke.mockClear());
 
   it('a text-only steer sends the id, the text and the queue mode, with no attachments field', () => {
-    void api.steerMessage(4, 'hello', [], 'one');
+    void api.steerMessage('main', 4, 'hello', [], 'one');
     expect(invoke).toHaveBeenCalledWith('steer_message', { chatId: 'main', id: 4, text: 'hello', mode: 'one' });
     expect(invoke.mock.calls[0][1]).not.toHaveProperty('attachments');
   });
 
   it('the mode defaults to all', () => {
-    void api.steerMessage(4, 'hello');
+    void api.steerMessage('main', 4, 'hello');
     expect(invoke.mock.calls[0][1]).toMatchObject({ mode: 'all' });
   });
 
   it('attachments are sent as given, and the transcript-only sha256 is not', () => {
-    void api.steerMessage(5, '', [{ ...IMAGE, sha256: 'e'.repeat(64) }], 'all');
+    void api.steerMessage('main', 5, '', [{ ...IMAGE, sha256: 'e'.repeat(64) }], 'all');
     const args = invoke.mock.calls[0][1] as { attachments: Record<string, unknown>[] };
     expect(args.attachments).toEqual([IMAGE]);
     expect(args.attachments[0]).not.toHaveProperty('sha256');
   });
 
   it('withdrawSteer asks the session to take the message back by its id', () => {
-    void api.withdrawSteer(6);
+    void api.withdrawSteer('main', 6);
     expect(invoke).toHaveBeenCalledWith('withdraw_steer', { chatId: 'main', id: 6 });
   });
 });
@@ -90,7 +90,7 @@ describe('api.answerQuestions', () => {
 
   it('answers the waiting question with its call id and answers', () => {
     const answers = [{ question_id: 'q1', selected: [0], skipped: false }];
-    void api.answerQuestions('call-1', answers);
+    void api.answerQuestions('main', 'call-1', answers);
     expect(invoke).toHaveBeenCalledWith('answer_questions', { chatId: 'main', callId: 'call-1', answers });
   });
 });
@@ -119,12 +119,12 @@ describe('api side commands', () => {
   beforeEach(() => invoke.mockClear());
 
   it('askBtw sends the question text', () => {
-    void api.askBtw('why did this fail?');
+    void api.askBtw('main', 'why did this fail?');
     expect(invoke).toHaveBeenCalledWith('ask_btw', { chatId: 'main', text: 'why did this fail?' });
   });
 
   it('suggestPrompts takes no arguments and asks for the suggestions', () => {
-    void api.suggestPrompts();
+    void api.suggestPrompts('main');
     expect(invoke).toHaveBeenCalledWith('suggest_prompts', { chatId: 'main' });
   });
 
@@ -139,17 +139,17 @@ describe('api side commands', () => {
   });
 
   it('compactConversation takes no arguments', () => {
-    void api.compactConversation();
+    void api.compactConversation('main');
     expect(invoke).toHaveBeenCalledWith('compact_conversation', { chatId: 'main' });
   });
 
   it('forkConversation takes no arguments', () => {
-    void api.forkConversation();
+    void api.forkConversation('main');
     expect(invoke).toHaveBeenCalledWith('fork_conversation', { chatId: 'main' });
   });
 
   it('exportConversation asks for the live conversation as Markdown', () => {
-    void api.exportConversation();
+    void api.exportConversation('main');
     expect(invoke).toHaveBeenCalledWith('export_conversation', { chatId: 'main' });
   });
 });
@@ -208,7 +208,7 @@ describe('api skills commands', () => {
   beforeEach(() => invoke.mockClear());
 
   it('listSkills passes the session id; the backend picks the project folders from the session', () => {
-    void api.listSkills();
+    void api.listSkills('main');
     expect(invoke).toHaveBeenLastCalledWith('list_skills', { chatId: 'main' });
   });
 
@@ -284,5 +284,14 @@ describe('api tab and chat commands', () => {
     expect(invoke).toHaveBeenLastCalledWith('list_chats', undefined);
     void api.listTabs();
     expect(invoke).toHaveBeenLastCalledWith('list_tabs', undefined);
+  });
+});
+
+describe('api.getStatus', () => {
+  it('sends the chat id, and the terminal id when one is given', () => {
+    void api.getStatus('main', 't2');
+    expect(invoke).toHaveBeenLastCalledWith('get_status', { chatId: 'main', sessionId: 't2' });
+    void api.getStatus('main');
+    expect(invoke).toHaveBeenLastCalledWith('get_status', { chatId: 'main', sessionId: null });
   });
 });

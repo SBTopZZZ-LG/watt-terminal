@@ -12,7 +12,8 @@ import { clampFontSize, defaultSizeStorage, FONT_SIZE_DEFAULT, saveFontSize, ste
 import type { SessionEvent, Status, TabInfo, WireEvent } from './types';
 
 export type Incoming = { kind: 'event'; event: WireEvent } | { kind: 'error'; message: string };
-export type ChatListener = (msg: Incoming) => void;
+/** Called with each chat message and the id of the chat it is for (errors are not chat-scoped: see reportError). */
+export type ChatListener = (msg: Incoming, chatId: string) => void;
 export type TabEventListener = (tab: TabController, ev: SessionEvent) => void;
 
 /** What the strip and the App render from the registry. Replaced on every change, so the same object means no change. */
@@ -36,8 +37,8 @@ export class TabManager {
   private readonly tabListeners = new Set<TabEventListener>();
   private readonly storeListeners = new Set<() => void>();
   private readonly fontListeners = new Set<(size: number) => void>();
-  /** The chat channel, attached once. Null until the first attach is started. */
-  private chatAttach: Promise<void> | null = null;
+  /** Each chat's agent channel, by chat id: the attach in flight or done. A failed attach is removed (see attachChat). */
+  private readonly chatAttach = new Map<string, Promise<void>>();
 
   /** The terminal with this id, created on first use. Later calls return the same controller. */
   ensure(id: string): TabController {
@@ -148,24 +149,24 @@ export class TabManager {
   }
 
   /**
-   * A new terminal, made visible to the chat when `visibleToAgent` (the new-tabs setting). Null at the tab limit, or when its
-   * shell did not start (the error is shown). The assignment's refusal is shown too; the terminal then stays private.
+   * A new terminal, made visible to chat `chatId` when `visibleToAgent` (the new-tabs setting). Null at the tab limit, or when
+   * its shell did not start (the error is shown). The assignment's refusal is shown too; the terminal then stays private.
    */
-  async createTab(visibleToAgent: boolean): Promise<TabController | null> {
+  async createTab(visibleToAgent: boolean, chatId: string): Promise<TabController | null> {
     const tab = await this.create();
     if (tab !== null && visibleToAgent) {
-      await this.assign(tab.id, true);
+      await this.assign(tab.id, true, chatId);
     }
     return tab;
   }
 
   /**
-   * Assigns a terminal to the chat (`on`), or unassigns it. The backend refuses while the chat is busy and would lose the
+   * Assigns a terminal to chat `chatId` (`on`), or unassigns it. The backend refuses while the chat is busy and would lose the
    * terminal; the refusal is shown. Then the owners are read again.
    */
-  async assign(id: string, on: boolean): Promise<void> {
+  async assign(id: string, on: boolean, chatId: string): Promise<void> {
     try {
-      await api.assignTab(CHAT_ID, id, on);
+      await api.assignTab(chatId, id, on);
     } catch (e) {
       this.reportError(e);
     }
@@ -196,6 +197,21 @@ export class TabManager {
     this.applyOwners(await api.listTabs());
   }
 
+  /**
+   * A new chat (no terminal, a new conversation), with its agent channel attached at once so none of its events are lost.
+   * Resolves with its id. Not used by the UI yet (multi-chat D2).
+   */
+  async createChat(): Promise<string> {
+    const chatId = await api.createChat();
+    await this.ensureChatAttached(chatId);
+    return chatId;
+  }
+
+  /** Attaches a chat's agent channel. Once per chat: a later call for the same chat reuses the attach (see attachChat). */
+  ensureChatAttached(chatId: string): Promise<void> {
+    return this.attachChat(chatId, false);
+  }
+
   /** Agent events and errors. Events that arrive while no listener is subscribed are not replayed. */
   readonly subscribeChat = (listener: ChatListener): (() => void) => {
     this.chatListeners.add(listener);
@@ -212,9 +228,12 @@ export class TabManager {
     };
   };
 
-  /** Shows an error to the user (through the chat listeners). */
+  /**
+   * Shows an error to the user (through the chat listeners). Errors are not chat-scoped (a terminal's failure is not a chat's),
+   * so they carry the default chat's id; the App shows them in whichever chat is active.
+   */
   reportError(e: unknown): void {
-    this.emitChat({ kind: 'error', message: errorText(e) });
+    this.emitChat({ kind: 'error', message: errorText(e) }, CHAT_ID);
   }
 
   /** The font size xterm is drawing with (all tabs share it). */
@@ -260,9 +279,9 @@ export class TabManager {
     this.setFontSize(next, true);
   }
 
-  private emitChat(msg: Incoming): void {
+  private emitChat(msg: Incoming, chatId: string): void {
     for (const listener of [...this.chatListeners]) {
-      listener(msg);
+      listener(msg, chatId);
     }
   }
 
@@ -282,8 +301,9 @@ export class TabManager {
           listener(tab, ev);
         }
       },
-      onStrayEvent: (event) => this.emitChat({ kind: 'event', event }),
-      attachChat: (fresh) => this.attachChat(fresh),
+      // The backend sends no agent event on a terminal's channel; should one come, it is the default chat's (as before).
+      onStrayEvent: (event) => this.emitChat({ kind: 'event', event }, CHAT_ID),
+      attachChat: (fresh) => this.attachKnownChats(fresh),
     };
     return new TabController(id, deps);
   }
@@ -314,7 +334,8 @@ export class TabManager {
   /** Starts or re-attaches a terminal's shell, then reads its status into the terminal. */
   private async connectTab(tab: TabController): Promise<Status> {
     await tab.connect();
-    const status = await api.getStatus(tab.id);
+    // The chat fields are the default chat's for now. Multi-chat D2 reads the active chat's (see App).
+    const status = await api.getStatus(CHAT_ID, tab.id);
     tab.applyStatus(status);
     return status;
   }
@@ -365,18 +386,33 @@ export class TabManager {
   }
 
   /**
-   * Attaches the chat's agent channel. Memoised while the attach has succeeded; `fresh` attaches again. A failed attach is
-   * retried by the next call.
+   * Attaches one chat's agent channel. Memoised per chat while the attach has succeeded; `fresh` attaches again (the channel
+   * is replaced). A failed attach is removed, so the next call retries it. The channel's closure tags every event with the
+   * chat's id, which is how the listeners know which chat an event is for.
    */
-  private attachChat(fresh: boolean): Promise<void> {
-    if (fresh || this.chatAttach === null) {
-      const channel = new Channel<WireEvent>((event) => this.emitChat({ kind: 'event', event }));
-      this.chatAttach = api.attachChat(CHAT_ID, channel).catch((e: unknown) => {
-        this.chatAttach = null;
-        throw e;
-      });
+  private attachChat(chatId: string, fresh: boolean): Promise<void> {
+    const existing = this.chatAttach.get(chatId);
+    if (!fresh && existing !== undefined) {
+      return existing;
     }
-    return this.chatAttach;
+    const channel = new Channel<WireEvent>((event) => this.emitChat({ kind: 'event', event }, chatId));
+    const attach: Promise<void> = api.attachChat(chatId, channel).catch((e: unknown) => {
+      if (this.chatAttach.get(chatId) === attach) {
+        this.chatAttach.delete(chatId);
+      }
+      throw e;
+    });
+    this.chatAttach.set(chatId, attach);
+    return attach;
+  }
+
+  /**
+   * The attach a terminal's restart asks for (TabDeps.attachChat): every chat this registry knows, the default chat always,
+   * each attached as `fresh` says. The backend's attach is idempotent, so a fresh one only replaces the channel.
+   */
+  private attachKnownChats(fresh: boolean): Promise<void> {
+    const chats = new Set([CHAT_ID, ...this.chatAttach.keys()]);
+    return Promise.all([...chats].map((chatId) => this.attachChat(chatId, fresh))).then(() => undefined);
   }
 }
 

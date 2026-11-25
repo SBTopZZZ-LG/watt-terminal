@@ -1,7 +1,6 @@
 import { useEffect, useRef, useSyncExternalStore } from 'react';
 import type { KeyboardEvent, MouseEvent, WheelEvent } from 'react';
 import { borderActive } from '../lib/agentControl';
-import { CHAT_ID } from '../lib/api';
 import { effectiveState } from '../lib/inputState';
 import { nextTabId } from '../lib/tabKeys';
 import { tabs } from '../lib/tabManager';
@@ -17,8 +16,8 @@ function focusTab(id: string): void {
   document.querySelector<HTMLElement>(`[data-tab-id="${id}"]`)?.focus();
 }
 
-function newTab(visibleToAgent: boolean): void {
-  void tabs.createTab(visibleToAgent).then((tab) => {
+function newTab(visibleToAgent: boolean, chatId: string): void {
+  void tabs.createTab(visibleToAgent, chatId).then((tab) => {
     if (tab !== null) {
       void tab.fitToContainer();
       tab.focus();
@@ -38,14 +37,16 @@ interface TabButtonProps {
   tab: TabController;
   selected: boolean;
   canClose: boolean;
+  /** The active chat: a dot marks a terminal visible to it. */
+  chatId: string;
   onKeyDown: (e: KeyboardEvent<HTMLButtonElement>, id: string) => void;
 }
 
-function TabButton({ tab, selected, canClose, onKeyDown }: TabButtonProps) {
+function TabButton({ tab, selected, canClose, chatId, onKeyDown }: TabButtonProps) {
   const s = useSyncExternalStore(tab.subscribe, tab.getSnapshot);
   const label = tabs.label(tab.id) ?? '';
   const ended = effectiveState(s.input) === 'exited';
-  const visible = isOwnedByChat(s.owner, CHAT_ID);
+  const visible = isOwnedByChat(s.owner, chatId);
   // The agent holds this terminal's shell (its turn runs a command here, or it is about to): the tab pulses.
   const controlling = borderActive(s.agentControl);
   const cls = ['term-tab', selected ? 'is-active' : '', ended ? 'is-ended' : ''].filter((c) => c !== '').join(' ');
@@ -90,6 +91,8 @@ function TabButton({ tab, selected, canClose, onKeyDown }: TabButtonProps) {
 export interface TabStripProps {
   /** The new-tabs setting: a terminal made with "+" joins the chat at once. */
   newTabsVisible: boolean;
+  /** The active chat. Its visible terminals get the dot, and "+" assigns to it. */
+  chatId: string;
 }
 
 /**
@@ -98,7 +101,7 @@ export interface TabStripProps {
  * between tabs, as the WAI-ARIA tabs pattern gives them. A vertical wheel scrolls the row sideways. Right-click (or the Menu
  * key) opens the tab's menu (see ContextMenu.tsx).
  */
-export function TabStrip({ newTabsVisible }: TabStripProps) {
+export function TabStrip({ newTabsVisible, chatId }: TabStripProps) {
   const { ids, activeId } = useSyncExternalStore(tabs.subscribeStore, tabs.getSnapshot);
   const scroller = useRef<HTMLDivElement>(null);
   const full = tabLimitReached(ids.length);
@@ -130,7 +133,7 @@ export function TabStrip({ newTabsVisible }: TabStripProps) {
         {ids.map((id) => {
           const tab = tabs.get(id);
           return tab === undefined ? null : (
-            <TabButton key={id} tab={tab} selected={id === activeId} canClose={ids.length > 1} onKeyDown={onKeyDown} />
+            <TabButton key={id} tab={tab} selected={id === activeId} canClose={ids.length > 1} chatId={chatId} onKeyDown={onKeyDown} />
           );
         })}
       </div>
@@ -143,7 +146,7 @@ export function TabStrip({ newTabsVisible }: TabStripProps) {
         onMouseDown={keepFocus}
         onClick={() => {
           if (!full) {
-            newTab(newTabsVisible);
+            newTab(newTabsVisible, chatId);
           }
         }}
       >

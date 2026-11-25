@@ -94,11 +94,11 @@ const cacheStorage = defaultSizeStorage();
  * The terminal an agent event is about: the one it names (`terminal`, sent when the chat has two or more), else the chat's
  * first terminal. Null when the chat has none.
  */
-function agentTarget(ev: WireEvent): TabController | null {
+function agentTarget(ev: WireEvent, chat: string): TabController | null {
   if ('terminal' in ev && ev.terminal !== undefined) {
     return tabs.get(ev.terminal) ?? null;
   }
-  return tabs.list().find((t) => isOwnedByChat(t.getSnapshot().owner, CHAT_ID)) ?? null;
+  return tabs.list().find((t) => isOwnedByChat(t.getSnapshot().owner, chat)) ?? null;
 }
 
 export default function App() {
@@ -173,6 +173,13 @@ export default function App() {
   // Which view the agent panel's body shows, the id of the live conversation, and how History is grouped.
   const [panelBody, setPanelBody] = useState<'chat' | 'history'>('chat');
   const [conversationId, setConversationId] = useState<string | null>(null);
+  // The active chat: the one the agent panel shows, and the id its requests carry. Only the default chat exists so far, so
+  // nothing changes it (multi-chat D2 adds the switch). The ref is for the listeners and the steps that run after awaits.
+  const [chatId] = useState<string>(CHAT_ID);
+  const chatIdRef = useRef<string>(CHAT_ID);
+  useEffect(() => {
+    chatIdRef.current = chatId;
+  });
   // A side command (`/btw`, `/compact`, `/fork`) is running: one model call outside a turn, or none at all. The bar
   // and History stay busy until it answers, and a send is refused so the text is kept.
   const [sideBusy, setSideBusy] = useState(false);
@@ -303,20 +310,20 @@ export default function App() {
   }, []);
 
   /** Takes the status snapshot again, e.g. after the live conversation changed. Resolves once it is applied. */
-  const refreshStatus = (): Promise<void> =>
-    api.getStatus(tab.id).then((s) => applyStatus(s, tab)).catch(reportError);
+  const refreshStatus = (chat: string): Promise<void> =>
+    api.getStatus(chat, tab.id).then((s) => applyStatus(s, tab)).catch(reportError);
 
   /**
    * Re-reads the control hold after `done`. `done` is emitted by `run_turn` before the worker's `OnDrop` calls
    * `end_turn`, so the first fetch can still see `agent_busy: true` and `settleControl` keeps the stale command id.
    * Retry while busy (up to 4 retries, ~250ms apart) so the later read settles it; errors are ignored.
    */
-  const refreshControl = useCallback(function refresh(target: TabController, attempt = 0): void {
-    api.getStatus(target.id).then(
+  const refreshControl = useCallback(function refresh(target: TabController, chat: string, attempt = 0): void {
+    api.getStatus(chat, target.id).then(
       (s) => {
         target.applyControl(s);
         if (s.agent_busy && attempt < 4) {
-          setTimeout(() => refresh(target, attempt + 1), 250);
+          setTimeout(() => refresh(target, chat, attempt + 1), 250);
         }
       },
       () => undefined,
@@ -327,8 +334,8 @@ export default function App() {
    * Reads approve-all as the shell on top sees it. Only its two fields change: a levels event is not a full status read (see
    * applyStatus, and the busy state it would reset).
    */
-  const refreshAutoState = useCallback(() => {
-    api.autoApproveState().then(
+  const refreshAutoState = useCallback((chat: string) => {
+    api.autoApproveState(chat).then(
       (s) => {
         setAutoApprove(s.auto);
         setAutoSuspended(s.suspended);
@@ -338,7 +345,8 @@ export default function App() {
   }, []);
 
   /** Reads only the live conversation's id again. The busy state stays the transcript's own, so a send still in transit is not lost. */
-  const syncConversationId = (): Promise<void> => api.getStatus().then((s) => setConversationId(s.conversation_id)).catch(reportError);
+  const syncConversationId = (chat: string): Promise<void> =>
+    api.getStatus(chat).then((s) => setConversationId(s.conversation_id)).catch(reportError);
 
   // The settings refresh's guards: a response is ignored after unmount, and when a newer refresh has started since.
   const settingsAlive = useRef(true);
@@ -359,7 +367,8 @@ export default function App() {
   const refreshSettingsState = useCallback(() => {
     settingsRequest.current += 1;
     const request = settingsRequest.current;
-    api.getStatus().then(
+    const chat = chatIdRef.current;
+    api.getStatus(chat).then(
       (s) => {
         if (!settingsAlive.current || request !== settingsRequest.current) {
           return;
@@ -519,6 +528,7 @@ export default function App() {
      * is read again so the live conversation id matches the backend.
      */
     const restoreLast = async (status: Status) => {
+      const chat = chatIdRef.current;
       if (restoring.current) {
         return;
       }
@@ -531,9 +541,9 @@ export default function App() {
       }
       const started = epoch.current;
       try {
-        const loaded = await api.loadConversation(lastId);
+        const loaded = await api.loadConversation(chat, lastId);
         if (epoch.current !== started || transcriptRef.current.items.length > 0) {
-          syncConversationId();
+          syncConversationId(chat);
           return;
         }
         epoch.current += 1;
@@ -547,12 +557,12 @@ export default function App() {
     };
 
     // The chat's events: the agent's, and the errors (see onMessage). The hold of the terminal is fed the agent's events too.
-    const handleEvent = (ev: WireEvent) => {
+    const handleEvent = (ev: WireEvent, chat: string) => {
       if (isSessionEvent(ev)) {
         // The terminal's own events come through handleTabEvent (see the controller); none should arrive here.
         return;
       }
-      agentTarget(ev)?.applyAgentEvent(ev);
+      agentTarget(ev, chat)?.applyAgentEvent(ev);
       switch (ev.type) {
         case 'integration_request':
           setAgentReq((cur) => agentRequestAfter(cur, ev));
@@ -568,9 +578,9 @@ export default function App() {
           // Reconcile with the status: a lost finish event leaves a stale command id holding the border on,
           // but at a local idle prompt no agent command can still be running.
           {
-            const target = agentTarget(ev);
+            const target = agentTarget(ev, chat);
             if (target !== null) {
-              refreshControl(target);
+              refreshControl(target, chat);
             }
           }
           return;
@@ -598,7 +608,7 @@ export default function App() {
     // agent's question also show.
     const handleTabEvent = (source: TabController, ev: SessionEvent) => {
       // Only the chat's own terminals reach its transcript and its question: an unassigned one's events stay out of both.
-      if (!isOwnedByChat(source.getSnapshot().owner, CHAT_ID)) {
+      if (!isOwnedByChat(source.getSnapshot().owner, chatIdRef.current)) {
         return;
       }
       switch (ev.type) {
@@ -610,7 +620,7 @@ export default function App() {
           // The depth ends an interactive group a level was pushed above (see transcript.ts). The same for an integration the
           // agent asked for and one the user started. The approve-all state follows the new top level.
           dispatchTranscript({ type: 'levels_changed', depth: ev.levels.length });
-          refreshAutoState();
+          refreshAutoState(chatIdRef.current);
           return;
         case 'record_finished':
           // Closes the interactive group the command opened on, if there is one (see transcript.ts).
@@ -621,12 +631,17 @@ export default function App() {
       }
     };
 
-    const onMessage = (msg: Incoming) => {
+    const onMessage = (msg: Incoming, eventChat: string) => {
       if (msg.kind === 'error') {
         dispatchTranscript({ type: 'notice', text: msg.message });
-      } else {
-        handleEvent(msg.event);
+        return;
       }
+      // Only the active chat's events reach the transcript. TODO(multi-chat D2): another chat's events reduce into that chat's
+      // own record. Until then they are dropped here, so single-chat behaviour does not change.
+      if (eventChat !== chatIdRef.current) {
+        return;
+      }
+      handleEvent(msg.event, eventChat);
     };
 
     const unsubscribe = tabs.subscribeChat(onMessage);
@@ -798,7 +813,7 @@ export default function App() {
           openSettings();
           return;
         case 'new-tab':
-          void tabs.createTab(newTabsVisibleRef.current);
+          void tabs.createTab(newTabsVisibleRef.current, chatIdRef.current);
           return;
         case 'close-tab': {
           const id = tabs.getSnapshot().activeId;
@@ -886,7 +901,7 @@ export default function App() {
     api.writeUser(tab.id, text).catch(reportError);
   };
 
-  const sendAgent = async (text: string, attachments: AttachmentInput[]): Promise<string | null> => {
+  const sendAgent = async (chat: string, text: string, attachments: AttachmentInput[]): Promise<string | null> => {
     // Refused while a switch is in flight: the text stays in the bar, and nothing lands in the conversation being switched to.
     if (switching.current) {
       return SEND_WHILE_SWITCHING_NOTICE;
@@ -900,7 +915,7 @@ export default function App() {
     // Added before the call, so the user's line lands above the agent's replies.
     dispatchTranscript({ type: 'user_sent', clientId, text, attachments: userAttachments(attachments) });
     try {
-      await api.agentMessage(text, attachments);
+      await api.agentMessage(chat, text, attachments);
       return null;
     } catch (e) {
       const message = errorText(e);
@@ -961,7 +976,8 @@ export default function App() {
    * state follows it (applyStatus), so a turn the UI thought was running cannot stay busy.
    */
   const cancelRunning = () => {
-    api.cancelAgent().catch(reportError).then(() => refreshStatus());
+    const chat = chatIdRef.current;
+    api.cancelAgent(chat).catch(reportError).then(() => refreshStatus(chat));
   };
 
   /**
@@ -969,11 +985,11 @@ export default function App() {
    * send right after it can be refused. Polls the status; after QUEUE_SLOT_WAIT_MS it gives up waiting, and the send goes
    * anyway (a refusal then puts the messages back in the queue).
    */
-  const waitForSlot = async (): Promise<void> => {
+  const waitForSlot = async (chat: string): Promise<void> => {
     const deadline = Date.now() + QUEUE_SLOT_WAIT_MS;
     for (;;) {
       try {
-        const status = await api.getStatus();
+        const status = await api.getStatus(chat);
         if (!status.agent_busy) {
           return;
         }
@@ -993,6 +1009,7 @@ export default function App() {
    * at the front of the queue (no retry; the user sees the queue and the error in the transcript). One drain at a time.
    */
   const drainQueue = async () => {
+    const chat = chatIdRef.current;
     // While a conversation is being switched, the queue is left alone: the switch clears it (clearQueue) when it lands.
     if (draining.current || switching.current) {
       return;
@@ -1000,7 +1017,7 @@ export default function App() {
     draining.current = true;
     const gen = queueGen.current;
     try {
-      await waitForSlot();
+      await waitForSlot(chat);
       if (queueGen.current !== gen) {
         return;
       }
@@ -1011,7 +1028,7 @@ export default function App() {
       }
       const taken = pending.slice(0, pending.length - rest.length);
       commitQueue(rest);
-      const err = await sendAgent(send.text, send.attachments);
+      const err = await sendAgent(chat, send.text, send.attachments);
       if (err !== null && queueGen.current === gen) {
         commitQueue([...taken, ...queueRef.current]);
       }
@@ -1033,6 +1050,7 @@ export default function App() {
    * asked for while one runs is run once more after it, unless the agent is busy or something is queued by then.
    */
   const requestSuggestions = async (): Promise<void> => {
+    const chat = chatIdRef.current;
     if (suggesting.current) {
       suggestAgain.current = true;
       return;
@@ -1041,7 +1059,7 @@ export default function App() {
     const gen = suggestGen.current;
     const conversation = conversationRef.current;
     try {
-      const result = await api.suggestPrompts();
+      const result = await api.suggestPrompts(chat);
       const shown = acceptSuggestions(result, { current: suggestGen.current === gen, busy: isBusy(transcriptRef.current) });
       setSuggestions(shown);
       // Kept under the conversation they were asked in, for its tail as it is now (see conversationCache.ts). A result shown
@@ -1064,7 +1082,7 @@ export default function App() {
 
   /** A suggested prompt was clicked: it is sent as a plain message, the same as a typed one but not through the command parser. */
   const sendSuggestion = (text: string) => {
-    void sendAgent(text, []);
+    void sendAgent(chatIdRef.current, text, []);
   };
 
   /**
@@ -1073,8 +1091,8 @@ export default function App() {
    * failure is not shown here; a send that really fails shows its error when it is sent). The row may be gone by the
    * answer (injected, withdrawn, restored by Stop): markSteered then changes nothing.
    */
-  const steerQueued = (id: number, text: string, attachments: AttachmentInput[]) => {
-    api.steerMessage(id, text, attachments, queueMode).then(
+  const steerQueued = (chat: string, id: number, text: string, attachments: AttachmentInput[]) => {
+    api.steerMessage(chat, id, text, attachments, queueMode).then(
       (accepted) => {
         if (accepted) {
           commitQueue(markSteered(queueRef.current, id));
@@ -1090,7 +1108,8 @@ export default function App() {
    * removes the row. A failed call leaves the row as it is.
    */
   const withdrawSteered = async (id: number): Promise<void> => {
-    const waiting = await api.withdrawSteer(id).catch((e: unknown) => {
+    const chat = chatIdRef.current;
+    const waiting = await api.withdrawSteer(chat, id).catch((e: unknown) => {
       reportError(e);
       return null;
     });
@@ -1162,6 +1181,7 @@ export default function App() {
   // Clears the agent's conversation. Refused while the agent is busy or a side command runs (the button is also disabled then),
   // before the backend is asked. On error the reason is shown in the transcript, and the conversation stays as it was.
   const newConversation = () => {
+    const chat = chatIdRef.current;
     const refusal = switchRefusal({ busy: isBusy(transcriptRef.current), sideBusy, switching: switching.current });
     if (refusal !== null) {
       dispatchTranscript({ type: 'notice', text: refusal });
@@ -1169,13 +1189,13 @@ export default function App() {
     }
     switching.current = true;
     epoch.current += 1;
-    api.newConversation()
+    api.newConversation(chat)
       .then(
         () => {
           clearQueue();
           dispatchTranscript({ type: 'conversation_reset' });
           // The new conversation has a new id, which the history view marks as current. Read before the switch ends.
-          return refreshStatus();
+          return refreshStatus(chat);
         },
         (e) => dispatchTranscript({ type: 'notice', text: errorText(e) }),
       )
@@ -1206,13 +1226,13 @@ export default function App() {
    * context become the live transcript at once. Never `openConversation`: that would reload from the store and race
    * a send, while this result is already the backend's live state.
    */
-  const applyLoaded = (loaded: LoadedConversation) => {
+  const applyLoaded = (chat: string, loaded: LoadedConversation) => {
     epoch.current += 1;
     clearQueue();
     dispatchTranscript({ type: 'conversation_loaded', messages: loaded.messages, todos: loaded.todos, context: loaded.context });
     setConversationId(loaded.id);
     setPanelBody('chat');
-    refreshStatus();
+    refreshStatus(chat);
   };
 
   /**
@@ -1225,6 +1245,7 @@ export default function App() {
     args: string,
     original: string,
   ): Promise<{ kind: 'send'; text: string } | { kind: 'handled' } | { kind: 'unknown' }> => {
+    const chat = chatIdRef.current;
     const builtin = findBuiltin(name);
     // Not a built-in: fetch the catalog fresh (the cwd can change) and expand the template.
     if (builtin === null) {
@@ -1291,7 +1312,7 @@ export default function App() {
           const matched = matchModel(options, args);
           if (matched.status === 'match') {
             await api.setDefaultModel(matched.choice.ref);
-            refreshStatus();
+            refreshStatus(chat);
             refreshSettingsState();
             const variant = matched.choice.ref.variant ?? null;
             dispatchTranscript({
@@ -1330,7 +1351,7 @@ export default function App() {
       }
       case 'export': {
         try {
-          const md = await api.exportConversation();
+          const md = await api.exportConversation(chat);
           if (md.trim() === '') {
             dispatchTranscript({ type: 'notice', text: 'There is nothing to export yet.', muted: true });
             return { kind: 'handled' };
@@ -1381,7 +1402,7 @@ export default function App() {
           setSideBusy(true);
           dispatchTranscript({ type: 'notice', text: 'Naming the conversation...', muted: true });
           try {
-            const name = await api.suggestName();
+            const name = await api.suggestName(chat);
             const meta = await api.renameConversation(conversationId, name);
             setHistoryKey((k) => k + 1);
             dispatchTranscript({ type: 'notice', text: `Renamed the conversation to "${meta.title}".`, muted: true });
@@ -1421,7 +1442,7 @@ export default function App() {
         }
         setSideBusy(true);
         try {
-          const answer = await api.askBtw(args);
+          const answer = await api.askBtw(chat, args);
           dispatchTranscript({ type: 'notice', text: `Side note:\n${answer}`, muted: true });
         } catch (e) {
           dispatchTranscript({ type: 'notice', text: errorText(e) });
@@ -1447,7 +1468,7 @@ export default function App() {
         setSideBusy(true);
         dispatchTranscript({ type: 'notice', text: 'Compacting the conversation...', muted: true });
         try {
-          applyLoaded(await api.compactConversation());
+          applyLoaded(chat, await api.compactConversation(chat));
           dispatchTranscript({ type: 'notice', text: 'Compacted into a new conversation.', muted: true });
         } catch (e) {
           dispatchTranscript({ type: 'notice', text: errorText(e) });
@@ -1472,7 +1493,7 @@ export default function App() {
         }
         setSideBusy(true);
         try {
-          applyLoaded(await api.forkConversation());
+          applyLoaded(chat, await api.forkConversation(chat));
           dispatchTranscript({ type: 'notice', text: 'Forked into a new conversation.', muted: true });
         } catch (e) {
           dispatchTranscript({ type: 'notice', text: errorText(e) });
@@ -1493,6 +1514,7 @@ export default function App() {
    * the stored history hold.
    */
   const onAgent = async (text: string, attachments: AttachmentInput[]): Promise<string | null> => {
+    const chat = chatIdRef.current;
     if (sideBusy) {
       return 'A side command is still running.';
     }
@@ -1502,20 +1524,20 @@ export default function App() {
       queueSeq.current += 1;
       const id = queueSeq.current;
       commitQueue(enqueue(queueRef.current, id, queued, attachments));
-      steerQueued(id, queued, attachments);
+      steerQueued(chat, id, queued, attachments);
       return null;
     };
     const parsed = parseCommand(text);
     if (parsed === null) {
-      return isBusy(transcriptRef.current) ? queueIt(text) : sendAgent(text, attachments);
+      return isBusy(transcriptRef.current) ? queueIt(text) : sendAgent(chat, text, attachments);
     }
     const outcome = await runCommand(parsed.name, parsed.args, text);
     // A template expands into a message: queued as that message, like a plain one, while busy.
     if (outcome.kind === 'send') {
-      return isBusy(transcriptRef.current) ? queueIt(outcome.text) : sendAgent(outcome.text, attachments);
+      return isBusy(transcriptRef.current) ? queueIt(outcome.text) : sendAgent(chat, outcome.text, attachments);
     }
     if (outcome.kind === 'unknown') {
-      return isBusy(transcriptRef.current) ? queueIt(text) : sendAgent(text, attachments);
+      return isBusy(transcriptRef.current) ? queueIt(text) : sendAgent(chat, text, attachments);
     }
     return null;
   };
@@ -1527,6 +1549,7 @@ export default function App() {
    * Resolves with the reason it was refused, or null when it was opened.
    */
   const openConversation = async (id: string): Promise<string | null> => {
+    const chat = chatIdRef.current;
     const refusal = switchRefusal({ busy: isBusy(transcriptRef.current), sideBusy, switching: switching.current });
     if (refusal !== null) {
       return refusal;
@@ -1536,12 +1559,12 @@ export default function App() {
       const started = epoch.current;
       let loaded: LoadedConversation;
       try {
-        loaded = await api.loadConversation(id);
+        loaded = await api.loadConversation(chat, id);
       } catch (e) {
         return errorText(e);
       }
       if (epoch.current !== started || isBusy(transcriptRef.current)) {
-        await syncConversationId();
+        await syncConversationId(chat);
         return 'The chat changed while this conversation was loading, so it was not opened. Open it again.';
       }
       epoch.current += 1;
@@ -1550,7 +1573,7 @@ export default function App() {
       setConversationId(loaded.id);
       setPanelBody('chat');
       setFocusToken((t) => t + 1);
-      await refreshStatus();
+      await refreshStatus(chat);
       return null;
     } finally {
       switching.current = false;
@@ -1559,13 +1582,14 @@ export default function App() {
 
   /** The live conversation was deleted from the History view: the backend started a new one, so the chat is reset to match. */
   const liveDeleted = () => {
+    const chat = chatIdRef.current;
     epoch.current += 1;
     clearQueue();
     dispatchTranscript({ type: 'conversation_reset' });
     // Its unsent text is dropped with it (see InputBar's draftDiscard), not saved under the deleted id.
     setDiscardDraft((d) => d + 1);
     setConversationId(null);
-    refreshStatus();
+    refreshStatus(chat);
   };
 
   /** A conversation was deleted from the History view (or all of them). What was kept for it goes too. */
@@ -1608,8 +1632,9 @@ export default function App() {
   };
 
   const answer = (callId: string, approve: boolean) => {
+    const chat = chatIdRef.current;
     dispatchTranscript({ type: 'approval_answering', callId, approve });
-    api.approveTool(callId, approve).then(
+    api.approveTool(chat, callId, approve).then(
       () => dispatchTranscript({ type: 'approval_sent', callId }),
       (e) => dispatchTranscript({ type: 'approval_failed', callId, message: errorText(e) }),
     );
@@ -1620,8 +1645,9 @@ export default function App() {
    * the shell or the approval paths. A refused send fails the card, so the user can retry it.
    */
   const answerQuestions = (callId: string, answers: QuestionAnswerInput[]) => {
+    const chat = chatIdRef.current;
     dispatchTranscript({ type: 'question_answering', callId, answers });
-    api.answerQuestions(callId, answers).catch((e) => {
+    api.answerQuestions(chat, callId, answers).catch((e) => {
       dispatchTranscript({ type: 'question_failed', callId, message: errorText(e) });
     });
   };
@@ -1778,10 +1804,11 @@ export default function App() {
 
   // On turns it off. Off, or on in another shell (suspended), turns it on for this shell: the backend ties it to the top level.
   const toggleAutoApprove = () => {
+    const chat = chatIdRef.current;
     const next = !(autoApprove && !autoSuspended);
-    api.setAutoApprove(next).then(() => {
+    api.setAutoApprove(chat, next).then(() => {
       setAutoApprove(next);
-      refreshAutoState();
+      refreshAutoState(chat);
     }, reportError);
   };
 
@@ -1801,12 +1828,13 @@ export default function App() {
 
   /** Integrate on the agent's question: the handshake runs with the keys locked, and its `done` event brings the result. */
   const acceptAgent = () => {
+    const chat = chatIdRef.current;
     if (agentReq?.kind !== 'asking') {
       return;
     }
     const { callId, label } = agentReq;
     setAgentReq({ kind: 'running', callId, label, shown: true });
-    api.answerIntegration(callId, true).catch((e: unknown) => {
+    api.answerIntegration(chat, callId, true).catch((e: unknown) => {
       // Refused: no such question is pending (it timed out, or the turn ended). Nothing is running for it.
       setAgentReq((cur) => (cur?.kind === 'running' && cur.callId === callId ? null : cur));
       dispatchTranscript({ type: 'notice', text: errorText(e) });
@@ -1815,13 +1843,14 @@ export default function App() {
 
   /** Decline on the agent's question (Decline, Escape, the backdrop). The dialog closes at once. */
   const declineAgent = () => {
+    const chat = chatIdRef.current;
     if (agentReq?.kind !== 'asking') {
       return;
     }
     const { callId } = agentReq;
     setAgentReq(null);
     // A refused answer means the question was already settled (timed out or cut short): the dialog is closed either way.
-    api.answerIntegration(callId, false).catch(() => undefined);
+    api.answerIntegration(chat, callId, false).catch(() => undefined);
   };
 
   const closeAgent = () => setAgentReq(null);
@@ -1836,6 +1865,7 @@ export default function App() {
   // shows up in the new one. Focus moves to the terminal when the new shell starts (see focusAfter). Any terminal can be
   // restarted (the strip's menu restarts one that is not the active one); the bar restarts the active one (restartShell).
   const restartTab = (target: TabController) => {
+    const chat = chatIdRef.current;
     if (target.getSnapshot().restarting) {
       return;
     }
@@ -1843,7 +1873,7 @@ export default function App() {
     target.resetForNewSession();
     // The chat's own terminal: the same conversation goes on, so what was queued comes back into the input rather than
     // being dropped. Another chat's or an unassigned terminal has none of that in this chat.
-    if (isOwnedByChat(target.getSnapshot().owner, CHAT_ID)) {
+    if (isOwnedByChat(target.getSnapshot().owner, chat)) {
       returnQueued();
       clearQueue();
       dispatchTranscript({ type: 'session_reset' });
@@ -1852,7 +1882,7 @@ export default function App() {
     target.resetAgentControl();
     target
       .restart()
-      .then(() => api.getStatus(target.id))
+      .then(() => api.getStatus(chat, target.id))
       .then((s) => applyStatus(s, target))
       .then(() => target.fitToContainer())
       .catch(reportError)
@@ -1908,7 +1938,7 @@ export default function App() {
         dock={panel.dock}
         terminal={
           <div className="terminal-area">
-            <TabStrip newTabsVisible={newTabsVisible} />
+            <TabStrip newTabsVisible={newTabsVisible} chatId={chatId} />
             <div className="term-stack">
               {tabs.list().map((t) => (
                 <TerminalView
@@ -2071,7 +2101,7 @@ export default function App() {
         <SettingsDialog
           focusModel={settingsFocusModel}
           onClose={closeSettings}
-          onChanged={refreshStatus}
+          onChanged={() => refreshStatus(chatIdRef.current)}
           onViewLoaded={refreshSettingsState}
           hideMarks={hideMarks}
           onHideMarksChange={setMarksHidden}
@@ -2101,6 +2131,7 @@ export default function App() {
         onClearTerminal={() => tab.clear(effectiveRef.current, handleTerminalInput)}
         onFindTerminal={openTerminalFind}
         onFindChat={openChatFind}
+        chatId={chatId}
         devtools={devtools}
         onRestartTab={(id) => {
           const target = tabs.get(id);

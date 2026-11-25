@@ -109,57 +109,57 @@ export const api = {
    * Sends one user message to the agent, with its attachments (images as PNG or JPEG, text documents as UTF-8). The field is
    * left out when there are none, so a text-only send is the same call as before.
    */
-  agentMessage(text: string, attachments: AttachmentInput[] = []) {
+  agentMessage(chatId: string, text: string, attachments: AttachmentInput[] = []) {
     // `sha256` is for the transcript only (see AttachmentInput), so it is not sent.
     const wire = attachments.map(({ sha256: _sha256, ...rest }) => rest);
-    return invoke<void>('agent_message', wire.length > 0 ? { chatId: CHAT_ID, text, attachments: wire } : { chatId: CHAT_ID, text });
+    return invoke<void>('agent_message', wire.length > 0 ? { chatId, text, attachments: wire } : { chatId, text });
   },
   /**
    * Steers a message into the running agent turn: it goes in at the turn's next step. Resolves true when accepted, false when
    * not (no agent turn running, the turn ending, or a side command running): the caller then queues it as before. `mode` is
    * the queue mode: `all` sends every waiting message together, `one` the first alone.
    */
-  steerMessage(id: number, text: string, attachments: AttachmentInput[] = [], mode: QueueMode = 'all') {
+  steerMessage(chatId: string, id: number, text: string, attachments: AttachmentInput[] = [], mode: QueueMode = 'all') {
     // As for agentMessage, `sha256` is for the transcript only, so it is not sent.
     const wire = attachments.map(({ sha256: _sha256, ...rest }) => rest);
-    const args = wire.length > 0 ? { chatId: CHAT_ID, id, text, attachments: wire, mode } : { chatId: CHAT_ID, id, text, mode };
+    const args = wire.length > 0 ? { chatId, id, text, attachments: wire, mode } : { chatId, id, text, mode };
     return invoke<boolean>('steer_message', args);
   },
   /** Takes a steered message back. True when it was still waiting, false when the turn had already taken it. */
-  withdrawSteer(id: number) {
-    return invoke<boolean>('withdraw_steer', { chatId: CHAT_ID, id });
+  withdrawSteer(chatId: string, id: number) {
+    return invoke<boolean>('withdraw_steer', { chatId, id });
   },
   /** Cancels the running agent turn, if any. Harmless when none is running. */
-  cancelAgent() {
-    return invoke<void>('cancel_agent', { chatId: CHAT_ID });
+  cancelAgent(chatId: string) {
+    return invoke<void>('cancel_agent', { chatId });
   },
   /** Clears the agent's conversation. Refused while the agent is busy. */
-  newConversation() {
-    return invoke<void>('new_conversation', { chatId: CHAT_ID });
+  newConversation(chatId: string) {
+    return invoke<void>('new_conversation', { chatId });
   },
-  approveTool(callId: string, approve: boolean) {
-    return invoke<void>('approve_tool', { chatId: CHAT_ID, callId, approve });
+  approveTool(chatId: string, callId: string, approve: boolean) {
+    return invoke<void>('approve_tool', { chatId, callId, approve });
   },
-  setAutoApprove(on: boolean) {
-    return invoke<void>('set_auto_approve', { chatId: CHAT_ID, on });
+  setAutoApprove(chatId: string, on: boolean) {
+    return invoke<void>('set_auto_approve', { chatId, on });
   },
   /**
    * Answers the agent's request to integrate the shell (its `asking` event). `accept` runs the integration; anything else
    * declines it. Errors when no such request is pending (it timed out, or the turn ended).
    */
-  answerIntegration(callId: string, accept: boolean) {
-    return invoke<void>('answer_integration', { chatId: CHAT_ID, callId, accept });
+  answerIntegration(chatId: string, callId: string, accept: boolean) {
+    return invoke<void>('answer_integration', { chatId, callId, accept });
   },
   /**
    * Answers the agent's clarification question (its `question_request` event). Errors when the answers are invalid
    * (the card stays and can retry) or no such question is pending (it already settled).
    */
-  answerQuestions(callId: string, answers: QuestionAnswerInput[]) {
-    return invoke<void>('answer_questions', { chatId: CHAT_ID, callId, answers });
+  answerQuestions(chatId: string, callId: string, answers: QuestionAnswerInput[]) {
+    return invoke<void>('answer_questions', { chatId, callId, answers });
   },
   /** Approve-all as the shell on top sees it. Read again after a levels event or a toggle. */
-  autoApproveState() {
-    return invoke<AutoApproveState>('auto_approve_state', { chatId: CHAT_ID });
+  autoApproveState(chatId: string) {
+    return invoke<AutoApproveState>('auto_approve_state', { chatId });
   },
   /**
    * Integrates the shell in the foreground (ssh, a nested shell, su, a container exec) as a new level. Slow: it waits for the
@@ -172,8 +172,8 @@ export const api = {
    * The chat's status. The chat fields come from the chat; the shell fields from the terminal `sessionId` names, or from the
    * chat's default terminal when none is given. Read the terminal's own status with its id, so it is not another's.
    */
-  getStatus(sessionId?: string) {
-    return invoke<Status>('get_status', { chatId: CHAT_ID, sessionId: sessionId ?? null });
+  getStatus(chatId: string, sessionId?: string) {
+    return invoke<Status>('get_status', { chatId, sessionId: sessionId ?? null });
   },
   /** The custom slash-command templates (global and project dirs), plus the two dirs so `/help` can show them. */
   listCommands(sessionId: string) {
@@ -183,22 +183,22 @@ export const api = {
    * Asks a one-off side question about the live conversation. One model call outside a turn; the answer is not
    * stored and the transcript only gets a notice. Refused while the agent is busy.
    */
-  askBtw(text: string) {
-    return invoke<string>('ask_btw', { chatId: CHAT_ID, text });
+  askBtw(chatId: string, text: string) {
+    return invoke<string>('ask_btw', { chatId, text });
   },
   /**
    * Suggests a title for the live conversation. One model call outside a turn; nothing is stored and the
    * transcript only gets notices. Refused while the agent is busy, and when there is nothing to name yet.
    */
-  suggestName() {
-    return invoke<string>('suggest_name', { chatId: CHAT_ID });
+  suggestName(chatId: string) {
+    return invoke<string>('suggest_name', { chatId });
   },
   /**
    * Suggests a few follow-up prompts after the latest reply. One read-only model call: it never blocks a turn or a send,
    * and nothing is stored. Empty when there is nothing to suggest. Errors reject; the caller ignores them.
    */
-  suggestPrompts() {
-    return invoke<string[]>('suggest_prompts', { chatId: CHAT_ID });
+  suggestPrompts(chatId: string) {
+    return invoke<string[]>('suggest_prompts', { chatId });
   },
   /** Brings the main window forward, for a clicked notification. Errors reject; the caller ignores them. */
   focusMainWindow() {
@@ -209,28 +209,28 @@ export const api = {
     return invoke<void>('open_devtools');
   },
   /** Summarizes the live conversation into a new conversation and switches to it. The old one stays in history. */
-  compactConversation() {
-    return invoke<LoadedConversation>('compact_conversation', { chatId: CHAT_ID });
+  compactConversation(chatId: string) {
+    return invoke<LoadedConversation>('compact_conversation', { chatId });
   },
   /** Copies the live conversation into a new one and switches to it. The old one stays untouched. */
-  forkConversation() {
-    return invoke<LoadedConversation>('fork_conversation', { chatId: CHAT_ID });
+  forkConversation(chatId: string) {
+    return invoke<LoadedConversation>('fork_conversation', { chatId });
   },
   /** The live conversation as Markdown for `/export`: the stored history, so nothing is lost to the UI cap. */
-  exportConversation() {
-    return invoke<string>('export_conversation', { chatId: CHAT_ID });
+  exportConversation(chatId: string) {
+    return invoke<string>('export_conversation', { chatId });
   },
   /** The saved conversations, most recently updated first. */
   listConversations() {
     return invoke<ConversationMeta[]>('list_conversations');
   },
   /** Opens a saved conversation as the live one. Refused while the agent is busy. */
-  loadConversation(id: string) {
-    return invoke<LoadedConversation>('load_conversation', { chatId: CHAT_ID, id });
+  loadConversation(chatId: string, id: string) {
+    return invoke<LoadedConversation>('load_conversation', { chatId, id });
   },
   /** The full image of an attachment of the open conversation, as a PNG or JPEG data URL. Rejects when it is no longer stored. */
-  getAttachment(sha256: string, mime: string) {
-    return invoke<string>('get_attachment', { chatId: CHAT_ID, sha256, mime });
+  getAttachment(chatId: string, sha256: string, mime: string) {
+    return invoke<string>('get_attachment', { chatId, sha256, mime });
   },
   /** Deletes a saved conversation. Refused while the agent is busy. `deleted_live` says the live conversation was reset. */
   deleteConversation(id: string) {
@@ -349,8 +349,8 @@ export const api = {
     return invoke<McpView>('mcp_set_tool_approval', { name, tool, level });
   },
   /** The skills in the user's folders and, when the session's local shell is on top, its project's. Missing folders are fine. */
-  listSkills() {
-    return invoke<SkillsView>('list_skills', { chatId: CHAT_ID });
+  listSkills(chatId: string) {
+    return invoke<SkillsView>('list_skills', { chatId });
   },
   /** Opens the native "choose a folder" dialog. Resolves with the chosen folder as a full path, or null when the user cancels. Rejects when the dialog cannot open. */
   async pickFolder(defaultPath?: string): Promise<string | null> {

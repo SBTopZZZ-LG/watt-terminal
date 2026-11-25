@@ -100,8 +100,8 @@ export interface TabDeps {
   /** An agent event on the tab channel. The backend sends none; kept so nothing is dropped silently. */
   onStrayEvent: (ev: WireEvent) => void;
   /**
-   * Attaches the chat's agent channel. Resolves once it is attached. `fresh` attaches again even when an attach already
-   * succeeded (after a restart of a shell); the backend attach is idempotent.
+   * Attaches the agent channels of the known chats (see TabManager). Resolves once they are attached. `fresh` attaches them
+   * again even when an attach already succeeded (after a restart of a shell); the backend attach is idempotent.
    */
   attachChat: (fresh: boolean) => Promise<void>;
 }

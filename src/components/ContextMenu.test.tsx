@@ -8,7 +8,7 @@ const noop = () => undefined;
 describe('ContextMenu', () => {
   it('renders nothing until something is right-clicked or the Menu key is pressed', () => {
     const html = renderToStaticMarkup(
-      <ContextMenu terminal={{ state: 'prompt', agentBusy: false, pasteRoutesToPty: true }} onClearTerminal={noop} onFindTerminal={noop} onFindChat={noop} devtools={false} onRestartTab={noop} />,
+      <ContextMenu terminal={{ state: 'prompt', agentBusy: false, pasteRoutesToPty: true }} onClearTerminal={noop} onFindTerminal={noop} onFindChat={noop} devtools={false} onRestartTab={noop} chatId="main" />,
     );
     expect(html).toBe('');
   });
