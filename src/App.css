@@ -1077,7 +1077,7 @@ a {
 }
 
 /* The agent's activity line at the bottom of the transcript while a turn is in flight (role status). */
-.agent-activity {
+.agent-activity-row {
   display: flex;
   align-items: center;
   gap: 6px;

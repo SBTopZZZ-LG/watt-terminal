@@ -32,7 +32,7 @@ describe('Transcript: reasoning and the activity line', () => {
 
   it('the activity line is shown only while busy', () => {
     const busy = render([thinking(true)], true);
-    expect(busy).toMatch(/class="agent-activity" role="status"/);
+    expect(busy).toMatch(/class="agent-activity-row" role="status"/);
     expect(busy).toContain('<span>Thinking</span>');
     expect(render([], false)).not.toContain('agent-activity');
   });
