@@ -197,10 +197,14 @@ export type TranscriptAction =
    */
   | { type: 'conversation_loaded'; messages: ChatMessage[]; todos?: TodoItem[]; context?: ContextUsage | null }
   /** The next older chunk of a paged conversation is converted and put above the items. Does nothing when none is left. */
-  | { type: 'older_loaded' };
+  | { type: 'older_loaded' }
+  /** Replaces the whole transcript with a saved one: a chat switch puts the shown chat's own transcript back (see chats.ts). */
+  | { type: 'replace'; transcript: Transcript };
 
 export function transcriptReducer(t: Transcript, action: TranscriptAction): Transcript {
   switch (action.type) {
+    case 'replace':
+      return action.transcript;
     case 'agent_event':
       return applyAgentEvent(t, action.event, action.at, action.terminal);
     case 'record_finished': {

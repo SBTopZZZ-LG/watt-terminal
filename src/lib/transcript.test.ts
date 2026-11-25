@@ -1235,3 +1235,12 @@ describe('transcriptReducer: paged conversations', () => {
     expect(run(many, reset).items).toHaveLength(MAX_ITEMS);
   });
 });
+
+describe('transcriptReducer: replace', () => {
+  it('puts a saved transcript back as it was, whatever the live one holds', () => {
+    const saved = run([{ type: 'user_sent', clientId: 1, text: 'hi' }, { type: 'agent_event', event: { type: 'text', text: 'hello' } }]);
+    const live = run([{ type: 'notice', text: 'other chat' }, { type: 'user_sent', clientId: 2, text: 'x' }]);
+    expect(transcriptReducer(live, { type: 'replace', transcript: saved })).toBe(saved);
+    expect(isBusy(transcriptReducer(live, { type: 'replace', transcript: EMPTY_TRANSCRIPT }))).toBe(false);
+  });
+});
