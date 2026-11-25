@@ -5662,3 +5662,72 @@ a {
   border-top: 1px solid var(--tip-rule);
   opacity: 0.35;
 }
+
+/* The fallback when the interface hit a render error (ErrorBoundary.tsx). It fills the window and needs nothing else from the app. */
+.crash-view {
+  position: fixed;
+  inset: 0;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  overflow: auto;
+  background: var(--bg);
+  color: var(--ink);
+}
+
+.crash-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: min(720px, 100%);
+  min-width: 0;
+}
+
+.crash-title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--ink-strong);
+}
+
+.crash-text {
+  margin: 0;
+  color: var(--muted);
+}
+
+.crash-details {
+  margin: 0;
+  max-height: 45vh;
+  overflow: auto;
+  padding: 12px;
+  border: 1px solid var(--rule);
+  background: var(--panel);
+  color: var(--ink);
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.crash-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.crash-button {
+  padding: 4px 12px;
+  border: 1px solid var(--rule-strong);
+  border-radius: 4px;
+  background: var(--tint);
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+}
+
+.crash-button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
