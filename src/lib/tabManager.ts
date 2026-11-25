@@ -174,6 +174,21 @@ export class TabManager {
   }
 
   /**
+   * Moves a terminal that chat `from` owns to chat `chatId`: it is unassigned there, then assigned here. A refusal (`from` is
+   * busy and would lose it) is shown, and nothing more is done. The owners are read again either way, so the strip shows what
+   * happened.
+   */
+  async move(id: string, from: string, chatId: string): Promise<void> {
+    try {
+      await api.assignTab(from, id, false);
+      await api.assignTab(chatId, id, true);
+    } catch (e) {
+      this.reportError(e);
+    }
+    await this.refresh().catch((e: unknown) => this.reportError(e));
+  }
+
+  /**
    * Closes a terminal: its session is closed, then its controller is disposed. The last terminal cannot be closed. When the
    * active one closes, its neighbour takes over. Resolves true when it closed.
    */

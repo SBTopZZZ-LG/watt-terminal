@@ -92,4 +92,28 @@ describe('TabManager chat channels', () => {
     await manager.assign('t2', true, 'c2');
     expect(invoke.mock.calls[0]).toEqual(['assign_tab_cmd', { chatId: 'c2', sessionId: 't2', on: true }]);
   });
+
+  it('move unassigns the terminal from its chat, assigns it to this one, then reads the owners again', async () => {
+    const manager = new TabManager();
+    invoke.mockImplementation(async (cmd: string) => (cmd === 'list_tabs' ? [] : undefined));
+    await manager.move('t2', 'c2', 'main');
+    expect(invoke.mock.calls.map(([cmd]) => cmd)).toEqual(['assign_tab_cmd', 'assign_tab_cmd', 'list_tabs']);
+    expect(invoke.mock.calls[0]).toEqual(['assign_tab_cmd', { chatId: 'c2', sessionId: 't2', on: false }]);
+    expect(invoke.mock.calls[1]).toEqual(['assign_tab_cmd', { chatId: 'main', sessionId: 't2', on: true }]);
+  });
+
+  it('move shows a refusal (the chat it leaves is busy) and assigns nothing more', async () => {
+    const manager = new TabManager();
+    const seen: unknown[] = [];
+    manager.subscribeChat((msg) => seen.push(msg));
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'assign_tab_cmd') {
+        throw 'chat c2 is busy';
+      }
+      return cmd === 'list_tabs' ? [] : undefined;
+    });
+    await manager.move('t2', 'c2', 'main');
+    expect(invoke.mock.calls.map(([cmd]) => cmd)).toEqual(['assign_tab_cmd', 'list_tabs']);
+    expect(seen).toEqual([{ kind: 'error', message: 'chat c2 is busy' }]);
+  });
 });

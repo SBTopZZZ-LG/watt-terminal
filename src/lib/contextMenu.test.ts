@@ -177,6 +177,10 @@ describe('menuFor: terminal tab', () => {
     expect(summary(menuFor(ctx('tab', { tabVisible: true, tabCanClose: true }), false))).toEqual(['Hide from agent', 'Restart', '---', 'Close']);
   });
 
+  it('says Move to this chat for a terminal another chat owns', () => {
+    expect(summary(menuFor(ctx('tab', { tabOther: true, tabCanClose: true }), false))).toEqual(['Move to this chat', 'Restart', '---', 'Close']);
+  });
+
   it('disables Close for the last terminal, and leaves Restart and the assignment enabled', () => {
     expect(summary(menuFor(ctx('tab', { tabCanClose: false }), false))).toEqual(['Make visible to agent', 'Restart', '---', 'Close (off)']);
   });

@@ -2165,7 +2165,7 @@ export default function App() {
         dock={panel.dock}
         terminal={
           <div className="terminal-area">
-            <TabStrip newTabsVisible={newTabsVisible} chatId={chatId} />
+            <TabStrip newTabsVisible={newTabsVisible} chatId={chatId} chatOrder={chatOrder} />
             <div className="term-stack">
               {tabs.list().map((t) => (
                 <TerminalView

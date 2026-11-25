@@ -299,6 +299,13 @@ a {
   }
 }
 
+/* A terminal another chat sees: a hollow dot in the muted colour (its title names the chat). */
+.term-tab-dot.is-other {
+  background: none;
+  border: 1px solid var(--muted);
+  box-sizing: border-box;
+}
+
 /* The close button shows on hover and focus, and always on the active tab. */
 .term-tab-close {
   flex: 0 0 auto;

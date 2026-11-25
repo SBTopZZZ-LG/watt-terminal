@@ -70,6 +70,8 @@ export interface MenuContext {
   link: boolean;
   /** Tab: the terminal is visible to the chat (its owner is this chat). The item says what the click does. */
   tabVisible: boolean;
+  /** Tab: another chat owns the terminal. The item then moves it to this chat. */
+  tabOther: boolean;
   /** Tab: the terminal can be closed (the last one cannot). */
   tabCanClose: boolean;
 }
@@ -89,6 +91,7 @@ export function emptyContext(region: MenuRegion): MenuContext {
     tool: false,
     link: false,
     tabVisible: false,
+    tabOther: false,
     tabCanClose: false,
   };
 }
@@ -132,15 +135,15 @@ function joinGroups(groups: (MenuItem | false)[][]): MenuItem[] {
  * all, Find in terminal; then Clear terminal (only at the prompt, with the agent idle, off the alternate screen) and Scroll
  * to bottom. Field: Cut and Paste when it is writable, Copy and Cut without a selection are disabled, then Select all.
  * Chat: Copy (selection), Copy message, Select all, Find in chat; then the code, tool and link items where they apply.
- * Chip: Copy value. Tab: the assignment (Make visible / Hide from agent), Restart, then Close (disabled for the last
- * terminal). None: no items.
+ * Chip: Copy value. Tab: the assignment (Make visible / Move to this chat / Hide from agent), Restart, then Close (disabled for
+ * the last terminal). None: no items.
  */
 export function menuFor(ctx: MenuContext, mac: boolean = IS_MAC): MenuItem[] {
   switch (ctx.region) {
     case 'tab':
       return joinGroups([
         [
-          item('tab-visibility', ctx.tabVisible ? 'Hide from agent' : 'Make visible to agent', { mac }),
+          item('tab-visibility', ctx.tabVisible ? 'Hide from agent' : ctx.tabOther ? 'Move to this chat' : 'Make visible to agent', { mac }),
           item('tab-restart', 'Restart', { mac }),
         ],
         [item('tab-close', 'Close', { disabled: !ctx.tabCanClose, mac })],

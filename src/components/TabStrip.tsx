@@ -5,6 +5,7 @@ import { effectiveState } from '../lib/inputState';
 import { nextTabId } from '../lib/tabKeys';
 import { tabs } from '../lib/tabManager';
 import type { TabController } from '../lib/tab';
+import { chatLabel } from '../lib/chats';
 import { isOwnedByChat, TAB_LIMIT_MESSAGE, tabLimitReached } from '../lib/tabStrip';
 
 /** A click or a press on a tab, the "+" or a "×" keeps the focus where it was: the terminal keeps the keys. */
@@ -39,14 +40,18 @@ interface TabButtonProps {
   canClose: boolean;
   /** The active chat: a dot marks a terminal visible to it. */
   chatId: string;
+  /** Every chat made here, in creation order (the names of the chats, see chats.ts). */
+  chatOrder: readonly string[];
   onKeyDown: (e: KeyboardEvent<HTMLButtonElement>, id: string) => void;
 }
 
-function TabButton({ tab, selected, canClose, chatId, onKeyDown }: TabButtonProps) {
+function TabButton({ tab, selected, canClose, chatId, chatOrder, onKeyDown }: TabButtonProps) {
   const s = useSyncExternalStore(tab.subscribe, tab.getSnapshot);
   const label = tabs.label(tab.id) ?? '';
   const ended = effectiveState(s.input) === 'exited';
   const visible = isOwnedByChat(s.owner, chatId);
+  // A terminal another chat sees: a muted dot, with that chat's name. An owner that is not a chat made here is not named.
+  const otherName = s.owner !== null && !visible && chatOrder.includes(s.owner) ? chatLabel(chatOrder, s.owner) : null;
   // The agent holds this terminal's shell (its turn runs a command here, or it is about to): the tab pulses.
   const controlling = borderActive(s.agentControl);
   const cls = ['term-tab', selected ? 'is-active' : '', ended ? 'is-ended' : ''].filter((c) => c !== '').join(' ');
@@ -68,6 +73,7 @@ function TabButton({ tab, selected, canClose, chatId, onKeyDown }: TabButtonProp
         onKeyDown={(e) => onKeyDown(e, tab.id)}
       >
         {visible && <span className="term-tab-dot" aria-hidden="true" />}
+        {otherName !== null && <span className="term-tab-dot is-other" aria-hidden="true" title={`Visible to ${otherName}`} />}
         {controlling && <span className="term-tab-control" aria-hidden="true" />}
         <span className="term-tab-label">{label}</span>
         {ended && <span className="term-tab-ended">ended</span>}
@@ -93,6 +99,8 @@ export interface TabStripProps {
   newTabsVisible: boolean;
   /** The active chat. Its visible terminals get the dot, and "+" assigns to it. */
   chatId: string;
+  /** Every chat made here, in creation order: a terminal another chat sees is named by it. */
+  chatOrder: readonly string[];
 }
 
 /**
@@ -101,7 +109,7 @@ export interface TabStripProps {
  * between tabs, as the WAI-ARIA tabs pattern gives them. A vertical wheel scrolls the row sideways. Right-click (or the Menu
  * key) opens the tab's menu (see ContextMenu.tsx).
  */
-export function TabStrip({ newTabsVisible, chatId }: TabStripProps) {
+export function TabStrip({ newTabsVisible, chatId, chatOrder }: TabStripProps) {
   const { ids, activeId } = useSyncExternalStore(tabs.subscribeStore, tabs.getSnapshot);
   const scroller = useRef<HTMLDivElement>(null);
   const full = tabLimitReached(ids.length);
@@ -133,7 +141,7 @@ export function TabStrip({ newTabsVisible, chatId }: TabStripProps) {
         {ids.map((id) => {
           const tab = tabs.get(id);
           return tab === undefined ? null : (
-            <TabButton key={id} tab={tab} selected={id === activeId} canClose={ids.length > 1} chatId={chatId} onKeyDown={onKeyDown} />
+            <TabButton key={id} tab={tab} selected={id === activeId} canClose={ids.length > 1} chatId={chatId} chatOrder={chatOrder} onKeyDown={onKeyDown} />
           );
         })}
       </div>

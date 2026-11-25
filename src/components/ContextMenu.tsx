@@ -67,7 +67,12 @@ function tabFactsOf(id: string, chatId: string): TabFacts | null {
   if (tab === undefined) {
     return null;
   }
-  return { visible: isOwnedByChat(tab.getSnapshot().owner, chatId), canClose: tabs.getSnapshot().ids.length > 1 };
+  const owner = tab.getSnapshot().owner;
+  return {
+    visible: isOwnedByChat(owner, chatId),
+    elsewhere: owner !== null && !isOwnedByChat(owner, chatId),
+    canClose: tabs.getSnapshot().ids.length > 1,
+  };
 }
 
 /** Shift+F10 and the Menu key open the menu from the keyboard. */
@@ -193,7 +198,13 @@ async function runAction(id: MenuItem['id'], snap: MenuSnapshot, props: ContextM
     case 'tab-visibility':
       // The registry shows a refusal (a busy chat that would lose the terminal) and re-reads the owners.
       if (snap.tabId !== null) {
-        await tabs.assign(snap.tabId, !snap.ctx.tabVisible, props.chatId);
+        // Another chat's terminal moves here; the owner is read now, as the menu may be older than the owner.
+        const owner = snap.ctx.tabOther ? (tabs.get(snap.tabId)?.getSnapshot().owner ?? null) : null;
+        if (owner !== null) {
+          await tabs.move(snap.tabId, owner, props.chatId);
+        } else {
+          await tabs.assign(snap.tabId, !snap.ctx.tabVisible, props.chatId);
+        }
       }
       return;
     case 'tab-restart':

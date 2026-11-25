@@ -23,6 +23,8 @@ export interface TabFacts {
   visible: boolean;
   /** The terminal may be closed (it is not the last one). */
   canClose: boolean;
+  /** Another chat owns the terminal (the item moves it to this one). Absent or false: none does, or this chat does. */
+  elsewhere?: boolean;
 }
 
 export type TextField = HTMLInputElement | HTMLTextAreaElement;
@@ -125,7 +127,7 @@ export function resolveMenu(
     if (id === null || facts === null) {
       return null;
     }
-    const ctx: MenuContext = { ...emptyContext('tab'), tabVisible: facts.visible, tabCanClose: facts.canClose };
+    const ctx: MenuContext = { ...emptyContext('tab'), tabVisible: facts.visible, tabOther: facts.elsewhere === true, tabCanClose: facts.canClose };
     return { ...base, ctx, tabId: id };
   }
 
