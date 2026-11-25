@@ -634,6 +634,8 @@ export default function App() {
     const step = altPanelStep(altPanel.current, { type: 'state', state: effective, open: layoutRef.current.open });
     altPanel.current = step.state;
     if (step.open !== null) {
+      // Focus inside the panel would fall to <body> when it hides, and the full-screen program would lose the keys.
+      if (step.open === false && panelRef.current?.contains(document.activeElement)) term.focus();
       dispatchPanel({ type: 'open', open: step.open });
     }
   }, [effective]);
