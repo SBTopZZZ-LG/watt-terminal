@@ -94,7 +94,8 @@ pub type LearnedLimits = Arc<Mutex<HashMap<String, u32>>>;
 pub type LastUsage = Arc<Mutex<Option<ContextUsage>>>;
 
 /// The host tool names the last accepted model reply was offered, shared by a conversation's agents (see
-/// `Conversation::offered_tools`). None until a reply is accepted.
+/// `Conversation::offered_tools`). None until a reply is accepted. A reply whose request carried a tools note moves it only
+/// once the note is delivered (see `LlmAgent::respond`).
 pub type OfferedTools = Arc<Mutex<Option<BTreeSet<String>>>>;
 
 /// How many names each half of the tool note lists. More are said as a count.
@@ -621,7 +622,7 @@ impl LlmAgent {
     }
 
     /// The host tools the last accepted reply was offered, shared with the conversation (see `Conversation::offered_tools`).
-    /// When a request offers a different set, its system text says what came and went (see `tools_note`). Without it, the
+    /// When a request offers a different set, its note says what came and went (see `tools_note`). Without it, the
     /// baseline lasts for this agent only, so the first request of an agent gets no note.
     pub fn with_offered_tools(mut self, offered: OfferedTools) -> Self {
         self.offered_tools = offered;
@@ -761,14 +762,11 @@ impl LlmAgent {
             // Built per request, so an external host's tools are the ones it offers now.
             let tools = request_tools(&self.tools, ctx.external_tools());
             let offered = host_tool_names(&self.tools, &tools);
-            // The note is for this request only: the baseline moves when a reply is accepted (see `respond`), so a retry
-            // of this call says the same again.
+            // The note is for this request only: the baseline moves when its reply is accepted and the note is delivered (see
+            // `respond`), so a retry of this call says the same again. It is not in the system text: it goes into the first
+            // tool result of the reply (see `run_calls`), so the system text, which providers cache, stays the same.
             let note = tools_note(lock_offered(&self.offered_tools).as_ref(), &offered);
-            let request_system = match &note {
-                Some(note) => format!("{system}\n\n{note}"),
-                None => system.clone(),
-            };
-            let Some(request) = self.fit_or_say(ctx, &tools, limit, &request_system, &mut resolver) else {
+            let Some(request) = self.fit_or_say(ctx, &tools, limit, &system, &mut resolver) else {
                 return Asked::Ended;
             };
             let sent_images = has_image_part(&request.messages);
@@ -1002,7 +1000,8 @@ impl LlmAgent {
     /// The calls after a stop are not run; the caller closes them in the history. `Stop::Steered` is not a stop of the turn:
     /// a steer waits after a finished call, so the calls after it are skipped and the steer goes in at the next step (see
     /// `respond`). A running call is never interrupted: the steer is looked at only between calls. `note` is the MCP note of the
-    /// request this reply answers (see `tools_note`): it is added once, to the first result recorded here.
+    /// request this reply answers (see `tools_note`): it is added once, to the first result recorded here, and taken, so a
+    /// caller that finds it None knows it was delivered.
     fn run_calls(
         &self,
         calls: &[ToolCall],
@@ -1010,7 +1009,7 @@ impl LlmAgent {
         commands: &mut u32,
         writes: &mut u32,
         skills_granted: &mut HashSet<String>,
-        mut note: Option<&str>,
+        note: &mut Option<String>,
     ) -> Option<Stop> {
         for (index, call) in calls.iter().enumerate() {
             if self.cancel.is_cancelled() {
@@ -1189,13 +1188,9 @@ impl Agent for LlmAgent {
             // The open commands when this request starts. One that is no longer open when the reply is acted on finished
             // while the reply was made. Empty once the redos are used up, so nothing can discard the reply then.
             let open = if redos < MAX_REDOS { ctx.open_record_ids() } else { Vec::new() };
-            let (reply, note) = match self.ask_model(ctx, finished.take().as_deref(), &open) {
-                Asked::Reply(reply, offered, note) if finished_among(&open, ctx).is_empty() => {
-                    // Accepted: the next request is compared with the tools this one was offered (see `tools_note`). Its note,
-                    // if it had one, goes into the first result of this reply's calls (see `run_calls`).
-                    *lock_offered(&self.offered_tools) = Some(offered);
-                    (reply, note)
-                }
+            let (reply, mut offered, mut note) = match self.ask_model(ctx, finished.take().as_deref(), &open) {
+                // Accepted. Its note, if it had one, goes into the first result of this reply's calls (see `run_calls`).
+                Asked::Reply(reply, offered, note) if finished_among(&open, ctx).is_empty() => (reply, Some(offered), note),
                 Asked::Reply(..) | Asked::Interrupted => {
                     // Discarded whole: not pushed to the history, and what the transcript showed of it is removed. The
                     // model is asked again on the same history, told which command finished (see `redo_note`).
@@ -1207,6 +1202,9 @@ impl Agent for LlmAgent {
                 }
                 Asked::Ended => return,
             };
+            // The next request is compared with the tools this one was offered (see `tools_note`). A pending note holds the
+            // baseline until it is delivered below: a reply that delivers none, or a turn that ends first, keeps it.
+            settle_offered(&self.offered_tools, &mut offered, &note);
             lock(&self.history).push_assistant(reply.raw);
             if reply.tool_calls.is_empty() {
                 // A steer that is waiting continues the turn: it goes in, and the model is asked again. Otherwise the mailbox
@@ -1230,9 +1228,10 @@ impl Agent for LlmAgent {
                 ctx.say(cap.notice());
                 return;
             }
-            if let Some(stop) =
-                self.run_calls(&reply.tool_calls, ctx, &mut commands, &mut writes, &mut skills_granted, note.as_deref())
-            {
+            let stop = self.run_calls(&reply.tool_calls, ctx, &mut commands, &mut writes, &mut skills_granted, &mut note);
+            // Settled before the stop is acted on: a note that run_calls delivered before stopping is delivered.
+            settle_offered(&self.offered_tools, &mut offered, &note);
+            if let Some(stop) = stop {
                 lock(&self.history).close_pending(stop.reason());
                 if stop == Stop::Denied {
                     ctx.say(DENIED_NOTICE);
@@ -1305,9 +1304,9 @@ fn host_tool_names(builtins: &[Value], tools: &[Value]) -> BTreeSet<String> {
     tools.iter().filter_map(tool_name).filter(|name| !builtin.contains(name)).map(str::to_string).collect()
 }
 
-/// The system text for a request whose host tools differ from the ones the last accepted reply was offered (`was`). None
-/// when there was no such reply, or the names are the same. Only the halves that have names are said. The same line also
-/// goes into the first tool result of the reply to that request, if it has calls (see `run_calls`).
+/// The note for a request whose host tools differ from the ones the last accepted reply was offered (`was`). None when
+/// there was no such reply, or the names are the same. Only the halves that have names are said. It goes into the first
+/// tool result of the reply to that request, if it has calls (see `run_calls`), never into the system text.
 fn tools_note(was: Option<&BTreeSet<String>>, now: &BTreeSet<String>) -> Option<String> {
     let was = was?;
     let added: Vec<&str> = now.difference(was).map(String::as_str).collect();
@@ -1323,6 +1322,17 @@ fn tools_note(was: Option<&BTreeSet<String>>, now: &BTreeSet<String>) -> Option<
         ));
     }
     (!parts.is_empty()).then(|| format!("MCP tools changed since your last request. {}", parts.join(" ")))
+}
+
+/// Moves the baseline to `offered`, the tools of an accepted reply, once no note is pending (`note` is None: it was never
+/// there or it was delivered). `offered` is taken, so it moves at most once.
+fn settle_offered(baseline: &OfferedTools, offered: &mut Option<BTreeSet<String>>, note: &Option<String>) {
+    if note.is_some() {
+        return;
+    }
+    if let Some(offered) = offered.take() {
+        *lock_offered(baseline) = Some(offered);
+    }
 }
 
 /// The names, at most `TOOL_NOTE_NAMES` of them, then how many more there are.

@@ -3301,7 +3301,7 @@ fn an_unchanged_set_of_tools_gives_no_note_on_the_next_turn() {
 }
 
 #[test]
-fn a_tool_that_appears_during_a_turn_is_noted_in_the_next_request() {
+fn a_tool_that_appears_during_a_turn_is_not_in_the_system_text() {
     let provider = serve(vec![Script::json(tool_reply(&[("c1", "ext_a", "{}")])), Script::json(text_reply("done"))]);
     let conv = Conversation::new().unwrap();
     let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
@@ -3312,7 +3312,8 @@ fn a_tool_that_appears_during_a_turn_is_noted_in_the_next_request() {
     let requests = provider.requests();
     assert_eq!(note_of(&requests[0]), None, "the first request is not noted");
     assert!(tool_names_of(&requests[1]).contains(&"ext_b".to_string()));
-    assert_eq!(note_of(&requests[1]).as_deref(), Some("MCP tools changed since your last request. Now available: ext_b."));
+    assert_eq!(note_of(&requests[1]), None, "the note is never in the system text");
+    assert!(!requests[1].contains("MCP tools changed"), "the reply to it has no calls, so the note is not delivered yet");
 }
 
 #[test]
@@ -3326,30 +3327,35 @@ fn a_tool_that_goes_away_is_noted_as_no_longer_available() {
     turn_with_host(&mut agent, &host, "second");
     let requests = provider.requests();
     assert!(!tool_names_of(&requests[1]).contains(&"ext_b".to_string()), "the request does not offer it");
-    assert_eq!(
-        note_of(&requests[1]).as_deref(),
-        Some(
-            "MCP tools changed since your last request. No longer available: ext_b (their server was disabled, disconnected or \
-             failed): do not call them."
-        )
-    );
+    assert_eq!(note_of(&requests[1]), None, "the note is never in the system text");
 }
 
 #[test]
-fn both_halves_are_said_once_and_the_note_is_not_kept_in_the_history() {
-    let provider = serve(vec![Script::json(text_reply("one")), Script::json(text_reply("two")), Script::json(text_reply("three"))]);
+fn both_halves_are_said_once_in_the_first_result_and_not_in_the_system_text() {
+    let provider = serve(vec![
+        Script::json(text_reply("one")),
+        Script::json(text_reply("two")),
+        Script::json(tool_reply(&[("c1", "y", "{}")])),
+        Script::json(text_reply("three")),
+    ]);
     let conv = Conversation::new().unwrap();
     let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
     let host = McpFake::with(&["x"]);
     turn_with_host(&mut agent, &host, "first");
     host.set(&["y"]);
+    // The reply to this request is text only: the note is not delivered, so the next turn's request says it again.
     turn_with_host(&mut agent, &host, "second");
     turn_with_host(&mut agent, &host, "third");
     let requests = provider.requests();
-    let both = note_of(&requests[1]).expect("a note");
-    assert!(both.contains("Now available: y.") && both.contains("No longer available: x ("), "{both}");
-    assert_eq!(note_of(&requests[2]), None, "the next request was offered the same set as the last accepted reply");
-    assert!(!serde_json::to_string(&stored(&conv.history())).unwrap().contains("MCP tools changed"));
+    assert_eq!(requests.len(), 4, "{requests:?}");
+    assert!(requests.iter().all(|raw| note_of(raw).is_none()), "the note is never in the system text");
+    assert!(!requests[1].contains("MCP tools changed"), "undelivered, so not in any result yet");
+    assert!(!requests[2].contains("MCP tools changed"), "the note is delivered by the reply to this request, not before");
+    let results = tool_results_of(&requests[3]);
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(results[0].contains("Now available: y.") && results[0].contains("No longer available: x ("), "{results:?}");
+    assert_eq!(results[0].matches("MCP tools changed").count(), 1, "{results:?}");
+    assert_eq!(serde_json::to_string(&stored(&conv.history())).unwrap().matches("MCP tools changed").count(), 1);
 }
 
 #[test]
@@ -3369,7 +3375,8 @@ fn a_request_that_fails_does_not_move_the_baseline_so_the_retry_still_says_it() 
     let provider = serve(vec![
         Script::json(text_reply("one")),
         Script::error("400 Bad Request", json!({"error": {"message": "no-such-model", "code": 400}})),
-        Script::json(text_reply("three")),
+        Script::json(tool_reply(&[("c1", "ext_a", "{}")])),
+        Script::json(text_reply("done")),
     ]);
     let conv = Conversation::new().unwrap();
     let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
@@ -3379,11 +3386,16 @@ fn a_request_that_fails_does_not_move_the_baseline_so_the_retry_still_says_it() 
     turn_with_host(&mut agent, &host, "second, fails");
     turn_with_host(&mut agent, &host, "third");
     let requests = provider.requests();
-    assert_eq!(requests.len(), 3, "the failed turn made one request");
-    assert_eq!(note_of(&requests[2]).as_deref(), Some("MCP tools changed since your last request. Now available: ext_b."));
+    assert_eq!(requests.len(), 4, "the failed turn made one request");
+    assert!(!requests[1].contains("MCP tools changed"), "the failed request carried it, but nothing was delivered");
+    assert_eq!(note_of(&requests[2]), None, "the note is never in the system text");
+    let results = tool_results_of(&requests[3]);
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(results[0].ends_with(NOTE_B_IN_RESULT), "{results:?}");
+    assert_eq!(requests[3].matches("MCP tools changed").count(), 1, "{}", requests[3]);
 }
 
-/// The MCP note that says ext_b came, as the system text has it.
+/// The MCP note that says ext_b came.
 const NOTE_B: &str = "MCP tools changed since your last request. Now available: ext_b.";
 /// The same note as the first tool result of a reply carries it: on its own line, at the end.
 const NOTE_B_IN_RESULT: &str = "\nMCP tools changed since your last request. Now available: ext_b.";
@@ -3432,7 +3444,8 @@ fn a_tool_that_appears_during_a_turn_is_also_noted_in_the_first_result_of_the_ne
     turn_with_host(&mut agent, &host, "use it");
     let requests = provider.requests();
     assert_eq!(requests.len(), 3);
-    assert_eq!(note_of(&requests[1]).as_deref(), Some(NOTE_B), "the system line is as before");
+    assert_eq!(note_of(&requests[1]), None, "the note is never in the system text");
+    assert!(!requests[1].contains("MCP tools changed"), "c1 has not run yet when this request is sent");
     assert_eq!(note_of(&requests[2]), None, "the next request was offered the same set as the last accepted reply");
     let results = tool_results_of(&requests[2]);
     assert_eq!(results.len(), 2, "{results:?}");
@@ -3457,6 +3470,7 @@ fn only_the_first_result_of_the_reply_carries_the_note_and_later_requests_do_not
     turn_with_host(&mut agent, &host, "more");
     let requests = provider.requests();
     assert_eq!(requests.len(), 4);
+    assert!(!requests[1].contains("MCP tools changed"), "the note is not in the system text or any result yet");
     let results = tool_results_of(&requests[2]);
     assert_eq!(results.len(), 3, "{results:?}");
     assert!(results[1].ends_with(NOTE_B_IN_RESULT), "{results:?}");
@@ -3481,7 +3495,7 @@ fn a_tool_that_goes_away_is_also_noted_in_the_first_result_of_the_reply() {
     let requests = provider.requests();
     let gone = "MCP tools changed since your last request. No longer available: ext_b (their server was disabled, disconnected or \
                 failed): do not call them.";
-    assert_eq!(note_of(&requests[1]).as_deref(), Some(gone));
+    assert_eq!(note_of(&requests[1]), None, "the note is never in the system text");
     let results = tool_results_of(&requests[2]);
     assert_eq!(results.len(), 1, "{results:?}");
     assert!(results[0].ends_with(&format!("\n{gone}")), "{results:?}");
@@ -3520,12 +3534,41 @@ fn a_discarded_reply_with_calls_leaves_no_note_behind_and_the_redo_gets_it_once(
     assert!(events.iter().any(|e| matches!(e, AgentEvent::ReplyDiscarded)), "{events:?}");
     let requests = provider.requests();
     assert_eq!(requests.len(), 4, "{events:?}");
-    assert_eq!(note_of(&requests[1]).as_deref(), Some(NOTE_B));
-    assert_eq!(note_of(&requests[2]).as_deref(), Some(NOTE_B), "the discard did not move the baseline, so the redo says it again");
+    assert!(!requests[1].contains("MCP tools changed"), "the discarded reply's request: nothing delivered");
+    assert!(!requests[2].contains("MCP tools changed"), "the discard delivered nothing, so the redo's request has no note");
+    // The redo's reply makes the call that gets the note: the discarded reply's call never ran, so it is not in the history.
     let results = tool_results_of(&requests[3]);
     assert_eq!(results.len(), 1, "{results:?}");
     assert!(results[0].ends_with(NOTE_B_IN_RESULT), "{results:?}");
     let stored_text = serde_json::to_string(&stored(&conv.history())).unwrap();
     assert!(!stored_text.contains("\"c1\""), "the discarded call is not in the history");
     assert_eq!(stored_text.matches("MCP tools changed").count(), 1, "{stored_text}");
+}
+
+#[test]
+fn a_text_only_reply_does_not_move_the_baseline_so_the_note_rides_on_a_later_tool_result() {
+    let provider = serve(vec![
+        Script::json(text_reply("one")),
+        Script::json(text_reply("two")),
+        Script::json(tool_reply(&[("c1", "ext_a", "{}")])),
+        Script::json(text_reply("done")),
+    ]);
+    let conv = Conversation::new().unwrap();
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
+    let host = McpFake::with(&["ext_a"]);
+    turn_with_host(&mut agent, &host, "first");
+    host.set(&["ext_a", "ext_b"]);
+    turn_with_host(&mut agent, &host, "second, text only");
+    // The tools are the same as in the last request, which had the note: it is said again, on the call's result.
+    turn_with_host(&mut agent, &host, "third");
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 4, "{requests:?}");
+    assert_eq!(note_of(&requests[1]), None, "the note is never in the system text");
+    assert!(!requests[1].contains("MCP tools changed"), "the text-only reply delivered nothing");
+    assert_eq!(note_of(&requests[2]), None, "the note is never in the system text");
+    assert!(!requests[2].contains("MCP tools changed"), "the request that makes the call is not noted in any result yet");
+    let results = tool_results_of(&requests[3]);
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(results[0].ends_with(NOTE_B_IN_RESULT), "{results:?}");
+    assert_eq!(requests[3].matches("MCP tools changed").count(), 1, "{}", requests[3]);
 }
