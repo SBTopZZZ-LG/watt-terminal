@@ -34,7 +34,9 @@ import type { AgentControl, BorderLevel } from './lib/agentControl';
 import { EMPTY_TRANSCRIPT, firstPendingApproval, hasOlder, isBusy, transcriptReducer } from './lib/transcript';
 import type { TranscriptItem } from './lib/transcript';
 import { chatBodyShown, loadPanelLayout, panelReducer, panelView, savePanelLayout } from './lib/panelLayout';
-import type { Container } from './lib/panelLayout';
+import type { Container, PanelAction } from './lib/panelLayout';
+import { altPanelStep, INITIAL_ALT_PANEL, layoutToSave } from './lib/altPanel';
+import type { AltPanelState } from './lib/altPanel';
 import { defaultSizeStorage } from './lib/zoom';
 import { agentActivity } from './lib/agentActivity';
 import { userAttachments } from './lib/attachments';
@@ -113,6 +115,13 @@ export default function App() {
   const [transcript, dispatchTranscript] = useReducer(transcriptReducer, EMPTY_TRANSCRIPT);
   // The agent panel's dock, sizes and open state. Saved on every change (see the effect below).
   const [panel, dispatchPanel] = useReducer(panelReducer, undefined, () => loadPanelLayout(defaultSizeStorage()));
+  // The panel's auto-hide while a full-screen program runs (see altPanel.ts). A ref: the listeners read it as it is now.
+  const altPanel = useRef<AltPanelState>(INITIAL_ALT_PANEL);
+  /** A panel action the user took (a button, the hotkey, a toast, History). Inside a full-screen run it takes control of the panel. */
+  const userPanel = (action: PanelAction) => {
+    altPanel.current = altPanelStep(altPanel.current, { type: 'user' }).state;
+    dispatchPanel(action);
+  };
   const workspaceRef = useRef<HTMLDivElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const workspace = useElementSize(workspaceRef, { width: window.innerWidth, height: window.innerHeight });
@@ -619,11 +628,23 @@ export default function App() {
     }
   }, [effective]);
 
-  // Saved on every change. A drag saves on each move; the write is a few hundred bytes. The UI state file gets the same
-  // change, debounced (see uiSaver).
+  // The panel closes while a full-screen program runs and opens again when it ends (see altPanel.ts). A user action in
+  // that run goes through userPanel instead, and takes control of the panel.
   useEffect(() => {
-    savePanelLayout(panel, defaultSizeStorage());
-    persist(panelPatch(panel));
+    const step = altPanelStep(altPanel.current, { type: 'state', state: effective, open: layoutRef.current.open });
+    altPanel.current = step.state;
+    if (step.open !== null) {
+      dispatchPanel({ type: 'open', open: step.open });
+    }
+  }, [effective]);
+
+  // Saved on every change. A drag saves on each move; the write is a few hundred bytes. The UI state file gets the same
+  // change, debounced (see uiSaver). While the panel is hidden for a full-screen program, the saved open state is the user's
+  // (see layoutToSave), so the hiding is never saved as their choice.
+  useEffect(() => {
+    const saved = layoutToSave(panel, altPanel.current);
+    savePanelLayout(saved, defaultSizeStorage());
+    persist(panelPatch(saved));
   }, [panel]);
 
   // Refits the terminal once a dock change, a rail change or a drag's end is on screen. The fit reads the settled size
@@ -659,7 +680,7 @@ export default function App() {
         // visible when the focus effect in InputBar runs.
         const { open } = layoutRef.current;
         if (!open) {
-          dispatchPanel({ type: 'open', open: true });
+          userPanel({ type: 'open', open: true });
         }
         const { bar } = routeRef.current;
         if (bar !== 'exited') {
@@ -1093,7 +1114,7 @@ export default function App() {
 
   /** Opens the agent panel on the chat view and moves focus to the bar. */
   const showChat = () => {
-    dispatchPanel({ type: 'open', open: true });
+    userPanel({ type: 'open', open: true });
     setPanelBody('chat');
     setFocusToken((t) => t + 1);
   };
@@ -1101,7 +1122,7 @@ export default function App() {
   /** The `/history` command. It opens the panel if collapsed and shows History; unlike the button it never toggles it closed. */
   const showHistory = () => {
     if (!panel.open) {
-      dispatchPanel({ type: 'open', open: true });
+      userPanel({ type: 'open', open: true });
     }
     // Remount, so the search field takes focus even when History is already shown.
     setHistoryKey((k) => k + 1);
@@ -1490,7 +1511,7 @@ export default function App() {
   /** The History button. It opens the panel first if it is collapsed, so the view is visible. Closing returns focus to it. */
   const toggleHistory = () => {
     if (!panel.open) {
-      dispatchPanel({ type: 'open', open: true });
+      userPanel({ type: 'open', open: true });
     }
     if (panelBody === 'history') {
       focusHistoryButton();
@@ -1838,7 +1859,7 @@ export default function App() {
           <AgentPanel
             ref={panelRef}
             view={view}
-            onExpand={() => dispatchPanel({ type: 'toggle' })}
+            onExpand={() => userPanel({ type: 'toggle' })}
             busy={busy || sideBusy}
             thinking={transcript.thinking}
             approvalPending={pendingApproval !== null}
@@ -1853,7 +1874,7 @@ export default function App() {
               onLoadOlder={() => dispatchTranscript({ type: 'older_loaded' })}
               approvalPending={pendingApproval !== null}
               open={panel.open}
-              onToggle={() => dispatchPanel({ type: 'toggle' })}
+              onToggle={() => userPanel({ type: 'toggle' })}
               onApprove={answer}
               onAnswerQuestions={answerQuestions}
               onNewConversation={newConversation}
