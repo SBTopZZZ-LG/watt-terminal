@@ -17,7 +17,7 @@
 //! Nothing here logs the key or a header value.
 
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::io;
@@ -92,6 +92,13 @@ pub type LearnedLimits = Arc<Mutex<HashMap<String, u32>>>;
 
 /// The context usage last emitted for a conversation, shared by its agents (see `Conversation::last_usage`).
 pub type LastUsage = Arc<Mutex<Option<ContextUsage>>>;
+
+/// The host tool names the last accepted model reply was offered, shared by a conversation's agents (see
+/// `Conversation::offered_tools`). None until a reply is accepted.
+pub type OfferedTools = Arc<Mutex<Option<BTreeSet<String>>>>;
+
+/// How many names each half of the tool note lists. More are said as a count.
+const TOOL_NOTE_NAMES: usize = 12;
 
 /// The provider settings read from the environment. Holds the key, so `Debug` hides it.
 #[derive(Clone)]
@@ -310,6 +317,9 @@ pub struct Conversation {
     /// The usage last emitted for this conversation, kept so a saved conversation can show its meter when it is restored.
     /// Cleared by `reset`; `restore` clears it too, and the caller then sets the saved one (see `set_last_usage`).
     last_usage: LastUsage,
+    /// The host tools the last accepted reply was offered (see `LlmAgent::with_offered_tools`). Reset by `reset`, `restore`
+    /// and `adopt`, like the calibration: a loaded or new conversation starts with none, so it gets no note.
+    offered_tools: OfferedTools,
 }
 
 impl Conversation {
@@ -323,6 +333,7 @@ impl Conversation {
             calibration: Arc::new(Mutex::new(Calibrator::default())),
             learned_limits: Arc::new(Mutex::new(HashMap::new())),
             last_usage: Arc::new(Mutex::new(None)),
+            offered_tools: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -358,13 +369,18 @@ impl Conversation {
         self.last_usage.clone()
     }
 
+    /// The host tools the last accepted reply was offered (see `LlmAgent::with_offered_tools`).
+    pub fn offered_tools(&self) -> OfferedTools {
+        self.offered_tools.clone()
+    }
+
     /// Sets the usage the conversation shows, for a conversation restored from storage (see `restore`).
     pub fn set_last_usage(&self, usage: Option<ContextUsage>) {
         *lock_usage(&self.last_usage) = usage;
     }
 
-    /// Clears the history, the todo list, any pending resume note, the calibration and the last usage, and rotates the id.
-    /// The caller makes sure no turn is running.
+    /// Clears the history, the todo list, any pending resume note, the calibration, the last usage and the offered tools, and
+    /// rotates the id. The caller makes sure no turn is running.
     pub fn reset(&self) -> io::Result<()> {
         let id = new_conversation_id()?;
         lock(&self.history).clear();
@@ -372,6 +388,7 @@ impl Conversation {
         *lock_note(&self.resume_note) = None;
         *lock_calibration(&self.calibration) = Calibrator::default();
         *lock_usage(&self.last_usage) = None;
+        *lock_offered(&self.offered_tools) = None;
         *lock_string(&self.id) = id;
         Ok(())
     }
@@ -389,6 +406,7 @@ impl Conversation {
         *lock_calibration(&self.calibration) = Calibrator::default();
         // The last usage belongs to the content it was measured on. The caller sets the saved one (see `set_last_usage`).
         *lock_usage(&self.last_usage) = None;
+        *lock_offered(&self.offered_tools) = None;
     }
 
     /// Makes a new conversation the live one: its id, history and todo list replace the current ones. The history and
@@ -402,11 +420,12 @@ impl Conversation {
         *lock_note(&self.resume_note) = None;
         *lock_calibration(&self.calibration) = Calibrator::default();
         *lock_usage(&self.last_usage) = None;
+        *lock_offered(&self.offered_tools) = None;
     }
 
     /// Another attached session continues this conversation: the id is copied and the history, todo list,
-    /// no-vision memo, calibration, learned limits and last usage are shared, so both conversations see the same
-    /// live state. The resume note is copied, so a note no turn has taken yet is still taken once.
+    /// no-vision memo, calibration, learned limits, last usage and offered tools are shared, so both conversations see the
+    /// same live state. The resume note is copied, so a note no turn has taken yet is still taken once.
     pub fn follow(&self) -> Self {
         Conversation {
             id: Mutex::new(lock_string(&self.id).clone()),
@@ -417,6 +436,7 @@ impl Conversation {
             calibration: self.calibration.clone(),
             learned_limits: self.learned_limits.clone(),
             last_usage: self.last_usage.clone(),
+            offered_tools: self.offered_tools.clone(),
         }
     }
 
@@ -505,6 +525,8 @@ pub struct LlmAgent {
     learned_limits: LearnedLimits,
     /// The usage last emitted, shared with the conversation (see `with_last_usage`).
     last_usage: LastUsage,
+    /// The host tools the last accepted reply was offered (see `with_offered_tools`).
+    offered_tools: OfferedTools,
 }
 
 impl LlmAgent {
@@ -544,6 +566,7 @@ impl LlmAgent {
             calibration: Arc::new(Mutex::new(Calibrator::default())),
             learned_limits: Arc::new(Mutex::new(HashMap::new())),
             last_usage: Arc::new(Mutex::new(None)),
+            offered_tools: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -594,6 +617,14 @@ impl LlmAgent {
     /// for this agent only. Every usage event this agent emits is also kept here.
     pub fn with_last_usage(mut self, last: LastUsage) -> Self {
         self.last_usage = last;
+        self
+    }
+
+    /// The host tools the last accepted reply was offered, shared with the conversation (see `Conversation::offered_tools`).
+    /// When a request offers a different set, its system text says what came and went (see `tools_note`). Without it, the
+    /// baseline lasts for this agent only, so the first request of an agent gets no note.
+    pub fn with_offered_tools(mut self, offered: OfferedTools) -> Self {
+        self.offered_tools = offered;
         self
     }
 
@@ -729,7 +760,15 @@ impl LlmAgent {
             };
             // Built per request, so an external host's tools are the ones it offers now.
             let tools = request_tools(&self.tools, ctx.external_tools());
-            let Some(request) = self.fit_or_say(ctx, &tools, limit, &system, &mut resolver) else {
+            let offered = host_tool_names(&self.tools, &tools);
+            // The note is for this request only: the baseline moves when a reply is accepted (see `respond`), so a retry
+            // of this call says the same again.
+            let note = tools_note(lock_offered(&self.offered_tools).as_ref(), &offered);
+            let request_system = match note {
+                Some(note) => format!("{system}\n\n{note}"),
+                None => system.clone(),
+            };
+            let Some(request) = self.fit_or_say(ctx, &tools, limit, &request_system, &mut resolver) else {
                 return Asked::Ended;
             };
             let sent_images = has_image_part(&request.messages);
@@ -741,9 +780,9 @@ impl LlmAgent {
                         lock_models(&self.no_vision).insert(self.model.clone());
                         let reply = self.finish_call(ctx, Ok(reply));
                         ctx.say(NO_VISION_NOTICE);
-                        return asked(reply);
+                        return asked(reply, offered);
                     }
-                    return asked(self.finish_call(ctx, Ok(reply)));
+                    return asked(self.finish_call(ctx, Ok(reply)), offered);
                 }
                 Err(LlmError::Cancelled) => return Asked::Ended,
                 Err(LlmError::Interrupted) => return Asked::Interrupted,
@@ -751,7 +790,7 @@ impl LlmAgent {
                     overflow_retry = false;
                     asker_error = None;
                     let Some(smaller) = self.overflow_retry_limit(&e, estimate, limit) else {
-                        return asked(self.finish_call(ctx, Err(e)));
+                        return asked(self.finish_call(ctx, Err(e)), offered);
                     };
                     // `smaller` is below the limit this request was fitted to, which is the effective one, so it only lowers it.
                     lock_learned(&self.learned_limits).insert(self.model.clone(), smaller);
@@ -769,7 +808,7 @@ impl LlmAgent {
                     image_refused = true;
                     asker_error = Some(e);
                 }
-                Err(e) => return asked(self.finish_call(ctx, Err(asker_error.take().unwrap_or(e)))),
+                Err(e) => return asked(self.finish_call(ctx, Err(asker_error.take().unwrap_or(e))), offered),
             }
         }
     }
@@ -1145,8 +1184,12 @@ impl Agent for LlmAgent {
             // while the reply was made. Empty once the redos are used up, so nothing can discard the reply then.
             let open = if redos < MAX_REDOS { ctx.open_record_ids() } else { Vec::new() };
             let reply = match self.ask_model(ctx, finished.take().as_deref(), &open) {
-                Asked::Reply(reply) if finished_among(&open, ctx).is_empty() => reply,
-                Asked::Reply(_) | Asked::Interrupted => {
+                Asked::Reply(reply, offered) if finished_among(&open, ctx).is_empty() => {
+                    // Accepted: the next request is compared with the tools this one was offered (see `tools_note`).
+                    *lock_offered(&self.offered_tools) = Some(offered);
+                    reply
+                }
+                Asked::Reply(..) | Asked::Interrupted => {
                     // Discarded whole: not pushed to the history, and what the transcript showed of it is removed. The
                     // model is asked again on the same history, told which command finished (see `redo_note`).
                     let ended = finished_among(&open, ctx);
@@ -1243,6 +1286,44 @@ fn request_tools(builtins: &[Value], host: Option<&dyn ExternalToolHost>) -> Vec
     tools
 }
 
+fn tool_name(tool: &Value) -> Option<&str> {
+    tool["function"]["name"].as_str()
+}
+
+/// The names of the host tools in one request's list: the list less the built-in names (see `request_tools`).
+fn host_tool_names(builtins: &[Value], tools: &[Value]) -> BTreeSet<String> {
+    let builtin: HashSet<&str> = builtins.iter().filter_map(tool_name).collect();
+    tools.iter().filter_map(tool_name).filter(|name| !builtin.contains(name)).map(str::to_string).collect()
+}
+
+/// The system text for a request whose host tools differ from the ones the last accepted reply was offered (`was`). None
+/// when there was no such reply, or the names are the same. Only the halves that have names are said.
+fn tools_note(was: Option<&BTreeSet<String>>, now: &BTreeSet<String>) -> Option<String> {
+    let was = was?;
+    let added: Vec<&str> = now.difference(was).map(String::as_str).collect();
+    let gone: Vec<&str> = was.difference(now).map(String::as_str).collect();
+    let mut parts = Vec::new();
+    if !added.is_empty() {
+        parts.push(format!("Now available: {}.", names_list(&added)));
+    }
+    if !gone.is_empty() {
+        parts.push(format!(
+            "No longer available: {} (their server was disabled, disconnected or failed): do not call them.",
+            names_list(&gone)
+        ));
+    }
+    (!parts.is_empty()).then(|| format!("MCP tools changed since your last request. {}", parts.join(" ")))
+}
+
+/// The names, at most `TOOL_NOTE_NAMES` of them, then how many more there are.
+fn names_list(names: &[&str]) -> String {
+    let shown = names.iter().take(TOOL_NOTE_NAMES).copied().collect::<Vec<_>>().join(", ");
+    match names.len().saturating_sub(TOOL_NOTE_NAMES) {
+        0 => shown,
+        more => format!("{shown}, and {more} more"),
+    }
+}
+
 /// True when a reply counts as polling: an agent-started command is still running, and every call in the reply is one that
 /// only looks at it or types into it (wait, get_screen, send_keys).
 fn is_polling(open: &[OpenAgentRecord], calls: &[ToolCall]) -> bool {
@@ -1280,8 +1361,8 @@ impl Cap {
 
 /// What one model call came to (see `ask_model`).
 enum Asked {
-    /// The reply, ready to be acted on.
-    Reply(AssistantReply),
+    /// The reply, ready to be acted on, with the host tool names its request offered.
+    Reply(AssistantReply, BTreeSet<String>),
     /// The call ended early because a command it was made with finished (see `send`). Its reply is discarded.
     Interrupted,
     /// No reply: the call was cancelled or failed, and the failure is already shown.
@@ -1289,8 +1370,8 @@ enum Asked {
 }
 
 /// The `Asked` of a call that may have no reply (see `finish_call`).
-fn asked(reply: Option<AssistantReply>) -> Asked {
-    reply.map_or(Asked::Ended, Asked::Reply)
+fn asked(reply: Option<AssistantReply>, offered: BTreeSet<String>) -> Asked {
+    reply.map_or(Asked::Ended, |reply| Asked::Reply(reply, offered))
 }
 
 /// Why the calls of a reply stopped before all ran. `Steered` does not end the turn: the calls after it are closed and the
@@ -1663,6 +1744,10 @@ fn lock_learned(m: &Mutex<HashMap<String, u32>>) -> MutexGuard<'_, HashMap<Strin
 }
 
 fn lock_usage(m: &Mutex<Option<ContextUsage>>) -> MutexGuard<'_, Option<ContextUsage>> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn lock_offered(m: &Mutex<Option<BTreeSet<String>>>) -> MutexGuard<'_, Option<BTreeSet<String>>> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -2296,6 +2381,48 @@ mod tests {
             assert!(shown.contains("[REDACTED]") && !shown.contains(secret), "{shown}");
             let long = project("ext_a", true, &Value::String("y".repeat(10_000)), &redactor);
             assert!(long.len() < 10_000, "a long host result is capped: {} bytes", long.len());
+        }
+
+        fn set(names: &[&str]) -> BTreeSet<String> {
+            names.iter().map(|n| n.to_string()).collect()
+        }
+
+        #[test]
+        fn the_host_names_are_the_request_tools_less_the_builtins() {
+            let host = FakeHost::new(&[("ext_a", ExternalApproval::Ask), ("run_command", ExternalApproval::Auto)], "x");
+            let tools = request_tools(&builtins(), Some(&host));
+            assert_eq!(host_tool_names(&builtins(), &tools), set(&["ext_a"]));
+            assert!(host_tool_names(&builtins(), &request_tools(&builtins(), None)).is_empty());
+        }
+
+        #[test]
+        fn no_note_without_a_last_reply_or_when_the_names_are_the_same() {
+            assert_eq!(tools_note(None, &set(&["a"])), None, "the first request has no note");
+            assert_eq!(tools_note(Some(&set(&["a", "b"])), &set(&["b", "a"])), None);
+            assert_eq!(tools_note(Some(&set(&[])), &set(&[])), None);
+        }
+
+        #[test]
+        fn a_note_says_what_came_and_what_went_and_only_the_halves_that_have_names() {
+            let appeared = tools_note(Some(&set(&["a"])), &set(&["a", "b", "c"])).expect("a note");
+            assert_eq!(appeared, "MCP tools changed since your last request. Now available: b, c.");
+            let gone = tools_note(Some(&set(&["a", "b"])), &set(&["a"])).expect("a note");
+            assert_eq!(
+                gone,
+                "MCP tools changed since your last request. No longer available: b (their server was disabled, disconnected or \
+                 failed): do not call them."
+            );
+            let both = tools_note(Some(&set(&["x"])), &set(&["y"])).expect("a note");
+            assert!(both.contains("Now available: y.") && both.contains("No longer available: x ("), "{both}");
+        }
+
+        #[test]
+        fn a_long_list_names_twelve_and_counts_the_rest() {
+            let many: Vec<String> = (0..15).map(|i| format!("t{i:02}")).collect();
+            let now: BTreeSet<String> = many.iter().cloned().collect();
+            let note = tools_note(Some(&set(&[])), &now).expect("a note");
+            assert!(note.contains("t00, t01, t02, t03, t04, t05, t06, t07, t08, t09, t10, t11, and 3 more."), "{note}");
+            assert!(!note.contains("t12"), "{note}");
         }
     }
 }
