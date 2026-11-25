@@ -46,6 +46,7 @@ use crate::core::observer::{InputState, IntegrationStatus, ObserverStatus, OpenA
 use crate::core::persist::attachments::AttachmentStore;
 use crate::core::settings::LimitsSettings;
 use crate::core::skills::{self, SkillIndex};
+use crate::core::terminals::terminal_note;
 use crate::core::skills::tool as skill_tool;
 use crate::core::tools::{foreground_next_step, SessionFacts, TopLevel};
 
@@ -710,6 +711,10 @@ impl LlmAgent {
             system = format!("{system}\n\n{note}");
         }
         if let Some(note) = location_note(&top, &self.redactor) {
+            system = format!("{system}\n\n{note}");
+        }
+        // Two or more terminals: one line of their ids (none with one or none, so the prompt is unchanged).
+        if let Some(note) = terminal_note(&ctx.terminal_ids()) {
             system = format!("{system}\n\n{note}");
         }
         // The agent's own command, when it is open, is described by its note. The foreground note is for any other program.

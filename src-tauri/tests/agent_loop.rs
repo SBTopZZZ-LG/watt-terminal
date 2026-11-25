@@ -231,6 +231,8 @@ struct FakeTools {
     steer_on_cwd: Option<SteerOnCwd>,
     /// Whether `steer_on_cwd` has fired.
     steered: Mutex<bool>,
+    /// The chat's terminal ids (`terminal_ids`). Empty: a single session.
+    terminals: Vec<String>,
 }
 
 impl FakeTools {
@@ -281,6 +283,10 @@ fn finished_record(id: u64, exit: i32) -> RecordSummary {
 }
 
 impl AgentTools for FakeTools {
+    fn terminal_ids(&self) -> Vec<String> {
+        self.terminals.clone()
+    }
+
     // The agent reaches every tool through `call`, which is overridden below, so these are never used.
     fn list_commands(&self, _n: usize) -> Vec<RecordSummary> {
         panic!("the loop calls tools by name through `call`")
@@ -1635,6 +1641,27 @@ fn the_request_carries_the_system_prompt_tools_auth_session_header_and_history()
     assert_eq!(messages[1], json!({"role": "user", "content": "first question"}));
     assert_eq!(messages[2], json!({"role": "assistant", "content": "first answer"}));
     assert_eq!(messages[3], json!({"role": "user", "content": "second question"}));
+}
+
+#[test]
+fn the_system_text_names_the_terminals_only_when_there_are_two_or_more() {
+    let line = "Terminals: t1 (default), t2. Pass `terminal` to pick one; call list_terminals for details.";
+    let cases = [(vec![], None), (vec!["t1".to_string()], None), (vec!["t1".to_string(), "t2".to_string()], Some(line))];
+    for (ids, expected) in cases {
+        let provider = serve(vec![Script::json(text_reply("a"))]);
+        let conv = Conversation::new().unwrap();
+        let s = settings(&provider.url, false);
+        let mut agent = agent_for(&s, &conv, Arc::new(TurnCancel::new()));
+        let tools = FakeTools { terminals: ids.clone(), ..FakeTools::default() };
+        turn(&mut agent, &tools, &no_gate(), "hi");
+
+        let system = body_of(&provider.requests()[0])["messages"][0]["content"].as_str().unwrap().to_string();
+        let want = match expected {
+            Some(line) => format!("{}\n\n{line}", prompt::system_prompt()),
+            None => prompt::system_prompt(),
+        };
+        assert_eq!(system, want, "terminals {ids:?}");
+    }
 }
 
 #[test]

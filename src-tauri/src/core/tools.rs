@@ -5,6 +5,7 @@
 //! one. Approval is not checked here; `agent::AgentCtx::call_tool` asks for it before calling these methods.
 
 use std::cell::Cell;
+use std::ops::Deref;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -386,6 +387,15 @@ pub trait AgentTools {
     fn scoped(&self, _name: &str, _args: &Value) -> Result<Option<Box<dyn AgentTools + '_>>, String> {
         Ok(None)
     }
+    /// The id of the terminal these tools act on, when the chat has two or more (see core/terminals). Left out otherwise, so
+    /// the events of a single terminal do not change. None for a single session.
+    fn terminal_id(&self) -> Option<String> {
+        None
+    }
+    /// The ids of the terminals of the chat, the default first. Empty for a single session.
+    fn terminal_ids(&self) -> Vec<String> {
+        Vec::new()
+    }
 
     /// Calls a tool by schema name. Optional arguments take their defaults. Does not ask for approval. `expected_level` is
     /// passed to `run_command` (see there).
@@ -528,9 +538,27 @@ impl TurnBudget {
     }
 }
 
+/// The session a `SessionTools` acts on: borrowed for a turn's own tools, or shared (an `Arc`) for a terminal's view, which
+/// must own what it acts on (see `SessionTools::shared`).
+enum SessionHandle<'a> {
+    Borrowed(&'a Session),
+    Shared(Arc<Session>),
+}
+
+impl Deref for SessionHandle<'_> {
+    type Target = Session;
+
+    fn deref(&self) -> &Session {
+        match self {
+            SessionHandle::Borrowed(session) => session,
+            SessionHandle::Shared(session) => session.as_ref(),
+        }
+    }
+}
+
 /// The tools over one live session. The agent makes one per turn; the budget (see `TurnBudget`) is per turn too.
 pub struct SessionTools<'a> {
-    session: &'a Session,
+    session: SessionHandle<'a>,
     /// The continuation wait `run_command` uses. `WAITING_FOR_INPUT_AFTER` unless a test overrides it.
     input_wait: Duration,
     /// When set, `run_command` checks it while it waits and before it sends anything.
@@ -548,6 +576,10 @@ impl<'a> SessionTools<'a> {
 
     /// Like `new`, with a different continuation wait. For tests.
     pub fn with_input_wait(session: &'a Session, input_wait: Duration) -> Self {
+        SessionTools::from_handle(SessionHandle::Borrowed(session), input_wait)
+    }
+
+    fn from_handle(session: SessionHandle<'a>, input_wait: Duration) -> Self {
         SessionTools {
             session,
             input_wait,
@@ -576,6 +608,14 @@ impl<'a> SessionTools<'a> {
 
     fn cancelled(&self) -> bool {
         self.cancel.as_ref().is_some_and(|c| c.is_cancelled())
+    }
+}
+
+impl SessionTools<'static> {
+    /// The tools over a shared session, for a terminal's view (core/terminals). The view owns its session, so it can be
+    /// returned from a call and kept while the terminal leaves the chat. The continuation wait is the default one.
+    pub fn shared(session: Arc<Session>) -> Self {
+        SessionTools::from_handle(SessionHandle::Shared(session), WAITING_FOR_INPUT_AFTER)
     }
 }
 

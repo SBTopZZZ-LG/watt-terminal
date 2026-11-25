@@ -42,7 +42,7 @@ use crate::core::chat::todo::{Todo, TodoList};
 use crate::core::foreground::Foreground;
 use crate::core::fs_tools::Scope;
 use crate::core::llm::TurnCancel;
-use crate::core::observer::{EventSink, InputState, IntegrationStatus, LevelInfo, ObserverStatus, SessionEvent};
+use crate::core::observer::{EventSink, InputState, IntegrationStatus, LOCAL_KEY, LevelInfo, ObserverStatus, SessionEvent};
 use crate::core::persist::conversations::{self, ConversationMeta};
 use crate::core::persist::workspace::workspace_for;
 use crate::core::persist::turn::{FinishedTurn, TurnEnv, resume, save_turn};
@@ -65,12 +65,16 @@ use crate::core::settings::{
 use crate::core::mcp::config::McpLevel;
 use crate::core::mcp::service::{McpImportResult, McpServerInput, McpService, McpStatus, McpView, TurnMcp};
 use crate::core::skills::{self, Places, SkillsSettings, SkillsView};
-use crate::core::tools::SessionTools;
+use crate::core::terminals::{ChatTerminals, Terminal};
+use crate::core::tools::{AgentTools, SessionTools, TurnBudget};
 
 /// The terminals: one shell each, keyed by tab id. A tab belongs to at most one chat (`Tab::owner`).
 type Reg = Registry<Tab>;
 /// The agent conversations, keyed by chat id.
 type ChatReg = Registry<Chat>;
+/// The terminals an agent turn took control of, each with the `terminal` its control event named (None: the only one). The
+/// turn clears them all when it ends (see `Chat::end_turn`).
+type Touched = Mutex<Vec<(Arc<Tab>, Option<String>)>>;
 
 /// The first tab's id. Its chat has the same id: single-tab parity, the app's first terminal belongs to chat `main`.
 const MAIN: &str = "main";
@@ -143,7 +147,10 @@ impl EventSink for EventsSink {
 
 /// One terminal: a shell (PTY) with its frontend data and session-event channels. `owner` is the chat it belongs to.
 pub struct Tab {
-    session: Session,
+    /// The terminal's id (the tab id the frontend uses). The model names it in `terminal`.
+    id: String,
+    /// Shared with the views of agent turns (see `Terminal::view`), which may outlive a call.
+    session: Arc<Session>,
     channels: Arc<Channels>,
     /// True while the agent holds this shell: a shell-acting call, or its own command on top (see `AgentEvent::AgentControl`).
     agent_control: AtomicBool,
@@ -151,11 +158,32 @@ pub struct Tab {
     owner: Mutex<Option<String>>,
     /// Creation order (see `next_tab_seq`).
     seq: u64,
+    /// The title shown for the terminal and given to the model. None until a later slice sets it.
+    title: Mutex<Option<String>>,
 }
 
 impl Tab {
     fn owner_id(&self) -> Option<String> {
         lock(&self.owner).clone()
+    }
+}
+
+impl Terminal for Tab {
+    fn id(&self) -> String {
+        self.id.clone()
+    }
+
+    fn title(&self) -> Option<String> {
+        lock(&self.title).clone()
+    }
+
+    /// The tools over this terminal's session, on the turn's budget and cancel. The view owns the session, not the tab.
+    fn view(self: Arc<Self>, budget: Arc<TurnBudget>, cancel: Option<Arc<TurnCancel>>) -> Box<dyn AgentTools> {
+        let mut tools = SessionTools::shared(self.session.clone()).with_budget(budget);
+        if let Some(cancel) = cancel {
+            tools = tools.with_cancel(cancel);
+        }
+        Box::new(tools)
     }
 }
 
@@ -209,16 +237,16 @@ impl Chat {
         *lock(&self.project_rules_seen) = None;
     }
 
-    /// Ends a turn: clears the cancel token, the control flag of the turn's terminal (telling the UI) and the busy flag.
-    /// Runs even when the turn panicked. Steers still waiting are given back first (`steer_returned`), so they arrive
-    /// before the turn's `done`. `control` is the terminal the turn ran on, if it had one.
-    fn end_turn(&self, control: Option<&Tab>) {
+    /// Ends a turn: clears the cancel token, the control flag of every terminal the turn took control of (telling the UI,
+    /// per terminal) and the busy flag. Runs even when the turn panicked. Steers still waiting are given back first
+    /// (`steer_returned`), so they arrive before the turn's `done`. `touched` is what the turn recorded (see `Touched`).
+    fn end_turn(&self, touched: &Touched) {
         *lock(&self.turn_cancel) = None;
         self.return_steers();
-        if let Some(tab) = control
-            && tab.agent_control.swap(false, Ordering::SeqCst)
-        {
-            self.send_agent(&AgentEvent::AgentControl { active: false });
+        for (tab, terminal) in lock(touched).drain(..) {
+            if tab.agent_control.swap(false, Ordering::SeqCst) {
+                self.send_agent(&AgentEvent::AgentControl { active: false, terminal });
+            }
         }
         self.agent_busy.store(false, Ordering::SeqCst);
     }
@@ -327,11 +355,24 @@ fn default_tab(reg: &Reg, chat_id: &str) -> Option<Arc<Tab>> {
     chat_tabs(reg, chat_id).into_iter().next()
 }
 
-/// A chat and its default terminal, for the chat commands that drive the shell. Missing either is "no session".
-fn chat_and_tab(reg: &Reg, chats: &ChatReg, chat_id: &str) -> Result<(Arc<Chat>, Arc<Tab>), String> {
-    let chat = chat_of(chats, chat_id)?;
-    let tab = default_tab(reg, chat_id).ok_or_else(|| no_session(chat_id))?;
-    Ok((chat, tab))
+/// A chat and its default terminal, for the chat commands. The terminal is None for a chat with no terminal, which is a
+/// legal chat: each command takes what it needs from the terminal when there is one. Missing chat is "no session".
+fn chat_and_default(reg: &Reg, chats: &ChatReg, chat_id: &str) -> Result<(Arc<Chat>, Option<Arc<Tab>>), String> {
+    Ok((chat_of(chats, chat_id)?, default_tab(reg, chat_id)))
+}
+
+/// The approve-all level of a chat's default terminal: its shell on top. The local level when there is no terminal.
+fn top_key_of(tab: Option<&Tab>) -> u64 {
+    tab.map_or(LOCAL_KEY, |tab| tab.session.top_key())
+}
+
+/// The terminals of a chat for an agent turn (see `ChatTerminals::new`): the registry's tabs of the chat, read on every
+/// call, so a terminal assigned or unassigned during a turn is seen by the next call.
+fn chat_terminals(app: tauri::AppHandle, chat_id: String) -> impl Fn() -> Vec<Arc<dyn Terminal>> + Send + Sync + 'static {
+    move || {
+        let reg = app.state::<Reg>();
+        chat_tabs(&reg, &chat_id).into_iter().map(|tab| tab as Arc<dyn Terminal>).collect()
+    }
 }
 
 /// The chat with `id`, created when it does not exist yet.
@@ -475,11 +516,10 @@ struct SavedState {
     context: LastUsage,
 }
 
-/// Saves the conversation: the whole history, todo list and last context usage, redacted, with the shell's directory.
-/// `in_turn` is true at a checkpoint inside a turn and false at the end of the turn. A failure is logged without any
-/// content and never fails the turn.
-fn save_conversation(store: &Persist, session: &Session, state: &SavedState, redactor: &Redactor, in_turn: bool) {
-    let cwd = session.cwd();
+/// Saves the conversation: the whole history, todo list and last context usage, redacted, with the shell's directory (`cwd`,
+/// None for a chat with no terminal). `in_turn` is true at a checkpoint inside a turn and false at the end of the turn. A
+/// failure is logged without any content and never fails the turn.
+fn save_conversation(store: &Persist, cwd: Option<Cwd>, state: &SavedState, redactor: &Redactor, in_turn: bool) {
     let cwd_pair = cwd.as_ref().map(|c| (c.host.as_str(), c.path.as_str()));
     let turn = FinishedTurn {
         conversation_id: &state.conversation_id,
@@ -498,15 +538,15 @@ fn save_conversation(store: &Persist, session: &Session, state: &SavedState, red
 }
 
 /// The checkpoint of an LLM turn (see `LlmAgent::with_checkpoint`): saves the conversation with `in_turn` set. Without
-/// a store, nothing is saved.
+/// a store, nothing is saved. `tab` is the chat's default terminal, if it has one (its directory is saved).
 fn checkpoint_saver(
     store: Option<Arc<Persist>>,
-    tab: Arc<Tab>,
+    tab: Option<Arc<Tab>>,
     state: Arc<SavedState>,
 ) -> impl FnMut(&Redactor) + Send + 'static {
     move |redactor| {
         if let Some(store) = store.as_ref() {
-            save_conversation(store, &tab.session, &state, redactor, true);
+            save_conversation(store, tab.as_ref().and_then(|tab| tab.session.cwd()), &state, redactor, true);
         }
     }
 }
@@ -610,11 +650,13 @@ fn attach_or_spawn(
         let session = Session::spawn(shim_id, cfg, Box::new(RawSink(channels.clone()))).map_err(io_err)?;
         session.set_event_sink(Arc::new(EventsSink(channels.clone())));
         Ok(Tab {
-            session,
+            id: session_id.to_string(),
+            session: Arc::new(session),
             channels,
             agent_control: AtomicBool::new(false),
             owner: Mutex::new(owner),
             seq: next_tab_seq(),
+            title: Mutex::new(None),
         })
     })?;
     if let Some((data, events)) = pending.take() {
@@ -761,12 +803,15 @@ async fn agent_message(
     persist: State<'_, PersistState>,
     settings: State<'_, SettingsState>,
 ) -> Result<(), String> {
-    let (chat, tab) = chat_and_tab(&reg, &chats, &session_id)?;
+    // A chat with no terminal runs its turn too. The project, the folder and the rules come from the default terminal when
+    // there is one, and are none otherwise.
+    let chat = chat_of(&chats, &session_id)?;
+    let tab = default_tab(&reg, &session_id);
     // The project instructions come from the terminal's live working directory, read once before the
     // turn starts. Anything unreadable just means no rules; it never fails the turn.
-    let project_root = session_project_root(&app, &tab);
+    let project_root = tab.as_deref().and_then(|tab| session_project_root(&app, tab));
     // The folder the file tools read this turn (core/fs_tools), from the same live directory.
-    let fs_scope = fs_scope_for(&app, &tab, project_root.clone());
+    let fs_scope = tab.as_deref().and_then(|tab| fs_scope_for(&app, tab, project_root.clone()));
     let project_rooted_rules =
         project_root.as_ref().and_then(|root| instructions::load(root).map(|rules| (root.clone(), rules)));
     let project_rules = project_rooted_rules.as_ref().map(|(_, rules)| rules.clone());
@@ -807,7 +852,7 @@ async fn agent_message(
             Ok(client) => {
                 // The images are on disk before the message is recorded, so a saved message never names a missing file.
                 if let Err(e) = write_images(store.as_deref(), &conversation_id, &prepared.images) {
-                    chat.end_turn(Some(&*tab));
+                    chat.end_turn(&Touched::default());
                     return Err(e);
                 }
                 let state = Arc::new(SavedState {
@@ -855,7 +900,7 @@ async fn agent_message(
                 (Some(agent), Some(state))
             }
             Err(e) => {
-                chat.end_turn(Some(&*tab));
+                chat.end_turn(&Touched::default());
                 return Err(e);
             }
         },
@@ -864,16 +909,31 @@ async fn agent_message(
     let worker = chat.clone();
     let worker_tab = tab.clone();
     let settle_cancel = cancel.clone();
+    let terminals = chat_terminals(app.clone(), session_id.clone());
+    let lookup = app.clone();
+    let touched: Arc<Touched> = Arc::new(Mutex::new(Vec::new()));
     let spawned = thread::Builder::new().name("agent".into()).spawn(move || {
-        // Runs on panic too, so a crashed turn cannot leave the agent busy or in control of the shell. Fired below once
+        // Runs on panic too, so a crashed turn cannot leave the agent busy or in control of a shell. Fired below once
         // the history is saved; after that it does nothing, so it cannot end a newer turn.
-        let mut end = OnDrop::new(|| worker.end_turn(Some(&*worker_tab)));
-        let tools = SessionTools::new(&worker_tab.session).with_cancel(cancel).with_wait_budget(limits.max_wait());
+        let mut end = OnDrop::new(|| worker.end_turn(&touched));
+        let tools = ChatTerminals::new(terminals, limits.max_wait()).with_cancel(cancel);
         let events = worker.clone();
         let control = worker_tab.clone();
+        let touch = touched.clone();
         let emit = move |ev: AgentEvent| {
-            if let AgentEvent::AgentControl { active } = &ev {
-                control.agent_control.store(*active, Ordering::SeqCst);
+            if let AgentEvent::AgentControl { active, terminal } = &ev {
+                // The control is of the terminal the event names (two or more terminals), else of the default one.
+                let target = match terminal {
+                    Some(id) => tab_of(&lookup.state::<Reg>(), id).ok(),
+                    None => control.clone(),
+                };
+                if let Some(target) = target {
+                    target.agent_control.store(*active, Ordering::SeqCst);
+                    let mut seen = lock(&touch);
+                    if *active && !seen.iter().any(|(known, _)| Arc::ptr_eq(known, &target)) {
+                        seen.push((target, terminal.clone()));
+                    }
+                }
             }
             events.send_agent(&ev);
         };
@@ -897,7 +957,7 @@ async fn agent_message(
         // failed. Then the turn is ended (frees the slot), and only then `Done` is sent: a message the user sends on the
         // back of `Done` finds the agent free. The guard above is fired here, so it does not end the turn a second time.
         if let (Some(agent), Some(store), Some(state)) = (llm.as_ref(), store.as_ref(), saved.as_ref()) {
-            save_conversation(store, &worker_tab.session, state, agent.redactor(), false);
+            save_conversation(store, worker_tab.as_ref().and_then(|tab| tab.session.cwd()), state, agent.redactor(), false);
         }
         end.fire();
         emit(AgentEvent::Done);
@@ -1006,8 +1066,8 @@ fn answer_questions(
 #[tauri::command]
 fn set_auto_approve(session_id: String, on: bool, reg: State<'_, Reg>, chats: State<'_, ChatReg>) -> Result<(), String> {
     // The shell on top is the level approve-all is tied to. The terminal supplies it, not the frontend.
-    let (chat, tab) = chat_and_tab(&reg, &chats, &session_id)?;
-    chat.approvals.set_auto_approve(on, tab.session.top_key());
+    let (chat, tab) = chat_and_default(&reg, &chats, &session_id)?;
+    chat.approvals.set_auto_approve(on, top_key_of(tab.as_deref()));
     Ok(())
 }
 
@@ -1026,8 +1086,8 @@ fn auto_approve_state(
     chats: State<'_, ChatReg>,
     settings: State<'_, SettingsState>,
 ) -> Result<AutoApproveState, String> {
-    let (chat, tab) = chat_and_tab(&reg, &chats, &session_id)?;
-    let state = chat.approvals.auto_state_across(tab.session.top_key(), follows_local(settings.0.as_deref()));
+    let (chat, tab) = chat_and_default(&reg, &chats, &session_id)?;
+    let state = chat.approvals.auto_state_across(top_key_of(tab.as_deref()), follows_local(settings.0.as_deref()));
     Ok(AutoApproveState { auto: state != AutoState::Off, suspended: state == AutoState::Suspended })
 }
 
@@ -1083,7 +1143,7 @@ fn get_status(
     settings: State<'_, SettingsState>,
 ) -> Result<Status, String> {
     // Chat fields come from the chat, terminal fields from its default terminal.
-    let (chat, tab) = chat_and_tab(&reg, &chats, &session_id)?;
+    let (chat, tab) = chat_and_default(&reg, &chats, &session_id)?;
     // The saved default's label reads no secret. Without a saved default the environment settings are shown. While
     // settings.json cannot be used, the agent is off and the environment settings are not shown in its place.
     let (llm, settings_state) = match settings.0.as_ref() {
@@ -1099,23 +1159,28 @@ fn get_status(
         }
         None => (env_llm(), None),
     };
-    let levels = tab.session.levels();
+    // A chat with no terminal has no shell: the shell fields are those of an exited, empty session with no levels.
+    let shell = tab.as_deref();
+    let levels = shell.map(|tab| tab.session.levels()).unwrap_or_default();
     let depth = levels.len();
     Ok(Status {
-        state: tab.session.state(),
-        foreground: tab.session.foreground(),
+        state: shell.map_or(InputState::Exited, |tab| tab.session.state()),
+        foreground: shell.and_then(|tab| tab.session.foreground()),
         levels: levels.into_iter().skip(1).collect(),
         depth,
-        integration: tab.session.integration_status(),
-        observer: tab.session.observer_status(),
-        cwd: tab.session.cwd(),
-        stats: tab.session.stats(),
+        integration: shell.map_or(IntegrationStatus::Raw, |tab| tab.session.integration_status()),
+        observer: shell.map_or(ObserverStatus::Ok, |tab| tab.session.observer_status()),
+        cwd: shell.and_then(|tab| tab.session.cwd()),
+        stats: shell.map_or(
+            SessionStats { forged_events: 0, stale_events: 0, overflow_events: 0, dropped_bytes: 0 },
+            |tab| tab.session.stats(),
+        ),
         auto_approve: chat.approvals.auto_approve(),
-        auto_approve_suspended: chat.approvals.auto_state_across(tab.session.top_key(), follows_local(settings.0.as_deref()))
+        auto_approve_suspended: chat.approvals.auto_state_across(top_key_of(shell), follows_local(settings.0.as_deref()))
             == AutoState::Suspended,
-        nonces: tab.session.nonces(),
+        nonces: shell.map(|tab| tab.session.nonces()).unwrap_or_default(),
         agent_busy: chat.agent_busy.load(Ordering::SeqCst),
-        agent_control: tab.agent_control.load(Ordering::SeqCst),
+        agent_control: shell.is_some_and(|tab| tab.agent_control.load(Ordering::SeqCst)),
         llm,
         conversation_id: chat.conversation.id(),
         settings_state,
@@ -1245,9 +1310,9 @@ fn fs_scope_for(app: &tauri::AppHandle, tab: &Tab, project_root: Option<PathBuf>
 /// an error.
 #[tauri::command]
 async fn list_skills(session_id: String, app: tauri::AppHandle, reg: State<'_, Reg>, chats: State<'_, ChatReg>) -> Result<SkillsView, String> {
-    let tab = chat_and_tab(&reg, &chats, &session_id)?.1;
+    let tab = chat_and_default(&reg, &chats, &session_id)?.1;
     blocking(move || {
-        let project_root = session_project_root(&app, &tab);
+        let project_root = tab.as_deref().and_then(|tab| session_project_root(&app, tab));
         let setup = skill_setup(&app, project_root);
         let (index, layout) = setup.load();
         Ok(skills::view(&index, &layout, &setup.settings))
@@ -1420,7 +1485,7 @@ async fn ask_btw(
     let cancel = Arc::new(TurnCancel::new());
     let (history, _, old_id) = chat.begin_turn(&cancel)?;
     // Ends the turn on every return; dropped explicitly before success.
-    let end = OnDrop::new({ let chat = chat.clone(); move || chat.end_turn(None) });
+    let end = OnDrop::new({ let chat = chat.clone(); move || chat.end_turn(&Touched::default()) });
     // The snapshot leaves the locks before any await.
     let snapshot = lock(&history).snapshot();
     // Reading a saved model touches the Keychain, so it runs on the blocking pool.
@@ -1455,7 +1520,7 @@ async fn suggest_name(
     let cancel = Arc::new(TurnCancel::new());
     let (history, _, old_id) = chat.begin_turn(&cancel)?;
     // Ends the turn on every return; dropped explicitly before success.
-    let end = OnDrop::new({ let chat = chat.clone(); move || chat.end_turn(None) });
+    let end = OnDrop::new({ let chat = chat.clone(); move || chat.end_turn(&Touched::default()) });
     // The snapshot leaves the locks before any await.
     let snapshot = lock(&history).snapshot();
     let limit = lock(&chat.conversation.last_usage()).clone().and_then(|u| u.limit);
@@ -1531,12 +1596,12 @@ async fn compact_conversation(
     settings: State<'_, SettingsState>,
 ) -> Result<LoadedConversation, String> {
     // The save records the terminal's directory, so the chat's default terminal is needed too.
-    let (chat, tab) = chat_and_tab(&reg, &chats, &session_id)?;
+    let (chat, tab) = chat_and_default(&reg, &chats, &session_id)?;
     let store = persist.get()?;
     let cancel = Arc::new(TurnCancel::new());
     let (history, todos, old_id) = chat.begin_turn(&cancel)?;
     // Ends the turn on every return; dropped explicitly before success.
-    let end = OnDrop::new({ let chat = chat.clone(); move || chat.end_turn(None) });
+    let end = OnDrop::new({ let chat = chat.clone(); move || chat.end_turn(&Touched::default()) });
     // The snapshot leaves the locks before any await.
     let snapshot = lock(&history).snapshot();
     let current_todos = lock(&todos).clone();
@@ -1569,7 +1634,7 @@ async fn compact_conversation(
     let messages = seeded.snapshot();
     // The header values resolve with the old conversation id, as the side call did.
     let redactor = llm_settings.redactor(&old_id);
-    let cwd = tab.session.cwd().map(|c| (c.host, c.path));
+    let cwd = tab.as_ref().and_then(|tab| tab.session.cwd()).map(|c| (c.host, c.path));
     let saver = store.clone();
     let saver_id = new_id.clone();
     let saver_messages = messages.clone();
@@ -1604,12 +1669,12 @@ async fn fork_conversation(
     persist: State<'_, PersistState>,
 ) -> Result<LoadedConversation, String> {
     // The save records the terminal's directory, so the chat's default terminal is needed too.
-    let (chat, tab) = chat_and_tab(&reg, &chats, &session_id)?;
+    let (chat, tab) = chat_and_default(&reg, &chats, &session_id)?;
     let store = persist.get()?;
     let cancel = Arc::new(TurnCancel::new());
     let (history, todos, old_id) = chat.begin_turn(&cancel)?;
     // Ends the turn on every return; dropped explicitly before success.
-    let end = OnDrop::new({ let chat = chat.clone(); move || chat.end_turn(None) });
+    let end = OnDrop::new({ let chat = chat.clone(); move || chat.end_turn(&Touched::default()) });
     // The snapshot leaves the locks before any await.
     let snapshot = lock(&history).snapshot();
     let current_todos = lock(&todos).clone();
@@ -1627,7 +1692,7 @@ async fn fork_conversation(
     let copier = store.clone();
     let (from, to) = (old_id.clone(), new_id.clone());
     blocking(move || copier.conversations.attachments().copy_conversation(&from, &to).map_err(io_err)).await?;
-    let cwd = tab.session.cwd().map(|c| (c.host, c.path));
+    let cwd = tab.as_ref().and_then(|tab| tab.session.cwd()).map(|c| (c.host, c.path));
     let saver = store.clone();
     let saver_id = new_id.clone();
     let saver_messages = snapshot.clone();
@@ -2350,6 +2415,18 @@ mod tests {
     fn only_the_first_terminal_joins_a_chat_on_start() {
         assert_eq!(owner_for_session("main"), Some("main"));
         assert_eq!(owner_for_session("other"), None);
+    }
+
+    #[test]
+    fn a_chat_with_no_terminal_runs_with_no_default_and_the_local_level() {
+        let reg: Reg = Registry::new();
+        let chats: ChatReg = Registry::new();
+        ensure_chat(&chats, "main").expect("the chat");
+        let (chat, tab) = chat_and_default(&reg, &chats, "main").expect("a chat with no terminal is legal");
+        assert_eq!(chat.id, "main");
+        assert!(tab.is_none());
+        assert_eq!(top_key_of(None), LOCAL_KEY);
+        assert!(chat_and_default(&reg, &chats, "absent").is_err(), "a missing chat is still no session");
     }
 
     #[test]

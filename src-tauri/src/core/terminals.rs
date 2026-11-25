@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 
 use crate::core::foreground::Foreground;
 use crate::core::keys::KeyPlan;
+use crate::core::llm::TurnCancel;
 use crate::core::observer::{InputState, IntegrationStatus, ObserverStatus, OpenAgentRecord};
 use crate::core::record::{Cwd, RecordSummary};
 use crate::core::session::IntegrateOutcome;
@@ -27,6 +28,17 @@ pub const TERMINAL_TOOLS: [&str; 8] =
 /// What a terminal tool says when the chat has no terminal. Nothing runs.
 pub const NO_TERMINAL: &str = "no terminal is assigned to this chat; ask the user to assign one";
 
+/// The system-text line that names the chat's terminals, when there are two or more: ids only, the default first. None for
+/// one or none, so a single-terminal prompt is unchanged. Titles and directories stay out of it (the prompt is cached).
+pub fn terminal_note(ids: &[String]) -> Option<String> {
+    if ids.len() < 2 {
+        return None;
+    }
+    let listed: Vec<String> =
+        ids.iter().enumerate().map(|(i, id)| if i == 0 { format!("{id} (default)") } else { id.clone() }).collect();
+    Some(format!("Terminals: {}. Pass `terminal` to pick one; call list_terminals for details.", listed.join(", ")))
+}
+
 /// Said for `run_command` and `wait` when they reach the chat's own tools rather than a terminal's view. Only a terminal's view
 /// may act on a shell, so this never runs anything.
 const NOT_ROUTED: &str = "this call did not name a terminal; it was not run";
@@ -37,8 +49,9 @@ pub trait Terminal: Send + Sync {
     fn id(&self) -> String;
     /// The title `list_terminals` gives, or None when there is none.
     fn title(&self) -> Option<String>;
-    /// The tools over this terminal, for one call. `budget` is the turn's, shared by every terminal of the turn.
-    fn view(self: Arc<Self>, budget: Arc<TurnBudget>) -> Box<dyn AgentTools>;
+    /// The tools over this terminal, for one call. `budget` is the turn's, shared by every terminal of the turn, and `cancel`
+    /// (when set) is the turn's cancel, which stops a waiting call.
+    fn view(self: Arc<Self>, budget: Arc<TurnBudget>, cancel: Option<Arc<TurnCancel>>) -> Box<dyn AgentTools>;
 }
 
 /// Reads the terminal set of the chat, in order: the first terminal is the default.
@@ -49,12 +62,19 @@ pub struct ChatTerminals {
     provider: Provider,
     /// The turn's wait and `send_keys` budget, shared by the views of every terminal.
     budget: Arc<TurnBudget>,
+    /// The turn's cancel, given to every view so a waiting call stops when the turn is cancelled. None: not cancellable.
+    cancel: Option<Arc<TurnCancel>>,
 }
 
 impl ChatTerminals {
     /// `terminals` gives the chat's terminals now, oldest first. `wait_budget` is the turn's `wait` limit.
     pub fn new(terminals: impl Fn() -> Vec<Arc<dyn Terminal>> + Send + Sync + 'static, wait_budget: Duration) -> Self {
-        ChatTerminals { provider: Box::new(terminals), budget: Arc::new(TurnBudget::new(wait_budget)) }
+        ChatTerminals { provider: Box::new(terminals), budget: Arc::new(TurnBudget::new(wait_budget)), cancel: None }
+    }
+
+    /// Lets the turn's cancel stop a waiting call in any of the chat's terminals (see `SessionTools::with_cancel`).
+    pub fn with_cancel(self, cancel: Arc<TurnCancel>) -> Self {
+        ChatTerminals { cancel: Some(cancel), ..self }
     }
 
     /// The ids of the chat's terminals now, the default first.
@@ -66,12 +86,28 @@ impl ChatTerminals {
         (self.provider)()
     }
 
+    /// The view of one terminal for this turn: its tools, on the turn's budget and cancel.
+    fn view_of(&self, terminal: &Arc<dyn Terminal>) -> Box<dyn AgentTools> {
+        terminal.clone().view(self.budget.clone(), self.cancel.clone())
+    }
+
     /// The view of the default terminal. With no terminal, a view that says so.
     fn default_view(&self) -> Box<dyn AgentTools> {
         match self.current().into_iter().next() {
-            Some(terminal) => terminal.view(self.budget.clone()),
+            Some(terminal) => self.view_of(&terminal),
             None => Box::new(NoTerminal),
         }
+    }
+
+    /// The terminal that owns record `id`, open or finished, if any. Record ids are process-wide, so at most one owns it.
+    fn owner(&self, terminals: &[Arc<dyn Terminal>], id: u64) -> Option<Arc<dyn Terminal>> {
+        terminals
+            .iter()
+            .find(|terminal| {
+                let view = self.view_of(terminal);
+                view.finished_summary(id).is_some() || view.open_record_ids().contains(&id)
+            })
+            .cloned()
     }
 
     /// `list_terminals`: one object per terminal, in order. `state`, `cwd` and `location` come from the terminal's view.
@@ -82,7 +118,7 @@ impl ChatTerminals {
                 .iter()
                 .enumerate()
                 .map(|(i, terminal)| {
-                    let view = terminal.clone().view(self.budget.clone());
+                    let view = self.view_of(terminal);
                     let facts = view.session_facts();
                     json!({
                         "id": terminal.id(),
@@ -106,17 +142,6 @@ fn explicit_terminal(args: &Value) -> Result<Option<&str>, String> {
     }
 }
 
-/// The terminal that owns record `id`, open or finished, if any. Record ids are process-wide, so at most one owns it.
-fn owner(terminals: &[Arc<dyn Terminal>], budget: &Arc<TurnBudget>, id: u64) -> Option<Arc<dyn Terminal>> {
-    terminals
-        .iter()
-        .find(|terminal| {
-            let view = Arc::clone(terminal).view(budget.clone());
-            view.finished_summary(id).is_some() || view.open_record_ids().contains(&id)
-        })
-        .cloned()
-}
-
 impl AgentTools for ChatTerminals {
     /// Routes a terminal tool to one terminal: the `terminal` argument wins, else the terminal that owns the record `id`
     /// names, else the default. A chat with no terminal refuses the call, and so does an unknown `terminal`.
@@ -134,14 +159,14 @@ impl AgentTools for ChatTerminals {
                 .find(|t| t.id() == id)
                 .cloned()
                 .ok_or_else(|| format!("no terminal '{id}' in this chat; call list_terminals"))?,
-            None => match args.get("id").and_then(Value::as_u64).and_then(|id| owner(&terminals, &self.budget, id)) {
+            None => match args.get("id").and_then(Value::as_u64).and_then(|id| self.owner(&terminals, id)) {
                 Some(terminal) => terminal,
                 None => first.clone(),
             },
         };
         // With two or more terminals the result names its terminal (see `TerminalView::call`). One terminal: unchanged.
         let tag = (terminals.len() >= 2).then(|| chosen.id());
-        Ok(Some(Box::new(TerminalView { tools: chosen.view(self.budget.clone()), tag })))
+        Ok(Some(Box::new(TerminalView { tools: self.view_of(&chosen), tag })))
     }
 
     fn call(&self, name: &str, args: &Value, expected_level: Option<u64>) -> Result<Value, String> {
@@ -186,11 +211,16 @@ impl AgentTools for ChatTerminals {
 
     /// The open commands of every terminal: the user's and the agent's, on all of them.
     fn open_record_ids(&self) -> Vec<u64> {
-        self.current().into_iter().flat_map(|t| t.view(self.budget.clone()).open_record_ids()).collect()
+        self.current().iter().flat_map(|t| self.view_of(t).open_record_ids()).collect()
     }
 
     fn finished_summary(&self, id: u64) -> Option<RecordSummary> {
-        self.current().into_iter().find_map(|t| t.view(self.budget.clone()).finished_summary(id))
+        self.current().iter().find_map(|t| self.view_of(t).finished_summary(id))
+    }
+
+    /// The ids of the terminals, for the system text (see `terminal_note`).
+    fn terminal_ids(&self) -> Vec<String> {
+        self.ids()
     }
 
     fn foreground(&self) -> Option<Foreground> {
@@ -346,6 +376,11 @@ impl AgentTools for TerminalView {
         self.tools.send_keys(plan, record, expected_level)
     }
 
+    /// The terminal's id, only when the chat has two or more (`tag` is set then): one terminal's events stay as they are.
+    fn terminal_id(&self) -> Option<String> {
+        self.tag.clone()
+    }
+
     fn call(&self, name: &str, args: &Value, expected_level: Option<u64>) -> Result<Value, String> {
         let value = self.tools.call(name, args, expected_level)?;
         Ok(match &self.tag {
@@ -368,6 +403,17 @@ mod tests {
     use super::*;
     use crate::core::agent::{AgentCtx, AgentEvent, ApprovalGate};
     use crate::core::tools::SEND_KEYS_PER_TURN;
+
+    #[test]
+    fn the_system_line_names_the_ids_only_with_two_or_more_terminals() {
+        let ids = |list: &[&str]| list.iter().map(|id| id.to_string()).collect::<Vec<String>>();
+        assert_eq!(terminal_note(&ids(&[])), None);
+        assert_eq!(terminal_note(&ids(&["t1"])), None, "one terminal: the prompt is unchanged");
+        assert_eq!(
+            terminal_note(&ids(&["t1", "t2"])).as_deref(),
+            Some("Terminals: t1 (default), t2. Pass `terminal` to pick one; call list_terminals for details.")
+        );
+    }
 
     /// What the fake views log: (terminal id, tool name, the level the call was bound to).
     type Log = Arc<Mutex<Vec<(String, String, Option<u64>)>>>;
@@ -398,7 +444,7 @@ mod tests {
             self.title.map(str::to_string)
         }
 
-        fn view(self: Arc<Self>, budget: Arc<TurnBudget>) -> Box<dyn AgentTools> {
+        fn view(self: Arc<Self>, budget: Arc<TurnBudget>, _cancel: Option<Arc<TurnCancel>>) -> Box<dyn AgentTools> {
             Box::new(FakeView { term: self, budget })
         }
     }
