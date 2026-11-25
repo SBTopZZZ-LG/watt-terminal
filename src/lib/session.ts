@@ -5,7 +5,7 @@
 // does that on exit.
 
 import { Channel } from '@tauri-apps/api/core';
-import { api, CHAT_ID, errorText } from './api';
+import { api, CHAT_ID, errorText, SESSION_ID } from './api';
 import type { StartResult, WireEvent } from './types';
 
 export type Incoming = { kind: 'event'; event: WireEvent } | { kind: 'error'; message: string };
@@ -58,7 +58,7 @@ export function setSessionNonces(list: readonly string[]): void {
 export function connect(rows: number, cols: number, onBytes: (buf: ArrayBuffer) => void): Promise<StartResult> {
   if (connection === null) {
     byteSink = onBytes;
-    connection = open(rows, cols, (r, c, data, events) => api.startSession(r, c, data, events));
+    connection = open(rows, cols, (r, c, data, events) => api.startSession(SESSION_ID, r, c, data, events));
   }
   return connection;
 }
@@ -68,7 +68,7 @@ export function connect(rows: number, cols: number, onBytes: (buf: ArrayBuffer) 
  * connect(). The caller clears the terminal first (resetForNewSession): bytes from the old shell must not reach it.
  */
 export function restart(rows: number, cols: number): Promise<StartResult> {
-  connection = open(rows, cols, (r, c, data, events) => api.restartSession(r, c, data, events));
+  connection = open(rows, cols, (r, c, data, events) => api.restartSession(SESSION_ID, r, c, data, events));
   return connection;
 }
 

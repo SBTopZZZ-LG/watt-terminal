@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useReducer, useRef, useState } from 'react';
 import type { RefObject } from 'react';
 import './App.css';
-import { api, errorText } from './lib/api';
+import { api, errorText, SESSION_ID } from './lib/api';
 import { showsDisplay } from './lib/approvalCard';
 import { copyText } from './lib/clipboard';
 import {
@@ -382,7 +382,7 @@ export default function App() {
   /** Reads the command catalog again for the `/help` dialog. Errors show in the dialog, never the transcript. */
   const loadHelp = () => {
     setHelpState({ kind: 'loading' });
-    api.listCommands().then(
+    api.listCommands(SESSION_ID).then(
       (catalog) => setHelpState({ kind: 'ready', text: renderHelp(catalog) }),
       (e: unknown) => setHelpState({ kind: 'error', message: errorText(e) }),
     );
@@ -784,7 +784,7 @@ export default function App() {
 
   const handleTerminalInput = useCallback((data: string) => {
     if (routeRef.current.keys === 'pty') {
-      api.writeUser(data).catch(reportError);
+      api.writeUser(SESSION_ID, data).catch(reportError);
     }
   }, []);
 
@@ -819,7 +819,7 @@ export default function App() {
   };
 
   const sendRaw = (text: string) => {
-    api.writeUser(text).catch(reportError);
+    api.writeUser(SESSION_ID, text).catch(reportError);
   };
 
   const sendAgent = async (text: string, attachments: AttachmentInput[]): Promise<string | null> => {
@@ -1160,7 +1160,7 @@ export default function App() {
     if (builtin === null) {
       let catalog;
       try {
-        catalog = await api.listCommands();
+        catalog = await api.listCommands(SESSION_ID);
       } catch {
         // The lookup failed: send the original text rather than swallow it.
         return { kind: 'send', text: original };
@@ -1721,7 +1721,7 @@ export default function App() {
   /** Runs the integration, and shows its result in the dialog. The keys stay locked until it answers. */
   const startIntegrate = () => {
     setIntegrate({ kind: 'running' });
-    api.integrateShell().then(
+    api.integrateShell(SESSION_ID).then(
       (outcome) => setIntegrate({ kind: 'result', outcome }),
       (e: unknown) => setIntegrate({ kind: 'result', outcome: { outcome: 'failed', hint: errorText(e) } }),
     );
@@ -1927,7 +1927,7 @@ export default function App() {
               busy={busy || sideBusy}
               focusToken={focusToken}
               onFocusChange={setBarOpen}
-              loadCommands={() => api.listCommands()}
+              loadCommands={() => api.listCommands(SESSION_ID)}
               onRestart={restartShell}
               restarting={restarting}
               onAgent={onAgent}

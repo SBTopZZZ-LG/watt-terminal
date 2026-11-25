@@ -10,7 +10,7 @@ import { FitAddon } from '@xterm/addon-fit';
 import { SearchAddon } from '@xterm/addon-search';
 import { Unicode11Addon } from '@xterm/addon-unicode11';
 import '@xterm/xterm/css/xterm.css';
-import { api, errorText } from './api';
+import { api, errorText, SESSION_ID } from './api';
 import { Coalescer } from './coalescer';
 import { CommandMarks } from './commandMarks';
 import { StripeLayer } from './stripeLayer';
@@ -109,7 +109,7 @@ const coalescer = new Coalescer({
     const at = epoch;
     term.write(batch, () => {
       if (at === epoch) {
-        api.ack(batch.length).catch(reportError);
+        api.ack(SESSION_ID, batch.length).catch(reportError);
       }
     });
   },
@@ -212,7 +212,7 @@ export const fitToContainer = createFitter({
     return dims ? { rows: dims.rows, cols: dims.cols } : null;
   },
   currentSize: () => ({ rows: term.rows, cols: term.cols }),
-  resizePty: (size) => api.resize(size.rows, size.cols),
+  resizePty: (size) => api.resize(SESSION_ID, size.rows, size.cols),
   resizeTerminal: (size) => term.resize(size.cols, size.rows),
   onError: (e) => reportError(`resize failed: ${errorText(e)}`),
 });

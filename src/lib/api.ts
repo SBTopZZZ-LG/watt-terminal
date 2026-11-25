@@ -57,12 +57,12 @@ export function errorText(e: unknown): string {
 }
 
 export const api = {
-  startSession(rows: number, cols: number, onData: Channel<ArrayBuffer>, onEvents: Channel<WireEvent>) {
-    return invoke<StartResult>('start_session', { sessionId: SESSION_ID, rows, cols, onData, onEvents });
+  startSession(sessionId: string, rows: number, cols: number, onData: Channel<ArrayBuffer>, onEvents: Channel<WireEvent>) {
+    return invoke<StartResult>('start_session', { sessionId, rows, cols, onData, onEvents });
   },
   /** Starts a new shell if the session has exited (new nonce); otherwise attaches like startSession. */
-  restartSession(rows: number, cols: number, onData: Channel<ArrayBuffer>, onEvents: Channel<WireEvent>) {
-    return invoke<StartResult>('restart_session', { sessionId: SESSION_ID, rows, cols, onData, onEvents });
+  restartSession(sessionId: string, rows: number, cols: number, onData: Channel<ArrayBuffer>, onEvents: Channel<WireEvent>) {
+    return invoke<StartResult>('restart_session', { sessionId, rows, cols, onData, onEvents });
   },
   /** Removes a terminal and kills its shell, at any time. An agent turn that held it is not cancelled. */
   closeSession(sessionId: string) {
@@ -96,14 +96,14 @@ export const api = {
   listChats() {
     return invoke<ChatInfo[]>('list_chats');
   },
-  ack(bytes: number) {
-    return invoke<void>('ack', { sessionId: SESSION_ID, bytes });
+  ack(sessionId: string, bytes: number) {
+    return invoke<void>('ack', { sessionId, bytes });
   },
-  resize(rows: number, cols: number) {
-    return invoke<void>('resize', { sessionId: SESSION_ID, rows, cols });
+  resize(sessionId: string, rows: number, cols: number) {
+    return invoke<void>('resize', { sessionId, rows, cols });
   },
-  writeUser(text: string) {
-    return invoke<void>('write_user', { sessionId: SESSION_ID, text });
+  writeUser(sessionId: string, text: string) {
+    return invoke<void>('write_user', { sessionId, text });
   },
   /**
    * Sends one user message to the agent, with its attachments (images as PNG or JPEG, text documents as UTF-8). The field is
@@ -165,15 +165,15 @@ export const api = {
    * Integrates the shell in the foreground (ssh, a nested shell, su, a container exec) as a new level. Slow: it waits for the
    * remote shell. While it runs, the terminal and the input bar take no keys.
    */
-  integrateShell() {
-    return invoke<IntegrateOutcome>('integrate_shell', { sessionId: SESSION_ID });
+  integrateShell(sessionId: string) {
+    return invoke<IntegrateOutcome>('integrate_shell', { sessionId });
   },
   getStatus() {
     return invoke<Status>('get_status', { chatId: CHAT_ID });
   },
   /** The custom slash-command templates (global and project dirs), plus the two dirs so `/help` can show them. */
-  listCommands() {
-    return invoke<CommandCatalog>('list_commands', { sessionId: SESSION_ID });
+  listCommands(sessionId: string) {
+    return invoke<CommandCatalog>('list_commands', { sessionId });
   },
   /**
    * Asks a one-off side question about the live conversation. One model call outside a turn; the answer is not

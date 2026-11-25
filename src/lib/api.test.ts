@@ -80,7 +80,7 @@ describe('api.listCommands', () => {
   beforeEach(() => invoke.mockClear());
 
   it('asks for the command catalog for this session', () => {
-    void api.listCommands();
+    void api.listCommands('main');
     expect(invoke).toHaveBeenCalledWith('list_commands', { sessionId: 'main' });
   });
 });
