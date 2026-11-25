@@ -1166,15 +1166,26 @@ fn env_llm() -> LlmStatus {
     LlmStatus { enabled: env.is_some(), model: env.map(|s| s.model.clone()), provider: None, variant: None }
 }
 
+/// The terminal `get_status` reads the shell fields from: the one `session_id` names (unknown is "no session"), or else
+/// the chat's default. None when the chat has no terminal.
+fn status_shell(reg: &Reg, chat_id: &str, session_id: Option<&str>) -> Result<Option<Arc<Tab>>, String> {
+    match session_id {
+        Some(id) => tab_of(reg, id).map(Some),
+        None => Ok(default_tab(reg, chat_id)),
+    }
+}
+
 #[tauri::command]
 fn get_status(
     chat_id: String,
+    session_id: Option<String>,
     reg: State<'_, Reg>,
     chats: State<'_, ChatReg>,
     settings: State<'_, SettingsState>,
 ) -> Result<Status, String> {
-    // Chat fields come from the chat, terminal fields from its default terminal.
-    let (chat, tab) = chat_and_default(&reg, &chats, &chat_id)?;
+    // Chat fields come from the chat, terminal fields from the terminal `session_id` names, else from its default terminal.
+    let chat = chat_of(&chats, &chat_id)?;
+    let tab = status_shell(&reg, &chat_id, session_id.as_deref())?;
     // The saved default's label reads no secret. Without a saved default the environment settings are shown. While
     // settings.json cannot be used, the agent is off and the environment settings are not shown in its place.
     let (llm, settings_state) = match settings.0.as_ref() {
@@ -2440,6 +2451,13 @@ mod tests {
         let ids: Vec<String> = (0..100).map(|_| next_shim_id()).collect();
         let distinct: std::collections::HashSet<&String> = ids.iter().collect();
         assert_eq!(distinct.len(), ids.len(), "shim ids collide: {ids:?}");
+    }
+
+    #[test]
+    fn status_shell_reads_the_named_terminal_or_none() {
+        let reg = Reg::new();
+        assert!(matches!(status_shell(&reg, "main", None), Ok(None)), "a chat with no terminal has no shell");
+        assert_eq!(status_shell(&reg, "main", Some("t9")).err().as_deref(), Some("no session t9"));
     }
 
     #[test]

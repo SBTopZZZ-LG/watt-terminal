@@ -15,10 +15,12 @@ export interface TabState {
   cwd: Cwd | null;
   levels: LevelInfo[];
   agentControl: AgentControl;
-  /** The title xterm reports (OSC 0/2), null until one arrives. The UI does not show it yet. */
+  /** The title xterm reports (OSC 0/2), null until one arrives. */
   title: string | null;
   /** A restart of this tab's shell is in flight. */
   restarting: boolean;
+  /** The chat the terminal belongs to (list_tabs), or null when no chat sees it. */
+  owner: string | null;
 }
 
 export const INITIAL_TAB_STATE: TabState = {
@@ -30,6 +32,7 @@ export const INITIAL_TAB_STATE: TabState = {
   agentControl: NO_CONTROL,
   title: null,
   restarting: false,
+  owner: null,
 };
 
 /** Whether a wire event is one of the terminal's own (the tab channel) rather than an agent event (the chat channel). */

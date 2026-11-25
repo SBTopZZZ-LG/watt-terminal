@@ -3,19 +3,34 @@
 // listeners only. Errors from any part go to the chat listeners too, where the transcript shows them.
 
 import { Channel } from '@tauri-apps/api/core';
-import { api, CHAT_ID, errorText } from './api';
+import { api, CHAT_ID, errorText, SESSION_ID } from './api';
 import { TabController } from './tab';
 import type { TabDeps } from './tab';
+import { allocTabId, neighbourAfterClose, tabLimitReached } from './tabStrip';
 import { clampFontSize, defaultSizeStorage, FONT_SIZE_DEFAULT, saveFontSize, stepFontSize } from './zoom';
-import type { SessionEvent, WireEvent } from './types';
+import type { SessionEvent, Status, TabInfo, WireEvent } from './types';
 
 export type Incoming = { kind: 'event'; event: WireEvent } | { kind: 'error'; message: string };
 export type ChatListener = (msg: Incoming) => void;
 export type TabEventListener = (tab: TabController, ev: SessionEvent) => void;
 
+/** What the strip and the App render from the registry. Replaced on every change, so the same object means no change. */
+export interface TabsSnapshot {
+  /** The tab ids, in order. */
+  readonly ids: readonly string[];
+  readonly activeId: string | null;
+}
+
 export class TabManager {
-  private readonly tabs = new Map<string, TabController>();
+  private tabs = new Map<string, TabController>();
+  /** The number each tab was shown with when it was created ("Terminal N"). Never renumbered. */
+  private ordinals = new Map<string, number>();
   private activeId: string | null = null;
+  /** The number the next created tab id starts from. `main` is the first tab, so the first created one is `t2`. */
+  private counter = 2;
+  private snapshot: TabsSnapshot = { ids: [], activeId: null };
+  /** The startup, run once (see start). */
+  private started: Promise<Status | null> | null = null;
   private readonly chatListeners = new Set<ChatListener>();
   private readonly tabListeners = new Set<TabEventListener>();
   private readonly storeListeners = new Set<() => void>();
@@ -29,18 +44,9 @@ export class TabManager {
     if (existing !== undefined) {
       return existing;
     }
-    const deps: TabDeps = {
-      onError: (e) => this.reportError(e),
-      onTabEvent: (tab, ev) => {
-        for (const listener of [...this.tabListeners]) {
-          listener(tab, ev);
-        }
-      },
-      onStrayEvent: (event) => this.emitChat({ kind: 'event', event }),
-      attachChat: () => this.attachChat(),
-    };
-    const tab = new TabController(id, deps);
+    const tab = this.build(id);
     this.tabs.set(id, tab);
+    this.ordinals.set(id, this.tabs.size);
     if (this.activeId === null) {
       this.activeId = id;
     }
@@ -52,8 +58,14 @@ export class TabManager {
     return this.tabs.get(id);
   }
 
+  /** Every terminal, in tab-strip order. */
   list(): TabController[] {
     return [...this.tabs.values()];
+  }
+
+  /** The number a tab was created with ("Terminal N" when it has no other title). 1 for an unknown id. */
+  ordinal(id: string): number {
+    return this.ordinals.get(id) ?? 1;
   }
 
   /** The tab the UI shows. Null before any tab exists. */
@@ -64,6 +76,9 @@ export class TabManager {
   setActive(id: string): void {
     if (!this.tabs.has(id)) {
       throw new Error(`no tab ${id}`);
+    }
+    if (this.activeId === id) {
+      return;
     }
     this.activeId = id;
     this.notifyStore();
@@ -76,6 +91,74 @@ export class TabManager {
       this.storeListeners.delete(listener);
     };
   };
+
+  /** The registry's snapshot, for useSyncExternalStore (see TabsSnapshot). */
+  readonly getSnapshot = (): TabsSnapshot => this.snapshot;
+
+  /**
+   * Startup. Reads the terminals the backend still has (they outlive a page reload), makes a controller for each in the
+   * backend's order, connects each and reads its status. With none, it starts `main`. Resolves with the active terminal's
+   * status, or null when that one did not connect (the error is shown). Runs once; later calls get the same promise.
+   */
+  start(): Promise<Status | null> {
+    if (this.started === null) {
+      this.started = this.runStart();
+    }
+    return this.started;
+  }
+
+  /**
+   * A new terminal, with its shell started, made active. Null at the tab limit, or when its shell did not start (the error
+   * is shown). The new terminal belongs to no chat until it is assigned.
+   */
+  async create(): Promise<TabController | null> {
+    if (tabLimitReached(this.tabs.size)) {
+      return null;
+    }
+    const { id, counter } = allocTabId(this.counter, new Set(this.tabs.keys()));
+    this.counter = counter;
+    const previous = this.activeId;
+    const tab = this.ensure(id);
+    this.setActive(id);
+    try {
+      await this.connectTab(tab);
+    } catch (e) {
+      this.drop(id);
+      if (previous !== null && this.tabs.has(previous)) {
+        this.setActive(previous);
+      }
+      // The shell may have started before the attach failed; closing it is best effort.
+      api.closeSession(id).catch(() => undefined);
+      this.reportError(e);
+      return null;
+    }
+    void this.refresh().catch((e: unknown) => this.reportError(e));
+    return tab;
+  }
+
+  /**
+   * Closes a terminal: its session is closed, then its controller is disposed. The last terminal cannot be closed. When the
+   * active one closes, its neighbour takes over. Resolves true when it closed.
+   */
+  async close(id: string): Promise<boolean> {
+    if (this.tabs.size <= 1 || !this.tabs.has(id)) {
+      return false;
+    }
+    try {
+      await api.closeSession(id);
+    } catch (e) {
+      this.reportError(e);
+      return false;
+    }
+    this.drop(id);
+    void this.refresh().catch((e: unknown) => this.reportError(e));
+    return true;
+  }
+
+  /** Reads list_tabs again and sets each known terminal's owner. Call after a create, a close or an assignment. */
+  async refresh(): Promise<void> {
+    this.applyOwners(await api.listTabs());
+  }
 
   /** Agent events and errors. Events that arrive while no listener is subscribed are not replayed. */
   readonly subscribeChat = (listener: ChatListener): (() => void) => {
@@ -148,14 +231,109 @@ export class TabManager {
   }
 
   private notifyStore(): void {
+    this.snapshot = { ids: [...this.tabs.keys()], activeId: this.activeId };
     for (const listener of [...this.storeListeners]) {
       listener();
     }
   }
 
-  /** Attaches the chat's agent channel once. A failed attach is retried by the next call. */
-  private attachChat(): Promise<void> {
-    if (this.chatAttach === null) {
+  /** A controller for `id`, wired to this registry. Not added to the map (see ensure and adopt). */
+  private build(id: string): TabController {
+    const deps: TabDeps = {
+      onError: (e) => this.reportError(e),
+      onTabEvent: (tab, ev) => {
+        for (const listener of [...this.tabListeners]) {
+          listener(tab, ev);
+        }
+      },
+      onStrayEvent: (event) => this.emitChat({ kind: 'event', event }),
+      attachChat: (fresh) => this.attachChat(fresh),
+    };
+    return new TabController(id, deps);
+  }
+
+  private async runStart(): Promise<Status | null> {
+    let infos: TabInfo[] = [];
+    try {
+      infos = await api.listTabs();
+    } catch (e) {
+      // Without the list, start `main` as a fresh page does. The error is shown.
+      this.reportError(e);
+    }
+    this.adopt(infos.length > 0 ? infos.map((t) => t.id) : [SESSION_ID]);
+    this.applyOwners(infos);
+    const tabs = this.list();
+    const statuses = await Promise.all(
+      tabs.map((tab) =>
+        this.connectTab(tab).catch((e: unknown) => {
+          this.reportError(e);
+          return null;
+        }),
+      ),
+    );
+    const at = tabs.findIndex((tab) => tab.id === this.activeId);
+    return at === -1 ? null : (statuses[at] ?? null);
+  }
+
+  /** Starts or re-attaches a terminal's shell, then reads its status into the terminal. */
+  private async connectTab(tab: TabController): Promise<Status> {
+    await tab.connect();
+    const status = await api.getStatus(tab.id);
+    tab.applyStatus(status);
+    return status;
+  }
+
+  /**
+   * Makes the registry hold exactly `ids`, in that order. Controllers already here keep their state. Any other is dropped:
+   * at startup nothing but the placeholder `main` exists, and it has not connected.
+   */
+  private adopt(ids: readonly string[]): void {
+    const next = new Map<string, TabController>();
+    for (const id of ids) {
+      next.set(id, this.tabs.get(id) ?? this.build(id));
+    }
+    for (const [id, tab] of this.tabs) {
+      if (!next.has(id)) {
+        tab.dispose();
+      }
+    }
+    const ordinals = new Map<string, number>();
+    ids.forEach((id, i) => ordinals.set(id, this.ordinals.get(id) ?? i + 1));
+    this.tabs = next;
+    this.ordinals = ordinals;
+    if (this.activeId === null || !next.has(this.activeId)) {
+      this.activeId = ids[0] ?? null;
+    }
+    this.notifyStore();
+  }
+
+  /** Removes a terminal and disposes its controller. When it was the active one, its neighbour takes over. */
+  private drop(id: string): void {
+    const tab = this.tabs.get(id);
+    if (tab === undefined) {
+      return;
+    }
+    if (this.activeId === id) {
+      this.activeId = neighbourAfterClose([...this.tabs.keys()], id);
+    }
+    this.tabs.delete(id);
+    this.ordinals.delete(id);
+    this.notifyStore();
+    tab.dispose();
+  }
+
+  private applyOwners(infos: readonly TabInfo[]): void {
+    for (const info of infos) {
+      this.tabs.get(info.id)?.setOwner(info.owner);
+    }
+  }
+
+  /**
+   * Attaches the chat's agent channel. Memoised while the attach has succeeded; `fresh` attaches again. A failed attach is
+   * retried by the next call.
+   */
+  private attachChat(fresh: boolean): Promise<void> {
+    if (fresh || this.chatAttach === null) {
       const channel = new Channel<WireEvent>((event) => this.emitChat({ kind: 'event', event }));
       this.chatAttach = api.attachChat(CHAT_ID, channel).catch((e: unknown) => {
         this.chatAttach = null;

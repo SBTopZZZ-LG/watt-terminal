@@ -168,8 +168,12 @@ export const api = {
   integrateShell(sessionId: string) {
     return invoke<IntegrateOutcome>('integrate_shell', { sessionId });
   },
-  getStatus() {
-    return invoke<Status>('get_status', { chatId: CHAT_ID });
+  /**
+   * The chat's status. The chat fields come from the chat; the shell fields from the terminal `sessionId` names, or from the
+   * chat's default terminal when none is given. Read the terminal's own status with its id, so it is not another's.
+   */
+  getStatus(sessionId?: string) {
+    return invoke<Status>('get_status', { chatId: CHAT_ID, sessionId: sessionId ?? null });
   },
   /** The custom slash-command templates (global and project dirs), plus the two dirs so `/help` can show them. */
   listCommands(sessionId: string) {

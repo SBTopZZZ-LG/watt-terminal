@@ -182,7 +182,7 @@ export function TerminalView({ controller, active, keysToPty, inputState, onInpu
       clearTimeout(fitTimer);
       clearTimeout(checkTimer);
     };
-  }, []);
+  }, [controller]);
 
   useEffect(() => {
     if (active) {

@@ -10,7 +10,7 @@ import { FitAddon } from '@xterm/addon-fit';
 import { SearchAddon } from '@xterm/addon-search';
 import { Unicode11Addon } from '@xterm/addon-unicode11';
 import '@xterm/xterm/css/xterm.css';
-import { api, errorText } from './api';
+import { api, CHAT_ID, errorText, SESSION_ID } from './api';
 import { agentControlAfter, NO_CONTROL, settleControl } from './agentControl';
 import type { ControlSnapshot } from './agentControl';
 import { clearActions } from './clear';
@@ -99,11 +99,17 @@ export interface TabDeps {
   onTabEvent: (tab: TabController, ev: SessionEvent) => void;
   /** An agent event on the tab channel. The backend sends none; kept so nothing is dropped silently. */
   onStrayEvent: (ev: WireEvent) => void;
-  /** Attaches the chat's agent channel. Resolves once it is attached. */
-  attachChat: () => Promise<void>;
+  /**
+   * Attaches the chat's agent channel. Resolves once it is attached. `fresh` attaches again even when an attach already
+   * succeeded (after a restart of a shell); the backend attach is idempotent.
+   */
+  attachChat: (fresh: boolean) => Promise<void>;
 }
 
 type StartCall = (rows: number, cols: number, data: Channel<ArrayBuffer>, events: Channel<WireEvent>) => Promise<StartResult>;
+
+/** A title change is sent to the backend after this quiet time, so a burst of changes sends its last value once. */
+const TITLE_SYNC_MS = 300;
 
 export class TabController {
   readonly id: string;
@@ -130,11 +136,14 @@ export class TabController {
   /** The nonces this tab's OSC events may carry: its shell's, and one per live nested level. Never shared with another tab. */
   private nonces: ReadonlySet<string> = new Set();
   private state: TabState = INITIAL_TAB_STATE;
+  private titleTimer: ReturnType<typeof setTimeout> | undefined;
   private readonly listeners = new Set<() => void>();
 
   constructor(id: string, deps: TabDeps) {
     this.id = id;
     this.deps = deps;
+    // Until list_tabs says otherwise, the owner is the backend's own rule: the first terminal belongs to chat `main`.
+    this.state = { ...INITIAL_TAB_STATE, owner: id === SESSION_ID ? CHAT_ID : null };
     this.term = new Terminal({
       allowProposedApi: true,
       cursorBlink: true,
@@ -164,7 +173,14 @@ export class TabController {
       },
     });
     this.marks = new CommandMarks(this.term, () => this.stripeLayer?.schedule());
-    this.term.onTitleChange((title) => this.patch({ title }));
+    this.term.onTitleChange((title) => {
+      this.patch({ title });
+      // The backend keeps the xterm title for list_terminals. Only the xterm title is sent; the fallbacks are the UI's.
+      clearTimeout(this.titleTimer);
+      this.titleTimer = setTimeout(() => {
+        api.setTabTitle(this.id, this.state.title?.trim() || null).catch(this.deps.onError);
+      }, TITLE_SYNC_MS);
+    });
     this.fitToContainer = createFitter({
       connected: () => this.connected,
       proposeSize: () => {
@@ -230,7 +246,7 @@ export class TabController {
    */
   connect(): Promise<StartResult> {
     if (this.connection === null) {
-      this.connection = this.open((rows, cols, data, events) => api.startSession(this.id, rows, cols, data, events)).then((result) => {
+      this.connection = this.open((rows, cols, data, events) => api.startSession(this.id, rows, cols, data, events), false).then((result) => {
         this.connected = true;
         return result;
       });
@@ -243,7 +259,7 @@ export class TabController {
    * caller clears the terminal first (resetForNewSession): bytes from the old shell must not reach it.
    */
   restart(): Promise<StartResult> {
-    this.connection = this.open((rows, cols, data, events) => api.restartSession(this.id, rows, cols, data, events));
+    this.connection = this.open((rows, cols, data, events) => api.restartSession(this.id, rows, cols, data, events), true);
     return this.connection;
   }
 
@@ -293,7 +309,26 @@ export class TabController {
   }
 
   focus(): void {
-    this.term.focus();
+    // Before mount() there is no textarea to focus; the tab is focused once it is shown.
+    if (this.mounted) {
+      this.term.focus();
+    }
+  }
+
+  /** The chat that owns this terminal, as list_tabs last said. Set by TabManager.refresh. */
+  setOwner(owner: string | null): void {
+    this.patch({ owner });
+  }
+
+  /**
+   * Frees the xterm instance and drops the listeners. The caller closes the session first. The host element is React's
+   * and goes with its component.
+   */
+  dispose(): void {
+    clearTimeout(this.titleTimer);
+    this.coalescer.discard();
+    this.listeners.clear();
+    this.term.dispose();
   }
 
   /** Cmd+K. See clear.ts. At the prompt it also sends Ctrl-L through `sendToPty`. term.clear() is not used (see clear.ts). */
@@ -357,7 +392,7 @@ export class TabController {
     return { rows: this.term.rows, cols: this.term.cols };
   }
 
-  private open(call: StartCall): Promise<StartResult> {
+  private open(call: StartCall, freshChat: boolean): Promise<StartResult> {
     this.generation += 1;
     const gen = this.generation;
     const { rows, cols } = this.size();
@@ -372,7 +407,7 @@ export class TabController {
       }
     });
     return call(rows, cols, data, events)
-      .then((result) => this.deps.attachChat().then(() => result))
+      .then((result) => this.deps.attachChat(freshChat).then(() => result))
       .then((result) => {
         if (gen === this.generation) {
           // A new shell has only its own nonce. The status read after the connect adds any nested levels still alive.

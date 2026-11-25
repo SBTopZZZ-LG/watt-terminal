@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useReducer, useRef, useState, useSyncExternalStore } from 'react';
 import type { RefObject } from 'react';
 import './App.css';
-import { api, errorText, SESSION_ID } from './lib/api';
+import { api, CHAT_ID, errorText, SESSION_ID } from './lib/api';
 import { showsDisplay } from './lib/approvalCard';
 import { copyText } from './lib/clipboard';
 import {
@@ -22,6 +22,7 @@ import { reportError, tabs } from './lib/tabManager';
 import type { Incoming } from './lib/tabManager';
 import { ActiveTabContext } from './lib/activeTab';
 import { isSessionEvent } from './lib/tabState';
+import { isOwnedByChat } from './lib/tabStrip';
 import type { TabController } from './lib/tab';
 import type { TabState } from './lib/tabState';
 import { appHotkeyFor } from './lib/appHotkeys';
@@ -57,6 +58,7 @@ import type { QueuedMessage } from './lib/messageQueue';
 import type { AttachmentInput, HistoryGroupBy, InputState, LlmStatus, LoadedConversation, QueueMode, QuestionAnswerInput, SessionEvent, SettingsStateView, Status, ThinkingMode, UiState, UiStatePatch, WireEvent } from './lib/types';
 import { recoveryKind } from './lib/settingsRecovery';
 import { TerminalView } from './components/TerminalView';
+import { TabStrip } from './components/TabStrip';
 import { InputBar } from './components/InputBar';
 import { Transcript } from './components/Transcript';
 import { TodoPanel } from './components/TodoPanel';
@@ -87,9 +89,23 @@ const uiSaver = createPatchSaver((patch: UiStatePatch) => {
 /** The per-conversation memory in localStorage: drafts and saved follow-up prompts (see conversationCache.ts). */
 const cacheStorage = defaultSizeStorage();
 
+/**
+ * The terminal an agent event is about: the one it names (`terminal`, sent when the chat has two or more), else the chat's
+ * first terminal. Null when the chat has none.
+ */
+function agentTarget(ev: WireEvent): TabController | null {
+  if ('terminal' in ev && ev.terminal !== undefined) {
+    return tabs.get(ev.terminal) ?? null;
+  }
+  return tabs.list().find((t) => isOwnedByChat(t.getSnapshot().owner, CHAT_ID)) ?? null;
+}
+
 export default function App() {
-  // The one terminal the UI shows. Its state (input, hold, levels, ...) is read from its controller (see tab.ts).
-  const [tab] = useState(() => tabs.ensure(SESSION_ID));
+  // The terminal the UI shows: the registry's active one (see tabManager.ts). Its state (input, hold, levels, ...) is read
+  // from its controller (see tab.ts). The first terminal is made here so there is one to show before the backend's list.
+  const [firstTab] = useState(() => tabs.ensure(SESSION_ID));
+  const registry = useSyncExternalStore(tabs.subscribeStore, tabs.getSnapshot);
+  const tab = (registry.activeId === null ? undefined : tabs.get(registry.activeId)) ?? firstTab;
   const { input, integration, observer, cwd, levels, agentControl, restarting } = useTabState(tab);
   const effective = effectiveState(input);
   const route = routeFor(effective, input.foreground);
@@ -256,8 +272,12 @@ export default function App() {
   const clientIds = useRef(0);
   const prevEffective = useRef<InputState>(effective);
 
-  const applyStatus = useCallback((s: Status) => {
-    tab.applyStatus(s);
+  /**
+   * Applies a status read for `target`, the terminal it was read for: its shell fields go to that terminal, the chat's to the
+   * UI. Stable (no closure over the active terminal), so the connection effect is not re-run by a switch.
+   */
+  const applyStatus = useCallback((s: Status, target: TabController) => {
+    target.applyStatus(s);
     setAutoApprove(s.auto_approve);
     setAutoSuspended(s.auto_approve_suspended);
     dispatchTranscript({ type: 'levels_changed', depth: s.depth });
@@ -272,27 +292,28 @@ export default function App() {
     if (!sideBusyRef.current) {
       dispatchTranscript({ type: 'sync_busy', busy: s.agent_busy });
     }
-  }, [tab]);
+  }, []);
 
   /** Takes the status snapshot again, e.g. after the live conversation changed. Resolves once it is applied. */
-  const refreshStatus = (): Promise<void> => api.getStatus().then(applyStatus).catch(reportError);
+  const refreshStatus = (): Promise<void> =>
+    api.getStatus(tab.id).then((s) => applyStatus(s, tab)).catch(reportError);
 
   /**
    * Re-reads the control hold after `done`. `done` is emitted by `run_turn` before the worker's `OnDrop` calls
    * `end_turn`, so the first fetch can still see `agent_busy: true` and `settleControl` keeps the stale command id.
    * Retry while busy (up to 4 retries, ~250ms apart) so the later read settles it; errors are ignored.
    */
-  const refreshControl = useCallback(function refresh(attempt = 0): void {
-    api.getStatus().then(
+  const refreshControl = useCallback(function refresh(target: TabController, attempt = 0): void {
+    api.getStatus(target.id).then(
       (s) => {
-        tab.applyControl(s);
+        target.applyControl(s);
         if (s.agent_busy && attempt < 4) {
-          setTimeout(() => refresh(attempt + 1), 250);
+          setTimeout(() => refresh(target, attempt + 1), 250);
         }
       },
       () => undefined,
     );
-  }, [tab]);
+  }, []);
 
   /**
    * Reads approve-all as the shell on top sees it. Only its two fields change: a levels event is not a full status read (see
@@ -369,7 +390,7 @@ export default function App() {
   /** Reads the command catalog again for the `/help` dialog. Errors show in the dialog, never the transcript. */
   const loadHelp = () => {
     setHelpState({ kind: 'loading' });
-    api.listCommands(SESSION_ID).then(
+    api.listCommands(tab.id).then(
       (catalog) => setHelpState({ kind: 'ready', text: renderHelp(catalog) }),
       (e: unknown) => setHelpState({ kind: 'error', message: errorText(e) }),
     );
@@ -519,7 +540,7 @@ export default function App() {
         // The terminal's own events come through handleTabEvent (see the controller); none should arrive here.
         return;
       }
-      tab.applyAgentEvent(ev);
+      agentTarget(ev)?.applyAgentEvent(ev);
       switch (ev.type) {
         case 'integration_request':
           setAgentReq((cur) => agentRequestAfter(cur, ev));
@@ -534,7 +555,12 @@ export default function App() {
           dispatchTranscript({ type: 'agent_event', event: ev });
           // Reconcile with the status: a lost finish event leaves a stale command id holding the border on,
           // but at a local idle prompt no agent command can still be running.
-          refreshControl();
+          {
+            const target = agentTarget(ev);
+            if (target !== null) {
+              refreshControl(target);
+            }
+          }
           return;
         case 'steer_injected':
           // The turn took these: their rows leave the queue, and the transcript shows them at that step (transcript.ts).
@@ -553,7 +579,8 @@ export default function App() {
     // The terminal's own events. Their state is in the controller (see tabState.ts); these are what the transcript and the
     // agent's question also show.
     const handleTabEvent = (source: TabController, ev: SessionEvent) => {
-      if (source !== tab) {
+      // Only the chat's own terminals reach its transcript and its question: an unassigned one's events stay out of both.
+      if (!isOwnedByChat(source.getSnapshot().owner, CHAT_ID)) {
         return;
       }
       switch (ev.type) {
@@ -586,20 +613,32 @@ export default function App() {
 
     const unsubscribe = tabs.subscribeChat(onMessage);
     const unsubscribeTabs = tabs.subscribeTabEvents(handleTabEvent);
-    tab
-      .connect()
-      .then(() => api.getStatus())
+    // Reads the backend's terminals and connects them (see TabManager.start). The status is the active terminal's.
+    tabs
+      .start()
       .then((status) => {
-        applyStatus(status);
-        void restoreLast(status);
+        const active = tabs.active;
+        if (status !== null && active !== null) {
+          applyStatus(status, active);
+          void restoreLast(status);
+        }
       })
-      .then(() => tab.fitToContainer())
+      .then(() => tabs.active?.fitToContainer())
       .catch(reportError);
     return () => {
       unsubscribe();
       unsubscribeTabs();
     };
-  }, [tab, applyStatus, refreshAutoState, refreshControl]);
+  }, [applyStatus, refreshAutoState, refreshControl]);
+
+  // The active terminal changed (a switch, a new one, a close). The new one is fitted to its host; it takes the keys unless
+  // the focus is in the tab strip, where the arrow keys move it.
+  useEffect(() => {
+    if (!document.activeElement?.closest('.term-tabs')) {
+      tab.focus();
+    }
+    void tab.fitToContainer();
+  }, [tab]);
 
   // Focus follows the shell's end, not its commands (see focusAfter): the bar takes it when the shell exits, the
   // terminal when a new one starts.
@@ -689,7 +728,7 @@ export default function App() {
         if (zone !== null) {
           e.preventDefault();
           if (zone === 'terminal') {
-            tab.term.selectAll();
+            tabs.active?.term.selectAll();
           } else {
             selectContentsOf(document.querySelector('.transcript-body'));
           }
@@ -726,7 +765,7 @@ export default function App() {
           return;
         case 'clear':
           // Clears the scrollback locally; at the prompt Ctrl-L goes through the same route as typed keys (see clear.ts).
-          tab.clear(effectiveRef.current, handleTerminalInput);
+          tabs.active?.clear(effectiveRef.current, handleTerminalInput);
           return;
         case 'zoom-in':
           tabs.zoomFont('in');
@@ -767,9 +806,11 @@ export default function App() {
     };
   }, [settingsKind, refreshSettingsState]);
 
+  // Only the active terminal calls this (see TerminalView), so the keys go to the one on screen.
   const handleTerminalInput = useCallback((data: string) => {
-    if (routeRef.current.keys === 'pty') {
-      api.writeUser(SESSION_ID, data).catch(reportError);
+    const id = tabs.active?.id;
+    if (id !== undefined && routeRef.current.keys === 'pty') {
+      api.writeUser(id, data).catch(reportError);
     }
   }, []);
 
@@ -804,7 +845,7 @@ export default function App() {
   };
 
   const sendRaw = (text: string) => {
-    api.writeUser(SESSION_ID, text).catch(reportError);
+    api.writeUser(tab.id, text).catch(reportError);
   };
 
   const sendAgent = async (text: string, attachments: AttachmentInput[]): Promise<string | null> => {
@@ -1145,7 +1186,7 @@ export default function App() {
     if (builtin === null) {
       let catalog;
       try {
-        catalog = await api.listCommands(SESSION_ID);
+        catalog = await api.listCommands(tab.id);
       } catch {
         // The lookup failed: send the original text rather than swallow it.
         return { kind: 'send', text: original };
@@ -1706,7 +1747,7 @@ export default function App() {
   /** Runs the integration, and shows its result in the dialog. The keys stay locked until it answers. */
   const startIntegrate = () => {
     setIntegrate({ kind: 'running' });
-    api.integrateShell(SESSION_ID).then(
+    api.integrateShell(tab.id).then(
       (outcome) => setIntegrate({ kind: 'result', outcome }),
       (e: unknown) => setIntegrate({ kind: 'result', outcome: { outcome: 'failed', hint: errorText(e) } }),
     );
@@ -1755,16 +1796,19 @@ export default function App() {
     }
     tab.setRestarting(true);
     tab.resetForNewSession();
-    // The same conversation goes on, so what was queued comes back into the input rather than being dropped.
-    returnQueued();
-    clearQueue();
-    dispatchTranscript({ type: 'session_reset' });
+    // The chat's own terminal: the same conversation goes on, so what was queued comes back into the input rather than
+    // being dropped. Another chat's or an unassigned terminal has none of that in this chat.
+    if (isOwnedByChat(tab.getSnapshot().owner, CHAT_ID)) {
+      returnQueued();
+      clearQueue();
+      dispatchTranscript({ type: 'session_reset' });
+      setAgentReq((cur) => agentRequestClosedBySession(cur));
+    }
     tab.resetAgentControl();
-    setAgentReq((cur) => agentRequestClosedBySession(cur));
     tab
       .restart()
-      .then(() => api.getStatus())
-      .then(applyStatus)
+      .then(() => api.getStatus(tab.id))
+      .then((s) => applyStatus(s, tab))
       .then(() => tab.fitToContainer())
       .catch(reportError)
       // Still true until the status is applied, so a second click cannot land while the old exit state is shown.
@@ -1817,22 +1861,25 @@ export default function App() {
         dock={panel.dock}
         terminal={
           <div className="terminal-area">
-            {tabs.list().map((t) => (
-              <TerminalView
-                key={t.id}
-                controller={t}
-                active={t === tab}
-                keysToPty={keyRoute.keys === 'pty'}
-                inputState={effective}
-                onInput={handleTerminalInput}
-                onAltChange={(alt) => t.dispatchInput({ type: 'alt', active: alt })}
-              />
-            ))}
-            {/* Shown during the agent's turn ('working', softer) and while it holds the shell ('control'). Never takes clicks; sits above the terminal background, below its decorations. */}
-            <div className={borderClass[border]} aria-hidden="true">
-              <div className="agent-control-glow" />
+            <TabStrip />
+            <div className="term-stack">
+              {tabs.list().map((t) => (
+                <TerminalView
+                  key={t.id}
+                  controller={t}
+                  active={t === tab}
+                  keysToPty={keyRoute.keys === 'pty'}
+                  inputState={effective}
+                  onInput={handleTerminalInput}
+                  onAltChange={(alt) => t.dispatchInput({ type: 'alt', active: alt })}
+                />
+              ))}
+              {/* Shown during the agent's turn ('working', softer) and while it holds the shell ('control'). Never takes clicks; sits above the terminal background, below its decorations. */}
+              <div className={borderClass[border]} aria-hidden="true">
+                <div className="agent-control-glow" />
+              </div>
+              {findOpen && <FindBar focusToken={findToken} onClose={closeFind} />}
             </div>
-            {findOpen && <FindBar focusToken={findToken} onClose={closeFind} />}
           </div>
         }
         divider={
@@ -1918,7 +1965,7 @@ export default function App() {
               busy={busy || sideBusy}
               focusToken={focusToken}
               onFocusChange={setBarOpen}
-              loadCommands={() => api.listCommands(SESSION_ID)}
+              loadCommands={() => api.listCommands(tab.id)}
               onRestart={restartShell}
               restarting={restarting}
               onAgent={onAgent}

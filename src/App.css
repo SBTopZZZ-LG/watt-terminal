@@ -171,6 +171,16 @@ a {
 
 .terminal-area {
   position: relative;
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* The terminals, their glow and the find bar. Below the tab strip. */
+.term-stack {
+  position: relative;
   flex: 1 1 auto;
   min-width: 0;
   min-height: 0;
@@ -180,6 +190,136 @@ a {
   position: absolute;
   inset: 0;
   background: var(--term-bg);
+}
+
+/* The terminal tabs (TabStrip): one row above the terminals. The tabs scroll sideways; the "+" stays at the end. Sized like the
+   Settings tab strip, with a comfortable padding. */
+.term-tabs {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: stretch;
+  min-width: 0;
+  border-bottom: 1px dashed var(--rule);
+}
+
+.term-tabs-scroll {
+  display: flex;
+  flex: 1 1 auto;
+  gap: 2px;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+}
+
+.term-tab-cell {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: stretch;
+}
+
+.term-tab {
+  position: relative;
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  max-width: 220px;
+  margin: 0 0 -1px;
+  padding: 6px 12px;
+  border: 0;
+  border-radius: 2px;
+  background: none;
+  box-shadow: inset 0 -2px 0 transparent;
+  color: var(--muted);
+  font-family: var(--ui-font);
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.term-tab:hover {
+  color: var(--ink);
+}
+
+.term-tab.is-active {
+  color: var(--accent);
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+
+.term-tab:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+/* A shell that exited: the tab stays, dimmed. */
+.term-tab.is-ended {
+  opacity: 0.55;
+}
+
+.term-tab.is-ended .term-tab-label {
+  font-style: italic;
+}
+
+.term-tab-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.term-tab-ended {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+/* A terminal the chat can see. */
+.term-tab-dot {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+/* The close button shows on hover and focus, and always on the active tab. */
+.term-tab-close {
+  flex: 0 0 auto;
+  padding: 0 6px;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  cursor: pointer;
+  opacity: 0;
+}
+
+.term-tab-cell:hover .term-tab-close,
+.term-tab.is-active + .term-tab-close,
+.term-tab-close:focus-visible {
+  opacity: 1;
+}
+
+.term-tab-close:hover {
+  color: var(--ink);
+}
+
+.term-tab-add {
+  flex: 0 0 auto;
+  padding: 6px 12px;
+  border: 0;
+  border-left: 1px dashed var(--rule);
+  background: none;
+  color: var(--accent);
+  font-family: var(--ui-font);
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.term-tab-add.is-disabled {
+  color: var(--muted);
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 /*
