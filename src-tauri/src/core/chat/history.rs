@@ -22,6 +22,9 @@ const REASONING_KEYS: [&str; 3] = ["reasoning_content", "reasoning", "reasoning_
 pub const STEER_KEY: &str = "steer";
 /// What closes a call that a steer skipped: the steer came after the call before it, and this one did not run.
 pub const STEER_SKIPPED: &str = "skipped: the user sent a new message";
+/// Set on a stored assistant message: the model's reasoning, redacted, shown as a thinking block when the conversation
+/// is reloaded. It is never sent to the provider (see `messages_with`), and it is not a reasoning field of the provider.
+pub const REASONING_KEY: &str = "watt_reasoning";
 
 #[derive(Debug, Default)]
 pub struct History {
@@ -148,6 +151,7 @@ impl History {
             let mut wire = m.clone();
             if let Some(obj) = wire.as_object_mut() {
                 obj.remove(STEER_KEY);
+                obj.remove(REASONING_KEY);
             }
             if role(m) == Some("user") {
                 if let Some(parts) = m.get("content").and_then(Value::as_array) {
@@ -1113,6 +1117,22 @@ mod tests {
         assert_eq!(w[5]["content"], "steered");
         // The most turns that can go is the count less the running one: a steer adds nothing to that.
         assert!(wire(&h, &TrimPlan { drop_turns: 2, ..TrimPlan::none() }).len() == 7, "the running turn is never dropped");
+    }
+
+    #[test]
+    fn a_reasoning_key_is_stored_and_kept_on_reload_but_never_sent() {
+        let mut h = History::new();
+        h.push_user("hi");
+        h.push_assistant(json!({"role": "assistant", "content": "answer", (REASONING_KEY): "thought it through"}));
+        let stored = h.snapshot();
+        assert_eq!(stored[1][REASONING_KEY], json!("thought it through"));
+        let sent = wire(&h, &TrimPlan::none());
+        assert!(sent.iter().all(|m| m.get(REASONING_KEY).is_none()), "{sent:?}");
+        assert_eq!(sent[2]["content"], "answer");
+        // The key survives a reload (repair_assistant keeps the message's other keys), and is still not sent.
+        let reloaded = History::from_messages(stored);
+        assert_eq!(reloaded.snapshot()[1][REASONING_KEY], json!("thought it through"));
+        assert!(wire(&reloaded, &TrimPlan::none()).iter().all(|m| m.get(REASONING_KEY).is_none()));
     }
 
     #[test]

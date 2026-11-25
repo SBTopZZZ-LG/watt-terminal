@@ -33,7 +33,7 @@ use crate::core::external_tools::{ExternalApproval, ExternalToolHost};
 use crate::core::foreground::{Foreground, ForegroundKind};
 use crate::core::chat::attachments::{Attachment, Resolver, transcript_view, user_content};
 use crate::core::chat::context::{self, Calibrator, ContextUsage};
-use crate::core::chat::history::{History, STEER_SKIPPED};
+use crate::core::chat::history::{History, REASONING_KEY, STEER_SKIPPED};
 use crate::core::chat::instructions;
 use crate::core::chat::project::project;
 use crate::core::chat::prompt;
@@ -917,8 +917,9 @@ impl LlmAgent {
         };
         let thinking = Cell::new(true);
         let streamed = Cell::new(false);
-        // The raw streamed text, kept for the partial redaction below.
+        // The raw streamed text and reasoning, kept for the partial reply stored below when the stream is cancelled or fails.
         let mut streamed_raw = String::new();
+        let mut reasoning_raw = String::new();
         ctx.emit(AgentEvent::Thinking { active: true });
         let before = ContextUsage {
             trimmed,
@@ -929,6 +930,7 @@ impl LlmAgent {
             let mut on_delta = |delta: Delta| match delta {
                 // Reasoning is shown as it streams, but it does not end the "thinking" state.
                 Delta::Reasoning(text) if !text.is_empty() => {
+                    reasoning_raw.push_str(&text);
                     ctx.emit(AgentEvent::ReasoningDelta { text: redact_stream_fragment(&self.redactor, &text) });
                 }
                 Delta::Text(text) if !text.is_empty() => {
@@ -950,11 +952,17 @@ impl LlmAgent {
         };
         stop_thinking(ctx, &thinking);
         // A stream that failed after showing text leaves a partial reply: the next request must see what the
-        // user saw. Nothing is pushed when nothing streamed, when the stream finished, when not streaming, or when the
-        // stream was interrupted: that reply is discarded whole (see `respond`).
+        // user saw. A cancel after reasoning alone leaves one too, with the reasoning kept for the transcript (not sent).
+        // Nothing is pushed when nothing streamed, when the stream finished, when not streaming, or when the stream was
+        // interrupted: that reply is discarded whole (see `respond`).
         let interrupted = matches!(&result, Err(LlmError::Interrupted));
+        let cancelled = matches!(&result, Err(LlmError::Cancelled));
         if result.is_err() && !interrupted && streamed.get() && !streamed_raw.is_empty() {
-            lock(&self.history).push_assistant(interrupted_message(&self.redactor, &streamed_raw));
+            let message = interrupted_message(&self.redactor, &streamed_raw);
+            lock(&self.history).push_assistant(with_reasoning(&self.redactor, message, &reasoning_raw));
+        } else if cancelled && !reasoning_raw.is_empty() {
+            let message = interrupted_message(&self.redactor, "");
+            lock(&self.history).push_assistant(with_reasoning(&self.redactor, message, &reasoning_raw));
         }
         if let Ok(reply) = &result
             && let Some(actual) = reply.usage.as_ref().map(|usage| usage.prompt_tokens).filter(|&n| n > 0)
@@ -1208,7 +1216,7 @@ impl Agent for LlmAgent {
             // The next request is compared with the tools this one was offered (see `tools_note`). A pending note holds the
             // baseline until it is delivered below: a reply that delivers none, or a turn that ends first, keeps it.
             settle_offered(&self.offered_tools, &mut offered, &note);
-            lock(&self.history).push_assistant(reply.raw);
+            lock(&self.history).push_assistant(with_reasoning(&self.redactor, reply.raw, &reply.reasoning));
             if reply.tool_calls.is_empty() {
                 // A steer that is waiting continues the turn: it goes in, and the model is asked again. Otherwise the mailbox
                 // closes in the same step as this check, so no steer can land after it and be lost (see `Steer::take_or_close`).
@@ -1447,9 +1455,24 @@ fn redact_stream_fragment(redactor: &Redactor, text: &str) -> String {
 
 /// The assistant message stored when a streamed reply fails after text arrived: the accumulated text,
 /// redacted as a whole, with a marker that the reply was interrupted. Redacting the whole text catches a
-/// credential split across two deltas, which the per-delta redaction above cannot see.
+/// credential split across two deltas, which the per-delta redaction above cannot see. With no text (a cancel
+/// after reasoning only) the message is the marker alone.
 fn interrupted_message(redactor: &Redactor, raw: &str) -> Value {
-    json!({"role": "assistant", "content": format!("{}\n\n[reply interrupted]", redactor.redact(raw))})
+    let content = if raw.is_empty() {
+        "[reply interrupted]".to_string()
+    } else {
+        format!("{}\n\n[reply interrupted]", redactor.redact(raw))
+    };
+    json!({"role": "assistant", "content": content})
+}
+
+/// `message` with the model's reasoning stored under `REASONING_KEY`, redacted as a whole. Nothing is added when there
+/// is no reasoning. The key is for the transcript only: it is never sent back to the model (see `History::messages_with`).
+fn with_reasoning(redactor: &Redactor, mut message: Value, reasoning: &str) -> Value {
+    if !reasoning.is_empty() {
+        message[REASONING_KEY] = json!(redactor.redact(reasoning));
+    }
+    message
 }
 
 /// The notice for a failed model call. Provider text is already free of the key (the adapter scrubs it).

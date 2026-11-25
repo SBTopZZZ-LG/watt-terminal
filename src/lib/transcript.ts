@@ -69,8 +69,8 @@ export type TranscriptItem =
   /** `muted` is a quiet note (the trim note), drawn in the muted colour rather than the warning one. */
   | { id: number; kind: 'notice'; text: string; muted?: boolean }
   /**
-   * The model's reasoning for one model call (live only: never stored, so a reloaded conversation has none). `streaming` is
-   * true while reasoning_delta events extend it. `startedAt` and `endedAt` are Unix ms, absent when the event had no time.
+   * The model's reasoning for one model call. Live, it is extended by reasoning_delta events; a reloaded conversation rebuilds
+   * it from the stored reasoning (see historyView.ts), with `streaming` false. `streaming` is true while deltas extend it. `startedAt` and `endedAt` are Unix ms, absent when the event had no time.
    */
   | { id: number; kind: 'thinking'; text: string; streaming: boolean; startedAt?: number; endedAt?: number };
 

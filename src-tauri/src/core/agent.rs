@@ -354,7 +354,8 @@ pub enum AgentEvent {
     QuestionRequest { call_id: String, questions: Vec<questions::Question> },
     /// Streamed assistant text. `Text` is still used for whole messages.
     TextDelta { text: String },
-    /// Streamed reasoning text of the model (shown, never stored). It does not change the "thinking" state.
+    /// Streamed reasoning text of the model (shown live; stored with the reply for the transcript, never sent back). It does
+    /// not change the "thinking" state.
     /// The wire type is `reasoning_delta`.
     ReasoningDelta { text: String },
     /// The model is working on a reply (true) or has produced its first output (false).

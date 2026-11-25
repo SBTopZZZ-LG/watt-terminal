@@ -8,6 +8,7 @@ import {
   groupByWorkspace,
   itemsFromMessages,
   NO_RESULT_TEXT,
+  REASONING_KEY,
   relativeTime,
   safeText,
   UNANSWERED_NOTE,
@@ -172,6 +173,37 @@ describe('itemsFromMessages', () => {
   it('a call with a missing function name is shown as unknown', () => {
     const items = itemsFromMessages([{ role: 'assistant', content: null, tool_calls: [{ id: 'c1' }] }, { role: 'tool', tool_call_id: 'c1', content: 'ok' }]);
     expect(items[0]).toMatchObject({ name: 'unknown', args: null });
+  });
+
+  it('stored reasoning is a thinking item before the agent text, with no times', () => {
+    const items = itemsFromMessages([{ role: 'assistant', content: 'Done.', [REASONING_KEY]: 'Let me think.' }]);
+    expect(items).toEqual([
+      { kind: 'thinking', text: 'Let me think.', streaming: false },
+      { kind: 'agent', text: 'Done.', streaming: false },
+    ]);
+  });
+
+  it('stored reasoning comes before the tool items of its message, and works with a parts array', () => {
+    const items = itemsFromMessages([
+      { role: 'assistant', content: [{ type: 'text', text: 'Checking.' }], tool_calls: [{ id: 'c1', type: 'function', function: { name: 'get_cwd', arguments: '{}' } }], [REASONING_KEY]: 'Need the dir.' },
+      { role: 'tool', tool_call_id: 'c1', content: '/home' },
+    ]);
+    expect(items.map((i) => i.kind)).toEqual(['thinking', 'agent', 'tool']);
+    expect(items[0]).toEqual({ kind: 'thinking', text: 'Need the dir.', streaming: false });
+  });
+
+  it('a reasoning-only message gives just the thinking item', () => {
+    const items = itemsFromMessages([{ role: 'assistant', content: '[reply interrupted]', [REASONING_KEY]: 'Partial thought' }]);
+    expect(items).toEqual([
+      { kind: 'thinking', text: 'Partial thought', streaming: false },
+      { kind: 'agent', text: '[reply interrupted]', streaming: false },
+    ]);
+  });
+
+  it('no thinking item when the reasoning is absent, empty, whitespace or not a string', () => {
+    expect(itemsFromMessages([{ role: 'assistant', content: 'a' }]).map((i) => i.kind)).toEqual(['agent']);
+    expect(itemsFromMessages([{ role: 'assistant', content: 'a', [REASONING_KEY]: '  ' }]).map((i) => i.kind)).toEqual(['agent']);
+    expect(itemsFromMessages([{ role: 'assistant', content: 'a', [REASONING_KEY]: 3 }]).map((i) => i.kind)).toEqual(['agent']);
   });
 });
 
