@@ -284,11 +284,18 @@ impl<F: FnOnce()> OnDrop<F> {
     }
 }
 
-impl<F: FnOnce()> Drop for OnDrop<F> {
-    fn drop(&mut self) {
+impl<F: FnOnce()> OnDrop<F> {
+    /// Runs the closure now, if it has not run yet. The drop then does nothing.
+    pub fn fire(&mut self) {
         if let Some(f) = self.0.take() {
             f();
         }
+    }
+}
+
+impl<F: FnOnce()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        self.fire();
     }
 }
 
@@ -1130,8 +1137,18 @@ pub trait Agent {
 
 /// Runs one turn and always ends it with `Done`.
 pub fn run_turn(agent: &mut dyn Agent, message: &UserMessage, ctx: &AgentCtx<'_>) {
-    agent.respond(message, ctx);
+    run_reply(agent, message, ctx);
     ctx.emit(AgentEvent::Done);
+}
+
+/// Runs the reply of one turn, without `Done`: the caller saves the history and ends the turn first, then emits `Done`
+/// (see the agent thread in lib.rs). A panic in the agent is caught and not rethrown: a notice says the reply stopped,
+/// so the caller still reaches its `Done`. The panic message itself is printed by the panic hook.
+pub fn run_reply(agent: &mut dyn Agent, message: &UserMessage, ctx: &AgentCtx<'_>) {
+    let replied = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| agent.respond(message, ctx)));
+    if replied.is_err() {
+        ctx.emit(AgentEvent::Notice { text: "The reply stopped because of an internal error. Ask again.".into() });
+    }
 }
 
 /// Deterministic keyword rules over the tools. No network, no model.
