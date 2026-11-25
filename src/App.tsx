@@ -48,7 +48,7 @@ import { onNotificationClick, sendAttention, watchWindowFocus } from './lib/atte
 import { acceptSuggestions, endsWithAgentText, shouldSuggest } from './lib/suggestions';
 import { NEW_DRAFT_KEY, forgetAllSuggestions, forgetConversation, forgetEverything, forgetSuggestions, loadSuggestions, saveSuggestions, transcriptSig } from './lib/conversationCache';
 import { SEND_WHILE_SWITCHING_NOTICE, switchRefusal } from './lib/switchGuard';
-import { drainBatch, enqueue, QUEUE_SLOT_POLL_MS, QUEUE_SLOT_WAIT_MS, removeQueued, shouldDrain } from './lib/messageQueue';
+import { drainBatch, enqueue, markSteered, QUEUE_SLOT_POLL_MS, QUEUE_SLOT_WAIT_MS, removeInjected, removeQueued, shouldDrain, takeWithdrawn, unsteer } from './lib/messageQueue';
 import type { QueuedMessage } from './lib/messageQueue';
 import type { AttachmentInput, Cwd, HistoryGroupBy, InputState, IntegrationStatus, LevelInfo, LlmStatus, LoadedConversation, ObserverStatus, QueueMode, QuestionAnswerInput, SettingsStateView, Status, ThinkingMode, UiState, UiStatePatch, WireEvent } from './lib/types';
 import { recoveryKind } from './lib/settingsRecovery';
@@ -155,7 +155,7 @@ export default function App() {
   // A side command (`/btw`, `/compact`, `/fork`) is running: one model call outside a turn, or none at all. The bar
   // and History stay busy until it answers, and a send is refused so the text is kept.
   const [sideBusy, setSideBusy] = useState(false);
-  // Messages typed while the agent works, sent after its turn (see messageQueue.ts). Not kept across a restart. The ref is the
+  // Messages typed while the agent works: steered into the running turn, or queued and sent after it (see messageQueue.ts). Not kept across a restart. The ref is the
   // same list for the steps that run outside a render. `queueGen` moves when the conversation changes, so a send in flight
   // never lands in another one. `queueMode` is the saved setting: all together, or one per turn.
   const [queue, setQueue] = useState<QueuedMessage[]>([]);
@@ -543,6 +543,15 @@ export default function App() {
           // Reconcile with the status: a lost finish event leaves a stale command id holding the border on,
           // but at a local idle prompt no agent command can still be running.
           refreshControl();
+          return;
+        case 'steer_injected':
+          // The turn took these: their rows leave the queue, and the transcript shows them at that step (transcript.ts).
+          commitQueue(removeInjected(queueRef.current, ev.ids));
+          dispatchTranscript({ type: 'agent_event', event: ev, at: Date.now() });
+          return;
+        case 'steer_returned':
+          // The turn did not take these: they are plain queued messages again, sent at the end of the turn.
+          commitQueue(unsteer(queueRef.current, ev.ids));
           return;
         case 'observer':
           setObserver(ev.status);
@@ -972,8 +981,51 @@ export default function App() {
     void sendAgent(text, []);
   };
 
-  /** Takes a queued message back, for the input to restore. Null when it is no longer queued. */
+  /**
+   * Offers a queued message to the running turn (steer_message): it goes in at the agent's next step. Accepted: the row is
+   * marked steered. Refused or failed: the row stays a plain queued message, sent at the end of the turn as before (a
+   * failure is not shown here; a send that really fails shows its error when it is sent). The row may be gone by the
+   * answer (injected, withdrawn, restored by Stop): markSteered then changes nothing.
+   */
+  const steerQueued = (id: number, text: string, attachments: AttachmentInput[]) => {
+    api.steerMessage(id, text, attachments, queueMode).then(
+      (accepted) => {
+        if (accepted) {
+          commitQueue(markSteered(queueRef.current, id));
+        }
+      },
+      () => undefined,
+    );
+  };
+
+  /**
+   * Takes a steered message back (withdraw_steer). The turn decides: if it was still waiting, the row goes and its text
+   * comes back into the input, as an unqueue does. If the turn already took it, nothing is done here: steer_injected
+   * removes the row. A failed call leaves the row as it is.
+   */
+  const withdrawSteered = async (id: number): Promise<void> => {
+    const waiting = await api.withdrawSteer(id).catch((e: unknown) => {
+      reportError(e);
+      return null;
+    });
+    if (waiting === null) {
+      return;
+    }
+    const { queue: next, removed } = takeWithdrawn(queueRef.current, id, waiting);
+    if (removed !== null) {
+      commitQueue(next);
+      // Restored the way a Stop restores the queue: the input takes it on the tick (see InputBar's restoreTick).
+      returned.current = [...returned.current, removed];
+      setRestoreTick((t) => t + 1);
+    }
+  };
+
+  /** Takes a queued message back, for the input to restore. Null when it is no longer queued, or when it is steered (withdrawSteered asks the turn first). */
   const unqueue = (id: number): QueuedMessage | null => {
+    if (queueRef.current.some((q) => q.id === id && q.steered === true)) {
+      void withdrawSteered(id);
+      return null;
+    }
     const { queue: next, removed } = removeQueued(queueRef.current, id);
     if (removed !== null) {
       commitQueue(next);
@@ -1356,7 +1408,9 @@ export default function App() {
     // Read again after any await: the turn may have ended meanwhile.
     const queueIt = (queued: string): null => {
       queueSeq.current += 1;
-      commitQueue(enqueue(queueRef.current, queueSeq.current, queued, attachments));
+      const id = queueSeq.current;
+      commitQueue(enqueue(queueRef.current, id, queued, attachments));
+      steerQueued(id, queued, attachments);
       return null;
     };
     const parsed = parseCommand(text);

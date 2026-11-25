@@ -56,7 +56,7 @@ Settings, then “Limits”: “Model calls per turn”, “Polling calls per tu
 ## Terminal tab
 Settings, then “Terminal”:
 - “Hide command separators and agent labels in the terminal” (a checkbox).
-- “Queued messages”: “Send them together, as one message (default)” or “Send them one at a time, one per turn”.
+- “Queued messages”: “Send them together, at the agent's next step (default)” or “Send them one at a time, one per step”. A message typed while the agent works goes in at its next step; one it does not take is sent when the turn ends.
 - “Reasoning”, under “How reasoning blocks show in the agent”: “Collapsed”, “Auto” or “Expanded”. A reasoning block shows as “Thinking”, then “Thought for” the seconds. Reasoning is not stored: it is gone after a reload or after switching conversation.
 - “Suggested prompts”: “Suggest follow-up prompts after each reply”.
 - “Notifications”: notify when the agent is done or needs the user while Watt is in the background.

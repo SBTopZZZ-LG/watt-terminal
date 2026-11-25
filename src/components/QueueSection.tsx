@@ -2,7 +2,7 @@ import { useId } from 'react';
 import type { QueueMode } from '../lib/types';
 
 export interface QueueSectionProps {
-  /** The saved setting: `all` sends the queued messages together after the turn, `one` one per turn. */
+  /** The saved setting: `all` sends the messages waiting together at the agent's next step, `one` one per step. */
   queueMode: QueueMode;
   /** Applied at once and saved with the UI state. Not part of the AI settings draft, so Save does not apply to it. */
   onQueueModeChange(mode: QueueMode): void;
@@ -20,7 +20,7 @@ export function QueueSection({ queueMode, onQueueModeChange }: QueueSectionProps
         Queued messages
       </h3>
       <fieldset className="settings-radios" aria-describedby={`${uid}-queue-help`}>
-        <legend>When messages are queued while the agent works</legend>
+        <legend>When messages are sent while the agent works</legend>
         <label className="settings-check">
           <input
             type="radio"
@@ -29,7 +29,7 @@ export function QueueSection({ queueMode, onQueueModeChange }: QueueSectionProps
             checked={queueMode === 'all'}
             onChange={() => onQueueModeChange('all')}
           />
-          Send them together, as one message (default)
+          Send them together, at the agent's next step (default)
         </label>
         <label className="settings-check">
           <input
@@ -39,11 +39,13 @@ export function QueueSection({ queueMode, onQueueModeChange }: QueueSectionProps
             checked={queueMode === 'one'}
             onChange={() => onQueueModeChange('one')}
           />
-          Send them one at a time, one per turn
+          Send them one at a time, one per step
         </label>
       </fieldset>
       <span className="settings-hint" id={`${uid}-queue-help`}>
-        Applies at once. A queued message can be removed before it is sent, and its text goes back into the input.
+        Applies at once. A message goes in at the agent's next step, after the tool call that is running or after a reply, and
+        the turn goes on. One the turn does not take is sent when it ends. A message still waiting can be removed, and its text
+        goes back into the input.
       </span>
     </section>
   );

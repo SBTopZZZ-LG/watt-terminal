@@ -116,6 +116,61 @@ describe('transcriptReducer: context usage', () => {
   });
 });
 
+describe('transcriptReducer: steered messages', () => {
+  const done: TranscriptAction = { type: 'agent_event', event: { type: 'done' } };
+  const injected = (text: string, attachments: { kind: 'image' | 'file'; name: string; bytes: number }[] = []): TranscriptAction => ({
+    type: 'agent_event',
+    event: { type: 'steer_injected', ids: [1], text, attachments },
+  });
+
+  it('a steer taken mid-turn does not count a turn in flight, so the turn still ends idle at done', () => {
+    // The trap: user_sent counts a turn, done ends one. Reusing user_sent for a steer would leave the UI busy forever.
+    const t = run([{ type: 'user_sent', clientId: 1, text: 'start' }, injected('steer'), done]);
+    expect(t.inFlight).toBe(0);
+    expect(isBusy(t)).toBe(false);
+  });
+
+  it('a steer alone (user_steered) leaves inFlight where it was', () => {
+    const before = run([{ type: 'user_sent', clientId: 1, text: 'start' }]);
+    const after = run([{ type: 'user_steered', text: 'more' }], before);
+    expect(after.inFlight).toBe(1);
+    expect(run([{ type: 'user_steered', text: 'more' }]).inFlight).toBe(0);
+  });
+
+  it('a steered message shows as a user message at the step it went in, with its attachments', () => {
+    const attachments = [{ kind: 'file' as const, name: 'notes.txt', bytes: 12 }];
+    const t = run([{ type: 'user_sent', clientId: 1, text: 'start' }, injected('look at this', attachments)]);
+    expect(t.items[1]).toEqual({ id: t.items[1].id, kind: 'user', text: 'look at this', attachments });
+    expect(t.items[1]).not.toHaveProperty('clientId');
+  });
+
+  it('a steer with no attachments shows no attachments field', () => {
+    const t = run([injected('plain')]);
+    expect(t.items[0]).toEqual({ id: t.items[0].id, kind: 'user', text: 'plain' });
+  });
+
+  it('a steer taken after a tool call lands after that call', () => {
+    const t = run([
+      { type: 'user_sent', clientId: 1, text: 'start' },
+      { type: 'agent_event', event: { type: 'tool_call', call_id: 'c1', name: 'get_cwd', args: {} } },
+      { type: 'agent_event', event: { type: 'tool_result', call_id: 'c1', name: 'get_cwd', ok: true, decision: 'read', result: {} } },
+      injected('next'),
+    ]);
+    expect(t.items.map((i) => i.kind)).toEqual(['user', 'tool', 'user']);
+  });
+
+  it('steer_returned adds nothing to the transcript', () => {
+    const before = run([{ type: 'user_sent', clientId: 1, text: 'start' }]);
+    const after = run([{ type: 'agent_event', event: { type: 'steer_returned', ids: [1] } }], before);
+    expect(after).toBe(before);
+  });
+
+  it('a failed send does not remove a steered message (it has no clientId to match)', () => {
+    const t = run([injected('steered'), { type: 'user_failed', clientId: 0, message: 'no' }]);
+    expect(t.items.map((i) => i.kind)).toEqual(['user', 'notice']);
+  });
+});
+
 describe('transcriptReducer: local actions', () => {
   it('a sent message shows as the user, and the turn is busy until done', () => {
     const t = run([{ type: 'user_sent', clientId: 7, text: 'what was the last command' }]);

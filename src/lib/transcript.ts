@@ -32,8 +32,8 @@ export interface UserAttachment {
 }
 
 export type TranscriptItem =
-  /** `attachments` is absent when the message had none. */
-  | { id: number; kind: 'user'; clientId: number; text: string; attachments?: UserAttachment[] }
+  /** `attachments` is absent when the message had none. `clientId` is absent for a steered message (it was never sent alone). */
+  | { id: number; kind: 'user'; clientId?: number; text: string; attachments?: UserAttachment[] }
   /** `streaming` is true while text_delta events are still extending this message. */
   | { id: number; kind: 'agent'; text: string; streaming: boolean }
   /**
@@ -141,6 +141,11 @@ export type TranscriptAction =
   | { type: 'user_sent'; clientId: number; text: string; attachments?: UserAttachment[] }
   /** The agent refused the message (Rust error). Drops the user item and the in-flight count. */
   | { type: 'user_failed'; clientId: number; message: string }
+  /**
+   * Steered messages went into the running turn (the steer_injected event): shown as a user message. Unlike user_sent this
+   * does not count a turn in flight, because the turn it went into already is (its `done` is still to come).
+   */
+  | { type: 'user_steered'; text: string; attachments?: UserAttachment[] }
   | { type: 'approval_answering'; callId: string; approve: boolean }
   /** The backend accepted the answer (approve_tool returned OK): the card shows its decision, while the command runs. */
   | { type: 'approval_sent'; callId: string }
@@ -189,6 +194,13 @@ export function transcriptReducer(t: Transcript, action: TranscriptAction): Tran
         id,
         kind: 'user',
         clientId: action.clientId,
+        text: action.text,
+        ...(action.attachments && action.attachments.length > 0 ? { attachments: action.attachments } : {}),
+      }));
+    case 'user_steered':
+      return add(t, (id) => ({
+        id,
+        kind: 'user',
         text: action.text,
         ...(action.attachments && action.attachments.length > 0 ? { attachments: action.attachments } : {}),
       }));
@@ -506,8 +518,10 @@ function applyAgentEvent(t0: Transcript, ev: AgentEvent, at: number | undefined)
     }
     case 'context_usage':
       return contextUsage(t, ev);
-    // Steering (part 2) is not rendered yet: the frontend does not steer, so the backend sends neither event in use.
+    // The steered message shows where the turn took it. Its queue row is App's to remove (see messageQueue.ts).
     case 'steer_injected':
+      return transcriptReducer(t, { type: 'user_steered', text: ev.text, attachments: ev.attachments });
+    // Nothing to show: the message is queued again, and App's queue rows change (see messageQueue.ts).
     case 'steer_returned':
       return t;
   }

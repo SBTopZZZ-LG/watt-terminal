@@ -569,7 +569,8 @@ describe('SettingsDialog: queued messages', () => {
     vi.stubGlobal('document', { activeElement: null });
     try {
       const all = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} hideMarks onHideMarksChange={NOOP} queueMode="all" onQueueModeChange={NOOP} thinkingMode="auto" onThinkingModeChange={NOOP} suggestPrompts={false} onSuggestPromptsChange={NOOP} notifications onNotificationsChange={NOOP} devtools={false} onDevtoolsChange={NOOP} />);
-      expect(all).toContain('When messages are queued while the agent works');
+      expect(all).toContain('When messages are sent while the agent works');
+      expect(all).toContain('Send them together, at the agent&#x27;s next step (default)');
       expect(all).toMatch(/<input type="radio"(?=[^>]*value="all")(?=[^>]*checked="")[^>]*\/>Send them together/);
       expect(all).toMatch(/<input type="radio"(?![^>]*checked="")[^>]*value="one"[^>]*\/>Send them one at a time/);
       const one = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} hideMarks onHideMarksChange={NOOP} queueMode="one" onQueueModeChange={NOOP} thinkingMode="auto" onThinkingModeChange={NOOP} suggestPrompts={false} onSuggestPromptsChange={NOOP} notifications onNotificationsChange={NOOP} devtools={false} onDevtoolsChange={NOOP} />);

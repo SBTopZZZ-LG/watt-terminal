@@ -1,14 +1,20 @@
-// Messages typed while the agent is busy. They wait in a queue and are sent after the turn ends: all at once as one
-// message, or one per turn (the queue_mode setting). Pure, so the rules are tested without React or the backend. The app
-// owns the queue state and does the sending (see App.tsx); this module only decides what goes where.
+// Messages typed while the agent is busy. Each is offered to the running turn (steered): it goes in at the agent's next
+// step. One the turn does not take waits in the queue and is sent after the turn ends: all at once as one message, or one
+// per turn (the queue_mode setting). Pure, so the rules are tested without React or the backend. The app owns the queue
+// state and does the sending (see App.tsx); this module only decides what goes where.
 
 import type { AttachmentInput, QueueMode } from './types';
 
-/** A message waiting for the agent to finish its turn. `id` is unique within the app run. */
+/**
+ * A message waiting to go to the agent. `id` is unique within the app run. `steered` is set once the running turn has
+ * accepted it (steer_message): it goes in at the agent's next step, and is removed when steer_injected names it. Cleared
+ * (back to a plain queued message) by steer_returned.
+ */
 export interface QueuedMessage {
   id: number;
   text: string;
   attachments: AttachmentInput[];
+  steered?: boolean;
 }
 
 /** How often the drain asks the backend whether its turn slot is free (the `done` event comes before the slot is released). */
@@ -25,6 +31,34 @@ export function enqueue(queue: QueuedMessage[], id: number, text: string, attach
 export function removeQueued(queue: QueuedMessage[], id: number): { queue: QueuedMessage[]; removed: QueuedMessage | null } {
   const removed = queue.find((q) => q.id === id) ?? null;
   return removed === null ? { queue, removed } : { queue: queue.filter((q) => q.id !== id), removed };
+}
+
+/**
+ * The outcome of withdrawing a steered message (withdraw_steer): `waiting` is whether the turn had not taken it yet. Only
+ * then is it removed (and its text goes back into the input). Otherwise the turn has it, and steer_injected removes the row.
+ */
+export function takeWithdrawn(queue: QueuedMessage[], id: number, waiting: boolean): { queue: QueuedMessage[]; removed: QueuedMessage | null } {
+  return waiting ? removeQueued(queue, id) : { queue, removed: null };
+}
+
+/** Marks a message as accepted by the running turn. A row that is gone (sent, removed, restored by Stop) is left as it is. */
+export function markSteered(queue: QueuedMessage[], id: number): QueuedMessage[] {
+  return queue.map((q) => (q.id === id ? { ...q, steered: true } : q));
+}
+
+/** Steer rows that the turn gave back (steer_returned): they are plain queued messages again, and drain at idle. */
+export function unsteer(queue: QueuedMessage[], ids: number[]): QueuedMessage[] {
+  return queue.map((q) => (ids.includes(q.id) ? { ...q, steered: false } : q));
+}
+
+/** Drops the rows the turn took in (steer_injected). Ids with no row (already restored by Stop) are ignored. */
+export function removeInjected(queue: QueuedMessage[], ids: number[]): QueuedMessage[] {
+  return queue.filter((q) => !ids.includes(q.id));
+}
+
+/** Whether any queued message is steered: the queue header then says the messages go in at the next step. */
+export function isSteering(queue: QueuedMessage[]): boolean {
+  return queue.some((q) => q.steered === true);
 }
 
 /**
@@ -66,8 +100,14 @@ export function shouldDrain(prevActive: boolean, active: boolean, queueLength: n
   return prevActive && !active && queueLength > 0;
 }
 
-/** The label above the queue rows, by mode. */
-export function queueHeader(mode: QueueMode): string {
+/**
+ * The label above the queue rows, by mode. `steering`: some row was accepted by the running turn, so it goes in at the
+ * agent's next step. Otherwise the rows wait for the end of the turn.
+ */
+export function queueHeader(mode: QueueMode, steering: boolean): string {
+  if (steering) {
+    return mode === 'one' ? "Will be sent one at a time at the agent's next step" : "Will be sent at the agent's next step";
+  }
   return mode === 'one' ? 'Queued · sent one at a time when the agent finishes' : 'Queued · sent together when the agent finishes';
 }
 
