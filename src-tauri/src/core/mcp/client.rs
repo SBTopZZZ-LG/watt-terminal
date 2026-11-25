@@ -52,6 +52,8 @@ pub enum ConnectFailure {
 pub struct Live {
     pub service: RunningService<RoleClient, Handler>,
     pub peer: Peer<RoleClient>,
+    /// The process group of a stdio server (its pid: the group leader, see `spawn_stdio`). None for HTTP.
+    pub group: Option<u32>,
 }
 
 /// The rmcp client handler. It only reports events to the runtime: a list change asks for a fresh `tools/list`.
@@ -93,11 +95,13 @@ async fn connect_inner(
     match transport {
         ResolvedTransport::Stdio { command, args, cwd, env } => {
             let (process, stderr) = spawn_stdio(&command, args, cwd, env).await.map_err(ConnectFailure::Failed)?;
+            // Read before the process is handed to rmcp, which owns it from here on.
+            let group = process.id();
             if let Some(stderr) = stderr {
                 drain_stderr(server.to_string(), stderr, events);
             }
             let service = handler.serve(process).await.map_err(|e| init_failure(&e, false))?;
-            finish(service, false).await
+            finish(service, false, group).await
         }
         ResolvedTransport::Http { url, headers } => {
             let config = http_config(&url, &headers).map_err(ConnectFailure::Failed)?;
@@ -105,7 +109,7 @@ async fn connect_inner(
                 .serve(StreamableHttpClientTransport::from_config(config))
                 .await
                 .map_err(|e| init_failure(&e, true))?;
-            finish(service, true).await
+            finish(service, true, None).await
         }
     }
 }
@@ -159,6 +163,27 @@ async fn spawn_stdio(
         .spawn()
         .map_err(|e| spawn_failure(command, searched, &e))
 }
+
+/// Kills the process group `group` of a stdio server with SIGKILL, so its whole tree dies. Called by the runtime when a
+/// graceful close timed out: rmcp's own kill escalation runs in the serve task, which the runtime drops when it shuts
+/// down, so it may never run. A group that is already gone is not an error.
+#[cfg(unix)]
+pub fn kill_group(group: u32) {
+    unsafe extern "C" {
+        fn killpg(pgrp: i32, sig: i32) -> i32;
+    }
+    const SIGKILL: i32 = 9; // the same number on Linux, macOS and the BSDs
+    // SAFETY: killpg takes two integers and no pointers. Its result is ignored: ESRCH (no such group) is the expected
+    // answer when the tree has already exited.
+    unsafe {
+        killpg(group as i32, SIGKILL);
+    }
+}
+
+/// Windows: the Job Object of a stdio server is owned by rmcp's transport, so it cannot be terminated from here. Its
+/// kill-on-close guarantee is unchanged.
+#[cfg(not(unix))]
+pub fn kill_group(_group: u32) {}
 
 /// The message for a server that did not start. A NotFound names the command as configured and where it was searched.
 /// The PATH is fixed when Watt starts, so a program installed later needs a restart of Watt.
@@ -219,11 +244,12 @@ fn drain_stderr(server: String, stderr: ChildStderr, events: UnboundedSender<Msg
 async fn finish(
     mut service: RunningService<RoleClient, Handler>,
     http: bool,
+    group: Option<u32>,
 ) -> Result<(Live, Vec<Tool>), ConnectFailure> {
     match service.list_all_tools().await {
         Ok(tools) => {
             let peer = service.peer().clone();
-            Ok((Live { service, peer }, tools))
+            Ok((Live { service, peer, group }, tools))
         }
         Err(error) => {
             let auth = error.is_authorization_required() || error.auth_challenge().is_some();
@@ -320,6 +346,41 @@ mod tests {
     fn stdio_servers_start_with_the_no_window_creation_flag() {
         const CREATE_NO_WINDOW_BIT: u32 = 0x0800_0000;
         assert_ne!(stdio_creation_flags().0 & CREATE_NO_WINDOW_BIT, 0);
+    }
+
+    /// A shell that leads its own process group and runs a `sleep` in it: killing the group takes the `sleep` too.
+    #[cfg(unix)]
+    #[test]
+    fn kill_group_takes_the_whole_process_group() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+        use std::process::{Command, Stdio};
+
+        let mut leader = Command::new("sh")
+            .args(["-c", "sleep 600 & echo $!; wait"])
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn the group leader");
+        let mut line = String::new();
+        BufReader::new(leader.stdout.take().expect("stdout")).read_line(&mut line).expect("grandchild pid");
+        let grandchild: u32 = line.trim().parse().expect("pid of the sleep");
+        let alive = |pid: u32| {
+            Command::new("sh")
+                .args(["-c", "kill -0 \"$1\" 2>/dev/null", "sh", &pid.to_string()])
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        assert!(alive(grandchild), "the sleep runs before the kill");
+
+        kill_group(leader.id());
+        let status = leader.wait().expect("reap the leader");
+        assert_eq!(status.signal(), Some(9), "the leader was killed with SIGKILL");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while alive(grandchild) {
+            assert!(std::time::Instant::now() < deadline, "the sleep (pid {grandchild}) survived the group kill");
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     #[tokio::test]
