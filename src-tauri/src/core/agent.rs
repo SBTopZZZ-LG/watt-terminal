@@ -508,18 +508,19 @@ fn new_call_id() -> String {
 }
 
 /// Tools that never change the shell. `read_tool` accepts only these. Must match `READ_NAMES` in core/chat/agent_loop.rs.
-const READ_TOOLS: [&str; 5] = ["list_commands", "get_command", "get_screen", "get_cwd", "wait"];
+const READ_TOOLS: [&str; 6] = ["list_commands", "get_command", "get_screen", "get_cwd", "wait", "list_terminals"];
 
 /// Built-in tools that may run without a gate decision: the read tools, `todo_write`, `ask_user` and the file tools
 /// (core/fs_tools). None of them touches the shell. `skill` is not here: it has its own gate (`call_skill`), so a call that
 /// reaches this path is refused. Any other name needs a gate decision: a gated built-in, or a host tool
 /// (core/external_tools). Must match the names routed in core/chat/agent_loop.rs (`run_call`).
-const BUILTIN_UNGATED: [&str; 11] = [
+const BUILTIN_UNGATED: [&str; 12] = [
     "list_commands",
     "get_command",
     "get_screen",
     "get_cwd",
     "wait",
+    "list_terminals",
     "todo_write",
     "ask_user",
     "read_file",
@@ -543,6 +544,8 @@ pub struct TurnRules {
 
 /// What an agent may use during one turn: the approval gate, the approval policy, the turn's rules, and a way to report
 /// events. The tools are private: the only route to them is `call_tool` (approval-gated) or `read_tool` (read-only names).
+/// Every field is a shared reference or `Copy`, so a copy with other tools is cheap (see `gate_and_execute`).
+#[derive(Clone, Copy)]
 pub struct AgentCtx<'a> {
     tools: &'a dyn AgentTools,
     approvals: &'a ApprovalGate,
@@ -658,7 +661,7 @@ impl<'a> AgentCtx<'a> {
         self.tools.finished_summary(id)
     }
 
-    /// Calls a read-only tool (`list_commands`, `get_command`, `get_screen`, `get_cwd`, `wait`) and reports the call
+    /// Calls a read-only tool (`list_commands`, `get_command`, `get_screen`, `get_cwd`, `wait`, `list_terminals`) and reports the call
     /// and its result. Never asks for approval. Any other name is refused without running.
     pub fn read_tool(&self, name: &str, args: Value) -> Result<Value, String> {
         if !READ_TOOLS.contains(&name) {
@@ -908,8 +911,24 @@ impl<'a> AgentCtx<'a> {
     }
 
     /// Applies the gate to one call and runs it if allowed. Returns the decision label, the reason (see
-    /// `AgentEvent::ToolResult`) and the result.
+    /// `AgentEvent::ToolResult`) and the result. A call for one terminal of several (see `AgentTools::scoped`) is gated on
+    /// that terminal's view, so the precheck, the card and the level are the terminal's own.
     fn gate_and_execute(
+        &self,
+        call_id: &str,
+        name: &str,
+        args: &Value,
+        gated: bool,
+    ) -> (&'static str, Option<&'static str>, Result<Value, String>) {
+        match self.tools.scoped(name, args) {
+            Ok(Some(view)) => AgentCtx { tools: &*view, ..*self }.gate_on_tools(call_id, name, args, gated),
+            Ok(None) => self.gate_on_tools(call_id, name, args, gated),
+            Err(refusal) => ("refused", None, Err(refusal)),
+        }
+    }
+
+    /// `gate_and_execute` on `self.tools`: the gate and the call, as they are for a single session.
+    fn gate_on_tools(
         &self,
         call_id: &str,
         name: &str,

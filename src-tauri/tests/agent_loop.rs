@@ -3170,7 +3170,7 @@ fn an_overflow_after_text_was_streamed_is_not_retried() {
 #[test]
 fn the_learned_limit_survives_a_reset_and_a_restore_and_the_smaller_of_it_and_the_configured_limit_applies() {
     let raw = untrimmed_long_estimate();
-    let small = limit_for(raw / 2, 512);
+    let small = limit_for(raw * 3 / 4, 512);
     let big = limit_for(raw * 2, 512);
     let conv = Conversation::new().unwrap();
     conv.learned_limits().lock().unwrap().insert(MODEL.to_string(), small);

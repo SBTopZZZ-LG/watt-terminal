@@ -115,6 +115,7 @@ mod tests {
         assert_eq!(
             names,
             [
+                "list_terminals",
                 "list_commands",
                 "get_command",
                 "get_screen",
@@ -161,7 +162,7 @@ mod tests {
         let defs = tool_definitions();
         let todo_defs = defs.iter().filter(|d| d["function"]["name"] == "todo_write").count();
         assert_eq!(todo_defs, 1);
-        assert_eq!(tools::schemas().len(), 8, "todo_write is not a backend tool");
+        assert_eq!(tools::schemas().len(), 9, "todo_write is not a backend tool");
     }
 
     #[test]
@@ -169,7 +170,7 @@ mod tests {
         let defs = tool_definitions();
         let ask_defs = defs.iter().filter(|d| d["function"]["name"] == "ask_user").count();
         assert_eq!(ask_defs, 1);
-        assert_eq!(tools::schemas().len(), 8, "ask_user is not a backend tool");
+        assert_eq!(tools::schemas().len(), 9, "ask_user is not a backend tool");
         assert!(defs.iter().any(|d| d["function"]["name"] == "todo_write"), "todo_write is still advertised");
     }
 

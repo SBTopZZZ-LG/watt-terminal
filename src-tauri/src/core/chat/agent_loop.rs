@@ -60,7 +60,7 @@ const ENV_MAX_TOKENS: &str = "WATT_LLM_MAX_TOKENS";
 
 /// Tool names the model may call that the loop routes by name. Anything else is an unknown tool. Must match `READ_TOOLS`
 /// in core/agent.rs.
-const READ_NAMES: [&str; 5] = ["list_commands", "get_command", "get_screen", "get_cwd", "wait"];
+const READ_NAMES: [&str; 6] = ["list_commands", "get_command", "get_screen", "get_cwd", "wait", "list_terminals"];
 /// Longest tool name echoed back in an error, so a model cannot make the history carry a huge name.
 const NAME_LIMIT: usize = 80;
 
