@@ -366,10 +366,18 @@ mod tests {
         BufReader::new(leader.stdout.take().expect("stdout")).read_line(&mut line).expect("grandchild pid");
         let grandchild: u32 = line.trim().parse().expect("pid of the sleep");
         let alive = |pid: u32| {
-            Command::new("sh")
-                .args(["-c", "kill -0 \"$1\" 2>/dev/null", "sh", &pid.to_string()])
+            let pid = pid.to_string();
+            let signalable = Command::new("sh")
+                .args(["-c", "kill -0 \"$1\" 2>/dev/null", "sh", &pid])
                 .status()
-                .is_ok_and(|s| s.success())
+                .is_ok_and(|s| s.success());
+            // kill -0 also succeeds on a zombie (exited, not reaped: PID 1 in the container does not reap), so the state decides too.
+            let state = Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default();
+            signalable && !state.is_empty() && !state.starts_with('Z')
         };
         assert!(alive(grandchild), "the sleep runs before the kill");
 
