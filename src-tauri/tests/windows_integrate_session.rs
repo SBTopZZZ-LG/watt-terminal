@@ -12,7 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use watt_terminal_lib::core::foreground::ForegroundKind;
-use watt_terminal_lib::core::observer::InputState;
+use watt_terminal_lib::core::observer::{InputState, LOCAL_KEY};
 use watt_terminal_lib::core::pty::OutputSink;
 use watt_terminal_lib::core::record::{Record, Source};
 use watt_terminal_lib::core::session::{IntegrateOutcome, Session, SpawnConfig};
@@ -144,22 +144,23 @@ fn nested_powershell_is_integrated_and_runs_commands_then_exits_back() {
         IntegrateOutcome::Integrated { key, sh, .. } => (key, sh),
         other => panic!("integration did not succeed: {other:?}; screen: {:?}", s.screen_snapshot().rows),
     };
-    assert_eq!((key, sh.as_str()), (1, "pwsh"));
+    assert_eq!(sh.as_str(), "pwsh");
+    assert_ne!(key, LOCAL_KEY, "the nested shell is not the local level");
     wait_prompt(&s);
     assert_eq!(s.levels().len(), 2, "levels={:?}", s.levels());
-    assert_eq!(s.top_key(), 1);
+    assert_eq!(s.top_key(), key);
     assert_eq!(s.location().as_deref(), Some(NESTED));
 
     s.submit(Source::Agent { call_id: "nested-hi".into() }, "echo hi").expect("agent submit at depth 2");
-    let hi = finished(&s, "echo hi", 1);
-    assert_eq!((hi.exit_code, hi.level), (Some(0), 1), "records={:?}", s.records());
+    let hi = finished(&s, "echo hi", key);
+    assert_eq!((hi.exit_code, hi.level), (Some(0), key), "records={:?}", s.records());
     assert_eq!(hi.output, "hi", "output={:?}", hi.output);
     assert_eq!(hi.location.as_deref(), Some(NESTED));
     assert!(matches!(&hi.source, Source::Agent { call_id } if call_id == "nested-hi"), "{:?}", hi.source);
     wait_prompt(&s);
 
     s.submit(Source::User, "cmd /c exit 3").expect("user submit at depth 2");
-    let native = finished(&s, "cmd /c exit 3", 1);
+    let native = finished(&s, "cmd /c exit 3", key);
     assert_eq!(native.exit_code, Some(3), "native exit code at depth 2");
     wait_prompt(&s);
 
@@ -195,22 +196,20 @@ fn ps51_and_operator_line_finishes_and_the_next_command_runs() {
     assert!(wait_until(|| at_ps_prompt(&s).then_some(())).is_some(), "5.1 never drew its prompt: {:?}", s.screen_snapshot().rows);
     assert!(wait_until(|| (!s.integration_starting()).then_some(())).is_some(), "5.1 still starting");
     let outcome = s.integrate_shell();
-    assert!(
-        matches!(outcome, IntegrateOutcome::Integrated { key: 1, .. }),
-        "5.1 not integrated: {outcome:?}; rows={:?} levels={:?}",
-        s.screen_snapshot().rows,
-        s.levels()
-    );
+    let IntegrateOutcome::Integrated { key, .. } = outcome else {
+        panic!("5.1 not integrated: {outcome:?}; rows={:?} levels={:?}", s.screen_snapshot().rows, s.levels());
+    };
+    assert_ne!(key, LOCAL_KEY, "5.1 is not the local level");
     wait_prompt(&s);
 
     s.submit(Source::Agent { call_id: "ps51-and".into() }, "echo a && echo b").expect("agent submit at depth 2");
-    let and = finished(&s, "echo a && echo b", 1);
+    let and = finished(&s, "echo a && echo b", key);
     assert!(and.exit_code.is_some_and(|c| c != 0), "exit={:?} output={:?}", and.exit_code, and.output);
     assert!(and.output.contains("&&"), "output={:?}", and.output);
     wait_prompt(&s);
 
     s.submit(Source::User, "echo ok").expect("user submit at depth 2");
-    let ok = finished(&s, "echo ok", 1);
+    let ok = finished(&s, "echo ok", key);
     assert_eq!((ok.exit_code, ok.output.as_str()), (Some(0), "ok"));
     wait_prompt(&s);
     drop(s);

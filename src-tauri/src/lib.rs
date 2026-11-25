@@ -69,8 +69,14 @@ use crate::core::tools::SessionTools;
 
 type Reg = Registry<Attached>;
 
-/// Counts restarts, to give each restarted shell its own shim directory name.
-static RESTARTS: AtomicU64 = AtomicU64::new(0);
+/// Counts shell spawns, so each one gets its own shim directory name (see `next_shim_id`).
+static SHIM_IDS: AtomicU64 = AtomicU64::new(0);
+
+/// A name for the next shell's shim directory, unique in this process. A dead shell's drop removes its own directory,
+/// which must never be the one a live shell is using, so no two spawns share a name (session ids are not used).
+fn next_shim_id() -> String {
+    SHIM_IDS.fetch_add(1, Ordering::SeqCst).to_string()
+}
 
 /// The frontend's channels for one session. Swapped on re-attach, so the session keeps running.
 #[derive(Default)]
@@ -383,7 +389,7 @@ async fn start_session(
     on_events: Channel<Value>,
     reg: State<'_, Reg>,
 ) -> Result<StartResult, String> {
-    attach_or_spawn(&reg, &session_id, &session_id, rows, cols, on_data, on_events, None)
+    attach_or_spawn(&reg, &session_id, &next_shim_id(), rows, cols, on_data, on_events, None)
 }
 
 /// Starts a new shell when the session has exited: the dead session is removed and a fresh one spawned, with a new
@@ -419,9 +425,7 @@ async fn restart_session(
         }
         None => None,
     };
-    // A new shim directory name: the dead session's drop removes its own directory, which must not be the new one.
-    let shim_id = format!("{session_id}-{}", RESTARTS.fetch_add(1, Ordering::SeqCst));
-    attach_or_spawn(&reg, &session_id, &shim_id, rows, cols, on_data, on_events, carry)
+    attach_or_spawn(&reg, &session_id, &next_shim_id(), rows, cols, on_data, on_events, carry)
 }
 
 /// Attaches to `session_id`, spawning its shell first if there is none. `shim_id` names the shim directory on spawn.
@@ -1998,6 +2002,13 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shim_ids_are_distinct_per_call() {
+        let ids: Vec<String> = (0..100).map(|_| next_shim_id()).collect();
+        let distinct: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(distinct.len(), ids.len(), "shim ids collide: {ids:?}");
+    }
 
     #[test]
     fn reattach_swaps_channels_and_resets_flow_control() {

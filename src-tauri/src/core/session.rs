@@ -20,7 +20,7 @@ use crate::core::foreground::{self, Foreground, ShellFamily};
 use crate::core::inject::{self, END_MARKER};
 use crate::core::keys::KeyPlan;
 use crate::core::observer::{
-    run_observer, Activity, CallStatus, Core, EventSink, InjectRefusal, InputState, IntegrationStatus, KeysRefusal, LevelInfo,
+    run_observer, Activity, CallStatus, Core, EventSink, IdSource, InjectRefusal, InputState, IntegrationStatus, KeysRefusal, LevelInfo,
     ObsMsg, ObsQueue, ObserverStatus, OpenAgentRecord, ScreenLines, ScreenSnapshot, Shared, YieldSignals, SHELL_EXITED_TEXT,
 };
 use crate::core::pty::{self, Gate, OutputSink};
@@ -197,7 +197,7 @@ impl Session {
         let reader = pair.master.try_clone_reader().map_err(to_io)?;
         let writer = pair.master.take_writer().map_err(to_io)?;
 
-        let shared = Arc::new(Shared::new(Core::new(&nonce, (cfg.rows, cfg.cols))));
+        let shared = Arc::new(Shared::new(Core::with_ids(&nonce, (cfg.rows, cfg.cols), IdSource::global())));
         let queue = Arc::new(ObsQueue::new());
         let gate = Arc::new(Gate::new());
 
