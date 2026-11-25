@@ -187,6 +187,8 @@ export interface ContextUsage {
   trimmed: boolean;
   calibrated: boolean;
   categories: { id: string; tokens: number }[];
+  /** Prompt tokens the provider served from its cache, a part of `used`. Null or absent when not reported (and in older saves). */
+  cached_tokens?: number | null;
 }
 
 /** What an agent's integration request ended with: the handshake's outcome, or `declined` (no integration, no handshake). */

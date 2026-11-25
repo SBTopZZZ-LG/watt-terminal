@@ -69,6 +69,25 @@ describe('ContextMeter: collapsed', () => {
   });
 });
 
+describe('ContextMeter: the cache hit figure', () => {
+  it('shows the share of the prompt served from cache, with a title giving the counts', () => {
+    const out = meter(usage({ used: 1234, cached_tokens: 1024 }));
+    expect(out).toContain('<span class="context-meter-cache" title="1,024 of 1,234 prompt tokens served from the provider&#x27;s cache">cache 83%</span>');
+    expect(out).toContain('aria-label="Context: 15% used, 1.2k of 8k tokens, cache 83%"');
+  });
+
+  it('shows a known zero as cache 0%', () => {
+    expect(meter(usage({ cached_tokens: 0 }))).toContain('<span class="context-meter-cache"');
+    expect(meter(usage({ cached_tokens: 0 }))).toContain('cache 0%</span>');
+  });
+
+  it('shows nothing when the provider did not report a count (absent, null, or older saves)', () => {
+    expect(meter(usage())).not.toContain('context-meter-cache');
+    expect(meter(usage({ cached_tokens: null }))).not.toContain('context-meter-cache');
+    expect(meter(usage())).toContain('aria-label="Context: 15% used, 1.2k of 8k tokens"');
+  });
+});
+
 describe('ContextBreakdown: the expanded view', () => {
   it('gives the headline, then the basis: the estimate or the provider count', () => {
     expect(breakdown(usage())).toContain('<p class="context-headline">Context: 1,234 of 8,000 tokens (15%)</p>');

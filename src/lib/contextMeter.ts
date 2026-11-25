@@ -170,6 +170,21 @@ export function headline(u: ContextUsage): string {
   return `Context: ${groupDigits(u.used)} of ${groupDigits(limit)} tokens (${percent(u.used, limit)})`;
 }
 
+/**
+ * The cache hit share of the last request's prompt, for the collapsed line: label 'cache 83%', title 'N of M prompt tokens
+ * served from the provider's cache'. Null when the provider did not report a cache count, so an unknown count shows nothing.
+ */
+export function cacheHit(u: Pick<ContextUsage, 'used' | 'cached_tokens'>): { label: string; title: string } | null {
+  if (u.cached_tokens === undefined || u.cached_tokens === null) {
+    return null;
+  }
+  const cached = Math.min(Math.max(0, u.cached_tokens), u.used);
+  return {
+    label: `cache ${percent(cached, u.used)}`,
+    title: `${groupDigits(cached)} of ${groupDigits(u.used)} prompt tokens served from the provider's cache`,
+  };
+}
+
 /** The categories with tokens, in the backend's order. */
 function shownCategories(u: ContextUsage): { id: string; tokens: number }[] {
   return u.categories.filter((c) => c.tokens > 0);

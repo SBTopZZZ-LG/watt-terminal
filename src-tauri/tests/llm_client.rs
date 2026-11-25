@@ -222,6 +222,7 @@ async fn stream_of_the_opencode_go_fixture_in_pieces_reads_the_tool_call_and_usa
     assert!(deltas.is_empty());
     assert_eq!(reply.tool_calls[0].id, "call_00_16a4w1l8hhiztd5311fg325f");
     assert_eq!(reply.usage.map(|u| u.completion_tokens), Some(23));
+    assert_eq!(reply.usage.map(|u| (u.prompt_tokens, u.cached_tokens)), Some((334, Some(256))));
     assert_eq!(reply.raw["content"], serde_json::Value::Null);
 }
 

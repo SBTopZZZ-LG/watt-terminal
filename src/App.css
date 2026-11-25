@@ -5151,6 +5151,13 @@ a {
   white-space: nowrap;
 }
 
+.context-meter-cache {
+  flex: 0 0 auto;
+  color: var(--muted);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
 .context-meter-figures {
   display: none;
   flex: 0 0 auto;
