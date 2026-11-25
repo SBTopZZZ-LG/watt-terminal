@@ -1061,6 +1061,147 @@ a {
   cursor: default;
 }
 
+/* The New chat button: the same icon button as New conversation, beside History. It is never blocked. */
+.transcript-new-chat {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  margin-right: 8px;
+  padding: 0;
+  border: 1px dashed transparent;
+  border-radius: 2px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.transcript-new-chat svg {
+  display: block;
+}
+
+.transcript-new-chat:hover {
+  border-color: var(--rule);
+  color: var(--accent);
+}
+
+.transcript-new-chat:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* The chats strip (two or more chats), above the transcript. Pills in the panel's rule colour, roomier than the terminal tabs. */
+.chat-tabs {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 4px;
+  align-items: center;
+  min-width: 0;
+  padding: 6px 12px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+  border-bottom: 1px dashed var(--rule);
+}
+
+.chat-tab-cell {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+}
+
+.chat-tab {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  max-width: 220px;
+  padding: 6px 12px;
+  border: 1px dashed transparent;
+  border-radius: 2px;
+  background: none;
+  color: var(--muted);
+  font-family: var(--ui-font);
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.chat-tab:hover {
+  color: var(--ink);
+  border-color: var(--rule);
+}
+
+.chat-tab.is-active {
+  color: var(--ink-strong);
+  border-color: var(--rule-strong);
+  background: var(--rule);
+}
+
+.chat-tab:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.chat-tab-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chat-tab-dot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+
+/* A turn running: pulses in the agent-control colour, as the terminal tab's dot does. */
+.chat-tab-dot.is-busy {
+  background: var(--ok);
+  animation: agent-control-pulse 2s ease-in-out infinite;
+}
+
+.chat-tab-dot.is-approval {
+  background: var(--warn);
+}
+
+.chat-tab-dot.is-question {
+  background: var(--accent);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chat-tab-dot.is-busy {
+    animation: none;
+    opacity: 0.8;
+  }
+}
+
+.chat-tab-close {
+  flex: 0 0 auto;
+  padding: 0 4px;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  cursor: pointer;
+}
+
+.chat-tab-close:hover {
+  color: var(--ink);
+}
+
+.chat-tab-close[aria-disabled="true"] {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.chat-tab-close:focus-visible {
+  outline: 1px solid var(--accent);
+}
+
 /* The settings notice above the chat body. Wraps at any width, and shrinks with the panel, so nothing overflows sideways. */
 .agent-notice {
   display: flex;

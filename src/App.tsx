@@ -21,6 +21,7 @@ import { effectiveVariants } from './lib/settingsForm';
 import { reportError, tabs } from './lib/tabManager';
 import type { Incoming } from './lib/tabManager';
 import { ActiveTabContext } from './lib/activeTab';
+import { ActiveChatContext } from './lib/activeChat';
 import { isSessionEvent } from './lib/tabState';
 import { isOwnedByChat } from './lib/tabStrip';
 import { nextTabId } from './lib/tabKeys';
@@ -38,6 +39,8 @@ import { borderActive, borderLevel } from './lib/agentControl';
 import type { BorderLevel } from './lib/agentControl';
 import { EMPTY_TRANSCRIPT, firstPendingApproval, hasOlder, isBusy, transcriptReducer } from './lib/transcript';
 import type { TranscriptItem } from './lib/transcript';
+import { chatBadges, chatCloseRefusal, chatLabel, chatSwitchRefusal, emptyRecord, nextActiveAfterClose, reduceBackgroundEvent } from './lib/chats';
+import type { ChatRecord } from './lib/chats';
 import { chatBodyShown, loadPanelLayout, panelReducer, panelView, savePanelLayout } from './lib/panelLayout';
 import type { Container, PanelAction } from './lib/panelLayout';
 import { altPanelStep, INITIAL_ALT_PANEL, layoutToSave } from './lib/altPanel';
@@ -62,6 +65,7 @@ import { TerminalView } from './components/TerminalView';
 import { TabStrip } from './components/TabStrip';
 import { InputBar } from './components/InputBar';
 import { Transcript } from './components/Transcript';
+import { ChatStrip } from './components/ChatStrip';
 import { TodoPanel } from './components/TodoPanel';
 import { ContextMeter } from './components/ContextMeter';
 import { StatusChip } from './components/StatusChip';
@@ -173,13 +177,24 @@ export default function App() {
   // Which view the agent panel's body shows, the id of the live conversation, and how History is grouped.
   const [panelBody, setPanelBody] = useState<'chat' | 'history'>('chat');
   const [conversationId, setConversationId] = useState<string | null>(null);
-  // The active chat: the one the agent panel shows, and the id its requests carry. Only the default chat exists so far, so
-  // nothing changes it (multi-chat D2 adds the switch). The ref is for the listeners and the steps that run after awaits.
-  const [chatId] = useState<string>(CHAT_ID);
+  // The active chat: the one the agent panel shows, and the id its requests carry. The ref is for the listeners and the steps
+  // that run after awaits. Changed only by swapTo (see the chats block below), which sets the ref at once.
+  const [chatId, setChatId] = useState<string>(CHAT_ID);
   const chatIdRef = useRef<string>(CHAT_ID);
   useEffect(() => {
     chatIdRef.current = chatId;
   });
+  // The chats of this page. `chatRecords` holds each chat's state while it is not shown (chats.ts); the shown chat's entry is
+  // stale, its state is the live one. `chatOrder` is every chat made here, in creation order (the names); `liveIds` the open ones.
+  const chatRecords = useRef(new Map<string, ChatRecord>([[CHAT_ID, emptyRecord()]]));
+  const [chatOrder, setChatOrder] = useState<string[]>([CHAT_ID]);
+  const [liveIds, setLiveIds] = useState<string[]>([CHAT_ID]);
+  // Moves when a background record changes, so the strip's badges render.
+  const [, bumpChats] = useReducer((n: number) => n + 1, 0);
+  // True from a swap until React has applied it: the busy-edge effects skip the swap instead of reading it as a turn change.
+  const swapping = useRef(false);
+  // Steps whose result lands in the shown chat when they end (a send, a queued drain, a bar command). A switch waits for them.
+  const pendingOps = useRef(0);
   // A side command (`/btw`, `/compact`, `/fork`) is running: one model call outside a turn, or none at all. The bar
   // and History stay busy until it answers, and a send is refused so the text is kept.
   const [sideBusy, setSideBusy] = useState(false);
@@ -309,9 +324,16 @@ export default function App() {
     }
   }, []);
 
+  /**
+   * applyStatus for a read asked for `chat`. The chat's fields are applied only while that chat is still the shown one (a
+   * switch may have happened while the read was in flight); the terminal's are always applied.
+   */
+  const applyStatusFor = (s: Status, target: TabController, chat: string) =>
+    chatIdRef.current === chat ? applyStatus(s, target) : target.applyStatus(s);
+
   /** Takes the status snapshot again, e.g. after the live conversation changed. Resolves once it is applied. */
   const refreshStatus = (chat: string): Promise<void> =>
-    api.getStatus(chat, tab.id).then((s) => applyStatus(s, tab)).catch(reportError);
+    api.getStatus(chat, tab.id).then((s) => applyStatusFor(s, tab, chat)).catch(reportError);
 
   /**
    * Re-reads the control hold after `done`. `done` is emitted by `run_turn` before the worker's `OnDrop` calls
@@ -337,6 +359,10 @@ export default function App() {
   const refreshAutoState = useCallback((chat: string) => {
     api.autoApproveState(chat).then(
       (s) => {
+        // Only the shown chat's flags are set here: a read for a chat that is no longer shown is dropped.
+        if (chatIdRef.current !== chat) {
+          return;
+        }
         setAutoApprove(s.auto);
         setAutoSuspended(s.suspended);
       },
@@ -346,7 +372,13 @@ export default function App() {
 
   /** Reads only the live conversation's id again. The busy state stays the transcript's own, so a send still in transit is not lost. */
   const syncConversationId = (chat: string): Promise<void> =>
-    api.getStatus(chat).then((s) => setConversationId(s.conversation_id)).catch(reportError);
+    api.getStatus(chat)
+      .then((s) => {
+        if (chatIdRef.current === chat) {
+          setConversationId(s.conversation_id);
+        }
+      })
+      .catch(reportError);
 
   // The settings refresh's guards: a response is ignored after unmount, and when a newer refresh has started since.
   const settingsAlive = useRef(true);
@@ -631,14 +663,39 @@ export default function App() {
       }
     };
 
+    /**
+     * An event of a chat that is not shown: the terminal it names is told (its border), and the chat's record takes the event
+     * (see chats.ts). Nothing is shown here; the strip's badges re-render. TODO(multi-chat D2): desktop notifications for a
+     * background chat's question, approval or finished turn (the shown chat's are in notifyAttention).
+     */
+    const handleBackground = (ev: WireEvent, chat: string) => {
+      if (isSessionEvent(ev)) {
+        return;
+      }
+      agentTarget(ev, chat)?.applyAgentEvent(ev);
+      if (ev.type === 'done') {
+        const target = agentTarget(ev, chat);
+        if (target !== null) {
+          refreshControl(target, chat);
+        }
+      }
+      // A chat this page closed (or never made) has no record: its late events go nowhere.
+      const record = chatRecords.current.get(chat);
+      if (record === undefined) {
+        return;
+      }
+      const terminal = ev.type === 'approval_request' && ev.terminal !== undefined ? tabs.label(ev.terminal) : null;
+      chatRecords.current.set(chat, reduceBackgroundEvent(record, ev, Date.now(), terminal));
+      bumpChats();
+    };
+
     const onMessage = (msg: Incoming, eventChat: string) => {
       if (msg.kind === 'error') {
         dispatchTranscript({ type: 'notice', text: msg.message });
         return;
       }
-      // Only the active chat's events reach the transcript. TODO(multi-chat D2): another chat's events reduce into that chat's
-      // own record. Until then they are dropped here, so single-chat behaviour does not change.
       if (eventChat !== chatIdRef.current) {
+        handleBackground(msg.event, eventChat);
         return;
       }
       handleEvent(msg.event, eventChat);
@@ -914,6 +971,7 @@ export default function App() {
     const clientId = clientIds.current;
     // Added before the call, so the user's line lands above the agent's replies.
     dispatchTranscript({ type: 'user_sent', clientId, text, attachments: userAttachments(attachments) });
+    pendingOps.current += 1;
     try {
       await api.agentMessage(chat, text, attachments);
       return null;
@@ -921,6 +979,8 @@ export default function App() {
       const message = errorText(e);
       dispatchTranscript({ type: 'user_failed', clientId, message });
       return message;
+    } finally {
+      pendingOps.current -= 1;
     }
   };
 
@@ -1015,6 +1075,7 @@ export default function App() {
       return;
     }
     draining.current = true;
+    pendingOps.current += 1;
     const gen = queueGen.current;
     try {
       await waitForSlot(chat);
@@ -1034,6 +1095,7 @@ export default function App() {
       }
     } finally {
       draining.current = false;
+      pendingOps.current -= 1;
       // A turn ended while this drain was running (its `done` can come before the send returns): the edge was not drained then.
       if (drainAgain.current) {
         drainAgain.current = false;
@@ -1109,10 +1171,19 @@ export default function App() {
    */
   const withdrawSteered = async (id: number): Promise<void> => {
     const chat = chatIdRef.current;
-    const waiting = await api.withdrawSteer(chat, id).catch((e: unknown) => {
-      reportError(e);
-      return null;
-    });
+    // Counted until the queue is updated below: a switch waits for it (the row is the shown chat's).
+    pendingOps.current += 1;
+    const waiting = await api.withdrawSteer(chat, id).then(
+      (w) => {
+        pendingOps.current -= 1;
+        return w;
+      },
+      (e: unknown) => {
+        pendingOps.current -= 1;
+        reportError(e);
+        return null;
+      },
+    );
     if (waiting === null) {
       return;
     }
@@ -1176,6 +1247,125 @@ export default function App() {
   const setNewTabsVisibleSetting = (on: boolean) => {
     setNewTabsVisible(on);
     persist(newTabsVisiblePatch(on));
+  };
+
+  // The chats. The shown chat's state is live (above); the others are records (chats.ts). A swap moves the state; the busy-edge
+  // effects below skip it (see `swapping`).
+
+  /**
+   * Makes `target` the shown chat, with no checks (see switchChat). The shown chat's state goes into its record when `keep`
+   * (a chat being closed keeps none). The target's record becomes the live state in one render. `swapping` stays set until
+   * that render's effects have run, so they skip the swap. The target's status is read again after it.
+   */
+  const swapTo = (target: string, keep: boolean) => {
+    const from = chatIdRef.current;
+    const next = chatRecords.current.get(target);
+    if (next === undefined || target === from) {
+      return;
+    }
+    if (keep) {
+      chatRecords.current.set(from, {
+        transcript: transcriptRef.current,
+        conversationId: conversationRef.current,
+        queue: queueRef.current,
+        agentReq,
+        autoApprove,
+        autoSuspended,
+      });
+    } else {
+      chatRecords.current.delete(from);
+    }
+    swapping.current = true;
+    // Whatever was waiting on the old chat's queue or epoch is stale now.
+    epoch.current += 1;
+    queueGen.current += 1;
+    chatIdRef.current = target;
+    transcriptRef.current = next.transcript;
+    conversationRef.current = next.conversationId;
+    queueRef.current = next.queue;
+    dispatchTranscript({ type: 'replace', transcript: next.transcript });
+    setChatId(target);
+    setConversationId(next.conversationId);
+    commitQueue(next.queue);
+    setAgentReq(next.agentReq);
+    setAutoApprove(next.autoApprove);
+    setAutoSuspended(next.autoSuspended);
+    // Suggestions are not kept per chat: the shown chat's saved ones come back through its conversation (see the effect below).
+    dropSuggestions();
+    bumpChats();
+    refreshStatus(target);
+    refreshAutoState(target);
+  };
+
+  /** Shows another chat. Refused (a notice; the text stays in the bar) while a side command, a switch or a send is in flight. */
+  const switchChat = (target: string) => {
+    if (target === chatIdRef.current) {
+      return;
+    }
+    const refusal = chatSwitchRefusal({ sideBusy: sideBusyRef.current, switching: switching.current, pending: pendingOps.current > 0 });
+    if (refusal !== null) {
+      dispatchTranscript({ type: 'notice', text: refusal, muted: true });
+      return;
+    }
+    swapTo(target, true);
+  };
+  // The latest switchChat, for a step that runs after an await (newChat): its closure then holds the state as it is now.
+  const switchLatest = useRef(switchChat);
+  useEffect(() => {
+    switchLatest.current = switchChat;
+  });
+
+  /** New chat: a chat with no terminal and no conversation yet, shown at once. Refused where a switch is. */
+  const newChat = async () => {
+    const refusal = chatSwitchRefusal({ sideBusy: sideBusyRef.current, switching: switching.current, pending: pendingOps.current > 0 });
+    if (refusal !== null) {
+      dispatchTranscript({ type: 'notice', text: refusal, muted: true });
+      return;
+    }
+    let id: string;
+    try {
+      id = await tabs.createChat();
+    } catch (e) {
+      reportError(e);
+      return;
+    }
+    chatRecords.current.set(id, emptyRecord());
+    setChatOrder((order) => [...order, id]);
+    setLiveIds((ids) => [...ids, id]);
+    bumpChats();
+    switchLatest.current(id);
+  };
+
+  /**
+   * Closes a chat: the backend ends it and frees its terminals, which are read again. Refused while it runs, or while a
+   * command is in flight in the shown chat. The last chat never closes. Closing the shown chat shows its neighbour.
+   */
+  const closeChat = async (id: string) => {
+    const shown = id === chatIdRef.current;
+    const busy = shown ? isBusy(transcriptRef.current) || sideBusyRef.current : chatBadges(chatRecords.current.get(id) ?? emptyRecord()).busy;
+    const refusal =
+      chatCloseRefusal(chatLabel(chatOrder, id), { count: liveIds.length, busy }) ??
+      (shown ? chatSwitchRefusal({ sideBusy: false, switching: switching.current, pending: pendingOps.current > 0 }) : null);
+    if (refusal !== null) {
+      dispatchTranscript({ type: 'notice', text: refusal, muted: true });
+      return;
+    }
+    try {
+      await api.closeChat(id);
+    } catch (e) {
+      reportError(e);
+      return;
+    }
+    // Still the shown chat only if the user has not switched away while the close was in flight.
+    const next = nextActiveAfterClose(liveIds, id);
+    if (chatIdRef.current === id && next !== null) {
+      swapTo(next, false);
+    }
+    chatRecords.current.delete(id);
+    setLiveIds((ids) => ids.filter((x) => x !== id));
+    bumpChats();
+    // The backend unassigned the chat's terminals: the owners are read again.
+    tabs.refresh().catch(reportError);
   };
 
   // Clears the agent's conversation. Refused while the agent is busy or a side command runs (the button is also disabled then),
@@ -1542,6 +1732,14 @@ export default function App() {
     return null;
   };
 
+  /** The bar's send, counted as in flight until it returns: a switch waits for it (see chatSwitchRefusal). */
+  const sendFromBar = (text: string, attachments: AttachmentInput[]): Promise<string | null> => {
+    pendingOps.current += 1;
+    return onAgent(text, attachments).finally(() => {
+      pendingOps.current -= 1;
+    });
+  };
+
   /**
    * A saved conversation was opened from the History view: it becomes the live transcript, and the chat is shown with the
    * input focused. The backend refuses the load while the agent is busy. A send, a new conversation or another open that
@@ -1682,6 +1880,10 @@ export default function App() {
   useEffect(() => {
     const prev = wasActive.current;
     wasActive.current = active;
+    // A chat swap is not a turn starting or ending (see swapTo). The previous value is kept current above all the same.
+    if (swapping.current) {
+      return;
+    }
     if (shouldDrain(prev, active, queueRef.current.length)) {
       if (draining.current) {
         drainAgain.current = true;
@@ -1770,6 +1972,9 @@ export default function App() {
   useEffect(() => {
     const prev = wasBusy.current;
     wasBusy.current = busy;
+    if (swapping.current) {
+      return;
+    }
     if (prev && !busy) {
       const last = transcript.items[transcript.items.length - 1];
       notifyAttention({ type: 'turn_idle', lastText: last !== undefined && last.kind === 'agent' ? last.text : null });
@@ -1781,19 +1986,30 @@ export default function App() {
       (i): i is Extract<TranscriptItem, { kind: 'question' }> => i.kind === 'question' && i.state === 'pending',
     ) ?? null;
   useEffect(() => {
-    if (pendingQuestionItem === null || !firstAttention(`question:${pendingQuestionItem.callId}`)) {
+    if (swapping.current || pendingQuestionItem === null || !firstAttention(`question:${pendingQuestionItem.callId}`)) {
       return;
     }
     notifyAttention({ type: 'question', text: pendingQuestionItem.questions[0]?.question ?? '' });
   }, [pendingQuestionItem?.callId]);
   useEffect(() => {
-    if (pendingApprovalItem === null || !firstAttention(`approval:${pendingApprovalItem.callId}`)) {
+    if (swapping.current || pendingApprovalItem === null || !firstAttention(`approval:${pendingApprovalItem.callId}`)) {
       return;
     }
     const shownInstead = showsDisplay(pendingApprovalItem.name, pendingApprovalItem.reason);
     const text = shownInstead ? (pendingApprovalItem.display ?? pendingApprovalItem.text) : pendingApprovalItem.text;
     notifyAttention({ type: 'approval', text });
   }, [pendingApprovalItem?.callId]);
+  // The swap is applied: the effects above have run for it, and skipped it. It ends here, so this one is declared after them.
+  // A queue left by a turn that ended in the background is sent now, when the chat is idle (a swap sends nothing by itself).
+  useEffect(() => {
+    if (!swapping.current) {
+      return;
+    }
+    swapping.current = false;
+    if (!busy && !sideBusy && queueRef.current.length > 0) {
+      void drainQueue();
+    }
+  });
   // Same busy as the input bar's loader (busy || sideBusy). An exited shell takes the border off even if a turn is still open.
   const border: BorderLevel = borderLevel(agentControl, (busy || sideBusy) && effective !== 'exited');
   const borderClass: Record<BorderLevel, string> = {
@@ -1807,7 +2023,10 @@ export default function App() {
     const chat = chatIdRef.current;
     const next = !(autoApprove && !autoSuspended);
     api.setAutoApprove(chat, next).then(() => {
-      setAutoApprove(next);
+      // The flag is the shown chat's: a chat switch made meanwhile keeps its own.
+      if (chatIdRef.current === chat) {
+        setAutoApprove(next);
+      }
       refreshAutoState(chat);
     }, reportError);
   };
@@ -1883,7 +2102,7 @@ export default function App() {
     target
       .restart()
       .then(() => api.getStatus(chat, target.id))
-      .then((s) => applyStatus(s, target))
+      .then((s) => applyStatusFor(s, target, chat))
       .then(() => target.fitToContainer())
       .catch(reportError)
       // Still true until the status is applied, so a second click cannot land while the old exit state is shown.
@@ -1914,9 +2133,17 @@ export default function App() {
     return el.getBoundingClientRect().width;
   };
   const activity = agentActivity(transcript.items, transcript.thinking, sideBusy);
+  // The strip's chats: the shown one's badges come from the live transcript, the others' from their records.
+  const shownBadges = chatBadges({ transcript });
+  const stripChats = liveIds.map((id) => ({
+    id,
+    label: chatLabel(chatOrder, id),
+    badges: id === chatId ? shownBadges : chatBadges(chatRecords.current.get(id) ?? emptyRecord()),
+  }));
 
   return (
     <ActiveTabContext.Provider value={tab}>
+    <ActiveChatContext.Provider value={chatId}>
     <div className="app">
       <StatusChip
         integration={integration}
@@ -1981,6 +2208,7 @@ export default function App() {
             thinking={transcript.thinking}
             approvalPending={pendingApproval !== null}
           >
+            {stripChats.length > 1 && <ChatStrip chats={stripChats} activeId={chatId} onSelect={switchChat} onClose={closeChat} />}
             {chatFindOpen && <ChatFindBar focusToken={chatFindToken} onClose={closeChatFind} />}
             <Transcript
               items={transcript.items}
@@ -1996,6 +2224,7 @@ export default function App() {
               onAnswerQuestions={answerQuestions}
               onNewConversation={newConversation}
               newBlocked={busy || sideBusy}
+              onNewChat={newChat}
               banner={
                 settingsState !== null && recoveryKind(settingsState) !== 'ok' && !settingsBannerHidden ? (
                   <SettingsBanner
@@ -2045,7 +2274,7 @@ export default function App() {
               loadCommands={() => api.listCommands(tab.id)}
               onRestart={restartShell}
               restarting={restarting}
-              onAgent={onAgent}
+              onAgent={sendFromBar}
               autoApprove={autoApprove}
               autoSuspended={autoSuspended}
               onToggleAutoApprove={toggleAutoApprove}
@@ -2080,7 +2309,7 @@ export default function App() {
               onApproveFirst={approveFirst}
               onDenyFirst={denyFirst}
               onClose={closeBar}
-              draftKey={conversationId ?? NEW_DRAFT_KEY}
+              draftKey={conversationId ?? (chatId === CHAT_ID ? NEW_DRAFT_KEY : `${NEW_DRAFT_KEY}:${chatId}`)}
               draftDiscard={discardDraft}
             />
           </AgentPanel>
@@ -2141,6 +2370,7 @@ export default function App() {
         }}
       />
     </div>
+    </ActiveChatContext.Provider>
     </ActiveTabContext.Provider>
   );
 }

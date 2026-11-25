@@ -1,5 +1,6 @@
-import { useEffect, useId, useRef, useState } from 'react';
-import { api, CHAT_ID, errorText } from '../lib/api';
+import { useContext, useEffect, useId, useRef, useState } from 'react';
+import { api, errorText } from '../lib/api';
+import { ActiveChatContext } from '../lib/activeChat';
 import { capDisplay, displayText } from '../lib/keysDisplay';
 import {
   FOLDER_STATUS_LABEL,
@@ -450,6 +451,8 @@ export function FolderSheet({
  * polling: the folders change only when the user changes them.
  */
 export function SkillsTab({ active }: { active: boolean }) {
+  // The shown chat's skills. The settings dialog mounts this tab fresh each time it opens, so the chat is read then.
+  const chat = useContext(ActiveChatContext);
   const [view, setView] = useState<SkillsView | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -461,8 +464,7 @@ export function SkillsTab({ active }: { active: boolean }) {
   const read = () => {
     const my = ++seq.current;
     setLoading(true);
-    // TODO(multi-chat D2): the chat whose skills these are. The default chat until then.
-    api.listSkills(CHAT_ID).then(
+    api.listSkills(chat).then(
       (v) => {
         if (my > applied.current) {
           applied.current = my;

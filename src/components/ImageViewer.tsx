@@ -15,6 +15,8 @@ export interface ViewerImage {
   full?: string;
   sha256?: string;
   mime?: string;
+  /** The chat whose conversation holds the stored image (the shown one, at the open). The default chat when absent. */
+  chat?: string;
 }
 
 type OpenImage = (image: ViewerImage) => void;
@@ -96,14 +98,13 @@ export function ImageViewer({ image, onClose, host }: { image: ViewerImage; onCl
   }, []);
 
   // The stored full image, when the open is for a sent image. A result that arrives after the viewer is gone is dropped.
-  const { sha256, mime, full: inHand } = image;
+  const { sha256, mime, full: inHand, chat } = image;
   useEffect(() => {
     if (inHand !== undefined || sha256 === undefined || mime === undefined) {
       return;
     }
     let live = true;
-    // TODO(multi-chat D2): the chat the image's conversation belongs to. The default chat until then.
-    api.getAttachment(CHAT_ID, sha256, mime).then(
+    api.getAttachment(chat ?? CHAT_ID, sha256, mime).then(
       (url) => {
         if (live) {
           setFull(url);
@@ -118,7 +119,7 @@ export function ImageViewer({ image, onClose, host }: { image: ViewerImage; onCl
     return () => {
       live = false;
     };
-  }, [inHand, sha256, mime]);
+  }, [inHand, sha256, mime, chat]);
 
   useEffect(() => {
     const onResize = () => setViewport(viewportSize());
