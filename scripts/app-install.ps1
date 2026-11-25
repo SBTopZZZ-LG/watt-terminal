@@ -39,7 +39,8 @@ function Find-Installer {
 # Rebuild when the installer is missing or older than any source input.
 function Test-InstallerStale([System.IO.FileInfo]$installer) {
   $inputs = @('src', 'src-tauri\src', 'src-tauri\windows', 'src-tauri\Cargo.toml', 'src-tauri\Cargo.lock',
-    'src-tauri\tauri.conf.json', 'package.json', 'index.html', 'vite.config.ts') |
+    'src-tauri\tauri.conf.json', 'src-tauri\tauri.windows.conf.json', 'src-tauri\vendor', 'package.json', 'index.html',
+    'vite.config.ts') |
     Where-Object { Test-Path -LiteralPath (Join-Path $root $_) }
   $newest = $inputs | ForEach-Object {
     $p = Join-Path $root $_
@@ -105,6 +106,16 @@ if (Test-Path -LiteralPath $installedExe -PathType Leaf) {
   Write-Output "  install dir: $installDir (exe present)"
 } else {
   $problems += "missing executable: $installedExe"
+}
+
+# portable-pty falls back silently to the inbox conhost if these are not next to the exe.
+foreach ($host_file in 'conpty.dll', 'OpenConsole.exe') {
+  $hostPath = Join-Path $installDir $host_file
+  if (Test-Path -LiteralPath $hostPath -PathType Leaf) {
+    Write-Output "  conpty host: $hostPath (present)"
+  } else {
+    $problems += "missing ConPTY host next to the exe: $hostPath"
+  }
 }
 
 $uninstKeys = @(Get-ChildItem -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall' -ErrorAction SilentlyContinue |

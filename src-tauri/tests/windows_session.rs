@@ -220,6 +220,26 @@ fn process_alive(pid: u32) -> bool {
     String::from_utf8_lossy(&out.stdout).contains(&format!("\"{pid}\""))
 }
 
+/// True if the process `pid` has `conpty.dll` loaded (tasklist lists the modules matching the filter).
+fn conpty_dll_loaded(pid: u32) -> bool {
+    let out = Command::new("tasklist")
+        .args(["/M", "conpty.dll", "/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .output()
+        .expect("run tasklist");
+    String::from_utf8_lossy(&out.stdout).to_ascii_lowercase().contains("conpty.dll")
+}
+
+/// portable-pty loads `conpty.dll` by bare name and falls back silently to the inbox conhost when it is missing. The
+/// inbox conhost dies with a full-screen TUI and takes pwsh with it, so this checks the bundled host is the one loaded.
+#[test]
+fn session_uses_the_sideloaded_conpty_host() {
+    let _g = serial();
+    let s = start("win-conpty-host");
+    wait_prompt(&s);
+    let pid = std::process::id();
+    assert!(conpty_dll_loaded(pid), "conpty.dll is not loaded in pid {pid}; the inbox conhost fallback is in use");
+}
+
 #[test]
 fn powershell_session_runs_commands_reports_cwd_and_terminates() {
     let _g = serial();

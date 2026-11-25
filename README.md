@@ -134,6 +134,8 @@ npm run app:uninstall:win      # uninstall silently, verify
 
 The install is per user, with no elevation (no admin prompt): files go to `%LOCALAPPDATA%\Watt`, and Watt is listed under Installed apps. A silent install (what the script runs) creates a Start Menu shortcut and a Desktop shortcut. The install script takes `-Rebuild`, `-CloseRunning` (stops a running Watt; without it the script stops and asks you to close Watt) and `-InstallerPath <exe>`. Uninstall removes the app folder, the shortcuts and the Installed apps entry. Your data in `%APPDATA%\dev.watt.terminal` and `%LOCALAPPDATA%\dev.watt.terminal` is kept.
 
+Watt ships Microsoft's ConPTY host (`conpty.dll` and `OpenConsole.exe`, MIT) next to `watt-terminal.exe`, so full-screen TUIs such as OpenCode exit without ending the shell. See `src-tauri/vendor/conpty/README.md`.
+
 The installer is not code signed, so SmartScreen shows an "unknown publisher" warning: choose More info, then Run anyway. The WebView2 runtime is needed; the installer downloads it only if it is missing, which needs internet. The scripts run PowerShell with `-ExecutionPolicy Bypass` for that process only.
 
 ## Tests
