@@ -30,12 +30,20 @@ export interface HotkeyEvent {
 /**
  * The hotkey for this keydown, or null when it is not one of ours. Only keydown counts; any other modifier means null.
  * `mac` picks the macOS or the Windows and Linux mapping. It defaults to the platform the app runs on.
+ * `inTerminal` is true when focus is in the terminal (xterm). Off macOS, plain Ctrl+F then goes to the shell (vim, less,
+ * readline forward-char), and only Ctrl+Shift+F finds there. macOS is unchanged.
  */
-export function appHotkeyFor(ev: HotkeyEvent, mac: boolean = IS_MAC): AppHotkey | null {
+export function appHotkeyFor(ev: HotkeyEvent, mac: boolean = IS_MAC, inTerminal = false): AppHotkey | null {
   if (ev.type !== 'keydown' || ev.altKey) {
     return null;
   }
-  return mac ? macHotkeyFor(ev) : ctrlHotkeyFor(ev);
+  if (mac) {
+    return macHotkeyFor(ev);
+  }
+  if (inTerminal && ev.ctrlKey && !ev.shiftKey && ev.key.toLowerCase() === 'f') {
+    return null;
+  }
+  return ctrlHotkeyFor(ev);
 }
 
 function macHotkeyFor(ev: HotkeyEvent): AppHotkey | null {

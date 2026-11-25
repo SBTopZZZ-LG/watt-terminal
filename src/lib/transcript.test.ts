@@ -166,6 +166,31 @@ describe('transcriptReducer: local actions', () => {
     expect(back.items[1]).toMatchObject({ kind: 'notice', text: 'no pending approval a1' });
   });
 
+  it('an accepted answer resolves the card as Approved while the command runs, and tool_result settles it again', () => {
+    const asked = run([
+      { type: 'agent_event', event: { type: 'approval_request', call_id: 'a1', name: 'run_command', text: 'npm install' } },
+    ]);
+    const answering = transcriptReducer(asked, { type: 'approval_answering', callId: 'a1', approve: true });
+    const sent = transcriptReducer(answering, { type: 'approval_sent', callId: 'a1' });
+    expect(sent.items[0]).toMatchObject({ kind: 'approval', state: 'resolved', approve: true });
+    expect(firstPendingApproval(sent)).toBeNull();
+    // A later tool_result changes nothing more on the card.
+    const done = transcriptReducer(sent, {
+      type: 'agent_event',
+      event: { type: 'tool_result', call_id: 'a1', name: 'run_command', ok: true, decision: 'manual', result: {} },
+    });
+    expect(done.items[0]).toMatchObject({ kind: 'approval', state: 'resolved', approve: true });
+  });
+
+  it('an accepted answer does not touch a card that is not answering', () => {
+    const asked = run([
+      { type: 'agent_event', event: { type: 'approval_request', call_id: 'a1', name: 'run_command', text: 'pwd' } },
+    ]);
+    expect(transcriptReducer(asked, { type: 'approval_sent', callId: 'a1' }).items[0]).toMatchObject({ state: 'pending' });
+    const answering = transcriptReducer(asked, { type: 'approval_answering', callId: 'a1', approve: false });
+    expect(transcriptReducer(answering, { type: 'approval_sent', callId: 'other' }).items[0]).toMatchObject({ state: 'answering' });
+  });
+
   it('an approval card for a nested shell carries its location; a local one has none', () => {
     const t = run([
       { type: 'agent_event', event: { type: 'approval_request', call_id: 'a1', name: 'run_command', text: 'pwd', level: 1, location: 'ssh ubuntu@lidia' } },
