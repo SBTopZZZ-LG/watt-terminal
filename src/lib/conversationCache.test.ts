@@ -392,4 +392,19 @@ describe('transcriptSig: live and rebuilt transcripts agree', () => {
   it('an empty transcript has a stable signature', () => {
     expect(transcriptSig([])).toBe('0:-');
   });
+
+  it('paging does not change the signature: the newest chunk, and the whole conversation once every chunk is loaded, agree', () => {
+    const many = Array.from({ length: 100 }, (_, i) => [
+      { role: 'user', content: `q${i}` },
+      { role: 'assistant', content: `a${i}` },
+    ]).flat();
+    const whole = transcriptSig(itemsFromMessages(many));
+    let paged = transcriptReducer(EMPTY_TRANSCRIPT, { type: 'conversation_loaded', messages: many });
+    expect(paged.older.length).toBeGreaterThan(0);
+    expect(transcriptSig(paged.items)).toBe(whole);
+    while (paged.older.length > 0) {
+      paged = transcriptReducer(paged, { type: 'older_loaded' });
+    }
+    expect(transcriptSig(paged.items)).toBe(whole);
+  });
 });

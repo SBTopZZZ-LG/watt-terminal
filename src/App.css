@@ -1125,6 +1125,8 @@ a {
   gap: 10px;
   max-height: 35vh;
   overflow-y: auto;
+  /* Older messages are prepended on a load, and Transcript.tsx compensates the scroll itself: the browser must not do it too. */
+  overflow-anchor: none;
   padding: 4px 12px 10px;
 }
 

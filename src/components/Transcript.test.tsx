@@ -96,12 +96,19 @@ describe('Transcript: approval countdown', () => {
   });
 
   it('a card from an older session has no countdown line', () => {
-    const html = render([
-      {
-        type: 'conversation_loaded',
-        items: [{ kind: 'approval', callId: 'c1', name: 'run_command', text: 'ls', display: null, state: 'pending', approve: null, reason: null, location: null }],
-      },
-    ]);
+    // A card with no expiresAt is the one an older session leaves; a loaded conversation never makes an approval card itself.
+    const html = renderToStaticMarkup(
+      <Transcript
+        items={[{ id: 1, kind: 'approval', callId: 'c1', name: 'run_command', text: 'ls', display: null, state: 'pending', approve: null, reason: null, location: null }]}
+        busy={false}
+        thinking={false}
+        open
+        onToggle={() => {}}
+        onApprove={() => {}}
+        onAnswerQuestions={() => {}}
+        onNewConversation={() => {}}
+      />,
+    );
     expect(html).toContain('class="approval approval-pending"');
     expect(html).not.toContain('approval-countdown');
   });

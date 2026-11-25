@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { activityLabel, approvalTitle, EMPTY_TRANSCRIPT, firstPendingApproval, isBusy, MAX_ITEMS, REDO_NOTE, TRIM_NOTE, transcriptReducer } from './transcript';
+import { activityLabel, approvalTitle, EMPTY_TRANSCRIPT, firstPendingApproval, hasOlder, isBusy, MAX_ITEMS, REDO_NOTE, TRIM_NOTE, transcriptReducer } from './transcript';
+import { itemsFromMessages } from './historyView';
 import { APPROVAL_WINDOW_MS } from './approvalTime';
-import type { QuestionSpec } from './types';
+import type { ChatMessage, QuestionSpec } from './types';
 import type { Transcript, TranscriptAction } from './transcript';
 
 function run(actions: TranscriptAction[], start: Transcript = EMPTY_TRANSCRIPT): Transcript {
@@ -663,18 +664,14 @@ describe('approvalTitle', () => {
 });
 
 describe('transcriptReducer: conversation_loaded', () => {
-  const loaded = (...items: Array<{ kind: 'user'; clientId: number; text: string } | { kind: 'agent'; text: string; streaming: boolean }>) =>
-    ({ type: 'conversation_loaded', items }) as TranscriptAction;
+  const loaded = (...messages: ChatMessage[]) => ({ type: 'conversation_loaded', messages }) as TranscriptAction;
 
   it('replaces the items, with ids from nextId, and clears busy and thinking', () => {
     const before = run([
       { type: 'user_sent', clientId: 1, text: 'live' },
       { type: 'agent_event', event: { type: 'thinking', active: true } },
     ]);
-    const after = transcriptReducer(
-      before,
-      loaded({ kind: 'user', clientId: 0, text: 'old question' }, { kind: 'agent', text: 'old answer', streaming: false }),
-    );
+    const after = transcriptReducer(before, loaded({ role: 'user', content: 'old question' }, { role: 'assistant', content: 'old answer' }));
     expect(after.items.map((i) => i.kind)).toEqual(['user', 'agent']);
     expect(after.items[0]).toMatchObject({ text: 'old question' });
     expect(after.items[0].id).toBe(before.nextId);
@@ -685,21 +682,27 @@ describe('transcriptReducer: conversation_loaded', () => {
     expect(isBusy(after)).toBe(false);
   });
 
-  it('no loaded item is streaming, even if the input says so', () => {
-    const after = transcriptReducer(EMPTY_TRANSCRIPT, loaded({ kind: 'agent', text: 'half', streaming: true }));
+  it('no loaded item is streaming', () => {
+    const after = transcriptReducer(EMPTY_TRANSCRIPT, loaded({ role: 'assistant', content: 'half' }));
     expect(after.items[0]).toMatchObject({ kind: 'agent', text: 'half', streaming: false });
   });
 
-  it('keeps the newest MAX_ITEMS, and ids keep increasing past the cap', () => {
-    const many = Array.from({ length: MAX_ITEMS + 10 }, (_, i) => ({ kind: 'user' as const, clientId: 0, text: `u${i}` }));
-    const after = transcriptReducer(EMPTY_TRANSCRIPT, loaded(...many));
+  it('a conversation within one chunk keeps the newest MAX_ITEMS, and ids keep increasing past the cap', () => {
+    // 60 messages (one chunk, so not paged) of 10 tool calls each: 600 items, of which the newest 500 are kept.
+    const calls: ChatMessage[] = Array.from({ length: 60 }, (_, m) => ({
+      role: 'assistant',
+      content: '',
+      tool_calls: Array.from({ length: 10 }, (_, c) => ({ id: `m${m}c${c}`, type: 'function', function: { name: 'read_file', arguments: '{}' } })),
+    }));
+    const after = transcriptReducer(EMPTY_TRANSCRIPT, loaded(...calls));
     expect(after.items).toHaveLength(MAX_ITEMS);
-    expect(after.items[0]).toMatchObject({ text: 'u10' });
-    expect(after.items[MAX_ITEMS - 1]).toMatchObject({ text: `u${MAX_ITEMS + 9}` });
+    expect(after.items[0]).toMatchObject({ callId: 'm10c0' });
+    expect(after.items[MAX_ITEMS - 1]).toMatchObject({ callId: 'm59c9' });
     const ids = after.items.map((i) => i.id);
     expect(ids).toEqual([...ids].sort((a, b) => a - b));
     expect(new Set(ids).size).toBe(ids.length);
-    expect(after.nextId).toBe(EMPTY_TRANSCRIPT.nextId + MAX_ITEMS + 10);
+    expect(after.nextId).toBe(EMPTY_TRANSCRIPT.nextId + 600);
+    expect(after.paged).toBe(false);
   });
 
   it('an empty conversation empties the transcript', () => {
@@ -708,7 +711,7 @@ describe('transcriptReducer: conversation_loaded', () => {
   });
 
   it('a notice after a load gets a fresh id', () => {
-    const after = run([loaded({ kind: 'user', clientId: 0, text: 'a' }), { type: 'notice', text: 'n' }]);
+    const after = run([loaded({ role: 'user', content: 'a' }), { type: 'notice', text: 'n' }]);
     expect(after.items[1].id).toBeGreaterThan(after.items[0].id);
   });
 });
@@ -754,13 +757,13 @@ describe('transcriptReducer: todo list', () => {
   it('conversation_loaded sets the list from the loaded todos', () => {
     const after = run([
       update([todo('live')]),
-      { type: 'conversation_loaded', items: [], todos: [todo('saved', 'in_progress')] },
+      { type: 'conversation_loaded', messages: [], todos: [todo('saved', 'in_progress')] },
     ]);
     expect(after.todos).toEqual([todo('saved', 'in_progress')]);
   });
 
   it('conversation_loaded without todos leaves the list empty', () => {
-    const after = run([update([todo('live')]), { type: 'conversation_loaded', items: [] }]);
+    const after = run([update([todo('live')]), { type: 'conversation_loaded', messages: [] }]);
     expect(after.todos).toEqual([]);
   });
 
@@ -972,15 +975,15 @@ describe('transcriptReducer: the context meter and the trim note', () => {
 
   it('a restored conversation takes its saved usage and adds no note', () => {
     const saved = { limit: 128000, used: 48213, reserved_output: 4096, trimmed: true, calibrated: true, categories: [{ id: 'user', tokens: 48213 }] };
-    const t = run([{ type: 'conversation_loaded', items: [{ kind: 'notice', text: 'x' }], context: saved }]);
+    const t = run([{ type: 'conversation_loaded', messages: [{ role: 'user', content: 'x' }], context: saved }]);
     expect(t.context).toEqual(saved);
-    expect(notices(t)).toHaveLength(1);
+    expect(notices(t)).toHaveLength(0);
     expect(t.trimNoted).toBe(false);
   });
 
   it('a restored conversation with no saved usage has no meter value', () => {
-    expect(run([{ type: 'conversation_loaded', items: [], context: null }]).context).toBeNull();
-    expect(run([{ type: 'conversation_loaded', items: [] }]).context).toBeNull();
+    expect(run([{ type: 'conversation_loaded', messages: [], context: null }]).context).toBeNull();
+    expect(run([{ type: 'conversation_loaded', messages: [] }]).context).toBeNull();
   });
 
   it('a reset clears the meter value and the note flag, so the next trimmed request notes again', () => {
@@ -1105,5 +1108,121 @@ describe('transcriptReducer: reply_discarded', () => {
   it('a redone call shows only its own text', () => {
     const t = run([thinking(true), delta('Let me'), discarded, thinking(true), delta('Done.'), done]);
     expect(t.items.filter((i) => i.kind === 'agent').map((i) => (i.kind === 'agent' ? i.text : ''))).toEqual(['Done.']);
+  });
+});
+
+describe('transcriptReducer: paged conversations', () => {
+  const user = (text: string): ChatMessage => ({ role: 'user', content: text });
+  const assistant = (text: string): ChatMessage => ({ role: 'assistant', content: text });
+  /** `n` turns of a user message and its answer: two messages and two items each. */
+  const turns = (n: number): ChatMessage[] => {
+    const out: ChatMessage[] = [];
+    for (let i = 0; i < n; i++) {
+      out.push(user(`q${i}`), assistant(`a${i}`));
+    }
+    return out;
+  };
+  /** `n` turns of a user message and an assistant message with `calls` tool calls: one user item and `calls` tool items each. */
+  const toolTurns = (n: number, calls: number): ChatMessage[] => {
+    const out: ChatMessage[] = [];
+    for (let t = 0; t < n; t++) {
+      const tool_calls = Array.from({ length: calls }, (_, c) => ({ id: `t${t}c${c}`, type: 'function', function: { name: 'read_file', arguments: '{}' } }));
+      out.push(user(`q${t}`), { role: 'assistant', content: '', tool_calls });
+    }
+    return out;
+  };
+  const load = (messages: ChatMessage[]): Transcript => transcriptReducer(EMPTY_TRANSCRIPT, { type: 'conversation_loaded', messages });
+  const older = (t: Transcript): Transcript => transcriptReducer(t, { type: 'older_loaded' });
+  const textsOf = (items: ReadonlyArray<{ kind: string; text?: string }>) => items.map((i) => i.text ?? i.kind);
+
+  it('a long conversation shows only its newest chunk, and keeps the older messages raw', () => {
+    const t = load(turns(100));
+    expect(t.items).toHaveLength(60);
+    expect(t.items[0]).toMatchObject({ kind: 'user', text: 'q70' });
+    expect(t.paged).toBe(true);
+    expect(hasOlder(t)).toBe(true);
+    expect(t.older).toHaveLength(140);
+  });
+
+  it('a conversation within one chunk is not paged, and has nothing older', () => {
+    const t = load(turns(10));
+    expect(t.items).toHaveLength(20);
+    expect(t.paged).toBe(false);
+    expect(hasOlder(t)).toBe(false);
+  });
+
+  it('older_loaded prepends the next chunk, with ids counting down below the items already shown', () => {
+    const shown = load(turns(100));
+    const t = older(shown);
+    expect(t.items).toHaveLength(120);
+    expect(t.items[0]).toMatchObject({ kind: 'user', text: 'q40' });
+    expect(t.items[0].id).toBe(-60);
+    expect(t.items[59].id).toBe(-1);
+    expect(t.items[60]).toMatchObject({ text: 'q70' });
+    expect(t.items[60].id).toBe(shown.items[0].id);
+    const ids = t.items.map((i) => i.id);
+    expect(ids).toEqual([...ids].sort((a, b) => a - b));
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(t.older).toHaveLength(80);
+  });
+
+  it('loading every older chunk shows every message once, in order, as a full conversation does', () => {
+    const messages = turns(100);
+    let t = load(messages);
+    while (hasOlder(t)) {
+      t = older(t);
+    }
+    expect(textsOf(t.items)).toEqual(textsOf(itemsFromMessages(messages)));
+    const ids = t.items.map((i) => i.id);
+    expect(ids).toEqual([...ids].sort((a, b) => a - b));
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(t.older).toEqual([]);
+    expect(t.paged).toBe(true);
+  });
+
+  it('older_loaded does nothing when nothing is older', () => {
+    const t = load(turns(10));
+    expect(older(t)).toBe(t);
+  });
+
+  it('a paged transcript is not trimmed from the front, and a live item is added at the end', () => {
+    // 30 turns of 20 tool calls in the newest chunk: 630 items, past the cap, so the transcript is paged.
+    const shown = load(toolTurns(60, 20));
+    expect(shown.items.length).toBeGreaterThan(MAX_ITEMS);
+    const t = transcriptReducer(shown, { type: 'notice', text: 'live' });
+    expect(t.items).toHaveLength(shown.items.length + 1);
+    expect(t.items[0]).toBe(shown.items[0]);
+  });
+
+  it('an unpaged transcript keeps the cap for live items', () => {
+    const many = Array.from({ length: MAX_ITEMS + 5 }, (_, i) => ({ type: 'notice' as const, text: `n${i}` }));
+    expect(run(many).items).toHaveLength(MAX_ITEMS);
+  });
+
+  it('reply_discarded after paging removes only the discarded call\'s items, not the older ones', () => {
+    const shown = older(load(turns(100)));
+    const t = run(
+      [
+        { type: 'agent_event', event: { type: 'thinking', active: true } },
+        { type: 'agent_event', event: { type: 'text_delta', text: 'draft' } },
+        { type: 'agent_event', event: { type: 'reply_discarded' } },
+      ],
+      shown,
+    );
+    expect(textsOf(t.items)).not.toContain('draft');
+    expect(t.items).toHaveLength(shown.items.length + 1);
+    expect(t.items[0]).toBe(shown.items[0]);
+  });
+
+  it('a reset or a new conversation clears the paging state', () => {
+    const paged = load(turns(100));
+    const reset = transcriptReducer(paged, { type: 'conversation_reset' });
+    expect(reset).toMatchObject({ items: [], older: [], paged: false, prevId: 0 });
+    const next = transcriptReducer(paged, { type: 'conversation_loaded', messages: turns(10) });
+    expect(next).toMatchObject({ older: [], paged: false, prevId: 0 });
+    expect(next.items).toHaveLength(20);
+    // After the reset the cap applies to live items again.
+    const many = Array.from({ length: MAX_ITEMS + 5 }, (_, i) => ({ type: 'notice' as const, text: `n${i}` }));
+    expect(run(many, reset).items).toHaveLength(MAX_ITEMS);
   });
 });

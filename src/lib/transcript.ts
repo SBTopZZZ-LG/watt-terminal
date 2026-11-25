@@ -1,13 +1,15 @@
 // The agent transcript: what the user said, what the agent said, its tool calls, and approval requests.
 // Pure reducer over AgentEvents (from Rust) and local actions (sent messages, clicks, errors).
 
-import type { AgentEvent, ApprovalReasonCode, ContextUsage, QuestionAnswerInput, QuestionResult, QuestionSpec, RecordSummary, TodoItem, ToolDecision } from './types';
+import type { AgentEvent, ApprovalReasonCode, ChatMessage, ContextUsage, QuestionAnswerInput, QuestionResult, QuestionSpec, RecordSummary, TodoItem, ToolDecision } from './types';
 import { APPROVAL_WINDOW_MS } from './approvalTime';
 import { visibleEscapes } from './visibleEscapes';
 import { TODO_TOOL } from './todoView';
 import { isListChange } from './todoPanel';
 import { ASK_USER_TOOL, closedResult, parseResult } from './questions';
 import { openFramesBelow, openRecordIds, openedBy } from './interactive';
+import { itemsFromMessages } from './historyView';
+import { olderStart, tailStart } from './transcriptPaging';
 
 export type ToolStatus = 'running' | 'ok' | 'failed';
 export type ApprovalState = 'pending' | 'answering' | 'resolved';
@@ -100,6 +102,15 @@ export interface Transcript {
    * thinking items from here on, which are that call's. Null before the first call.
    */
   callStart: number | null;
+  /** The saved messages not shown yet, raw and in order: the older part of a loaded conversation (see transcriptPaging.ts). */
+  older: ChatMessage[];
+  /**
+   * A loaded conversation had messages older than its newest chunk, so the items are paged: they are not trimmed from the
+   * front (the view would jump). Stays set once the older messages are all loaded.
+   */
+  paged: boolean;
+  /** The id of the newest prepended item (see `older_loaded`). Prepended items count down from 0, so they never clash with live ids. */
+  prevId: number;
 }
 
 export interface FinishedRecord {
@@ -118,7 +129,15 @@ export const EMPTY_TRANSCRIPT: Transcript = {
   context: null,
   trimNoted: false,
   callStart: null,
+  older: [],
+  paged: false,
+  prevId: 0,
 };
+
+/** Whether the saved conversation has older messages to load (see `older_loaded`). */
+export function hasOlder(t: Pick<Transcript, 'older'>): boolean {
+  return t.older.length > 0;
+}
 
 /** The note shown when a reply is discarded because a command finished while it was made (see `reply_discarded`). */
 export const REDO_NOTE = 'Command finished: redoing the reply.';
@@ -126,7 +145,7 @@ export const REDO_NOTE = 'Command finished: redoing the reply.';
 /** The note shown once in a turn when older content was left out of a request. */
 export const TRIM_NOTE = 'Older messages or tool output were left out of the request to fit the model\'s context window.';
 
-/** Keeps the transcript bounded; the oldest items go first. */
+/** Keeps the transcript bounded; the oldest items go first. Not applied to a paged transcript (see `Transcript.paged`). */
 export const MAX_ITEMS = 500;
 
 /** How many finished agent commands are remembered for a group that opens late. */
@@ -167,11 +186,14 @@ export type TranscriptAction =
   /** The agent's conversation was cleared on the Rust side. Only sent after a successful reset, never while busy. Clears the todos too. */
   | { type: 'conversation_reset' }
   /**
-   * A saved conversation was opened as the live one. Replaces the items. Ids come from nextId; the newest MAX_ITEMS are kept.
-   * Never sent while busy (the backend refuses to load then). `todos` is the loaded conversation's list; absent means none.
+   * A saved conversation was opened as the live one. Replaces the items with its newest chunk (see transcriptPaging.ts); the
+   * older messages wait in `older`. Ids come from nextId. Without older messages the newest MAX_ITEMS are kept. Never sent
+   * while busy (the backend refuses to load then). `todos` is the loaded conversation's list; absent means none.
    * `context` is the usage the conversation was saved with (the meter's value on open); absent or null means none.
    */
-  | { type: 'conversation_loaded'; items: NewItem[]; todos?: TodoItem[]; context?: ContextUsage | null };
+  | { type: 'conversation_loaded'; messages: ChatMessage[]; todos?: TodoItem[]; context?: ContextUsage | null }
+  /** The next older chunk of a paged conversation is converted and put above the items. Does nothing when none is left. */
+  | { type: 'older_loaded' };
 
 export function transcriptReducer(t: Transcript, action: TranscriptAction): Transcript {
   switch (action.type) {
@@ -290,22 +312,43 @@ export function transcriptReducer(t: Transcript, action: TranscriptAction): Tran
     case 'levels_changed':
       return levelsChanged(t, action.depth);
     case 'conversation_reset':
-      // Keeps nextId, so ids stay unique for the React keys of the items that come after.
-      return { ...t, items: [], inFlight: 0, thinking: false, todos: [], context: null, trimNoted: false };
+      // Keeps nextId, so ids stay unique for the React keys of the items that come after. The paging state goes too.
+      return { ...t, items: [], inFlight: 0, thinking: false, todos: [], context: null, trimNoted: false, older: [], paged: false, prevId: 0 };
     case 'conversation_loaded': {
-      // Every id is used up, even for the items the cap drops, so ids keep increasing.
-      const made = action.items.map((item, i) => keyed(item, t.nextId + i));
-      const items = made.length > MAX_ITEMS ? made.slice(made.length - MAX_ITEMS) : made;
+      // Only the newest chunk is shown; the rest waits in `older`. Every id is used up, even for the items the cap drops.
+      const cut = tailStart(action.messages);
+      const made = itemsFromMessages(action.messages.slice(cut)).map((item, i) => keyed(item, t.nextId + i));
       return {
         ...t,
-        items,
-        nextId: t.nextId + action.items.length,
+        items: capped(made, cut > 0),
+        nextId: t.nextId + made.length,
+        older: action.messages.slice(0, cut),
+        paged: cut > 0,
+        prevId: 0,
         inFlight: 0,
         thinking: false,
         todos: action.todos ?? [],
         context: action.context ?? null,
         trimNoted: false,
       };
+    }
+    case 'older_loaded': {
+      if (t.older.length === 0) {
+        return t;
+      }
+      // The next chunk is taken from the end of `older`. A chunk that converts to no items (only messages that show nothing)
+      // is skipped, so every call adds items while there are any left.
+      let older = t.older;
+      let chunk: NewItem[];
+      do {
+        const cut = olderStart(older, older.length);
+        chunk = itemsFromMessages(older.slice(cut));
+        older = older.slice(0, cut);
+      } while (chunk.length === 0 && older.length > 0);
+      // Prepended ids count down, so the chunk's ids stay ascending and below every id already shown.
+      const prevId = t.prevId - chunk.length;
+      const made = chunk.map((item, i) => keyed(item, prevId + i));
+      return { ...t, items: [...made, ...t.items], older, paged: true, prevId };
     }
   }
 }
@@ -576,7 +619,12 @@ function add(t: Transcript, make: (id: number) => TranscriptItem): Transcript {
   const item = make(t.nextId);
   const items = [...closeStream(t.items), item];
   // Trimming drops the oldest items only. The streamed message is always the last item, so it is never trimmed here.
-  return { ...t, items: items.length > MAX_ITEMS ? items.slice(items.length - MAX_ITEMS) : items, nextId: t.nextId + 1 };
+  return { ...t, items: capped(items, t.paged), nextId: t.nextId + 1 };
+}
+
+/** The newest MAX_ITEMS items. A paged transcript is not trimmed from the front: the view above the newest items would jump. */
+function capped(items: TranscriptItem[], paged: boolean): TranscriptItem[] {
+  return !paged && items.length > MAX_ITEMS ? items.slice(items.length - MAX_ITEMS) : items;
 }
 
 /** A tool row whose result opens an interactive group records the shell depth it opened at. Other rows are returned as they are. */
@@ -619,7 +667,7 @@ function closeIfFinished(t: Transcript, callId: string): Transcript {
   }
   const marker: TranscriptItem = { id: t.nextId, kind: 'record_end', recordId: done.recordId, exit: done.exit };
   const items = [...t.items.slice(0, at + 1), marker, ...t.items.slice(at + 1)];
-  return { ...t, items: items.length > MAX_ITEMS ? items.slice(items.length - MAX_ITEMS) : items, nextId: t.nextId + 1 };
+  return { ...t, items: capped(items, t.paged), nextId: t.nextId + 1 };
 }
 
 /** The call id of the oldest approval still waiting for an answer, or null. */
