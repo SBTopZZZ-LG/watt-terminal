@@ -30,7 +30,7 @@ use watt_terminal_lib::core::keys::KeyPlan;
 use watt_terminal_lib::core::observer::{InputState, IntegrationStatus, ObserverStatus, OpenAgentRecord};
 use watt_terminal_lib::core::record::{Cwd, RecordStatus, RecordSummary, Source};
 use watt_terminal_lib::core::session::IntegrateOutcome;
-use watt_terminal_lib::core::tools::{AgentTools, CommandView, RunOutcome, ScreenView, SendKeysOutcome, SessionFacts, TopLevel, WaitView};
+use watt_terminal_lib::core::tools::{running_note, AgentTools, CommandView, RunOutcome, ScreenView, SendKeysOutcome, SessionFacts, TopLevel, WaitView};
 use serde_json::{Value, json};
 
 const KEY: &str = "sk-or-test-SECRETVALUE-0123456789";
@@ -336,11 +336,18 @@ impl AgentTools for FakeTools {
                 }
                 Ok(json!({"host": "box", "path": "/home/u"}))
             }
-            "wait" => Ok(json!({
-                "reason": "timeout", "waited_ms": 5000, "state": "running",
-                "screen": {"rows": ["sleep 30"], "cursor": [1, 0], "alternate_screen": false, "size": [24, 80],
-                           "state": "running", "observer_status": "ok", "integration_status": "live"},
-            })),
+            "wait" => {
+                let mut value = json!({
+                    "reason": "timeout", "waited_ms": 5000, "state": "running",
+                    "screen": {"rows": ["sleep 30"], "cursor": [1, 0], "alternate_screen": false, "size": [24, 80],
+                               "state": "running", "observer_status": "ok", "integration_status": "live"},
+                });
+                // The running time as the real `wait` adds it (`running_note`), read from the fake's open records now.
+                if let Some(running) = running_note(&self.open.lock().unwrap(), None) {
+                    value["note"] = json!(running);
+                }
+                Ok(value)
+            }
             "run_command" if self.running_record.is_some() => Ok(json!({
                 "outcome": "running", "reason": "timeout", "record_id": self.running_record, "call_id": "run-1",
                 "state": "running", "waited_ms": 1000, "screen_tail": ["$ sleep 3"],
@@ -2077,9 +2084,50 @@ fn an_open_agent_command_is_described_in_every_model_call() {
     assert_eq!(requests.len(), 2);
     for raw in &requests {
         let system = system_of(raw);
-        assert!(system.contains("your command id 7 `sleep 30` is still running (3m)"), "{system}");
+        assert!(system.contains("your command id 7 `sleep 30` is still running. Use wait with id 7"), "{system}");
+        assert!(!system.contains("running for") && !system.contains("(3m)"), "the system text has no elapsed time: {system}");
         assert!(system.contains("Use wait with id 7") && system.contains("run_command is unavailable until it ends"), "{system}");
     }
+}
+
+/// A command the agent left running is in the system text without its elapsed time, so that text is the same in every model
+/// call while it runs. Its running time is in the wait result instead, as it is when that result is made.
+#[test]
+fn a_running_command_keeps_the_system_text_fixed_and_its_age_in_the_wait_result() {
+    let provider = serve(vec![
+        Script::json(tool_reply(&[("call_w1", "wait", "{\"seconds\":1}")])),
+        Script::json(text_reply("still going")),
+        Script::json(tool_reply(&[("call_w2", "wait", "{\"seconds\":1}")])),
+        Script::json(text_reply("still going, later")),
+    ]);
+    let conv = Conversation::new().unwrap();
+    let tools = FakeTools::default();
+    tools.open.lock().unwrap().push(OpenAgentRecord {
+        id: 7,
+        call_id: "run-1".into(),
+        command: "sleep 300".into(),
+        age: Duration::from_secs(10),
+        on_top: true,
+    });
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
+    let gate = auto_gate();
+    turn(&mut agent, &tools, &gate, "wait for it");
+    // The elapsed time moves on before the second turn: the system text must not follow it.
+    tools.open.lock().unwrap()[0].age = Duration::from_secs(75);
+    turn(&mut agent, &tools, &gate, "and now?");
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 4);
+    let system = system_of(&requests[0]);
+    assert!(system.contains("your command id 7 `sleep 300` is still running. "), "{system}");
+    assert!(!system.contains("running for"), "{system}");
+    for raw in &requests {
+        assert_eq!(system_of(raw), system, "the system text is byte-identical in every model call");
+    }
+    let first = body_of(&requests[1]);
+    assert!(tool_content(first["messages"].as_array().expect("messages"), "call_w1").contains("running for 10s."));
+    let second = body_of(&requests[3]);
+    assert!(tool_content(second["messages"].as_array().expect("messages"), "call_w2").contains("running for 1m."));
 }
 
 /// A command parked under a nested shell is still running, but run_command is not unavailable: it works in that shell.
@@ -2098,7 +2146,7 @@ fn a_parked_agent_command_says_the_nested_shell_on_top_takes_the_commands() {
     let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
     turn(&mut agent, &tools, &auto_gate(), "hello");
     let system = system_of(&provider.requests()[0]);
-    assert!(system.contains("your command id 4 `ssh h` is still running (12s)"), "{system}");
+    assert!(system.contains("your command id 4 `ssh h` is still running, under the nested shell"), "{system}");
     assert!(system.contains("under the nested shell on top of it") && !system.contains("run_command is unavailable"), "{system}");
 }
 
@@ -2148,14 +2196,15 @@ fn the_agent_note_names_the_command_and_offers_integration_for_an_ssh_session() 
     let ssh = Foreground { kind: ForegroundKind::Ssh, command: "ssh h".into() };
     let rec = OpenAgentRecord { id: 3, call_id: "run-2".into(), command: "ssh h".into(), age: Duration::from_secs(4), on_top: true };
     let note = agent_record_note(std::slice::from_ref(&rec), Some(&ssh), &r).expect("a note");
-    assert!(note.contains("your command id 3 `ssh h` is still running (4s)"), "{note}");
+    assert!(note.contains("your command id 3 `ssh h` is still running. "), "{note}");
     assert!(note.contains("request_integration"), "{note}");
     assert_eq!(note.matches("ssh h").count(), 1, "the command is named once: {note}");
 
     let sleep = Foreground { kind: ForegroundKind::Other, command: "sleep 9".into() };
     let rec = OpenAgentRecord { id: 5, call_id: "run-3".into(), command: "sleep 9".into(), age: Duration::from_secs(70), on_top: true };
     let note = agent_record_note(std::slice::from_ref(&rec), Some(&sleep), &r).expect("a note");
-    assert!(note.contains("(1m)") && !note.contains("request_integration"), "{note}");
+    assert!(note.contains("your command id 5 `sleep 9` is still running. ") && !note.contains("request_integration"), "{note}");
+    assert!(!note.contains("running for") && !note.contains("(1m)"), "{note}");
     assert_eq!(agent_record_note(&[], None, &r), None);
 }
 

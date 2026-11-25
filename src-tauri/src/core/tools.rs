@@ -391,16 +391,22 @@ pub trait AgentTools {
                 let limit = usize_arg(args, "limit", DEFAULT_LIMIT)?.min(MAX_LIMIT);
                 to_json(self.get_command(id, offset, limit)?)
             }
-            "get_screen" => match lines_arg(args)? {
-                None => to_json(self.get_screen()),
-                Some((lines, note)) => {
-                    let mut value = to_json(self.get_screen_lines(lines))?;
-                    if let Some(note) = note {
-                        value["note"] = json!(note);
+            "get_screen" => {
+                let mut value = match lines_arg(args)? {
+                    None => to_json(self.get_screen())?,
+                    Some((lines, note)) => {
+                        let mut value = to_json(self.get_screen_lines(lines))?;
+                        if let Some(note) = note {
+                            value["note"] = json!(note);
+                        }
+                        value
                     }
-                    Ok(value)
+                };
+                if let Some(running) = running_note(&self.open_agent_records(), self.foreground_age()) {
+                    add_note(&mut value, &running);
                 }
-            },
+                Ok(value)
+            }
             "get_cwd" => to_json(self.get_cwd()),
             "wait" => {
                 let (seconds, note) = wait_seconds_arg(args);
@@ -409,6 +415,9 @@ pub trait AgentTools {
                 let mut value = to_json(self.wait(seconds, ignore_updates, record)?)?;
                 if let Some(note) = note {
                     value["note"] = json!(note);
+                }
+                if let Some(running) = running_note(&self.open_agent_records(), self.foreground_age()) {
+                    add_note(&mut value, &running);
                 }
                 Ok(value)
             }
@@ -442,6 +451,11 @@ pub trait AgentTools {
                 };
                 if input_note {
                     notes.push(INPUT_WAIT_NOTE.to_string());
+                }
+                if reason.is_some()
+                    && let Some(running) = running_note(&self.open_agent_records(), self.foreground_age())
+                {
+                    notes.push(running);
                 }
                 if !notes.is_empty() {
                     value["note"] = json!(notes.join(" "));
@@ -1063,6 +1077,29 @@ pub fn age_text(age: Duration) -> String {
     } else {
         format!("{}h", secs / 3600)
     }
+}
+
+/// The running time for a result that reports on a command still running: one sentence per open command the agent started,
+/// and the foreground program's time when no command of the agent's is on top. None when nothing is running. It is read when
+/// the result is made, so each call sees the time as it is then (it is not in the system text, which must not change).
+pub fn running_note(open: &[OpenAgentRecord], foreground_age: Option<Duration>) -> Option<String> {
+    let mut parts: Vec<String> =
+        open.iter().map(|rec| format!("Your command id {} has been running for {}.", rec.id, age_text(rec.age))).collect();
+    if !open.iter().any(|rec| rec.on_top)
+        && let Some(age) = foreground_age
+    {
+        parts.push(format!("The foreground program has been running for {}.", age_text(age)));
+    }
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+/// Adds `text` to a result's `note`, after the note it already has.
+fn add_note(value: &mut Value, text: &str) {
+    let note = match value["note"].as_str() {
+        Some(prev) => format!("{prev} {text}"),
+        None => text.to_string(),
+    };
+    value["note"] = json!(note);
 }
 
 /// Whether a `run_command` outcome is a record that ended without its end marker because the shell exited (`state` is the
@@ -1718,6 +1755,33 @@ mod tests {
         assert_eq!(age_text(Duration::from_secs(42)), "42s");
         assert_eq!(age_text(Duration::from_secs(180)), "3m");
         assert_eq!(age_text(Duration::from_secs(7300)), "2h");
+    }
+
+    #[test]
+    fn running_note_gives_the_open_commands_and_the_foreground_time() {
+        let rec = |id: u64, on_top: bool, secs: u64| OpenAgentRecord {
+            id,
+            call_id: "run-1".into(),
+            command: "sleep 9".into(),
+            age: Duration::from_secs(secs),
+            on_top,
+        };
+        assert_eq!(running_note(&[], None), None);
+        assert_eq!(
+            running_note(&[], Some(Duration::from_secs(180))).as_deref(),
+            Some("The foreground program has been running for 3m.")
+        );
+        assert_eq!(running_note(&[rec(7, true, 42)], None).as_deref(), Some("Your command id 7 has been running for 42s."));
+        // The agent's own command on top is the foreground too: its time is said once, for the command.
+        assert_eq!(
+            running_note(&[rec(7, true, 42)], Some(Duration::from_secs(42))).as_deref(),
+            Some("Your command id 7 has been running for 42s.")
+        );
+        // Parked under a nested shell, the foreground is not the agent's command, so its time is said as well.
+        assert_eq!(
+            running_note(&[rec(4, false, 12)], Some(Duration::from_secs(12))).as_deref(),
+            Some("Your command id 4 has been running for 12s. The foreground program has been running for 12s.")
+        );
     }
 
     /// The `summary` caption both write tools carry: required for `run_command`, optional for `send_keys`. It is
