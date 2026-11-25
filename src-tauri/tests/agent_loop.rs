@@ -23,6 +23,7 @@ use watt_terminal_lib::core::chat::prompt;
 use watt_terminal_lib::core::chat::questions;
 use watt_terminal_lib::core::chat::redact::Redactor;
 use watt_terminal_lib::core::chat::todo;
+use watt_terminal_lib::core::external_tools::{ExternalApproval, ExternalDisplay, ExternalToolHost, ExternalToolSchema};
 use watt_terminal_lib::core::foreground::{Foreground, ForegroundKind};
 use watt_terminal_lib::core::llm::{TurnCancel, http_client};
 use watt_terminal_lib::core::keys::KeyPlan;
@@ -373,6 +374,7 @@ fn agent_for(s: &LlmSettings, conv: &Conversation, cancel: Arc<TurnCancel>) -> L
         .with_no_vision(conv.no_vision())
         .with_calibration(conv.calibration())
         .with_learned_limits(conv.learned_limits())
+        .with_offered_tools(conv.offered_tools())
 }
 
 /// Runs one turn and returns every event it emitted, `Done` included.
@@ -3185,4 +3187,196 @@ fn on_drop_fire_runs_once_and_the_later_drop_does_nothing() {
         assert_eq!(runs.get(), 1, "fire runs the closure now");
     }
     assert_eq!(runs.get(), 1, "the drop after fire does not run it again");
+}
+
+/// A host of external tools that a test changes between model requests: its list is read at each request. A call may
+/// replace the list (`replace_on_call`), as a server that connects or drops during a turn would.
+struct McpFake {
+    tools: Mutex<Vec<String>>,
+    on_call: Mutex<Option<Vec<String>>>,
+}
+
+fn names(tools: &[&str]) -> Vec<String> {
+    tools.iter().map(|t| t.to_string()).collect()
+}
+
+impl McpFake {
+    fn with(tools: &[&str]) -> Self {
+        McpFake { tools: Mutex::new(names(tools)), on_call: Mutex::new(None) }
+    }
+
+    fn set(&self, tools: &[&str]) {
+        *self.tools.lock().unwrap() = names(tools);
+    }
+
+    fn replace_on_call(&self, tools: &[&str]) {
+        *self.on_call.lock().unwrap() = Some(names(tools));
+    }
+}
+
+impl ExternalToolHost for McpFake {
+    fn schemas(&self) -> Vec<ExternalToolSchema> {
+        self.tools
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|name| ExternalToolSchema {
+                name: name.clone(),
+                description: format!("fake {name}"),
+                parameters: json!({"type": "object", "properties": {}}),
+            })
+            .collect()
+    }
+
+    fn owns(&self, name: &str) -> bool {
+        self.tools.lock().unwrap().iter().any(|n| n == name)
+    }
+
+    fn approval(&self, _name: &str) -> ExternalApproval {
+        ExternalApproval::Auto
+    }
+
+    fn display(&self, name: &str, _args: &Value) -> ExternalDisplay {
+        ExternalDisplay { server: "fake-server".to_string(), tool: name.to_string() }
+    }
+
+    fn call(&self, name: &str, _args: Value, _cancel: &TurnCancel) -> Result<String, String> {
+        let next = self.on_call.lock().unwrap().take();
+        if let Some(tools) = next {
+            *self.tools.lock().unwrap() = tools;
+        }
+        Ok(format!("{name} ran"))
+    }
+}
+
+/// Runs one turn with `host` attached, as the app attaches the tools of its MCP servers.
+fn turn_with_host(agent: &mut LlmAgent, host: &McpFake, text: &str) -> Vec<AgentEvent> {
+    let gate = auto_gate();
+    let cancel = TurnCancel::new();
+    let tools = FakeTools::default();
+    let log: Mutex<Vec<AgentEvent>> = Mutex::new(Vec::new());
+    let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+    let ctx = AgentCtx::new(&tools, &gate, &emit).with_external_tools(host, &cancel);
+    agent::run_turn(agent, &UserMessage::text(text), &ctx);
+    log.into_inner().unwrap()
+}
+
+/// The MCP note of a request's system message, from its start to the end (the note is the last block), if it has one.
+fn note_of(raw: &str) -> Option<String> {
+    let system = system_of(raw);
+    system.find("MCP tools changed").map(|at| system[at..].to_string())
+}
+
+fn tool_names_of(raw: &str) -> Vec<String> {
+    body_of(raw)["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+#[test]
+fn the_first_request_of_a_conversation_has_no_mcp_note() {
+    let provider = serve(vec![Script::json(text_reply("hi"))]);
+    let conv = Conversation::new().unwrap();
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
+    turn_with_host(&mut agent, &McpFake::with(&["ext_a"]), "hello");
+    let requests = provider.requests();
+    assert!(tool_names_of(&requests[0]).contains(&"ext_a".to_string()), "the host tool is offered");
+    assert_eq!(note_of(&requests[0]), None);
+}
+
+#[test]
+fn an_unchanged_set_of_tools_gives_no_note_on_the_next_turn() {
+    let provider = serve(vec![Script::json(text_reply("one")), Script::json(text_reply("two"))]);
+    let conv = Conversation::new().unwrap();
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
+    let host = McpFake::with(&["ext_a"]);
+    turn_with_host(&mut agent, &host, "first");
+    turn_with_host(&mut agent, &host, "second");
+    assert_eq!(note_of(&provider.requests()[1]), None);
+}
+
+#[test]
+fn a_tool_that_appears_during_a_turn_is_noted_in_the_next_request() {
+    let provider = serve(vec![Script::json(tool_reply(&[("c1", "ext_a", "{}")])), Script::json(text_reply("done"))]);
+    let conv = Conversation::new().unwrap();
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
+    let host = McpFake::with(&["ext_a"]);
+    // The call to ext_a is the moment ext_b's server finishes connecting.
+    host.replace_on_call(&["ext_a", "ext_b"]);
+    turn_with_host(&mut agent, &host, "use it");
+    let requests = provider.requests();
+    assert_eq!(note_of(&requests[0]), None, "the first request is not noted");
+    assert!(tool_names_of(&requests[1]).contains(&"ext_b".to_string()));
+    assert_eq!(note_of(&requests[1]).as_deref(), Some("MCP tools changed since your last request. Now available: ext_b."));
+}
+
+#[test]
+fn a_tool_that_goes_away_is_noted_as_no_longer_available() {
+    let provider = serve(vec![Script::json(text_reply("one")), Script::json(text_reply("two"))]);
+    let conv = Conversation::new().unwrap();
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
+    let host = McpFake::with(&["ext_a", "ext_b"]);
+    turn_with_host(&mut agent, &host, "first");
+    host.set(&["ext_a"]);
+    turn_with_host(&mut agent, &host, "second");
+    let requests = provider.requests();
+    assert!(!tool_names_of(&requests[1]).contains(&"ext_b".to_string()), "the request does not offer it");
+    assert_eq!(
+        note_of(&requests[1]).as_deref(),
+        Some(
+            "MCP tools changed since your last request. No longer available: ext_b (their server was disabled, disconnected or \
+             failed): do not call them."
+        )
+    );
+}
+
+#[test]
+fn both_halves_are_said_once_and_the_note_is_not_kept_in_the_history() {
+    let provider = serve(vec![Script::json(text_reply("one")), Script::json(text_reply("two")), Script::json(text_reply("three"))]);
+    let conv = Conversation::new().unwrap();
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
+    let host = McpFake::with(&["x"]);
+    turn_with_host(&mut agent, &host, "first");
+    host.set(&["y"]);
+    turn_with_host(&mut agent, &host, "second");
+    turn_with_host(&mut agent, &host, "third");
+    let requests = provider.requests();
+    let both = note_of(&requests[1]).expect("a note");
+    assert!(both.contains("Now available: y.") && both.contains("No longer available: x ("), "{both}");
+    assert_eq!(note_of(&requests[2]), None, "the next request was offered the same set as the last accepted reply");
+    assert!(!serde_json::to_string(&stored(&conv.history())).unwrap().contains("MCP tools changed"));
+}
+
+#[test]
+fn a_new_conversation_starts_with_no_note() {
+    let provider = serve(vec![Script::json(text_reply("one")), Script::json(text_reply("two"))]);
+    let conv = Conversation::new().unwrap();
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
+    turn_with_host(&mut agent, &McpFake::with(&["ext_a"]), "first");
+    conv.reset().unwrap();
+    let mut fresh = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
+    turn_with_host(&mut fresh, &McpFake::with(&["ext_b"]), "second");
+    assert_eq!(note_of(&provider.requests()[1]), None);
+}
+
+#[test]
+fn a_request_that_fails_does_not_move_the_baseline_so_the_retry_still_says_it() {
+    let provider = serve(vec![
+        Script::json(text_reply("one")),
+        Script::error("400 Bad Request", json!({"error": {"message": "no-such-model", "code": 400}})),
+        Script::json(text_reply("three")),
+    ]);
+    let conv = Conversation::new().unwrap();
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
+    let host = McpFake::with(&["ext_a"]);
+    turn_with_host(&mut agent, &host, "first");
+    host.set(&["ext_a", "ext_b"]);
+    turn_with_host(&mut agent, &host, "second, fails");
+    turn_with_host(&mut agent, &host, "third");
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3, "the failed turn made one request");
+    assert_eq!(note_of(&requests[2]).as_deref(), Some("MCP tools changed since your last request. Now available: ext_b."));
 }

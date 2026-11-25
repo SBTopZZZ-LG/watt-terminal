@@ -679,6 +679,7 @@ async fn agent_message(
                     .with_calibration(att.conversation.calibration())
                     .with_learned_limits(att.conversation.learned_limits())
                     .with_last_usage(att.conversation.last_usage())
+                    .with_offered_tools(att.conversation.offered_tools())
                     .with_extra_secrets(mcp_turn.as_ref().map_or_else(Vec::new, |turn| turn.secret_values.clone()));
                 if let Some(persist) = store.as_ref() {
                     agent = agent.with_attachments(persist.conversations.attachments().clone());
