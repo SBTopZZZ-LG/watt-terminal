@@ -116,4 +116,65 @@ describe('TabManager chat channels', () => {
     expect(invoke.mock.calls.map(([cmd]) => cmd)).toEqual(['assign_tab_cmd', 'list_tabs']);
     expect(seen).toEqual([{ kind: 'error', message: 'chat c2 is busy' }]);
   });
+
+  it('a closed chat is not attached again on a terminal restart; the others still are', async () => {
+    const manager = new TabManager();
+    await manager.ensureChatAttached('main');
+    await manager.ensureChatAttached('c2');
+    manager.forgetChat('c2');
+    invoke.mockClear();
+    await manager['attachKnownChats'](true);
+    expect(attachCalls().map(([, args]) => (args as { chatId: string }).chatId)).toEqual(['main']);
+  });
+
+  it('a closed default chat is not recreated by a terminal restart', async () => {
+    const manager = new TabManager();
+    await manager.ensureChatAttached('main');
+    manager.forgetChat('main');
+    invoke.mockClear();
+    await manager['attachKnownChats'](true);
+    expect(attachCalls()).toHaveLength(0);
+  });
+
+  it('the default chat is still re-attached on a restart when it is the only chat', async () => {
+    const manager = new TabManager();
+    await manager.ensureChatAttached('main');
+    invoke.mockClear();
+    await manager['attachKnownChats'](true);
+    expect(attachCalls().map(([, args]) => (args as { chatId: string }).chatId)).toEqual(['main']);
+  });
+
+  it('one chat failing to re-attach does not stop the others or reject the restart', async () => {
+    const manager = new TabManager();
+    const seen: unknown[] = [];
+    manager.subscribeChat((msg) => seen.push(msg));
+    await manager.ensureChatAttached('main');
+    await manager.ensureChatAttached('c2');
+    invoke.mockClear();
+    invoke.mockImplementation(async (cmd: string, args?: Args) => {
+      if (cmd === 'attach_chat' && args?.chatId === 'main') {
+        throw 'chat main is gone';
+      }
+      return undefined;
+    });
+    await expect(manager['attachKnownChats'](true)).resolves.toBeUndefined();
+    expect(attachCalls().map(([, args]) => (args as { chatId: string }).chatId)).toEqual(['main', 'c2']);
+    expect(seen).toEqual([{ kind: 'error', message: 'chat main is gone' }]);
+  });
+
+  it('createChat closes the chat it created when its attach fails, and rethrows', async () => {
+    const manager = new TabManager();
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === 'create_chat') {
+        return 'c2';
+      }
+      if (cmd === 'attach_chat') {
+        throw 'attach refused';
+      }
+      return undefined;
+    });
+    await expect(manager.createChat()).rejects.toBe('attach refused');
+    expect(invoke.mock.calls.map(([cmd]) => cmd)).toEqual(['create_chat', 'attach_chat', 'close_chat']);
+    expect(invoke.mock.calls[2]).toEqual(['close_chat', { chatId: 'c2' }]);
+  });
 });

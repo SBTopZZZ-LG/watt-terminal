@@ -1356,6 +1356,8 @@ export default function App() {
       reportError(e);
       return;
     }
+    // The chat is gone on the backend: a terminal restart must not attach it again.
+    tabs.forgetChat(id);
     // Still the shown chat only if the user has not switched away while the close was in flight.
     const next = nextActiveAfterClose(liveIds, id);
     if (chatIdRef.current === id && next !== null) {

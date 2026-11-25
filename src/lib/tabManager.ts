@@ -39,6 +39,8 @@ export class TabManager {
   private readonly fontListeners = new Set<(size: number) => void>();
   /** Each chat's agent channel, by chat id: the attach in flight or done. A failed attach is removed (see attachChat). */
   private readonly chatAttach = new Map<string, Promise<void>>();
+  /** Chats closed in this session (see forgetChat). A terminal restart does not attach them. */
+  private readonly closedChats = new Set<string>();
 
   /** The terminal with this id, created on first use. Later calls return the same controller. */
   ensure(id: string): TabController {
@@ -218,13 +220,28 @@ export class TabManager {
    */
   async createChat(): Promise<string> {
     const chatId = await api.createChat();
-    await this.ensureChatAttached(chatId);
+    try {
+      await this.ensureChatAttached(chatId);
+    } catch (e) {
+      // Without its channel the new chat is unusable; closing it is best effort, so it is not left on the backend.
+      api.closeChat(chatId).catch(() => undefined);
+      throw e;
+    }
     return chatId;
   }
 
   /** Attaches a chat's agent channel. Once per chat: a later call for the same chat reuses the attach (see attachChat). */
   ensureChatAttached(chatId: string): Promise<void> {
     return this.attachChat(chatId, false);
+  }
+
+  /**
+   * A chat was closed on the backend: its attach is dropped, and a terminal restart no longer attaches it (see
+   * attachKnownChats). Attaching the default chat would make the backend create it again, so a closed one stays closed.
+   */
+  forgetChat(chatId: string): void {
+    this.chatAttach.delete(chatId);
+    this.closedChats.add(chatId);
   }
 
   /** Agent events and errors. Events that arrive while no listener is subscribed are not replayed. */
@@ -422,12 +439,21 @@ export class TabManager {
   }
 
   /**
-   * The attach a terminal's restart asks for (TabDeps.attachChat): every chat this registry knows, the default chat always,
-   * each attached as `fresh` says. The backend's attach is idempotent, so a fresh one only replaces the channel.
+   * The attach a terminal's restart asks for (TabDeps.attachChat): every chat this registry knows, the default chat included
+   * unless it was closed, each attached as `fresh` says. The backend's attach is idempotent, so a fresh one only replaces the
+   * channel. A chat that fails to attach (it may no longer exist) is shown; it does not stop the others or the restart.
    */
-  private attachKnownChats(fresh: boolean): Promise<void> {
+  private async attachKnownChats(fresh: boolean): Promise<void> {
     const chats = new Set([CHAT_ID, ...this.chatAttach.keys()]);
-    return Promise.all([...chats].map((chatId) => this.attachChat(chatId, fresh))).then(() => undefined);
+    for (const chatId of this.closedChats) {
+      chats.delete(chatId);
+    }
+    const results = await Promise.allSettled([...chats].map((chatId) => this.attachChat(chatId, fresh)));
+    for (const result of results) {
+      if (result.status === 'rejected') {
+        this.reportError(result.reason);
+      }
+    }
   }
 }
 
