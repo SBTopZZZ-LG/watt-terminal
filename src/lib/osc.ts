@@ -2,7 +2,7 @@
 // field 2 (`n=<nonce>`). Rust is the authority for records and gating. The frontend uses these events only to
 // place markers and gutter decorations, so a payload without an accepted nonce is ignored, never acted on.
 //
-// The accepted nonces are the local shell's and one per nested level (see session.ts). A nested level's nonce is added
+// The accepted nonces are the local shell's and one per nested level (see tab.ts). A nested level's nonce is added
 // when Rust announces the level, and removed when the level is popped.
 //
 // Payload shapes (from src-tauri/src/core/shim/integration.zsh and scanner.rs):

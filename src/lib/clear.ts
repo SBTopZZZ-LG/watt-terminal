@@ -1,5 +1,5 @@
 // What Cmd+K does, decided from the xterm buffer and the effective input state. Pure: no xterm, so it is unit-tested.
-// terminal.ts's clearTerminal carries out the decision.
+// tab.ts's TabController.clear carries out the decision.
 
 import type { InputState } from './types';
 

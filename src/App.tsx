@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useReducer, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useReducer, useRef, useState, useSyncExternalStore } from 'react';
 import type { RefObject } from 'react';
 import './App.css';
 import { api, errorText, SESSION_ID } from './lib/api';
@@ -18,19 +18,22 @@ import {
 } from './lib/commands';
 import type { ModelChoice } from './lib/commands';
 import { effectiveVariants } from './lib/settingsForm';
-import { connect, reportError, restart, setSessionNonces, subscribe } from './lib/session';
-import type { Incoming } from './lib/session';
-import { clearTerminal, currentFontSize, fitToContainer, markConnected, marks, onFontSizeChange, receiveBytes, resetForNewSession, setFontSize, term, terminalSize, zoomFont } from './lib/terminal';
+import { reportError, tabs } from './lib/tabManager';
+import type { Incoming } from './lib/tabManager';
+import { ActiveTabContext } from './lib/activeTab';
+import { isSessionEvent } from './lib/tabState';
+import type { TabController } from './lib/tab';
+import type { TabState } from './lib/tabState';
 import { appHotkeyFor } from './lib/appHotkeys';
 import { findZone } from './lib/findZone';
 import { isEditableElement, isSelectAllKey, selectAllTarget, selectContentsOf } from './lib/selectAll';
-import { effectiveState, focusAfter, inputReducer, INITIAL_INPUT, isFocusBarHotkey, routeFor } from './lib/inputState';
+import { effectiveState, focusAfter, isFocusBarHotkey, routeFor } from './lib/inputState';
 import type { BarMode, Route } from './lib/inputState';
-import { agentDialogPhase, agentIntegratingQuietly, agentRequestAfter, agentRequestClosedBySession, agentRunning, canIntegrate, integratesLocalShell, nestedLevels } from './lib/integrate';
+import { agentDialogPhase, agentIntegratingQuietly, agentRequestAfter, agentRequestClosedBySession, agentRunning, canIntegrate, integratesLocalShell } from './lib/integrate';
 import type { AgentRequest, IntegratePhase } from './lib/integrate';
 import { useSettledStrip } from './lib/stripSettle';
-import { agentControlAfter, borderActive, borderLevel, NO_CONTROL, settleControl } from './lib/agentControl';
-import type { AgentControl, BorderLevel } from './lib/agentControl';
+import { borderActive, borderLevel } from './lib/agentControl';
+import type { BorderLevel } from './lib/agentControl';
 import { EMPTY_TRANSCRIPT, firstPendingApproval, hasOlder, isBusy, transcriptReducer } from './lib/transcript';
 import type { TranscriptItem } from './lib/transcript';
 import { chatBodyShown, loadPanelLayout, panelReducer, panelView, savePanelLayout } from './lib/panelLayout';
@@ -51,7 +54,7 @@ import { NEW_DRAFT_KEY, forgetAllSuggestions, forgetConversation, forgetEverythi
 import { SEND_WHILE_SWITCHING_NOTICE, switchRefusal } from './lib/switchGuard';
 import { drainBatch, enqueue, markSteered, QUEUE_SLOT_POLL_MS, QUEUE_SLOT_WAIT_MS, removeInjected, removeQueued, shouldDrain, takeWithdrawn, unsteer } from './lib/messageQueue';
 import type { QueuedMessage } from './lib/messageQueue';
-import type { AttachmentInput, Cwd, HistoryGroupBy, InputState, IntegrationStatus, LevelInfo, LlmStatus, LoadedConversation, ObserverStatus, QueueMode, QuestionAnswerInput, SettingsStateView, Status, ThinkingMode, UiState, UiStatePatch, WireEvent } from './lib/types';
+import type { AttachmentInput, HistoryGroupBy, InputState, LlmStatus, LoadedConversation, QueueMode, QuestionAnswerInput, SessionEvent, SettingsStateView, Status, ThinkingMode, UiState, UiStatePatch, WireEvent } from './lib/types';
 import { recoveryKind } from './lib/settingsRecovery';
 import { TerminalView } from './components/TerminalView';
 import { InputBar } from './components/InputBar';
@@ -85,7 +88,9 @@ const uiSaver = createPatchSaver((patch: UiStatePatch) => {
 const cacheStorage = defaultSizeStorage();
 
 export default function App() {
-  const [input, dispatchInput] = useReducer(inputReducer, INITIAL_INPUT);
+  // The one terminal the UI shows. Its state (input, hold, levels, ...) is read from its controller (see tab.ts).
+  const [tab] = useState(() => tabs.ensure(SESSION_ID));
+  const { input, integration, observer, cwd, levels, agentControl, restarting } = useTabState(tab);
   const effective = effectiveState(input);
   const route = routeFor(effective, input.foreground);
   // What the status strip shows of the state and the foreground hint: the prompt is held while a quick command runs (see stripSettle.ts).
@@ -100,8 +105,6 @@ export default function App() {
   // The dialog's phase for the agent's request (null: the dialog shows nothing for it, as in auto mode).
   const agentPhase = agentDialogPhase(agentReq);
   const keyRoute: Route = locked ? { ...route, keys: 'drop' } : route;
-  // The nested shell levels, outermost first (the local one is not listed). The last is the shell on top.
-  const [levels, setLevels] = useState<LevelInfo[]>([]);
   // The consent says "this machine" for a bare shell typed here (see integratesLocalShell). Read per render: the foreground is live.
   const localShell = integratesLocalShell(input.foreground, levels);
   // Approve-all is on, but it was switched on in another shell level, so it is off in the shell on top.
@@ -129,16 +132,9 @@ export default function App() {
   // Bumped when a drag or key step ends, so the terminal refits once the new size is on screen.
   const [settle, setSettle] = useState(0);
   const settleLayout = useCallback(() => setSettle((s) => s + 1), []);
-  const [integration, setIntegration] = useState<IntegrationStatus>('booting');
-  const [observer, setObserver] = useState<ObserverStatus>('ok');
-  const [cwd, setCwd] = useState<Cwd | null>(null);
   const [autoApprove, setAutoApprove] = useState(false);
   const [llm, setLlm] = useState<LlmStatus>({ enabled: false, model: null });
   const [focusToken, setFocusToken] = useState(0);
-  const [restarting, setRestarting] = useState(false);
-  // The agent's hold on the shell: an approved call executing, or a command it started still running (see
-  // agentControl.ts). Drives the green border around the terminal.
-  const [agentControl, setAgentControl] = useState<AgentControl>(NO_CONTROL);
   // The find bar is mounted while open. Its token moves focus into it when Cmd+F is pressed again.
   const [findOpen, setFindOpen] = useState(false);
   const [findToken, setFindToken] = useState(0);
@@ -261,31 +257,22 @@ export default function App() {
   const prevEffective = useRef<InputState>(effective);
 
   const applyStatus = useCallback((s: Status) => {
-    dispatchInput({ type: 'rust_state', state: s.state, foreground: s.foreground ?? null });
-    setIntegration(s.integration);
-    setObserver(s.observer);
-    setCwd(s.cwd);
+    tab.applyStatus(s);
     setAutoApprove(s.auto_approve);
     setAutoSuspended(s.auto_approve_suspended);
-    setLevels(s.levels);
-    setSessionNonces(s.nonces);
     dispatchTranscript({ type: 'levels_changed', depth: s.depth });
     setLlm(s.llm);
     setSettingsState(s.settings_state ?? null);
     if (recoveryKind(s.settings_state) !== 'ok') {
       setSettingsBannerHidden(false);
     }
-    setAgentControl((c) => settleControl(c, s));
     setConversationId(s.conversation_id);
     // The backend's busy also covers a side command (btw, suggest_name), which never sends `done`. While one runs, the status
     // says nothing about the transcript's turn, so it is not synced; once it ends, the next status reads idle.
     if (!sideBusyRef.current) {
       dispatchTranscript({ type: 'sync_busy', busy: s.agent_busy });
     }
-    if (s.observer === 'desynced') {
-      marks.observerDesynced();
-    }
-  }, []);
+  }, [tab]);
 
   /** Takes the status snapshot again, e.g. after the live conversation changed. Resolves once it is applied. */
   const refreshStatus = (): Promise<void> => api.getStatus().then(applyStatus).catch(reportError);
@@ -298,14 +285,14 @@ export default function App() {
   const refreshControl = useCallback(function refresh(attempt = 0): void {
     api.getStatus().then(
       (s) => {
-        setAgentControl((c) => settleControl(c, s));
+        tab.applyControl(s);
         if (s.agent_busy && attempt < 4) {
           setTimeout(() => refresh(attempt + 1), 250);
         }
       },
       () => undefined,
     );
-  }, []);
+  }, [tab]);
 
   /**
    * Reads approve-all as the shell on top sees it. Only its two fields change: a levels event is not a full status read (see
@@ -445,9 +432,9 @@ export default function App() {
       if (panelSync.migrate !== null) {
         persist(panelPatch(panelSync.migrate));
       }
-      const fontSync = reconcileFont(currentFontSize(), remote.font_size);
+      const fontSync = reconcileFont(tabs.currentFontSize(), remote.font_size);
       if (fontSync.apply !== null) {
-        setFontSize(fontSync.apply, false);
+        tabs.setFontSize(fontSync.apply, false);
       }
       if (fontSync.migrate !== null) {
         persist(fontPatch(fontSync.migrate));
@@ -481,7 +468,7 @@ export default function App() {
         setDevtools(dev);
       }
     });
-    const unsubscribeFont = onFontSizeChange((size) => persist(fontPatch(size)));
+    const unsubscribeFont = tabs.onFontSizeChange((size) => persist(fontPatch(size)));
     const flushOnHide = () => uiSaver.flush();
     window.addEventListener('pagehide', flushOnHide);
     return () => {
@@ -526,17 +513,14 @@ export default function App() {
       }
     };
 
+    // The chat's events: the agent's, and the errors (see onMessage). The hold of the terminal is fed the agent's events too.
     const handleEvent = (ev: WireEvent) => {
-      setAgentControl((c) => agentControlAfter(c, ev));
+      if (isSessionEvent(ev)) {
+        // The terminal's own events come through handleTabEvent (see the controller); none should arrive here.
+        return;
+      }
+      tab.applyAgentEvent(ev);
       switch (ev.type) {
-        case 'state':
-          dispatchInput({ type: 'rust_state', state: ev.state, foreground: ev.foreground ?? null });
-          // A shell that exited ends a question still waiting (see agentRequestAfter).
-          setAgentReq((cur) => agentRequestAfter(cur, ev));
-          return;
-        case 'integration':
-          setIntegration(ev.status);
-          return;
         case 'integration_request':
           setAgentReq((cur) => agentRequestAfter(cur, ev));
           // The agent's question is the one that counts: a consent dialog the user opened for this shell gives way to it.
@@ -561,34 +545,34 @@ export default function App() {
           // The turn did not take these: they are plain queued messages again, sent at the end of the turn.
           commitQueue(unsteer(queueRef.current, ev.ids));
           return;
-        case 'observer':
-          setObserver(ev.status);
-          if (ev.status === 'desynced') {
-            marks.observerDesynced();
-          }
+        default:
+          dispatchTranscript({ type: 'agent_event', event: ev, at: Date.now() });
+      }
+    };
+
+    // The terminal's own events. Their state is in the controller (see tabState.ts); these are what the transcript and the
+    // agent's question also show.
+    const handleTabEvent = (source: TabController, ev: SessionEvent) => {
+      if (source !== tab) {
+        return;
+      }
+      switch (ev.type) {
+        case 'state':
+          // A shell that exited ends a question still waiting (see agentRequestAfter).
+          setAgentReq((cur) => agentRequestAfter(cur, ev));
           return;
-        case 'cwd':
-          setCwd(ev.cwd);
-          return;
-        case 'record_started':
-          marks.recordStarted(ev.source.kind === 'agent');
+        case 'levels':
+          // The depth ends an interactive group a level was pushed above (see transcript.ts). The same for an integration the
+          // agent asked for and one the user started. The approve-all state follows the new top level.
+          dispatchTranscript({ type: 'levels_changed', depth: ev.levels.length });
+          refreshAutoState();
           return;
         case 'record_finished':
           // Closes the interactive group the command opened on, if there is one (see transcript.ts).
           dispatchTranscript({ type: 'record_finished', record: ev.record });
           return;
-        case 'levels':
-          // Rust pushed, popped or pending-ed a level. The nonces are taken first, so the bytes after this event are checked
-          // against them. The location and approve-all follow the new top level.
-          setSessionNonces(ev.nonces);
-          setLevels(nestedLevels(ev.levels));
-          // The depth ends an interactive group a level was pushed above (see transcript.ts). The same for an integration the
-          // agent asked for and one the user started.
-          dispatchTranscript({ type: 'levels_changed', depth: ev.levels.length });
-          refreshAutoState();
-          return;
         default:
-          dispatchTranscript({ type: 'agent_event', event: ev, at: Date.now() });
+          return;
       }
     };
 
@@ -600,21 +584,22 @@ export default function App() {
       }
     };
 
-    const unsubscribe = subscribe(onMessage);
-    const { rows, cols } = terminalSize();
-    connect(rows, cols, receiveBytes)
-      .then(() => {
-        markConnected();
-        return api.getStatus();
-      })
+    const unsubscribe = tabs.subscribeChat(onMessage);
+    const unsubscribeTabs = tabs.subscribeTabEvents(handleTabEvent);
+    tab
+      .connect()
+      .then(() => api.getStatus())
       .then((status) => {
         applyStatus(status);
         void restoreLast(status);
       })
-      .then(() => fitToContainer())
+      .then(() => tab.fitToContainer())
       .catch(reportError);
-    return unsubscribe;
-  }, [applyStatus, refreshAutoState, refreshControl]);
+    return () => {
+      unsubscribe();
+      unsubscribeTabs();
+    };
+  }, [tab, applyStatus, refreshAutoState, refreshControl]);
 
   // Focus follows the shell's end, not its commands (see focusAfter): the bar takes it when the shell exits, the
   // terminal when a new one starts.
@@ -622,7 +607,7 @@ export default function App() {
     const target = focusAfter(prevEffective.current, effective);
     prevEffective.current = effective;
     if (target === 'xterm') {
-      term.focus();
+      tab.focus();
     } else if (target === 'bar') {
       setFocusToken((t) => t + 1);
     }
@@ -635,7 +620,7 @@ export default function App() {
     altPanel.current = step.state;
     if (step.open !== null) {
       // Focus inside the panel would fall to <body> when it hides, and the full-screen program would lose the keys.
-      if (step.open === false && panelRef.current?.contains(document.activeElement)) term.focus();
+      if (step.open === false && panelRef.current?.contains(document.activeElement)) tab.focus();
       dispatchPanel({ type: 'open', open: step.open });
     }
   }, [effective]);
@@ -653,7 +638,7 @@ export default function App() {
   // of .term-host. The ResizeObserver on .term-host refits too (with its own debounce); this one makes the final fit
   // land on the final layout. Runs after React has committed the change, so it never measures the old layout.
   useEffect(() => {
-    const frame = requestAnimationFrame(() => void fitToContainer());
+    const frame = requestAnimationFrame(() => void tab.fitToContainer());
     return () => cancelAnimationFrame(frame);
   }, [panel.dock, panel.open, settle]);
 
@@ -704,7 +689,7 @@ export default function App() {
         if (zone !== null) {
           e.preventDefault();
           if (zone === 'terminal') {
-            term.selectAll();
+            tab.term.selectAll();
           } else {
             selectContentsOf(document.querySelector('.transcript-body'));
           }
@@ -740,17 +725,17 @@ export default function App() {
           setFindToken((t) => t + 1);
           return;
         case 'clear':
-          // Clears the scrollback locally; at the prompt Ctrl-L goes through the same route as typed keys (see clearTerminal).
-          clearTerminal(effectiveRef.current, handleTerminalInput);
+          // Clears the scrollback locally; at the prompt Ctrl-L goes through the same route as typed keys (see clear.ts).
+          tab.clear(effectiveRef.current, handleTerminalInput);
           return;
         case 'zoom-in':
-          zoomFont('in');
+          tabs.zoomFont('in');
           return;
         case 'zoom-out':
-          zoomFont('out');
+          tabs.zoomFont('out');
           return;
         case 'zoom-reset':
-          zoomFont('reset');
+          tabs.zoomFont('reset');
           return;
         case 'settings':
           openSettings();
@@ -790,7 +775,7 @@ export default function App() {
 
   const closeFind = () => {
     setFindOpen(false);
-    term.focus();
+    tab.focus();
   };
 
   // Esc in the chat find: closes it and gives focus back to where it was opened from. The terminal find is not touched.
@@ -1759,7 +1744,7 @@ export default function App() {
   // Escape in the bar gives the keyboard back to the terminal. On the alternate screen it also closes the strip.
   const closeBar = () => {
     setBarOpen(false);
-    term.focus();
+    tab.focus();
   };
 
   // Starts a new shell after the old one exited. The terminal is cleared first, so nothing from the old shell
@@ -1768,22 +1753,22 @@ export default function App() {
     if (restarting) {
       return;
     }
-    setRestarting(true);
-    resetForNewSession();
+    tab.setRestarting(true);
+    tab.resetForNewSession();
     // The same conversation goes on, so what was queued comes back into the input rather than being dropped.
     returnQueued();
     clearQueue();
     dispatchTranscript({ type: 'session_reset' });
-    setAgentControl(NO_CONTROL);
+    tab.resetAgentControl();
     setAgentReq((cur) => agentRequestClosedBySession(cur));
-    const { rows, cols } = terminalSize();
-    restart(rows, cols)
+    tab
+      .restart()
       .then(() => api.getStatus())
       .then(applyStatus)
-      .then(() => fitToContainer())
+      .then(() => tab.fitToContainer())
       .catch(reportError)
       // Still true until the status is applied, so a second click cannot land while the old exit state is shown.
-      .finally(() => setRestarting(false));
+      .finally(() => tab.setRestarting(false));
   };
 
   const approveFirst = () => {
@@ -1810,6 +1795,7 @@ export default function App() {
   const activity = agentActivity(transcript.items, transcript.thinking, sideBusy);
 
   return (
+    <ActiveTabContext.Provider value={tab}>
     <div className="app">
       <StatusChip
         integration={integration}
@@ -1831,12 +1817,17 @@ export default function App() {
         dock={panel.dock}
         terminal={
           <div className="terminal-area">
-            <TerminalView
-              keysToPty={keyRoute.keys === 'pty'}
-              inputState={effective}
-              onInput={handleTerminalInput}
-              onAltChange={(active) => dispatchInput({ type: 'alt', active })}
-            />
+            {tabs.list().map((t) => (
+              <TerminalView
+                key={t.id}
+                controller={t}
+                active={t === tab}
+                keysToPty={keyRoute.keys === 'pty'}
+                inputState={effective}
+                onInput={handleTerminalInput}
+                onAltChange={(alt) => t.dispatchInput({ type: 'alt', active: alt })}
+              />
+            ))}
             {/* Shown during the agent's turn ('working', softer) and while it holds the shell ('control'). Never takes clicks; sits above the terminal background, below its decorations. */}
             <div className={borderClass[border]} aria-hidden="true">
               <div className="agent-control-glow" />
@@ -2011,13 +2002,19 @@ export default function App() {
       <Tooltip />
       <ContextMenu
         terminal={{ state: effective, agentBusy: busy || sideBusy, pasteRoutesToPty: keyRoute.keys === 'pty' }}
-        onClearTerminal={() => clearTerminal(effectiveRef.current, handleTerminalInput)}
+        onClearTerminal={() => tab.clear(effectiveRef.current, handleTerminalInput)}
         onFindTerminal={openTerminalFind}
         onFindChat={openChatFind}
         devtools={devtools}
       />
     </div>
+    </ActiveTabContext.Provider>
   );
+}
+
+/** The state of one terminal, as it changes. Its fields are the names the UI reads (see tabState.ts). */
+function useTabState(tab: TabController): TabState {
+  return useSyncExternalStore(tab.subscribe, tab.getSnapshot);
 }
 
 /**

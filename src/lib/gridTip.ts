@@ -1,4 +1,4 @@
-import type { GridInfo } from './terminal';
+import type { GridInfo } from './tab';
 
 /**
  * The grid chip's tooltip: the numbers to report when the text looks clipped, one per line (the tooltip keeps line breaks).

@@ -1,13 +1,15 @@
 import { useEffect, useRef } from 'react';
-import { fitToContainer, gridScreen, measureGrid, mountTerminal, setCursorHidden, term } from '../lib/terminal';
+import type { CSSProperties } from 'react';
+import type { Terminal } from '@xterm/xterm';
+import type { TabController } from '../lib/tab';
 import { clipboardActionFor, createKeyFilter } from '../lib/keymap';
 import { copyText, readClipboardText } from '../lib/clipboard';
 import { createOverflowGuard } from '../lib/gridFit';
-import { reportError } from '../lib/session';
+import { reportError } from '../lib/tabManager';
 import type { InputState } from '../lib/types';
 
 /** Copies the selection, then clears it, so a later Ctrl+C interrupts again. Nothing happens without a selection. */
-function copySelection(): void {
+function copySelection(term: Terminal): void {
   if (!term.hasSelection()) {
     return;
   }
@@ -20,7 +22,7 @@ function copySelection(): void {
 }
 
 /** Pastes the clipboard's text as typed text would be: through xterm, so bracketed paste applies. Ctrl+V and the context menu's Paste both use it. */
-export async function pasteFromClipboard(): Promise<void> {
+export async function pasteFromClipboard(term: Terminal): Promise<void> {
   const text = await readClipboardText(navigator.clipboard);
   if (text === null) {
     reportError('Could not read the clipboard.');
@@ -56,6 +58,10 @@ function watchPixelRatio(onChange: () => void): () => void {
 }
 
 interface Props {
+  /** The terminal this host shows. */
+  controller: TabController;
+  /** Only the active terminal takes keys, alt-screen changes and the cursor. The others are drawn hidden (see the return). */
+  active: boolean;
   /** True when keystrokes go to the PTY. False only after the shell exited, when the terminal drops them. */
   keysToPty: boolean;
   /** The effective input state (alt screen and exit included). Decides which keys are rewritten. */
@@ -64,12 +70,15 @@ interface Props {
   onAltChange: (active: boolean) => void;
 }
 
-export function TerminalView({ keysToPty, inputState, onInput, onAltChange }: Props) {
+/** A hidden host keeps its size (so the fit still works) and takes no pointer or focus. */
+const HIDDEN: CSSProperties = { visibility: 'hidden', pointerEvents: 'none' };
+
+export function TerminalView({ controller, active, keysToPty, inputState, onInput, onAltChange }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   // Latest props for the long-lived xterm listeners, which are registered once.
-  const latest = useRef({ keysToPty, inputState, onInput, onAltChange });
+  const latest = useRef({ active, keysToPty, inputState, onInput, onAltChange });
   useEffect(() => {
-    latest.current = { keysToPty, inputState, onInput, onAltChange };
+    latest.current = { active, keysToPty, inputState, onInput, onAltChange };
   });
 
   useEffect(() => {
@@ -77,10 +86,13 @@ export function TerminalView({ keysToPty, inputState, onInput, onAltChange }: Pr
     if (!host) {
       return;
     }
-    mountTerminal(host);
+    const term = controller.term;
+    controller.mount(host);
     // The terminal has the keyboard from the start; the agent bar takes it only on its hotkey.
-    term.focus();
-    latest.current.onAltChange(term.buffer.active.type === 'alternate');
+    if (latest.current.active) {
+      term.focus();
+      latest.current.onAltChange(term.buffer.active.type === 'alternate');
+    }
 
     // Rewrites Option+Arrow, Cmd+Arrow, Cmd+Backspace and Shift+Enter (see keymap.ts). A mapped key goes to the PTY
     // through term.input, so it takes the same route as typed text. xterm never sees the key.
@@ -91,9 +103,9 @@ export function TerminalView({ keysToPty, inputState, onInput, onAltChange }: Pr
       if (clip !== null) {
         ev.preventDefault();
         if (clip === 'copy') {
-          copySelection();
+          copySelection(term);
         } else {
-          void pasteFromClipboard();
+          void pasteFromClipboard(term);
         }
         return false;
       }
@@ -108,8 +120,16 @@ export function TerminalView({ keysToPty, inputState, onInput, onAltChange }: Pr
       return true;
     });
 
-    const dataSub = term.onData((data) => latest.current.onInput(data));
-    const bufferSub = term.buffer.onBufferChange((buf) => latest.current.onAltChange(buf.type === 'alternate'));
+    const dataSub = term.onData((data) => {
+      if (latest.current.active) {
+        latest.current.onInput(data);
+      }
+    });
+    const bufferSub = term.buffer.onBufferChange((buf) => {
+      if (latest.current.active) {
+        latest.current.onAltChange(buf.type === 'alternate');
+      }
+    });
 
     // Fits are triggered by the host and the grid resizing, by window resizes, by devicePixelRatio changes and by font
     // loads. The grid can change size with the host unchanged (DPR, font metrics), so the grid is observed too.
@@ -118,12 +138,12 @@ export function TerminalView({ keysToPty, inputState, onInput, onAltChange }: Pr
     let fitTimer: ReturnType<typeof setTimeout> | undefined;
     let checkTimer: ReturnType<typeof setTimeout> | undefined;
     const checkOverflow = createOverflowGuard({
-      measure: measureGrid,
-      refit: () => fitToContainer(),
+      measure: () => controller.measureGrid(),
+      refit: () => controller.fitToContainer(),
       onGiveUp: (m) => console.warn('terminal grid still wider than its container after refits', m),
     });
     const fitAndCheck = async () => {
-      await fitToContainer();
+      await controller.fitToContainer();
       await checkOverflow();
     };
     const trigger = (delay: number) => {
@@ -138,7 +158,7 @@ export function TerminalView({ keysToPty, inputState, onInput, onAltChange }: Pr
 
     const observer = new ResizeObserver(() => trigger(50));
     observer.observe(host);
-    const screen = gridScreen();
+    const screen = controller.gridScreen();
     if (screen) {
       observer.observe(screen);
     }
@@ -165,8 +185,10 @@ export function TerminalView({ keysToPty, inputState, onInput, onAltChange }: Pr
   }, []);
 
   useEffect(() => {
-    setCursorHidden(!keysToPty);
-  }, [keysToPty]);
+    if (active) {
+      controller.setCursorHidden(!keysToPty);
+    }
+  }, [active, controller, keysToPty]);
 
-  return <div className="term-host" ref={hostRef} />;
+  return <div className="term-host" ref={hostRef} style={active ? undefined : HIDDEN} />;
 }
