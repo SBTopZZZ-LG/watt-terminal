@@ -17,6 +17,12 @@ pub const ELIDED_RESULT: &str = "[output elided; call get_command to read it aga
 /// Reasoning fields that are removed from stored assistant messages unless `echo_reasoning` is set.
 const REASONING_KEYS: [&str; 3] = ["reasoning_content", "reasoning", "reasoning_details"];
 
+/// Set on a stored user message that is a steer: a message sent into the running turn (see core/agent `Steer`). It belongs
+/// to that turn, so it is never a turn start for trimming or `turn_count`, and it is not sent to the provider.
+pub const STEER_KEY: &str = "steer";
+/// What closes a call that a steer skipped: the steer came after the call before it, and this one did not run.
+pub const STEER_SKIPPED: &str = "skipped: the user sent a new message";
+
 #[derive(Debug, Default)]
 pub struct History {
     messages: Vec<Value>,
@@ -37,8 +43,23 @@ impl History {
     /// Appends a user message with the given content: a string, or the parts array of a message with attachments (see
     /// core/chat/attachments). Calls still pending from the last assistant message are closed first.
     pub fn push_user_content(&mut self, content: Value) {
-        self.close_pending("skipped: turn ended");
-        self.messages.push(json!({"role": "user", "content": content}));
+        self.push_user_message(content, "skipped: turn ended", false);
+    }
+
+    /// Appends a steer (see `STEER_KEY`): a user message sent into the running turn, after the tool results of the last
+    /// assistant message. Calls still pending are closed with `STEER_SKIPPED` first.
+    pub fn push_steer_content(&mut self, content: Value) {
+        self.push_user_message(content, STEER_SKIPPED, true);
+    }
+
+    /// The one place a user message is stored. `reason` closes the calls still pending; `steer` marks the message.
+    fn push_user_message(&mut self, content: Value, reason: &str, steer: bool) {
+        self.close_pending(reason);
+        let mut message = json!({"role": "user", "content": content});
+        if steer {
+            message[STEER_KEY] = json!(true);
+        }
+        self.messages.push(message);
     }
 
     /// Appends an assistant message as given (reasoning fields removed unless `echo_reasoning` is set). Calls still
@@ -107,15 +128,15 @@ impl History {
     }
 
     /// The request's message list under `plan` (see core/chat/trim): `messages` with the older content left out. The
-    /// stored messages are not changed. Dropped turns are cut at a user message, so no tool result is separated from its
-    /// call, and the first message after the system message is the first kept user message.
+    /// stored messages are not changed. Dropped turns are cut at a turn's user message (a steer is never one), so no tool
+    /// result is separated from its call, and the first message after the system message is the first kept user message.
     pub fn messages_with(&self, system: &str, resolver: &mut Resolver<'_>, plan: &TrimPlan) -> Vec<Value> {
-        let turns: Vec<usize> =
-            self.messages.iter().enumerate().filter(|(_, m)| role(m) == Some("user")).map(|(i, _)| i).collect();
+        let turns: Vec<usize> = self.messages.iter().enumerate().filter(|(_, m)| is_turn_start(m)).map(|(i, _)| i).collect();
         // The last turn is never dropped.
         let drop = plan.drop_turns.min(turns.len().saturating_sub(1));
         let start = if drop == 0 { 0 } else { turns[drop] };
-        let last_user = turns.last().copied();
+        // The running turn (its user message and the steers after it) keeps its documents.
+        let last_turn = turns.last().copied();
         // The newest `keep` tool results of the kept messages stay; the older ones are replaced.
         let tools: Vec<usize> = (start..self.messages.len()).filter(|&i| role(&self.messages[i]) == Some("tool")).collect();
         let replaced = plan.keep_tool_results.map_or(0, |keep| tools.len().saturating_sub(keep));
@@ -125,9 +146,12 @@ impl History {
         out.push(json!({"role": "system", "content": system}));
         for (index, m) in self.messages.iter().enumerate().skip(start) {
             let mut wire = m.clone();
+            if let Some(obj) = wire.as_object_mut() {
+                obj.remove(STEER_KEY);
+            }
             if role(m) == Some("user") {
                 if let Some(parts) = m.get("content").and_then(Value::as_array) {
-                    let parts = if plan.elide_old_docs && Some(index) != last_user {
+                    let parts = if plan.elide_old_docs && last_turn.is_some_and(|last| index < last) {
                         elide_documents(parts)
                     } else {
                         parts.clone()
@@ -145,9 +169,9 @@ impl History {
         out
     }
 
-    /// The number of stored user messages, which is the number of turns.
+    /// The number of turns: the stored user messages, less the steers (a steer belongs to the turn it was sent in).
     pub fn turn_count(&self) -> usize {
-        self.messages.iter().filter(|m| role(m) == Some("user")).count()
+        self.messages.iter().filter(|m| is_turn_start(m)).count()
     }
 
     /// Replaces the content of every tool message except the most recent `keep_recent` with `ELIDED_RESULT`.
@@ -233,6 +257,11 @@ impl History {
 
 fn role(m: &Value) -> Option<&str> {
     m.get("role").and_then(Value::as_str)
+}
+
+/// A user message that starts a turn: not a steer (see `STEER_KEY`).
+fn is_turn_start(m: &Value) -> bool {
+    role(m) == Some("user") && m.get(STEER_KEY).is_none()
 }
 
 /// The parts of a user message with each document replaced by a note that it was left out. The parts keep their order,
@@ -1056,6 +1085,63 @@ mod tests {
         tool_turn(&mut h, "a", &["c1"]);
         tool_turn(&mut h, "b", &["c2"]);
         assert_eq!(h.turn_count(), 2);
+    }
+
+    /// The running turn "running", with a call that a steer skipped and a steer after it, as the loop leaves them.
+    fn steered_history() -> History {
+        let mut h = History::new();
+        tool_turn(&mut h, "first", &["c1"]);
+        h.push_user("running");
+        h.push_assistant(assistant_calls(&["c2", "c3"]));
+        h.push_tool_result("c2", "result of c2");
+        h.close_pending(STEER_SKIPPED);
+        h.push_steer_content(json!("steered"));
+        h.push_assistant(json!({"role": "assistant", "content": "answer to the steer"}));
+        h
+    }
+
+    #[test]
+    fn a_steer_is_part_of_its_turn_for_the_count_and_for_dropping() {
+        let h = steered_history();
+        assert_eq!(h.turn_count(), 2, "the steer is not a turn");
+        // Dropping the older turn keeps the running one whole: its message, its calls and the steer after them.
+        let w = wire(&h, &TrimPlan { drop_turns: 1, ..TrimPlan::none() });
+        assert_wire_paired(&w);
+        assert_eq!(w.len(), 7, "system, then the running turn's six messages: {w:?}");
+        assert!(w[1]["content"].as_str().unwrap_or_default().starts_with(OMITTED_TURNS_NOTE));
+        assert_eq!(w[1]["content"].as_str().map(|c| c.contains("running")), Some(true));
+        assert_eq!(w[5]["content"], "steered");
+        // The most turns that can go is the count less the running one: a steer adds nothing to that.
+        assert!(wire(&h, &TrimPlan { drop_turns: 2, ..TrimPlan::none() }).len() == 7, "the running turn is never dropped");
+    }
+
+    #[test]
+    fn a_steer_is_stored_with_its_flag_but_sent_without_it() {
+        let h = steered_history();
+        let stored = h.snapshot();
+        assert_eq!(stored[8]["steer"], json!(true));
+        assert!(stored[4].get("steer").is_none(), "the turn's own message is not a steer");
+        assert!(wire(&h, &TrimPlan::none()).iter().all(|m| m.get("steer").is_none()));
+        // The flag survives a reload, so the steer still belongs to its turn after one.
+        let reloaded = History::from_messages(stored);
+        assert_eq!(reloaded.turn_count(), 2);
+        assert_eq!(reloaded.snapshot()[8]["steer"], json!(true));
+    }
+
+    #[test]
+    fn the_running_turn_keeps_its_documents_when_a_steer_follows_them() {
+        let mut h = History::new();
+        h.push_user_content(json!([text_part("old"), file_part("old.txt", "OLDDOC")]));
+        h.push_assistant(json!({"role": "assistant", "content": "ok"}));
+        h.push_user_content(json!([text_part("now"), file_part("now.txt", "NOWDOC")]));
+        h.push_assistant(assistant_calls(&["c1"]));
+        h.push_tool_result("c1", "result of c1");
+        h.close_pending(STEER_SKIPPED);
+        h.push_steer_content(json!([text_part("more"), file_part("more.txt", "MOREDOC")]));
+        let plan = TrimPlan { elide_old_docs: true, ..TrimPlan::none() };
+        let text = serde_json::to_string(&wire(&h, &plan)).unwrap();
+        assert!(!text.contains("OLDDOC"), "an older turn's document is elided");
+        assert!(text.contains("NOWDOC") && text.contains("MOREDOC"), "the running turn keeps its documents");
     }
 
     #[test]

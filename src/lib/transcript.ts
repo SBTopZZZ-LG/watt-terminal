@@ -506,6 +506,10 @@ function applyAgentEvent(t0: Transcript, ev: AgentEvent, at: number | undefined)
     }
     case 'context_usage':
       return contextUsage(t, ev);
+    // Steering (part 2) is not rendered yet: the frontend does not steer, so the backend sends neither event in use.
+    case 'steer_injected':
+    case 'steer_returned':
+      return t;
   }
 }
 

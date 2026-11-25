@@ -23,7 +23,9 @@ use tauri_plugin_window_state::StateFlags;
 // Core logic (PTY, shell integration, observer, agent) has no Tauri dependency, so `cargo test` runs it headless.
 pub mod core;
 
-use crate::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate, AutoState, MockAgent, OnDrop, TurnRules, UserMessage};
+use crate::core::agent::{
+    self, AgentCtx, AgentEvent, ApprovalGate, AutoState, MockAgent, OnDrop, Steer, SteerItem, SteerMode, TurnRules, UserMessage,
+};
 use crate::core::env::{env_setting, home_dir};
 use crate::core::approval::{self, ApprovalPolicy, ManualPolicy};
 use crate::core::chat::agent_loop::{self, Conversation, LastUsage, LlmAgent, LlmSettings, USER_AGENT};
@@ -129,22 +131,35 @@ pub struct Attached {
     /// The project instructions already announced: the workspace root path and the rules text. A turn whose
     /// loaded pair differs announces itself with an `AgentEvent::Notice`; a repeat stays quiet.
     project_rules_seen: Mutex<Option<(String, String)>>,
+    /// The steer mailbox of the running turn: messages sent while it runs (see `steer_message`). Open only for an agent turn.
+    steer: Steer,
 }
 
 impl Attached {
     /// Ends a turn: clears the cancel token, the control flag (telling the UI) and the busy flag. Runs even when the
-    /// turn panicked.
+    /// turn panicked. Steers still waiting are given back first (`steer_returned`), so they arrive before the turn's `done`.
     fn end_turn(&self) {
         *lock(&self.turn_cancel) = None;
+        self.return_steers();
         if self.agent_control.swap(false, Ordering::SeqCst) {
             self.channels.send_json(&AgentEvent::AgentControl { active: false });
         }
         self.agent_busy.store(false, Ordering::SeqCst);
     }
 
-    /// Cancels the running turn, if any, and denies its pending approvals. Harmless when no turn is running.
+    /// Closes the steer mailbox and gives back what it still holds (`steer_returned`, when there is any).
+    fn return_steers(&self) {
+        let ids: Vec<u64> = self.steer.close_and_take().iter().map(|item| item.id).collect();
+        if !ids.is_empty() {
+            self.channels.send_json(&AgentEvent::SteerReturned { ids });
+        }
+    }
+
+    /// Cancels the running turn, if any, and denies its pending approvals. Harmless when no turn is running. The steers
+    /// waiting for the turn are given back: a cancel clears them.
     fn cancel_turn(&self) {
         agent::cancel_turn(&self.turn_cancel, &self.approvals);
+        self.return_steers();
     }
 
     /// Whether the terminal's Ctrl-C belongs to the agent's turn, and so cancels it. Never when the agent is not
@@ -443,6 +458,7 @@ fn attach_or_spawn(
             turn_cancel: Mutex::new(None),
             conversation,
             project_rules_seen: Mutex::new(None),
+            steer: Steer::default(),
         })
     })?;
     if let Some((data, events)) = pending.take() {
@@ -598,6 +614,8 @@ async fn agent_message(
     .await?;
     let cancel = Arc::new(TurnCancel::new());
     let (history, todos, conversation_id) = att.begin_turn(&cancel)?;
+    // Opened for an agent turn only: side commands also take the slot through `begin_turn`, and never get a mailbox.
+    att.steer.open();
     // Announced once per root and rules text: a repeat stays quiet, and no file means no notice.
     // Never stored in the history; the rules themselves ride the turn's system message only.
     if let Some((root, rules)) = project_rooted_rules.as_ref() {
@@ -693,7 +711,10 @@ async fn agent_message(
         if let Some(turn) = mcp_turn.as_ref() {
             turn.settle(&settle_cancel);
         }
-        let base = AgentCtx::new(&tools, &worker.approvals, &emit).with_policy(policy.as_ref()).with_rules(rules);
+        let base = AgentCtx::new(&tools, &worker.approvals, &emit)
+            .with_policy(policy.as_ref())
+            .with_rules(rules)
+            .with_steer(&worker.steer);
         let ctx = match mcp_turn.as_ref() {
             Some(turn) => base.with_external_tools(&*turn.manager, &settle_cancel),
             None => base,
@@ -713,10 +734,45 @@ async fn agent_message(
     });
     if let Err(e) = spawned {
         *lock(&att.turn_cancel) = None;
+        att.return_steers();
         att.agent_busy.store(false, Ordering::SeqCst);
         return Err(e.to_string());
     }
     Ok(())
+}
+
+/// Sends a message into the running agent turn (steering): it goes in at the turn's next step, after the tool call that is
+/// running (a running call is not interrupted). `mode` is "all" (the default: every waiting message in one) or "one" (the
+/// first alone). Returns true when the message was accepted. False means it was not: no agent turn is running, the turn is
+/// ending, or a side command holds the slot. The caller then queues the message as it does otherwise. Never starts a turn.
+/// The attachments are checked and stored as `agent_message` does it.
+#[tauri::command]
+async fn steer_message(
+    session_id: String,
+    id: u64,
+    text: String,
+    attachments: Option<Vec<AttachmentInput>>,
+    mode: Option<String>,
+    reg: State<'_, Reg>,
+    persist: State<'_, PersistState>,
+) -> Result<bool, String> {
+    let att = session(&reg, &session_id)?;
+    let mode = SteerMode::parse(mode.as_deref().unwrap_or("all"))?;
+    let prepared = prepare(&attachments.unwrap_or_default())?;
+    if !att.steer.is_open() {
+        return Ok(false);
+    }
+    // The images are on disk before the message can be taken into the history (see `agent_message`).
+    write_images(persist.0.as_deref(), &att.conversation.id(), &prepared.images)?;
+    let item = SteerItem { id, text, attachments: prepared.attachments };
+    Ok(att.steer.accept(item, mode))
+}
+
+/// Takes a steered message back before the turn takes it. True when it was still waiting, so the caller restores it to the
+/// composer. False when it was already taken into the turn (or was never accepted).
+#[tauri::command]
+fn withdraw_steer(session_id: String, id: u64, reg: State<'_, Reg>) -> Result<bool, String> {
+    Ok(session(&reg, &session_id)?.steer.withdraw(id))
 }
 
 /// Starts a new conversation: the history is cleared and the id rotated. Refused while the agent is working. Takes
@@ -1865,6 +1921,8 @@ pub fn run() {
             resize,
             write_user,
             agent_message,
+            steer_message,
+            withdraw_steer,
             cancel_agent,
             new_conversation,
             ask_btw,

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use watt_terminal_lib::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate, TurnRules, UserMessage};
+use watt_terminal_lib::core::agent::{self, AgentCtx, AgentEvent, ApprovalGate, Steer, SteerItem, SteerMode, TurnRules, UserMessage};
 use watt_terminal_lib::core::chat::agent_loop::{agent_record_note, Conversation, LlmAgent, LlmSettings};
 use watt_terminal_lib::core::chat::attachments::{Attachment, Resolver};
 use watt_terminal_lib::core::chat::context::{self, ContextUsage};
@@ -18,7 +18,7 @@ use watt_terminal_lib::core::chat::trim::{OLD_OUTPUT_NOTE, OMITTED_TURNS_NOTE, T
 use watt_terminal_lib::core::persist::attachments::{sha256_hex, AttachmentStore};
 use watt_terminal_lib::core::settings::LimitsSettings;
 use watt_terminal_lib::core::skills::{self, Root};
-use watt_terminal_lib::core::chat::history::History;
+use watt_terminal_lib::core::chat::history::{History, STEER_SKIPPED};
 use watt_terminal_lib::core::chat::prompt;
 use watt_terminal_lib::core::chat::questions;
 use watt_terminal_lib::core::chat::redact::Redactor;
@@ -203,6 +203,9 @@ data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"funct
 data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
 data: [DONE]\n\n";
 
+/// The mailbox, the messages (id, text) a `get_cwd` call steers in, and their mode (see `FakeTools::steer_on_cwd`).
+type SteerOnCwd = (Arc<Steer>, Vec<(u64, &'static str)>, SteerMode);
+
 /// The tools the fake agent may reach. Every call is recorded; nothing touches a shell.
 #[derive(Default)]
 struct FakeTools {
@@ -223,12 +226,33 @@ struct FakeTools {
     facts: Option<SessionFacts>,
     /// The shell on top (`top_level`): its kind, and whether it is a nested level.
     top: TopLevel,
+    /// When set, the first `get_cwd` call accepts these steers (id, text) into the mailbox, under this mode (see `Steer`).
+    steer_on_cwd: Option<SteerOnCwd>,
+    /// Whether `steer_on_cwd` has fired.
+    steered: Mutex<bool>,
 }
 
 impl FakeTools {
     fn reached(&self) -> Vec<String> {
         self.reached.lock().unwrap().clone()
     }
+
+    /// Accepts the `steer_on_cwd` messages, once: the steer arrives while a tool call runs.
+    fn steer_now(&self) {
+        let Some((steer, items, mode)) = &self.steer_on_cwd else { return };
+        let mut fired = self.steered.lock().unwrap();
+        if std::mem::replace(&mut *fired, true) {
+            return;
+        }
+        for (id, text) in items {
+            steer.accept(steering(*id, text), *mode);
+        }
+    }
+}
+
+/// A steered message with no attachments.
+fn steering(id: u64, text: &str) -> SteerItem {
+    SteerItem { id, text: text.into(), attachments: Vec::new() }
 }
 
 /// An auto-approving gate: `run_command` runs without a card.
@@ -303,6 +327,7 @@ impl AgentTools for FakeTools {
         self.reached.lock().unwrap().push(name.to_string());
         match name {
             "get_cwd" => {
+                self.steer_now();
                 if let Some(cancel) = &self.cancel_on_cwd {
                     cancel.cancel();
                 }
@@ -1106,6 +1131,207 @@ fn the_model_call_cap_stops_the_turn_and_runs_nothing_after_it() {
     assert_eq!(last["role"], "tool");
     assert!(last["content"].as_str().unwrap().contains("model call limit"), "{last}");
     assert_paired(&msgs);
+}
+
+/// Runs one turn with `steer` as its mailbox (the caller opens it). `on_event` sees each event as it is emitted, so a test
+/// can steer at a given point. Returns every event, `Done` included.
+fn turn_steered(
+    agent: &mut LlmAgent,
+    tools: &dyn AgentTools,
+    steer: &Steer,
+    text: &str,
+    on_event: impl Fn(&AgentEvent),
+) -> Vec<AgentEvent> {
+    let gate = no_gate();
+    let log: Mutex<Vec<AgentEvent>> = Mutex::new(Vec::new());
+    let emit = |ev: AgentEvent| {
+        on_event(&ev);
+        log.lock().unwrap().push(ev);
+    };
+    let ctx = AgentCtx::new(tools, &gate, &emit).with_steer(steer);
+    agent::run_turn(agent, &UserMessage::text(text), &ctx);
+    log.into_inner().unwrap()
+}
+
+/// The ids and texts of the `steer_injected` events, in order.
+fn injections(events: &[AgentEvent]) -> Vec<(Vec<u64>, String)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::SteerInjected { ids, text, .. } => Some((ids.clone(), text.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_steer_during_a_call_skips_the_calls_after_it_and_goes_in_before_the_next_model_call() {
+    let provider = serve(vec![
+        Script::json(tool_reply(&[("call_1", "get_cwd", "{}"), ("call_2", "get_cwd", "{}")])),
+        Script::json(text_reply("changing course")),
+    ]);
+    let conv = Conversation::new().unwrap();
+    let steer = Arc::new(Steer::default());
+    steer.open();
+    let tools = FakeTools { steer_on_cwd: Some((steer.clone(), vec![(7, "change of plan")], SteerMode::All)), ..FakeTools::default() };
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
+    let events = turn_steered(&mut agent, &tools, &steer, "where am I", |_| {});
+
+    assert_eq!(tools.reached(), ["get_cwd"], "the call after the steer is not run");
+    assert_eq!(texts(&events), ["changing course"]);
+    assert_eq!(injections(&events), [(vec![7], "change of plan".to_string())]);
+    assert!(matches!(events.last(), Some(AgentEvent::Done)));
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let messages = body_of(&requests[1])["messages"].as_array().unwrap().clone();
+    assert_paired(&messages);
+    assert_eq!(tool_content(&messages, "call_1"), "box:/home/u", "the running call finished with its result");
+    assert_eq!(tool_content(&messages, "call_2"), STEER_SKIPPED);
+    assert_eq!(messages[messages.len() - 2]["tool_call_id"], "call_2", "the steer comes after the tool results");
+    assert_eq!(messages.last().unwrap(), &json!({"role": "user", "content": "change of plan"}), "no steer marker goes to the provider");
+    // `stored` is the wire copy, which leaves the marker out; the saved snapshot keeps it.
+    assert!(conv.history().lock().unwrap().snapshot().iter().any(|m| m["steer"] == json!(true)), "the steer is stored, marked");
+}
+
+#[test]
+fn a_steer_sent_during_a_plain_reply_is_answered_by_one_more_model_call() {
+    let provider = serve(vec![
+        Script::json(text_reply("first answer")),
+        Script::json(text_reply("answer to the steer")),
+    ]);
+    let conv = Conversation::new().unwrap();
+    let steer = Steer::default();
+    steer.open();
+    // The steer lands while the first reply is being shown, so it is waiting when the reply ends.
+    let fired = std::cell::Cell::new(false);
+    let events = turn_steered(&mut agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new())), &FakeTools::default(), &steer, "hello", |ev| {
+        if matches!(ev, AgentEvent::Text { .. }) && !fired.replace(true) {
+            steer.accept(steering(7, "also this"), SteerMode::All);
+        }
+    });
+
+    assert_eq!(texts(&events), ["first answer", "answer to the steer"]);
+    assert_eq!(injections(&events), [(vec![7], "also this".to_string())]);
+    assert!(matches!(events.last(), Some(AgentEvent::Done)));
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2, "the turn went on: one more model call");
+    let messages = body_of(&requests[1])["messages"].as_array().unwrap().clone();
+    assert_eq!(messages.last().unwrap(), &json!({"role": "user", "content": "also this"}));
+    assert_eq!(messages[messages.len() - 2]["content"], "first answer");
+    assert!(!steer.pending(), "nothing is left waiting");
+}
+
+#[test]
+fn mode_one_takes_one_waiting_steer_per_step() {
+    let provider = serve(vec![
+        Script::json(tool_reply(&[("call_1", "get_cwd", "{}")])),
+        Script::json(text_reply("reply to first")),
+        Script::json(text_reply("reply to second")),
+    ]);
+    let conv = Conversation::new().unwrap();
+    let steer = Arc::new(Steer::default());
+    steer.open();
+    let tools = FakeTools {
+        steer_on_cwd: Some((steer.clone(), vec![(7, "first"), (8, "second")], SteerMode::One)),
+        ..FakeTools::default()
+    };
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
+    let events = turn_steered(&mut agent, &tools, &steer, "start", |_| {});
+
+    assert_eq!(injections(&events), [(vec![7], "first".to_string()), (vec![8], "second".to_string())]);
+    assert_eq!(texts(&events), ["reply to first", "reply to second"]);
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    let last_of = |raw: &String| body_of(raw)["messages"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(last_of(&requests[1]), json!({"role": "user", "content": "first"}));
+    assert_eq!(last_of(&requests[2]), json!({"role": "user", "content": "second"}));
+}
+
+#[test]
+fn mode_all_takes_every_waiting_steer_as_one_message() {
+    let provider = serve(vec![
+        Script::json(tool_reply(&[("call_1", "get_cwd", "{}")])),
+        Script::json(text_reply("reply to both")),
+    ]);
+    let conv = Conversation::new().unwrap();
+    let steer = Arc::new(Steer::default());
+    steer.open();
+    let tools = FakeTools {
+        steer_on_cwd: Some((steer.clone(), vec![(7, "first"), (8, "second")], SteerMode::All)),
+        ..FakeTools::default()
+    };
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
+    let events = turn_steered(&mut agent, &tools, &steer, "start", |_| {});
+
+    assert_eq!(injections(&events), [(vec![7, 8], "first\n\nsecond".to_string())]);
+    assert_eq!(provider.requests().len(), 2);
+}
+
+#[test]
+fn a_cancelled_turn_leaves_its_waiting_steers_to_be_given_back() {
+    let provider = serve(vec![Script::json(tool_reply(&[("call_1", "get_cwd", "{}"), ("call_2", "get_cwd", "{}")]))]);
+    let conv = Conversation::new().unwrap();
+    let cancel = Arc::new(TurnCancel::new());
+    let steer = Arc::new(Steer::default());
+    steer.open();
+    let tools = FakeTools {
+        cancel_on_cwd: Some(cancel.clone()),
+        steer_on_cwd: Some((steer.clone(), vec![(7, "never sent")], SteerMode::All)),
+        ..FakeTools::default()
+    };
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, cancel);
+    let events = turn_steered(&mut agent, &tools, &steer, "start", |_| {});
+
+    assert_eq!(tools.reached(), ["get_cwd"], "the cancel stops the calls after the first");
+    assert!(injections(&events).is_empty());
+    assert_eq!(provider.requests().len(), 1, "no model call after a cancel");
+    // What the app does on a cancel and at the turn's end: the mailbox closes and gives back what waits.
+    let returned: Vec<u64> = steer.close_and_take().iter().map(|item| item.id).collect();
+    assert_eq!(returned, vec![7]);
+    assert!(!steer.accept(steering(8, "late"), SteerMode::All), "a closed mailbox refuses");
+    assert_paired(&stored(&conv.history()));
+}
+
+#[test]
+fn a_failed_turn_leaves_its_waiting_steers_to_be_given_back() {
+    let provider = serve(vec![Script::error("400 Bad Request", json!({"error": {"message": "no-such-model", "code": 400}}))]);
+    let conv = Conversation::new().unwrap();
+    let steer = Steer::default();
+    steer.open();
+    // The steer lands before the request is sent (the context usage event comes first), so the failing reply leaves it waiting.
+    let fired = std::cell::Cell::new(false);
+    let events = turn_steered(&mut agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new())), &FakeTools::default(), &steer, "hello", |ev| {
+        if matches!(ev, AgentEvent::ContextUsage(_)) && !fired.replace(true) {
+            steer.accept(steering(7, "waiting"), SteerMode::All);
+        }
+    });
+
+    assert!(injections(&events).is_empty());
+    assert!(matches!(events.last(), Some(AgentEvent::Done)));
+    let returned: Vec<u64> = steer.close_and_take().iter().map(|item| item.id).collect();
+    assert_eq!(returned, vec![7]);
+}
+
+#[test]
+fn a_steer_does_not_lift_the_model_call_cap() {
+    let scripts: Vec<Script> = (1..=(MAX_MODEL_CALLS + 1))
+        .map(|n| Script::json(tool_reply(&[(&format!("call_{n}"), "get_cwd", "{}")])))
+        .collect();
+    let provider = serve(scripts);
+    let conv = Conversation::new().unwrap();
+    let steer = Arc::new(Steer::default());
+    steer.open();
+    let tools = FakeTools { steer_on_cwd: Some((steer.clone(), vec![(7, "keep going")], SteerMode::All)), ..FakeTools::default() };
+    let mut agent = agent_for(&settings(&provider.url, false), &conv, Arc::new(TurnCancel::new()));
+    let events = turn_steered(&mut agent, &tools, &steer, "keep looking", |_| {});
+
+    assert_eq!(injections(&events).len(), 1, "the steer went in once");
+    assert_eq!(provider.requests().len(), MAX_MODEL_CALLS + 1, "the steer's model call counts against the cap");
+    assert_eq!(
+        texts(&events),
+        [format!("I stopped after {MAX_MODEL_CALLS} model calls in one turn. The limit can be changed in Settings > Limits.")]
+    );
+    assert_paired(&stored(&conv.history()));
 }
 
 /// One of the agent's own commands, open and on top, as the observer reports it while it runs.
