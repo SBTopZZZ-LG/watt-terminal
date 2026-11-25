@@ -256,26 +256,27 @@ function fnv1a(text: string): string {
 }
 
 /**
- * A signature of the conversation's tail: the number of user and agent messages, and the text of the last agent message
- * (trimmed, hashed with its length). Only those count, so the live transcript (which also holds notices, tool rows and
- * streamed items) and the one rebuilt from the saved messages (itemsFromMessages) give the same value for the same chat.
- * Blank agent text is not a message on either side.
+ * A signature of the conversation's tail: the user messages sent since the last agent message, and the text of that agent
+ * message (trimmed, hashed with its length). Only those count, so the live transcript (which also holds notices, tool rows
+ * and streamed items) and the one rebuilt from the saved messages (itemsFromMessages) give the same value for the same chat.
+ * Blank agent text is not a message on either side. The count stops at the last agent message, not at the start, so
+ * older messages loaded by paging (see transcriptPaging.ts) do not change it.
  */
 export function transcriptSig(items: readonly SigItem[]): string {
-  let count = 0;
+  let since = 0;
   let last: string | null = null;
   for (const item of items) {
     if (item.kind === 'user') {
-      count += 1;
+      since += 1;
     } else if (item.kind === 'agent' && typeof item.text === 'string' && item.text.trim() !== '') {
-      count += 1;
+      since = 0;
       last = item.text.trim();
     }
   }
   if (last === null) {
-    return `${count}:-`;
+    return `${since}:-`;
   }
-  return `${count}:${last.length}:${fnv1a(last)}`;
+  return `${since}:${last.length}:${fnv1a(last)}`;
 }
 
 // ---- storage-level operations (used by the UI) ----

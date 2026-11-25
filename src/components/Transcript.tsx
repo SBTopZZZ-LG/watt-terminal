@@ -3,6 +3,7 @@ import type { MouseEvent, ReactNode, UIEvent, WheelEvent } from 'react';
 import { isFileWrite, previewText } from '../lib/approvalCard';
 import { copyText } from '../lib/clipboard';
 import { isAtBottom, shouldFollowAfterSend } from '../lib/stickScroll';
+import { keptTop, needsFill, wantsOlder } from '../lib/transcriptPaging';
 import { activityLabel, approvalTitle } from '../lib/transcript';
 import type { TranscriptItem, UserAttachment } from '../lib/transcript';
 import type { QuestionAnswerInput, ThinkingMode, TodoItem } from '../lib/types';
@@ -57,6 +58,10 @@ interface Props {
   banner?: ReactNode;
   /** How reasoning blocks show (the Reasoning setting). Defaults to auto. */
   thinkingMode?: ThinkingMode;
+  /** A loaded conversation has older messages not shown yet (see transcriptPaging.ts). */
+  hasOlder?: boolean;
+  /** Loads the next older chunk, above the items. Asked for on an upward scroll near the top, and while the view has nothing to scroll. */
+  onLoadOlder?: () => void;
 }
 
 /** The agent conversation, docked above the input bar. Collapsible, scrollable, and capped by CSS. */
@@ -78,6 +83,8 @@ export function Transcript({
   history,
   banner = null,
   thinkingMode = 'auto',
+  hasOlder = false,
+  onLoadOlder,
 }: Props) {
   const bodyRef = useRef<HTMLDivElement>(null);
   const sectionRef = useRef<HTMLElement>(null);
@@ -93,6 +100,20 @@ export function Transcript({
   const [showJump, setShowJump] = useState(false);
   /** The chat body is on screen. Switching to the history view and back remounts it, like closing and opening the panel. */
   const bodyShown = chatBodyShown(open, view);
+  /**
+   * The body's scroll as it was when an older chunk was asked for, until that chunk is in. The chunk is added above the view,
+   * so the layout effect below moves the view down by the growth, in the same frame as the change (no visible jump).
+   */
+  const pendingPrepend = useRef<{ top: number; height: number } | null>(null);
+
+  /** Asks the reducer for the next older chunk, after taking the scroll state it is held against. */
+  const requestOlder = (body: HTMLDivElement) => {
+    if (onLoadOlder === undefined) {
+      return;
+    }
+    pendingPrepend.current = { top: body.scrollTop, height: body.scrollHeight };
+    onLoadOlder();
+  };
 
   // The part above the body (the header and the banners) in px, published as --transcript-chrome. In a sized panel the transcript's
   // least size is this plus the body's floor (App.css), so the floor holds and the body is never clipped. With no body on screen
@@ -146,12 +167,24 @@ export function Transcript({
     const body = bodyRef.current;
     if (!body) {
       shownBody.current = null;
+      pendingPrepend.current = null;
       return;
     }
     if (body !== shownBody.current) {
       shownBody.current = body;
       following.current = true;
       setShowJump(false);
+      pendingPrepend.current = null;
+    }
+    // The items change this commit is the older chunk asked for (nothing else changes the items while it is pending). Scrolled
+    // up, the view keeps its content; following the bottom, the snap below keeps it there.
+    const pending = pendingPrepend.current;
+    if (pending !== null) {
+      pendingPrepend.current = null;
+      if (!following.current) {
+        body.scrollTop = keptTop(pending, body.scrollHeight);
+        lastTop.current = body.scrollTop;
+      }
     }
     if (shouldFollowAfterSend(prev, last)) {
       following.current = true;
@@ -159,6 +192,11 @@ export function Transcript({
     if (following.current) {
       body.scrollTop = body.scrollHeight;
       lastTop.current = body.scrollTop;
+    }
+    // Content that does not fill the view has nothing to scroll, so the next older chunk goes in. One per commit: it ends
+    // when the content fills the view or no older messages are left.
+    if (hasOlder && pendingPrepend.current === null && needsFill(body)) {
+      requestOlder(body);
     }
   }, [items, bodyShown]);
 
@@ -194,6 +232,9 @@ export function Transcript({
       following.current = false;
     }
     setShowJump(!following.current);
+    if (wantsOlder({ movedUp, top, hasOlder, pending: pendingPrepend.current !== null })) {
+      requestOlder(el);
+    }
   };
 
   // Catches a wheel up before the scroll it causes is handled, so a streamed delta in between cannot pull the view down.

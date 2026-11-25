@@ -31,12 +31,11 @@ import type { AgentRequest, IntegratePhase } from './lib/integrate';
 import { useSettledStrip } from './lib/stripSettle';
 import { agentControlAfter, borderActive, borderLevel, NO_CONTROL, settleControl } from './lib/agentControl';
 import type { AgentControl, BorderLevel } from './lib/agentControl';
-import { EMPTY_TRANSCRIPT, firstPendingApproval, isBusy, transcriptReducer } from './lib/transcript';
+import { EMPTY_TRANSCRIPT, firstPendingApproval, hasOlder, isBusy, transcriptReducer } from './lib/transcript';
 import type { TranscriptItem } from './lib/transcript';
 import { chatBodyShown, loadPanelLayout, panelReducer, panelView, savePanelLayout } from './lib/panelLayout';
 import type { Container } from './lib/panelLayout';
 import { defaultSizeStorage } from './lib/zoom';
-import { itemsFromMessages } from './lib/historyView';
 import { agentActivity } from './lib/agentActivity';
 import { userAttachments } from './lib/attachments';
 import { defaultModelVision } from './lib/modelVision';
@@ -509,7 +508,7 @@ export default function App() {
           return;
         }
         epoch.current += 1;
-        dispatchTranscript({ type: 'conversation_loaded', items: itemsFromMessages(loaded.messages), todos: loaded.todos, context: loaded.context });
+        dispatchTranscript({ type: 'conversation_loaded', messages: loaded.messages, todos: loaded.todos, context: loaded.context });
         setConversationId(loaded.id);
       } catch {
         if (transcriptRef.current.items.length === 0) {
@@ -1117,7 +1116,7 @@ export default function App() {
   const applyLoaded = (loaded: LoadedConversation) => {
     epoch.current += 1;
     clearQueue();
-    dispatchTranscript({ type: 'conversation_loaded', items: itemsFromMessages(loaded.messages), todos: loaded.todos, context: loaded.context });
+    dispatchTranscript({ type: 'conversation_loaded', messages: loaded.messages, todos: loaded.todos, context: loaded.context });
     setConversationId(loaded.id);
     setPanelBody('chat');
     refreshStatus();
@@ -1454,7 +1453,7 @@ export default function App() {
       }
       epoch.current += 1;
       clearQueue();
-      dispatchTranscript({ type: 'conversation_loaded', items: itemsFromMessages(loaded.messages), todos: loaded.todos, context: loaded.context });
+      dispatchTranscript({ type: 'conversation_loaded', messages: loaded.messages, todos: loaded.todos, context: loaded.context });
       setConversationId(loaded.id);
       setPanelBody('chat');
       setFocusToken((t) => t + 1);
@@ -1850,6 +1849,8 @@ export default function App() {
               busy={busy}
               thinking={transcript.thinking}
               thinkingMode={thinkingMode}
+              hasOlder={hasOlder(transcript)}
+              onLoadOlder={() => dispatchTranscript({ type: 'older_loaded' })}
               approvalPending={pendingApproval !== null}
               open={panel.open}
               onToggle={() => dispatchPanel({ type: 'toggle' })}
