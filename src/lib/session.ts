@@ -1,11 +1,11 @@
-// The one connection to the Rust session: its two channels, the listeners for events, and the nonce.
+// The one connection to the Rust session: its shell channels, the chat's agent channel, the listeners for events, and the nonce.
 //
 // connect() is memoised. React StrictMode mounts effects twice, and a second start_session would only swap
 // channels, so the first connection is kept for the page's lifetime. Nothing here kills the session: the Rust side
 // does that on exit.
 
 import { Channel } from '@tauri-apps/api/core';
-import { api, errorText } from './api';
+import { api, CHAT_ID, errorText } from './api';
 import type { StartResult, WireEvent } from './types';
 
 export type Incoming = { kind: 'event'; event: WireEvent } | { kind: 'error'; message: string };
@@ -89,11 +89,18 @@ function open(
       emit({ kind: 'event', event });
     }
   });
-  return call(rows, cols, data, events).then((result) => {
-    if (gen === generation) {
-      // A new shell has only its own nonce. The status read after the connect adds any nested levels still alive.
-      setSessionNonces([result.nonce]);
-    }
-    return result;
+  // The agent's events come on their own channel, attached to the chat. They belong to the chat, not the shell, so this
+  // channel is not checked against the generation: a restart does not drop them. Both channels feed the same listeners.
+  const agent = new Channel<WireEvent>((event) => {
+    emit({ kind: 'event', event });
   });
+  return call(rows, cols, data, events)
+    .then((result) => api.attachChat(CHAT_ID, agent).then(() => result))
+    .then((result) => {
+      if (gen === generation) {
+        // A new shell has only its own nonce. The status read after the connect adds any nested levels still alive.
+        setSessionNonces([result.nonce]);
+      }
+      return result;
+    });
 }

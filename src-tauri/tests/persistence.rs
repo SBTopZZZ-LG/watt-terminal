@@ -220,6 +220,7 @@ fn finish(
         cwd,
         in_turn: false,
         context: None,
+        remember: true,
     };
     let env = TurnEnv { local_host: "this-mac", home: None };
     save_turn(persist, turn, agent.redactor(), env, now).expect("save succeeds")
@@ -404,6 +405,7 @@ fn a_turn_saved_over_a_damaged_conversation_file_goes_through_and_is_listed() {
         cwd: None,
         in_turn: false,
         context: None,
+        remember: true,
     };
     let env = TurnEnv { local_host: "this-mac", home: None };
     let saved = save_turn(&persist, turn, &Redactor::new(Vec::new()), env, 9).expect("save succeeds").expect("saved");
@@ -551,6 +553,7 @@ fn new_conversation_clears_the_todo_list_and_the_saved_copy_keeps_its_own() {
         cwd: None,
         in_turn: false,
         context: None,
+        remember: true,
     };
     save_turn(&persist, turn, &Redactor::new(Vec::new()), TurnEnv { local_host: "this-mac", home: None }, 4).unwrap();
 
@@ -656,6 +659,7 @@ fn recording_checkpoint(persist: &Arc<Persist>, conv: &Conversation) -> (impl Fn
             cwd: None,
             in_turn: true,
             context: None,
+            remember: true,
         };
         let env = TurnEnv { local_host: "this-mac", home: None };
         save_turn(&persist, turn, redactor, env, 10).expect("the checkpoint saves");
@@ -729,6 +733,7 @@ fn a_turn_cut_short_by_a_crash_resumes_with_the_interrupted_note() {
             cwd: None,
             in_turn: true,
             context: None,
+            remember: true,
         };
     save_turn(&persist, turn, &Redactor::new(Vec::new()), TurnEnv { local_host: "this-mac", home: None }, 1).unwrap();
 

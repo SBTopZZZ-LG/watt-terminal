@@ -16,19 +16,19 @@ describe('api.agentMessage', () => {
 
   it('a text-only send is the same call as before: no attachments field', () => {
     void api.agentMessage('hello');
-    expect(invoke).toHaveBeenCalledWith('agent_message', { sessionId: 'main', text: 'hello' });
+    expect(invoke).toHaveBeenCalledWith('agent_message', { chatId: 'main', text: 'hello' });
     const args = invoke.mock.calls[0][1] ?? {};
     expect(args).not.toHaveProperty('attachments');
   });
 
   it('an empty attachments list leaves the field out too', () => {
     void api.agentMessage('hello', []);
-    expect(invoke.mock.calls[0][1]).toEqual({ sessionId: 'main', text: 'hello' });
+    expect(invoke.mock.calls[0][1]).toEqual({ chatId: 'main', text: 'hello' });
   });
 
   it('attachments are sent as given, with the text (which may be empty)', () => {
     void api.agentMessage('', [IMAGE]);
-    expect(invoke).toHaveBeenCalledWith('agent_message', { sessionId: 'main', text: '', attachments: [IMAGE] });
+    expect(invoke).toHaveBeenCalledWith('agent_message', { chatId: 'main', text: '', attachments: [IMAGE] });
   });
 
   it('the transcript-only sha256 of an image is not sent', () => {
@@ -45,7 +45,7 @@ describe('api.getAttachment', () => {
   it('asks the session for the stored image by its address and type', () => {
     const sha = 'f'.repeat(64);
     void api.getAttachment(sha, 'image/png');
-    expect(invoke).toHaveBeenCalledWith('get_attachment', { sessionId: 'main', sha256: sha, mime: 'image/png' });
+    expect(invoke).toHaveBeenCalledWith('get_attachment', { chatId: 'main', sha256: sha, mime: 'image/png' });
   });
 });
 
@@ -54,7 +54,7 @@ describe('api.steerMessage and api.withdrawSteer', () => {
 
   it('a text-only steer sends the id, the text and the queue mode, with no attachments field', () => {
     void api.steerMessage(4, 'hello', [], 'one');
-    expect(invoke).toHaveBeenCalledWith('steer_message', { sessionId: 'main', id: 4, text: 'hello', mode: 'one' });
+    expect(invoke).toHaveBeenCalledWith('steer_message', { chatId: 'main', id: 4, text: 'hello', mode: 'one' });
     expect(invoke.mock.calls[0][1]).not.toHaveProperty('attachments');
   });
 
@@ -72,7 +72,7 @@ describe('api.steerMessage and api.withdrawSteer', () => {
 
   it('withdrawSteer asks the session to take the message back by its id', () => {
     void api.withdrawSteer(6);
-    expect(invoke).toHaveBeenCalledWith('withdraw_steer', { sessionId: 'main', id: 6 });
+    expect(invoke).toHaveBeenCalledWith('withdraw_steer', { chatId: 'main', id: 6 });
   });
 });
 
@@ -91,7 +91,7 @@ describe('api.answerQuestions', () => {
   it('answers the waiting question with its call id and answers', () => {
     const answers = [{ question_id: 'q1', selected: [0], skipped: false }];
     void api.answerQuestions('call-1', answers);
-    expect(invoke).toHaveBeenCalledWith('answer_questions', { sessionId: 'main', callId: 'call-1', answers });
+    expect(invoke).toHaveBeenCalledWith('answer_questions', { chatId: 'main', callId: 'call-1', answers });
   });
 });
 
@@ -120,12 +120,12 @@ describe('api side commands', () => {
 
   it('askBtw sends the question text', () => {
     void api.askBtw('why did this fail?');
-    expect(invoke).toHaveBeenCalledWith('ask_btw', { sessionId: 'main', text: 'why did this fail?' });
+    expect(invoke).toHaveBeenCalledWith('ask_btw', { chatId: 'main', text: 'why did this fail?' });
   });
 
   it('suggestPrompts takes no arguments and asks for the suggestions', () => {
     void api.suggestPrompts();
-    expect(invoke).toHaveBeenCalledWith('suggest_prompts', { sessionId: 'main' });
+    expect(invoke).toHaveBeenCalledWith('suggest_prompts', { chatId: 'main' });
   });
 
   it('focusMainWindow takes no arguments and asks the backend to bring the window forward', () => {
@@ -140,17 +140,17 @@ describe('api side commands', () => {
 
   it('compactConversation takes no arguments', () => {
     void api.compactConversation();
-    expect(invoke).toHaveBeenCalledWith('compact_conversation', { sessionId: 'main' });
+    expect(invoke).toHaveBeenCalledWith('compact_conversation', { chatId: 'main' });
   });
 
   it('forkConversation takes no arguments', () => {
     void api.forkConversation();
-    expect(invoke).toHaveBeenCalledWith('fork_conversation', { sessionId: 'main' });
+    expect(invoke).toHaveBeenCalledWith('fork_conversation', { chatId: 'main' });
   });
 
   it('exportConversation asks for the live conversation as Markdown', () => {
     void api.exportConversation();
-    expect(invoke).toHaveBeenCalledWith('export_conversation', { sessionId: 'main' });
+    expect(invoke).toHaveBeenCalledWith('export_conversation', { chatId: 'main' });
   });
 });
 
@@ -209,7 +209,7 @@ describe('api skills commands', () => {
 
   it('listSkills passes the session id; the backend picks the project folders from the session', () => {
     void api.listSkills();
-    expect(invoke).toHaveBeenLastCalledWith('list_skills', { sessionId: 'main' });
+    expect(invoke).toHaveBeenLastCalledWith('list_skills', { chatId: 'main' });
   });
 
   it('setSkillsSettings sends the folders (null for the defaults), the switched-off names and the approval levels as one input', () => {
@@ -252,5 +252,37 @@ describe('api.setAgentSettings', () => {
     expect(invoke).toHaveBeenCalledWith('set_agent_settings', { input: { on_denied: 'stop' } });
     void api.setAgentSettings({ on_denied: 'continue' });
     expect(invoke).toHaveBeenLastCalledWith('set_agent_settings', { input: { on_denied: 'continue' } });
+  });
+});
+
+describe('api tab and chat commands', () => {
+  beforeEach(() => invoke.mockClear());
+
+  it('a terminal is closed by its session id', () => {
+    void api.closeSession('t2');
+    expect(invoke).toHaveBeenCalledWith('close_session', { sessionId: 't2' });
+  });
+
+  it('a title is sent as given, null clears it', () => {
+    void api.setTabTitle('main', 'npm test');
+    expect(invoke).toHaveBeenLastCalledWith('set_tab_title', { sessionId: 'main', title: 'npm test' });
+    void api.setTabTitle('main', null);
+    expect(invoke).toHaveBeenLastCalledWith('set_tab_title', { sessionId: 'main', title: null });
+  });
+
+  it('a terminal is assigned to a chat by both ids', () => {
+    void api.assignTab('c1', 'main', true);
+    expect(invoke).toHaveBeenCalledWith('assign_tab_cmd', { chatId: 'c1', sessionId: 'main', on: true });
+  });
+
+  it('a chat is created, closed and listed, and terminals are listed', () => {
+    void api.createChat();
+    expect(invoke).toHaveBeenLastCalledWith('create_chat', undefined);
+    void api.closeChat('c1');
+    expect(invoke).toHaveBeenLastCalledWith('close_chat', { chatId: 'c1' });
+    void api.listChats();
+    expect(invoke).toHaveBeenLastCalledWith('list_chats', undefined);
+    void api.listTabs();
+    expect(invoke).toHaveBeenLastCalledWith('list_tabs', undefined);
   });
 });

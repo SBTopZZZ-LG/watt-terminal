@@ -201,6 +201,23 @@ export interface StartResult {
   nonce: string;
 }
 
+/** A terminal as `list_tabs` gives it. `owner` is the chat it belongs to, or null when no chat sees it. */
+export interface TabInfo {
+  id: string;
+  owner: string | null;
+  state: InputState;
+  nonce: string;
+  title: string | null;
+}
+
+/** A chat as `list_chats` gives it. `tabs` are the ids of its terminals, oldest first. */
+export interface ChatInfo {
+  id: string;
+  conversation_id: string;
+  busy: boolean;
+  tabs: string[];
+}
+
 export interface SessionStats {
   forged_events: number;
   /** Tagged events from popped shell levels. Optional so an older status payload still type-checks. */
