@@ -325,6 +325,20 @@ export function InputBar(props: Props) {
     </div>
   );
 
+  // Queued messages the app took back (a Stop, a restart) come into the input here. Runs once per tick.
+  const restoreSeen = useRef(props.restoreTick ?? 0);
+  useEffect(() => {
+    const tick = props.restoreTick ?? 0;
+    if (tick === restoreSeen.current) {
+      return;
+    }
+    restoreSeen.current = tick;
+    const items = props.takeReturned?.() ?? [];
+    if (items.length > 0) {
+      restoreQueued(items);
+    }
+  }, [props.restoreTick]);
+
   if (mode === 'exited') {
     return (
       <div className="bar bar-exited">
@@ -431,20 +445,6 @@ export function InputBar(props: Props) {
     setError(null);
     setRestoreToken((t) => t + 1);
   }
-
-  // Queued messages the app took back (a Stop, a restart) come into the input here. Runs once per tick.
-  const restoreSeen = useRef(props.restoreTick ?? 0);
-  useEffect(() => {
-    const tick = props.restoreTick ?? 0;
-    if (tick === restoreSeen.current) {
-      return;
-    }
-    restoreSeen.current = tick;
-    const items = props.takeReturned?.() ?? [];
-    if (items.length > 0) {
-      restoreQueued(items);
-    }
-  }, [props.restoreTick]);
 
   /** Takes a menu row: the text becomes `/name` (plus a space when it takes arguments) and the menu shuts, so it does not reopen for the new text. */
   function acceptItem(item: CommandMenuItem) {
