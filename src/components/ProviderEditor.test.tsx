@@ -2,8 +2,16 @@ import { describe, expect, it } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { ProviderEditor, ProviderEditorFoot } from './ProviderEditor';
 import type { ProviderEditorProps, TestState } from './ProviderEditor';
-import { draftFromPreset, draftFromProvider, draftNew, newHeaderDraft, renameHeader, toggleSecret } from '../lib/settingsForm';
-import type { DraftProblems, ProviderDraft, VariantDraft } from '../lib/settingsForm';
+import {
+  draftFromPreset,
+  draftFromProvider,
+  draftNew,
+  emptySampling,
+  newHeaderDraft,
+  renameHeader,
+  toggleSecret,
+} from '../lib/settingsForm';
+import type { DraftProblems, ProviderDraft, SamplingDraft, VariantDraft } from '../lib/settingsForm';
 import type { Provider } from '../lib/types';
 
 const PROVIDER: Provider = {
@@ -336,7 +344,7 @@ describe('ProviderEditor: models', () => {
   });
 
   it('a model id is shown as text, not markup', () => {
-    const d = { ...SAVED, models: [{ id: '<b>x</b>', source: 'custom' as const, context_limit: '', provider_context: null, variants: [] }] };
+    const d = { ...SAVED, models: [{ id: '<b>x</b>', source: 'custom' as const, context_limit: '', provider_context: null, variants: [], sampling: emptySampling() }] };
     const out = html({ draft: d, saved: d });
     expect(out).toContain('&lt;b&gt;x&lt;/b&gt;');
     expect(out).not.toContain('<b>x</b>');
@@ -572,5 +580,46 @@ describe('ProviderEditor: variants', () => {
     const out = html({ draft: d, saved: d });
     expect(out).not.toContain('<img src=x>');
     expect(out).toContain('&lt;img src=x&gt;');
+  });
+});
+
+describe('ProviderEditor: sampling parameters', () => {
+  /** The clean saved draft with the first model's parameter inputs set. */
+  function withParams(sampling: Partial<SamplingDraft>): ProviderDraft {
+    return { ...SAVED, models: [{ ...SAVED.models[0], sampling: { ...emptySampling(), ...sampling } }, SAVED.models[1]] };
+  }
+
+  it('each model has a collapsible Parameters section that shows the provider note and six fields', () => {
+    const out = html();
+    expect(out).toContain('<details class="settings-params"><summary>Parameters</summary>');
+    expect(out).toContain(
+      "Providers may ignore or reject parameters their model doesn&#x27;t support. Leave a field empty to use the model&#x27;s default.",
+    );
+    for (const label of ['Temperature', 'Top P', 'Top K', 'Frequency penalty', 'Presence penalty', 'Seed']) {
+      expect(inputLabelled(out, `${label} for big/one`), label).toContain('placeholder="default"');
+      expect(inputLabelled(out, `${label} for mini`), label).toContain('placeholder="default"');
+    }
+  });
+
+  it('a saved parameter is shown as its text, and an empty one as an empty field', () => {
+    const out = html({ draft: withParams({ temperature: '0.7' }), saved: withParams({ temperature: '0.7' }) });
+    expect(inputLabelled(out, 'Temperature for big/one')).toContain('value="0.7"');
+    expect(inputLabelled(out, 'Seed for big/one')).toContain('value=""');
+  });
+
+  it('the parameter fields are disabled while the editor is locked', () => {
+    const out = html({ locked: true });
+    expect(inputLabelled(out, 'Temperature for big/one')).toContain('disabled=""');
+    expect(inputLabelled(out, 'Seed for mini')).toContain('disabled=""');
+  });
+
+  it('a parameter problem is shown under its model', () => {
+    const d = withParams({ temperature: '3' });
+    const problems: DraftProblems = {
+      ...NO_PROBLEMS,
+      models: { 'big/one': 'Temperature must be a number from 0 to 2.' },
+    };
+    const out = html({ draft: d, saved: null, problems });
+    expect(out).toContain('<span class="settings-error">Temperature must be a number from 0 to 2.</span>');
   });
 });

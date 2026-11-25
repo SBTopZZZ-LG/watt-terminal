@@ -431,6 +431,18 @@ export interface Model {
   source: ModelSource;
   /** The model's variants. Absent or empty when it has none. */
   variants?: ModelVariant[];
+  /** The model's sampling parameters. Absent when none is set; a field that is not set is absent too. */
+  sampling?: Sampling;
+}
+
+/** Optional sampling parameters of a model. Each set field is sent as the body key of the same name. Ranges: see settingsForm. */
+export interface Sampling {
+  temperature?: number;
+  top_p?: number;
+  top_k?: number;
+  frequency_penalty?: number;
+  presence_penalty?: number;
+  seed?: number;
 }
 
 export interface Provider {

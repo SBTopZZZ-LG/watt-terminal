@@ -6,6 +6,7 @@ import {
   draftFromProvider,
   draftNew,
   effectiveVariants,
+  emptySampling,
   fetchSummaryText,
   hasProblems,
   hostChangeNotice,
@@ -31,7 +32,7 @@ import {
   withId,
   withName,
 } from './settingsForm';
-import type { ProviderDraft, VariantDraft } from './settingsForm';
+import type { ProviderDraft, SamplingDraft, VariantDraft } from './settingsForm';
 import type { Model, Provider, ProviderPreset, Settings } from './types';
 
 const SAVED: Provider = {
@@ -189,7 +190,7 @@ describe('preset and new drafts', () => {
     expect(isDirty({ ...start, chat_url: 'https://openrouter.ai/api/v2/chat/completions' }, start)).toBe(true);
     expect(isDirty({ ...start, apiKey: 'sk-live' }, start)).toBe(true);
     expect(isDirty({ ...start, headers: [...start.headers, newHeaderDraft()] }, start)).toBe(true);
-    expect(isDirty({ ...start, models: [{ id: 'gpt', source: 'custom', context_limit: '', provider_context: null, variants: [] }] }, start)).toBe(
+    expect(isDirty({ ...start, models: [{ id: 'gpt', source: 'custom', context_limit: '', provider_context: null, variants: [], sampling: emptySampling() }] }, start)).toBe(
       true,
     );
   });
@@ -426,7 +427,7 @@ describe('validateDraft', () => {
 
   it('model ids are listed once, and a context limit must be blank or a positive whole number', () => {
     const d = saved();
-    d.models.push({ id: 'mini', source: 'custom', context_limit: '', provider_context: null, variants: [] });
+    d.models.push({ id: 'mini', source: 'custom', context_limit: '', provider_context: null, variants: [], sampling: emptySampling() });
     d.models[0].context_limit = '0';
     const p = validateDraft(d, []);
     expect(p.models.mini).toBe('Model "mini" is listed more than once.');
@@ -959,5 +960,79 @@ describe('hostChangeNotice', () => {
     const d = saved();
     d.chat_url = 'not a url';
     expect(hostChangeNotice(saved(), d, true)).toBeNull();
+  });
+});
+
+describe('sampling parameters', () => {
+  /** The saved provider's draft with the first model's sampling inputs set to the given text. */
+  function draftWithSampling(sampling: Partial<SamplingDraft>): ProviderDraft {
+    const d = saved();
+    return { ...d, models: [{ ...d.models[0], sampling: { ...emptySampling(), ...sampling } }, d.models[1]] };
+  }
+
+  it('a model without parameters is read as blank inputs and writes no sampling key', () => {
+    const d = saved();
+    expect(d.models[0].sampling).toEqual(emptySampling());
+    const input = buildSaveInput(d);
+    expect(input.provider.models[0]).not.toHaveProperty('sampling');
+    expect(JSON.stringify(input)).not.toContain('sampling');
+  });
+
+  it('saved parameters are read as text, and the unset ones stay blank', () => {
+    const provider: Provider = {
+      ...SAVED,
+      models: [{ ...SAVED.models[0], sampling: { temperature: 0.7, top_k: 40 } }, SAVED.models[1]],
+    };
+    const d = draftFromProvider(provider, PRESENT);
+    expect(d.models[0].sampling).toEqual({ ...emptySampling(), temperature: '0.7', top_k: '40' });
+  });
+
+  it('a saved parameter survives a load and a save unchanged', () => {
+    const sampling = { temperature: 0.7, top_p: 0.9, top_k: 0, frequency_penalty: -0.5, presence_penalty: 2, seed: 9007199254740991 };
+    const provider: Provider = { ...SAVED, models: [{ ...SAVED.models[0], sampling }, SAVED.models[1]] };
+    expect(buildSaveInput(draftFromProvider(provider, PRESENT)).provider.models[0].sampling).toEqual(sampling);
+  });
+
+  it('a save sends only the set parameters, as numbers, and zero counts as set', () => {
+    const input = buildSaveInput(draftWithSampling({ temperature: ' 0.7 ', seed: '42', top_k: '0' }));
+    expect(input.provider.models[0].sampling).toEqual({ temperature: 0.7, top_k: 0, seed: 42 });
+    expect(input.provider.models[1]).not.toHaveProperty('sampling');
+  });
+
+  it('a parameter typed into a model makes the provider dirty', () => {
+    expect(isDirty(draftWithSampling({ temperature: '0.5' }), saved())).toBe(true);
+  });
+
+  it('the range edges are valid', () => {
+    const edges = draftWithSampling({
+      temperature: '0',
+      top_p: '1',
+      top_k: '0',
+      frequency_penalty: '-2',
+      presence_penalty: '2',
+      seed: '9007199254740991',
+    });
+    expect(validateDraft(edges, []).models).toEqual({});
+    expect(validateDraft(draftWithSampling({ temperature: '2', top_p: '0', seed: '-9007199254740991' }), []).models).toEqual({});
+  });
+
+  it('a value out of range or not a number is refused, and the message names the parameter', () => {
+    const cases: [Partial<SamplingDraft>, string][] = [
+      [{ temperature: '2.5' }, 'Temperature must be a number from 0 to 2.'],
+      [{ temperature: 'hot' }, 'Temperature must be a number.'],
+      [{ temperature: '1e3' }, 'Temperature must be a number.'],
+      [{ temperature: 'Infinity' }, 'Temperature must be a number.'],
+      [{ top_p: '1.01' }, 'Top P must be a number from 0 to 1.'],
+      [{ frequency_penalty: '-3' }, 'Frequency penalty must be a number from -2 to 2.'],
+      [{ presence_penalty: '2.1' }, 'Presence penalty must be a number from -2 to 2.'],
+      [{ top_k: '1.5' }, 'Top K must be a whole number.'],
+      [{ top_k: '-1' }, 'Top K must be a whole number from 0 to 9007199254740991.'],
+      [{ seed: '9007199254740993' }, 'Seed must be a whole number from -9007199254740991 to 9007199254740991.'],
+    ];
+    for (const [sampling, message] of cases) {
+      const problems = validateDraft(draftWithSampling(sampling), []);
+      expect(problems.models['big/one'], JSON.stringify(sampling)).toBe(message);
+      expect(hasProblems(problems), JSON.stringify(sampling)).toBe(true);
+    }
   });
 });

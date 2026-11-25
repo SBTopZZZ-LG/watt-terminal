@@ -314,6 +314,45 @@ pub struct HeaderEntry {
     pub previous_name: Option<String>,
 }
 
+/// A model's sampling parameters: top-level body keys sent with every main-agent request to it (see `resolve`). A field
+/// that is `None` is not sent, so the provider's default applies. Ranges are checked by `validate_sampling`.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct Sampling {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<i64>,
+}
+
+impl Sampling {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The body keys this sets. An unset field is not a key.
+    pub fn overlay(&self) -> serde_json::Map<String, serde_json::Value> {
+        [
+            ("temperature", self.temperature.map(serde_json::Value::from)),
+            ("top_p", self.top_p.map(serde_json::Value::from)),
+            ("top_k", self.top_k.map(serde_json::Value::from)),
+            ("frequency_penalty", self.frequency_penalty.map(serde_json::Value::from)),
+            ("presence_penalty", self.presence_penalty.map(serde_json::Value::from)),
+            ("seed", self.seed.map(serde_json::Value::from)),
+        ]
+        .into_iter()
+        .filter_map(|(key, value)| value.map(|value| (key.to_string(), value)))
+        .collect()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Model {
     pub id: String,
@@ -331,6 +370,9 @@ pub struct Model {
     /// The model's variants. Left out of the file when empty, so a file from before variants is written as before.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub variants: Vec<ModelVariant>,
+    /// The model's sampling parameters. Left out of the file when none is set, so a file from before them is written as before.
+    #[serde(default, skip_serializing_if = "Sampling::is_empty")]
+    pub sampling: Sampling,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -571,6 +613,37 @@ fn validate_model(label: &str, model: &Model, problems: &mut Vec<String>) {
                 variant.id
             ));
         }
+    }
+    validate_sampling(&model_label, &model.sampling, problems);
+}
+
+/// The largest integer a JavaScript number holds exactly. The settings UI cannot send a seed or top_k beyond it.
+const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
+
+/// Checks the ranges of a model's sampling parameters. A non-finite number fails its range check.
+fn validate_sampling(model_label: &str, sampling: &Sampling, problems: &mut Vec<String>) {
+    let floats = [
+        ("temperature", sampling.temperature, 0.0, 2.0),
+        ("top_p", sampling.top_p, 0.0, 1.0),
+        ("frequency_penalty", sampling.frequency_penalty, -2.0, 2.0),
+        ("presence_penalty", sampling.presence_penalty, -2.0, 2.0),
+    ];
+    for (name, value, min, max) in floats {
+        if let Some(value) = value
+            && !(value.is_finite() && (min..=max).contains(&value))
+        {
+            problems.push(format!("{model_label}: {name} must be a number from {min} to {max}"));
+        }
+    }
+    if let Some(top_k) = sampling.top_k
+        && !(0..=MAX_SAFE_INTEGER).contains(&top_k)
+    {
+        problems.push(format!("{model_label}: top_k must be a whole number from 0 to {MAX_SAFE_INTEGER}"));
+    }
+    if let Some(seed) = sampling.seed
+        && !(-MAX_SAFE_INTEGER..=MAX_SAFE_INTEGER).contains(&seed)
+    {
+        problems.push(format!("{model_label}: seed must be a whole number from -{MAX_SAFE_INTEGER} to {MAX_SAFE_INTEGER}"));
     }
 }
 
@@ -829,6 +902,7 @@ mod tests {
             vision: None,
             source: ModelSource::Custom,
             variants: Vec::new(),
+            sampling: Default::default(),
         }
     }
 
@@ -1103,6 +1177,7 @@ mod tests {
             vision: None,
             source: ModelSource::Fetched,
             variants: Vec::new(),
+            sampling: Default::default(),
         }];
         assert_eq!(p.effective_context_limit("m", None), None);
         assert_eq!(p.effective_context_limit("m", Some(8_000)), Some(8_000));
@@ -1817,5 +1892,95 @@ mod tests {
         assert!(text.contains(r#""variants""#), "{text}");
         assert!(text.contains(r#""variant": "fast""#), "{text}");
         assert_eq!(load(dir.path()).unwrap(), settings);
+    }
+
+    fn with_sampling(sampling: Sampling) -> Vec<String> {
+        problems_after(|s| s.providers[0].models[0].sampling = sampling)
+    }
+
+    #[test]
+    fn sampling_at_the_range_edges_is_valid_and_outside_it_is_refused() {
+        let edges = Sampling {
+            temperature: Some(2.0),
+            top_p: Some(0.0),
+            top_k: Some(0),
+            frequency_penalty: Some(-2.0),
+            presence_penalty: Some(2.0),
+            seed: Some(MAX_SAFE_INTEGER),
+        };
+        assert!(with_sampling(edges).is_empty());
+        let low = Sampling { temperature: Some(0.0), top_p: Some(1.0), seed: Some(-MAX_SAFE_INTEGER), ..Sampling::default() };
+        assert!(with_sampling(low).is_empty());
+        assert!(with_sampling(Sampling::default()).is_empty(), "nothing set is valid");
+
+        let cases = [
+            ("temperature above 2", Sampling { temperature: Some(2.5), ..Sampling::default() }, "temperature must be"),
+            ("temperature below 0", Sampling { temperature: Some(-0.1), ..Sampling::default() }, "temperature must be"),
+            ("temperature NaN", Sampling { temperature: Some(f64::NAN), ..Sampling::default() }, "temperature must be"),
+            ("temperature infinite", Sampling { temperature: Some(f64::INFINITY), ..Sampling::default() }, "temperature must be"),
+            ("top_p above 1", Sampling { top_p: Some(1.5), ..Sampling::default() }, "top_p must be"),
+            ("top_p NaN", Sampling { top_p: Some(f64::NAN), ..Sampling::default() }, "top_p must be"),
+            ("frequency_penalty below -2", Sampling { frequency_penalty: Some(-2.5), ..Sampling::default() }, "frequency_penalty must be"),
+            ("presence_penalty above 2", Sampling { presence_penalty: Some(2.5), ..Sampling::default() }, "presence_penalty must be"),
+            ("top_k negative", Sampling { top_k: Some(-1), ..Sampling::default() }, "top_k must be"),
+            ("top_k past JS-safe", Sampling { top_k: Some(MAX_SAFE_INTEGER + 1), ..Sampling::default() }, "top_k must be"),
+            ("seed past JS-safe", Sampling { seed: Some(MAX_SAFE_INTEGER + 1), ..Sampling::default() }, "seed must be"),
+            ("seed below JS-safe", Sampling { seed: Some(-MAX_SAFE_INTEGER - 1), ..Sampling::default() }, "seed must be"),
+        ];
+        for (label, sampling, fragment) in cases {
+            let problems = with_sampling(sampling);
+            assert!(problems.iter().any(|p| p.contains(fragment)), "{label}: {problems:?}");
+            assert!(problems.iter().all(|p| p.contains("\"big-1\"")), "{label} names the model: {problems:?}");
+        }
+    }
+
+    #[test]
+    fn sampling_round_trips_and_unset_fields_are_not_written() {
+        let dir = TempDir::new();
+        save(dir.path(), &valid()).unwrap();
+        let text = fs::read_to_string(settings_path(dir.path())).unwrap();
+        assert!(!text.contains("sampling"), "a model without sampling writes no key: {text}");
+
+        let mut settings = valid();
+        settings.providers[0].models[0].sampling =
+            Sampling { temperature: Some(0.7), top_k: Some(40), ..Sampling::default() };
+        save(dir.path(), &settings).unwrap();
+        let text = fs::read_to_string(settings_path(dir.path())).unwrap();
+        assert!(text.contains(r#""temperature": 0.7"#), "{text}");
+        assert!(text.contains(r#""top_k": 40"#), "{text}");
+        for key in ["top_p", "frequency_penalty", "presence_penalty", "seed"] {
+            assert!(!text.contains(&format!("\"{key}\"")), "{key} is unset, so not written: {text}");
+        }
+        assert_eq!(load(dir.path()).unwrap(), settings);
+    }
+
+    #[test]
+    fn an_older_file_without_sampling_loads_with_none_set() {
+        let dir = TempDir::new();
+        fs::create_dir_all(dir.path()).unwrap();
+        let json = br#"{"version":1,"providers":[{"id":"acme","name":"Acme","chat_url":"https://api.example.com/v1/chat/completions","models":[{"id":"m","context_limit":4000,"provider_context":8000,"source":"fetched"}]}]}"#;
+        fs::write(settings_path(dir.path()), json).unwrap();
+        let loaded = load(dir.path()).unwrap();
+        assert_eq!(loaded.providers[0].models[0].sampling, Sampling::default());
+    }
+
+    #[test]
+    fn the_overlay_has_only_the_set_keys_and_none_is_protected() {
+        let all = Sampling {
+            temperature: Some(0.5),
+            top_p: Some(0.9),
+            top_k: Some(40),
+            frequency_penalty: Some(0.1),
+            presence_penalty: Some(-0.1),
+            seed: Some(7),
+        };
+        let keys: Vec<String> = all.overlay().keys().cloned().collect();
+        assert_eq!(keys.len(), 6, "{keys:?}");
+        for key in &keys {
+            assert!(!PROTECTED_BODY_KEYS.contains(&key.as_str()), "{key} must not be a protected key");
+        }
+        let one = Sampling { seed: Some(7), ..Sampling::default() }.overlay();
+        assert_eq!(serde_json::Value::Object(one), serde_json::json!({"seed": 7}));
+        assert!(Sampling::default().overlay().is_empty());
     }
 }

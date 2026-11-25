@@ -4527,6 +4527,28 @@ a {
   line-height: 1.4;
 }
 
+/* Parameters: the per-model collapsible list of sampling inputs. The inputs wrap in a narrow dialog. */
+.settings-params {
+  margin-top: 4px;
+}
+
+.settings-params summary {
+  color: var(--muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.settings-params-fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 4px 0;
+}
+
+.settings-params-fields input[type="text"] {
+  width: 8em;
+}
+
 .settings-test {
   font-size: 11px;
   overflow-wrap: anywhere;

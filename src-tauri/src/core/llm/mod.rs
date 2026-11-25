@@ -107,7 +107,7 @@ pub struct ChatRequest {
     pub tools: Option<Vec<Value>>,
     /// Sent only when `Some`.
     pub max_tokens: Option<u32>,
-    /// A variant's overlay: extra top-level body keys, merged by `request_body`. `None` sends the base body only.
+    /// An overlay of extra top-level body keys (sampling parameters, a variant's body), merged by `request_body`. `None` sends the base body only.
     pub extra: Option<serde_json::Map<String, Value>>,
 }
 
@@ -722,6 +722,17 @@ mod tests {
         let body = request_body(&req, false);
         assert_eq!(body["max_completion_tokens"], 128);
         assert!(body.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn sampling_overlay_sends_only_the_keys_it_has() {
+        let req = ChatRequest { extra: extra_of(&[("temperature", json!(0.7)), ("seed", json!(42))]), ..one_message() };
+        let body = request_body(&req, false);
+        assert_eq!(body["temperature"], json!(0.7));
+        assert_eq!(body["seed"], json!(42));
+        for key in ["top_p", "top_k", "frequency_penalty", "presence_penalty"] {
+            assert!(body.get(key).is_none(), "{key} is unset, so not sent: {body}");
+        }
     }
 
     #[test]
