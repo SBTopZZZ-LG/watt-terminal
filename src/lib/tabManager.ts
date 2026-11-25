@@ -7,6 +7,7 @@ import { api, CHAT_ID, errorText, SESSION_ID } from './api';
 import { TabController } from './tab';
 import type { TabDeps } from './tab';
 import { allocTabId, neighbourAfterClose, tabLimitReached } from './tabStrip';
+import { pickTabTitle } from './tabState';
 import { clampFontSize, defaultSizeStorage, FONT_SIZE_DEFAULT, saveFontSize, stepFontSize } from './zoom';
 import type { SessionEvent, Status, TabInfo, WireEvent } from './types';
 
@@ -66,6 +67,16 @@ export class TabManager {
   /** The number a tab was created with ("Terminal N" when it has no other title). 1 for an unknown id. */
   ordinal(id: string): number {
     return this.ordinals.get(id) ?? 1;
+  }
+
+  /** The title a terminal shows in the strip and in agent events (see pickTabTitle). Null for an unknown id. */
+  label(id: string): string | null {
+    const tab = this.tabs.get(id);
+    if (tab === undefined) {
+      return null;
+    }
+    const s = tab.getSnapshot();
+    return pickTabTitle({ xtermTitle: s.title, foreground: s.input.foreground, cwd: s.cwd, index: this.ordinal(id) });
   }
 
   /** The tab the UI shows. Null before any tab exists. */
@@ -134,6 +145,31 @@ export class TabManager {
     }
     void this.refresh().catch((e: unknown) => this.reportError(e));
     return tab;
+  }
+
+  /**
+   * A new terminal, made visible to the chat when `visibleToAgent` (the new-tabs setting). Null at the tab limit, or when its
+   * shell did not start (the error is shown). The assignment's refusal is shown too; the terminal then stays private.
+   */
+  async createTab(visibleToAgent: boolean): Promise<TabController | null> {
+    const tab = await this.create();
+    if (tab !== null && visibleToAgent) {
+      await this.assign(tab.id, true);
+    }
+    return tab;
+  }
+
+  /**
+   * Assigns a terminal to the chat (`on`), or unassigns it. The backend refuses while the chat is busy and would lose the
+   * terminal; the refusal is shown. Then the owners are read again.
+   */
+  async assign(id: string, on: boolean): Promise<void> {
+    try {
+      await api.assignTab(CHAT_ID, id, on);
+    } catch (e) {
+      this.reportError(e);
+    }
+    await this.refresh().catch((e: unknown) => this.reportError(e));
   }
 
   /**

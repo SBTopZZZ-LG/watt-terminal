@@ -256,6 +256,15 @@ describe('transcriptReducer: local actions', () => {
     expect(t.items[1]).toMatchObject({ kind: 'approval', location: null });
   });
 
+  it('an approval card carries the title of its terminal when the caller gives one; without it there is no terminal field', () => {
+    const t = run([
+      { type: 'agent_event', event: { type: 'approval_request', call_id: 'a1', name: 'run_command', text: 'pwd' }, terminal: 'Terminal 2' },
+      { type: 'agent_event', event: { type: 'approval_request', call_id: 'a2', name: 'run_command', text: 'pwd' } },
+    ]);
+    expect(t.items[0]).toMatchObject({ kind: 'approval', terminal: 'Terminal 2' });
+    expect(t.items[1]).not.toHaveProperty('terminal');
+  });
+
   it('the first pending approval is the oldest one', () => {
     const t = run([
       { type: 'agent_event', event: { type: 'approval_request', call_id: 'a1', name: 'run_command', text: 'x' } },

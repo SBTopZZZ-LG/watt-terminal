@@ -23,6 +23,7 @@ import type { Incoming } from './lib/tabManager';
 import { ActiveTabContext } from './lib/activeTab';
 import { isSessionEvent } from './lib/tabState';
 import { isOwnedByChat } from './lib/tabStrip';
+import { nextTabId } from './lib/tabKeys';
 import type { TabController } from './lib/tab';
 import type { TabState } from './lib/tabState';
 import { appHotkeyFor } from './lib/appHotkeys';
@@ -45,7 +46,7 @@ import { defaultSizeStorage } from './lib/zoom';
 import { agentActivity } from './lib/agentActivity';
 import { userAttachments } from './lib/attachments';
 import { defaultModelVision } from './lib/modelVision';
-import { createPatchSaver, devtoolsPatch, fontPatch, hideMarksPatch, notificationsPatch, panelPatch, queueModePatch, reconcileDevtools, reconcileFont, reconcileGroupBy, reconcileHideMarks, reconcileNotifications, reconcilePanel, reconcileQueueMode, reconcileSuggestPrompts, reconcileThinkingMode, shouldRestoreLast, suggestPromptsPatch, thinkingModePatch } from './lib/uiState';
+import { createPatchSaver, devtoolsPatch, fontPatch, hideMarksPatch, newTabsVisiblePatch, notificationsPatch, panelPatch, queueModePatch, reconcileDevtools, reconcileFont, reconcileGroupBy, reconcileHideMarks, reconcileNewTabsVisible, reconcileNotifications, reconcilePanel, reconcileQueueMode, reconcileSuggestPrompts, reconcileThinkingMode, shouldRestoreLast, suggestPromptsPatch, thinkingModePatch } from './lib/uiState';
 import { DEFAULT_THINKING_MODE } from './lib/thinking';
 import { decideAttention } from './lib/attention';
 import type { AttentionEvent } from './lib/attention';
@@ -222,6 +223,8 @@ export default function App() {
   // The layout inspector setting (Terminal tab, Developer). Off until the file says otherwise; the backend refuses to open
   // DevTools while it is off, and this only decides whether the right-click menu offers the item.
   const [devtools, setDevtools] = useState(false);
+  // Whether a new terminal joins the chat at once (Terminal tab). Off until the file says otherwise: a new one is private.
+  const [newTabsVisible, setNewTabsVisible] = useState(false);
   const windowFocused = useRef(true);
   const attentionKey = useRef<string | null>(null);
   // The UI state file, read at startup. Nothing is written to it until that read has been reconciled (see uiReady).
@@ -258,6 +261,11 @@ export default function App() {
   const settingsOpenRef = useRef(false);
   useEffect(() => {
     settingsOpenRef.current = settingsOpen;
+  });
+  // Read by the keydown listener too (the new-tab hotkey), which is registered once.
+  const newTabsVisibleRef = useRef(false);
+  useEffect(() => {
+    newTabsVisibleRef.current = newTabsVisible;
   });
   // Read after the awaits of the startup restore, so it sees the transcript as it is then.
   const transcriptRef = useRef(transcript);
@@ -488,6 +496,10 @@ export default function App() {
       if (dev !== null) {
         setDevtools(dev);
       }
+      const newTabs = reconcileNewTabsVisible(remote.new_tabs_visible_to_agent);
+      if (newTabs !== null) {
+        setNewTabsVisible(newTabs);
+      }
     });
     const unsubscribeFont = tabs.onFontSizeChange((size) => persist(fontPatch(size)));
     const flushOnHide = () => uiSaver.flush();
@@ -571,6 +583,12 @@ export default function App() {
           // The turn did not take these: they are plain queued messages again, sent at the end of the turn.
           commitQueue(unsteer(queueRef.current, ev.ids));
           return;
+        case 'approval_request': {
+          // With two or more terminals the card names the one it runs on (the backend sends its id): the card shows its title.
+          const terminal = ev.terminal === undefined ? null : tabs.label(ev.terminal);
+          dispatchTranscript({ type: 'agent_event', event: ev, at: Date.now(), terminal: terminal ?? undefined });
+          return;
+        }
         default:
           dispatchTranscript({ type: 'agent_event', event: ev, at: Date.now() });
       }
@@ -779,6 +797,26 @@ export default function App() {
         case 'settings':
           openSettings();
           return;
+        case 'new-tab':
+          void tabs.createTab(newTabsVisibleRef.current);
+          return;
+        case 'close-tab': {
+          const id = tabs.getSnapshot().activeId;
+          if (id !== null) {
+            void tabs.close(id);
+          }
+          return;
+        }
+        case 'next-tab':
+        case 'prev-tab': {
+          // The strip's own arrow keys (see TabStrip): the same wrap-around, on the registry's order.
+          const { ids, activeId } = tabs.getSnapshot();
+          const next = activeId === null ? null : nextTabId(ids, activeId, app === 'next-tab' ? 'ArrowRight' : 'ArrowLeft');
+          if (next !== null) {
+            tabs.setActive(next);
+          }
+          return;
+        }
       }
     };
     window.addEventListener('keydown', onKey, true);
@@ -1113,6 +1151,12 @@ export default function App() {
   const setDevtoolsSetting = (on: boolean) => {
     setDevtools(on);
     persist(devtoolsPatch(on));
+  };
+
+  /** The new-tabs setting is applied at once and saved with the UI state. It only affects tabs made from now on. */
+  const setNewTabsVisibleSetting = (on: boolean) => {
+    setNewTabsVisible(on);
+    persist(newTabsVisiblePatch(on));
   };
 
   // Clears the agent's conversation. Refused while the agent is busy or a side command runs (the button is also disabled then),
@@ -1789,31 +1833,34 @@ export default function App() {
   };
 
   // Starts a new shell after the old one exited. The terminal is cleared first, so nothing from the old shell
-  // shows up in the new one. Focus moves to the terminal when the new shell starts (see focusAfter).
-  const restartShell = () => {
-    if (restarting) {
+  // shows up in the new one. Focus moves to the terminal when the new shell starts (see focusAfter). Any terminal can be
+  // restarted (the strip's menu restarts one that is not the active one); the bar restarts the active one (restartShell).
+  const restartTab = (target: TabController) => {
+    if (target.getSnapshot().restarting) {
       return;
     }
-    tab.setRestarting(true);
-    tab.resetForNewSession();
+    target.setRestarting(true);
+    target.resetForNewSession();
     // The chat's own terminal: the same conversation goes on, so what was queued comes back into the input rather than
     // being dropped. Another chat's or an unassigned terminal has none of that in this chat.
-    if (isOwnedByChat(tab.getSnapshot().owner, CHAT_ID)) {
+    if (isOwnedByChat(target.getSnapshot().owner, CHAT_ID)) {
       returnQueued();
       clearQueue();
       dispatchTranscript({ type: 'session_reset' });
       setAgentReq((cur) => agentRequestClosedBySession(cur));
     }
-    tab.resetAgentControl();
-    tab
+    target.resetAgentControl();
+    target
       .restart()
-      .then(() => api.getStatus(tab.id))
-      .then((s) => applyStatus(s, tab))
-      .then(() => tab.fitToContainer())
+      .then(() => api.getStatus(target.id))
+      .then((s) => applyStatus(s, target))
+      .then(() => target.fitToContainer())
       .catch(reportError)
       // Still true until the status is applied, so a second click cannot land while the old exit state is shown.
-      .finally(() => tab.setRestarting(false));
+      .finally(() => target.setRestarting(false));
   };
+
+  const restartShell = () => restartTab(tab);
 
   const approveFirst = () => {
     if (pendingApproval !== null) {
@@ -1861,7 +1908,7 @@ export default function App() {
         dock={panel.dock}
         terminal={
           <div className="terminal-area">
-            <TabStrip />
+            <TabStrip newTabsVisible={newTabsVisible} />
             <div className="term-stack">
               {tabs.list().map((t) => (
                 <TerminalView
@@ -2038,6 +2085,8 @@ export default function App() {
           onNotificationsChange={setNotificationsSetting}
           devtools={devtools}
           onDevtoolsChange={setDevtoolsSetting}
+          newTabsVisible={newTabsVisible}
+          onNewTabsVisibleChange={setNewTabsVisibleSetting}
         />
       )}
       {helpOpen && <HelpDialog load={helpState} onRetry={loadHelp} onClose={closeHelp} />}
@@ -2053,6 +2102,12 @@ export default function App() {
         onFindTerminal={openTerminalFind}
         onFindChat={openChatFind}
         devtools={devtools}
+        onRestartTab={(id) => {
+          const target = tabs.get(id);
+          if (target !== undefined) {
+            restartTab(target);
+          }
+        }}
       />
     </div>
     </ActiveTabContext.Provider>

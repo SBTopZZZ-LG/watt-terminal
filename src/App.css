@@ -282,6 +282,23 @@ a {
   background: var(--accent);
 }
 
+/* The agent holds this terminal's shell: a dot that pulses in the agent-control colour (see .agent-control-glow). */
+.term-tab-control {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ok);
+  animation: agent-control-pulse 2s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .term-tab-control {
+    animation: none;
+    opacity: 0.8;
+  }
+}
+
 /* The close button shows on hover and focus, and always on the active tab. */
 .term-tab-close {
   flex: 0 0 auto;

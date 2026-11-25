@@ -391,6 +391,8 @@ export interface UiState {
   notifications: boolean;
   /** Enables the layout inspector (the right-click menu's "Open layout inspector" item). Always a boolean: false when the file has no value. */
   devtools: boolean;
+  /** A new terminal joins the current chat at once. Always a boolean: false when the file has no value. */
+  new_tabs_visible_to_agent: boolean;
 }
 
 /** A change to the UI state. An absent field is left alone, `null` clears it, a value sets it. */
@@ -409,6 +411,8 @@ export interface UiStatePatch {
   notifications?: boolean;
   /** As `hide_marks`: a boolean, so `null` is ignored too. */
   devtools?: boolean;
+  /** As `hide_marks`: a boolean, so `null` is ignored too. */
+  new_tabs_visible_to_agent?: boolean;
 }
 
 // AI provider settings (src-tauri/src/core/settings). Secrets are never in these types: they are only written, as

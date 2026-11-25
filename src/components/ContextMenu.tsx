@@ -1,13 +1,14 @@
 import { useContext, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { flushSync } from 'react-dom';
 import type { Ref } from 'react';
-import { api } from '../lib/api';
+import { api, CHAT_ID } from '../lib/api';
 import { copyText, readClipboardText } from '../lib/clipboard';
 import { edgeIndex, menuFor, menuKey, menuPlacement, stepIndex, typeaheadIndex, withLayoutInspector } from '../lib/contextMenu';
 import type { MenuItem } from '../lib/contextMenu';
 import { fieldSelectedText, resolveMenu } from '../lib/contextMenuDom';
-import type { MenuSnapshot, TerminalFacts, TextField } from '../lib/contextMenuDom';
-import { reportError } from '../lib/tabManager';
+import type { MenuSnapshot, TabFacts, TerminalFacts, TextField } from '../lib/contextMenuDom';
+import { reportError, tabs } from '../lib/tabManager';
+import { isOwnedByChat } from '../lib/tabStrip';
 import { selectContentsOf } from '../lib/selectAll';
 import { ActiveTabContext } from '../lib/activeTab';
 import type { Placement } from '../lib/tooltip';
@@ -34,6 +35,8 @@ export interface ContextMenuProps {
   onFindChat: () => void;
   /** The developer setting: true adds "Open layout inspector" to every menu the app opens. Read when a menu opens. */
   devtools: boolean;
+  /** Restarts a terminal's shell, as the strip's tab menu asks (App runs the chat's restart steps). */
+  onRestartTab: (id: string) => void;
 }
 
 interface OpenMenu {
@@ -54,6 +57,15 @@ function terminalFacts(t: ContextMenuProps['terminal'], term: Terminal | null): 
     altScreen: term !== null && term.buffer.active.type === 'alternate',
     hasSelection: term !== null && term.hasSelection(),
   };
+}
+
+/** What the tab registry says about a terminal, for its tab items. Null for an id with no terminal. */
+function tabFactsOf(id: string): TabFacts | null {
+  const tab = tabs.get(id);
+  if (tab === undefined) {
+    return null;
+  }
+  return { visible: isOwnedByChat(tab.getSnapshot().owner, CHAT_ID), canClose: tabs.getSnapshot().ids.length > 1 };
 }
 
 /** Shift+F10 and the Menu key open the menu from the keyboard. */
@@ -176,6 +188,22 @@ async function runAction(id: MenuItem['id'], snap: MenuSnapshot, props: ContextM
       return copyOrReport(texts.link);
     case 'copy-chip':
       return copyOrReport(texts.chip);
+    case 'tab-visibility':
+      // The registry shows a refusal (a busy chat that would lose the terminal) and re-reads the owners.
+      if (snap.tabId !== null) {
+        await tabs.assign(snap.tabId, !snap.ctx.tabVisible);
+      }
+      return;
+    case 'tab-restart':
+      if (snap.tabId !== null) {
+        props.onRestartTab(snap.tabId);
+      }
+      return;
+    case 'tab-close':
+      if (snap.tabId !== null) {
+        await tabs.close(snap.tabId);
+      }
+      return;
     case 'open-layout-inspector':
       // The backend refuses unless the setting is on; a refusal is reported like any other failed action.
       return api.openDevtools();
@@ -330,7 +358,7 @@ export function ContextMenu(props: ContextMenuProps) {
       if (!e.shiftKey && target.closest('.xterm') !== null && (latestTerm.current?.modes.mouseTrackingMode ?? 'none') !== 'none') {
         return;
       }
-      const snap = resolveMenu(target, terminalFacts(latest.current.terminal, latestTerm.current), origin);
+      const snap = resolveMenu(target, terminalFacts(latest.current.terminal, latestTerm.current), origin, tabFactsOf);
       if (snap !== null) {
         show(snap, { x: e.clientX, y: e.clientY }, false);
       }
@@ -350,7 +378,7 @@ export function ContextMenu(props: ContextMenuProps) {
         if (!(el instanceof HTMLElement)) {
           return;
         }
-        const snap = resolveMenu(el, terminalFacts(latest.current.terminal, latestTerm.current), el);
+        const snap = resolveMenu(el, terminalFacts(latest.current.terminal, latestTerm.current), el, tabFactsOf);
         if (snap !== null) {
           show(snap, pointBelow(el), true);
         }

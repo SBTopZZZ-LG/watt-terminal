@@ -48,8 +48,9 @@ export type TranscriptItem =
    * `reason` is why the card asks. `location` is the nested shell the command is for (its label), or null on the local shell.
    * `display` is the decoded input of a send_keys card (null for the others, and for a card from an older backend).
    * `expiresAt` is when the countdown runs out (Unix ms); absent for a card from an older session.
+   * `terminal` is the title of the terminal the call runs on, when the chat has two or more (absent otherwise).
    */
-  | { id: number; kind: 'approval'; callId: string; name: string; text: string; display: string | null; state: ApprovalState; approve: boolean | null; reason: ApprovalReasonCode | null; location: string | null; expiresAt?: number }
+  | { id: number; kind: 'approval'; callId: string; name: string; text: string; display: string | null; state: ApprovalState; approve: boolean | null; reason: ApprovalReasonCode | null; location: string | null; expiresAt?: number; terminal?: string }
   /**
    * The agent's clarification question (`ask_user`). `questions` are the backend's, with its ids. `answers` are the
    * ones sent (or being sent); `result` is the settled outcome once the tool result arrives. `error` is why a send
@@ -152,8 +153,11 @@ export const MAX_ITEMS = 500;
 const MAX_FINISHED = 16;
 
 export type TranscriptAction =
-  /** `at` is when the event arrived (Unix ms). Only a tool call's start time uses it, so it may be left out in tests. */
-  | { type: 'agent_event'; event: AgentEvent; at?: number }
+  /**
+   * `at` is when the event arrived (Unix ms). Only a tool call's start time uses it, so it may be left out in tests.
+   * `terminal` is the title of the terminal the event names, for an approval card (the caller reads it from the registry).
+   */
+  | { type: 'agent_event'; event: AgentEvent; at?: number; terminal?: string }
   /** A command the shell ran has finished. Closes the interactive group it opened on, if one is open (see interactive.ts). */
   | { type: 'record_finished'; record: RecordSummary }
   /** A message was handed to the agent. Counts as in flight until its `done`. */
@@ -198,7 +202,7 @@ export type TranscriptAction =
 export function transcriptReducer(t: Transcript, action: TranscriptAction): Transcript {
   switch (action.type) {
     case 'agent_event':
-      return applyAgentEvent(t, action.event, action.at);
+      return applyAgentEvent(t, action.event, action.at, action.terminal);
     case 'record_finished': {
       const { id, exit_code, source } = action.record;
       if (openRecordIds(t.items).has(id)) {
@@ -429,7 +433,7 @@ function endReasoning(t: Transcript, at: number | undefined): Transcript {
   return { ...t, items: [...t.items.slice(0, -1), { ...last, streaming: false, endedAt: at }] };
 }
 
-function applyAgentEvent(t0: Transcript, ev: AgentEvent, at: number | undefined): Transcript {
+function applyAgentEvent(t0: Transcript, ev: AgentEvent, at: number | undefined, terminal: string | undefined): Transcript {
   const t = endsReasoning(ev) ? endReasoning(t0, at) : t0;
   switch (ev.type) {
     case 'reasoning_delta':
@@ -513,6 +517,7 @@ function applyAgentEvent(t0: Transcript, ev: AgentEvent, at: number | undefined)
         reason: ev.reason ?? null,
         location: ev.location ?? null,
         expiresAt: (at ?? Date.now()) + APPROVAL_WINDOW_MS,
+        ...(terminal !== undefined ? { terminal } : {}),
       }));
     case 'question_request':
       return add(t, (id) => ({

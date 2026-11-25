@@ -524,6 +524,9 @@ export interface SettingsDialogProps {
   /** Whether the right-click menu offers the layout inspector. Owned by the caller (UI state). */
   devtools: boolean;
   onDevtoolsChange(on: boolean): void;
+  /** Whether a new terminal joins the current chat at once. Owned by the caller (UI state). */
+  newTabsVisible: boolean;
+  onNewTabsVisibleChange(on: boolean): void;
 }
 
 /**
@@ -533,7 +536,7 @@ export interface SettingsDialogProps {
  * and goes back to where it was on close. Esc closes; a click on the backdrop closes. Unsaved changes are asked about
  * before they are dropped.
  */
-export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded, hideMarks, onHideMarksChange, queueMode, onQueueModeChange, thinkingMode, onThinkingModeChange, suggestPrompts, onSuggestPromptsChange, notifications, onNotificationsChange, devtools, onDevtoolsChange }: SettingsDialogProps) {
+export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded, hideMarks, onHideMarksChange, queueMode, onQueueModeChange, thinkingMode, onThinkingModeChange, suggestPrompts, onSuggestPromptsChange, notifications, onNotificationsChange, devtools, onDevtoolsChange, newTabsVisible, onNewTabsVisibleChange }: SettingsDialogProps) {
   const titleId = useId();
   const dialogRef = useRef<HTMLDivElement | null>(null);
   // The card's element, kept as state as well: the sheets draw into it, so they render once it exists.
@@ -1220,7 +1223,12 @@ export function SettingsDialog({ focusModel, onClose, onChanged, onViewLoaded, h
 
   const terminalPanel = (
     <>
-      <TerminalSection hideMarks={hideMarks} onHideMarksChange={onHideMarksChange} />
+      <TerminalSection
+        hideMarks={hideMarks}
+        onHideMarksChange={onHideMarksChange}
+        newTabsVisible={newTabsVisible}
+        onNewTabsVisibleChange={onNewTabsVisibleChange}
+      />
       <QueueSection queueMode={queueMode} onQueueModeChange={onQueueModeChange} />
       <ThinkingSection thinkingMode={thinkingMode} onThinkingModeChange={onThinkingModeChange} />
       <SuggestSection suggestPrompts={suggestPrompts} onSuggestPromptsChange={onSuggestPromptsChange} />

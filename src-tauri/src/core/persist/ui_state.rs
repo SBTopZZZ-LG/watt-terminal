@@ -40,6 +40,8 @@ const SUGGEST_PROMPTS_DEFAULT: bool = true;
 const NOTIFICATIONS_DEFAULT: bool = true;
 /// The layout inspector (WebView2 DevTools, from the right-click menu) is off unless the file says otherwise.
 const DEVTOOLS_DEFAULT: bool = false;
+/// New terminals are private to the user (not visible to the agent) unless the file says otherwise.
+const NEW_TABS_VISIBLE_DEFAULT: bool = false;
 /// Largest accepted panel size, in pixels.
 const MAX_PANEL_SIZE: f64 = 20_000.0;
 
@@ -86,6 +88,10 @@ pub struct UiState {
     /// DevTools. Missing or invalid in the file reads as the default, `false`.
     #[serde(default = "devtools_default")]
     pub devtools: bool,
+    /// A new terminal joins the current chat at once, rather than staying private until it is assigned. Missing or invalid
+    /// in the file reads as the default, `false`.
+    #[serde(default = "new_tabs_visible_default")]
+    pub new_tabs_visible_to_agent: bool,
 }
 
 fn hide_marks_default() -> bool {
@@ -104,6 +110,10 @@ fn devtools_default() -> bool {
     DEVTOOLS_DEFAULT
 }
 
+fn new_tabs_visible_default() -> bool {
+    NEW_TABS_VISIBLE_DEFAULT
+}
+
 impl Default for UiState {
     fn default() -> Self {
         Self {
@@ -118,6 +128,7 @@ impl Default for UiState {
             suggest_prompts: SUGGEST_PROMPTS_DEFAULT,
             notifications: NOTIFICATIONS_DEFAULT,
             devtools: DEVTOOLS_DEFAULT,
+            new_tabs_visible_to_agent: NEW_TABS_VISIBLE_DEFAULT,
         }
     }
 }
@@ -146,6 +157,8 @@ pub struct UiStatePatch {
     pub notifications: Option<bool>,
     /// As `hide_marks`: a boolean, so `null` leaves it alone.
     pub devtools: Option<bool>,
+    /// As `hide_marks`: a boolean, so `null` leaves it alone.
+    pub new_tabs_visible_to_agent: Option<bool>,
 }
 
 /// Distinguishes an absent field (outer `None`, via `default`) from `null` (`Some(None)`).
@@ -211,6 +224,9 @@ impl UiStateStore {
         }
         if let Some(devtools) = patch.devtools {
             state.devtools = devtools;
+        }
+        if let Some(visible) = patch.new_tabs_visible_to_agent {
+            state.new_tabs_visible_to_agent = visible;
         }
         state.version = UI_STATE_VERSION;
         self.write(&state)?;
@@ -294,6 +310,7 @@ fn tolerant(value: &Value) -> UiState {
         suggest_prompts: obj.get("suggest_prompts").and_then(Value::as_bool).unwrap_or(SUGGEST_PROMPTS_DEFAULT),
         notifications: obj.get("notifications").and_then(Value::as_bool).unwrap_or(NOTIFICATIONS_DEFAULT),
         devtools: obj.get("devtools").and_then(Value::as_bool).unwrap_or(DEVTOOLS_DEFAULT),
+        new_tabs_visible_to_agent: obj.get("new_tabs_visible_to_agent").and_then(Value::as_bool).unwrap_or(NEW_TABS_VISIBLE_DEFAULT),
     }
 }
 
@@ -422,6 +439,7 @@ mod tests {
             suggest_prompts: Some(true),
             notifications: Some(false),
             devtools: Some(true),
+            new_tabs_visible_to_agent: Some(true),
         };
         let written = s.patch(patch).unwrap();
         assert_eq!(s.load().unwrap(), written);
@@ -435,6 +453,7 @@ mod tests {
         assert!(written.suggest_prompts);
         assert!(!written.notifications);
         assert!(written.devtools);
+        assert!(written.new_tabs_visible_to_agent);
     }
 
     #[test]
@@ -870,6 +889,38 @@ mod tests {
         assert!(!off.devtools);
         assert!(!s.load().unwrap().devtools);
         assert_eq!(patch_from(json!({})).devtools, None);
+    }
+
+    #[test]
+    fn new_tabs_visible_is_off_by_default_and_a_boolean_only() {
+        let tmp = TempDir::new();
+        assert!(!store(&tmp).load().unwrap().new_tabs_visible_to_agent, "no file");
+        assert!(!UiState::default().new_tabs_visible_to_agent);
+        assert!(!read_text(&tmp, r#"{"font_size": 12}"#).new_tabs_visible_to_agent, "an old file has none");
+        assert!(read_text(&tmp, r#"{"new_tabs_visible_to_agent": true}"#).new_tabs_visible_to_agent);
+        assert!(!read_text(&tmp, r#"{"new_tabs_visible_to_agent": "yes"}"#).new_tabs_visible_to_agent, "non-boolean falls back to the default");
+        assert!(!read_text(&tmp, r#"{"new_tabs_visible_to_agent": 1}"#).new_tabs_visible_to_agent, "non-boolean falls back to the default");
+        assert!(!read_text(&tmp, r#"{"new_tabs_visible_to_agent": null}"#).new_tabs_visible_to_agent);
+    }
+
+    #[test]
+    fn new_tabs_visible_patch_sets_persists_and_null_or_absent_leaves_it_alone() {
+        let tmp = TempDir::new();
+        let s = store(&tmp);
+        let on = s.patch(patch_from(json!({"new_tabs_visible_to_agent": true}))).unwrap();
+        assert!(on.new_tabs_visible_to_agent);
+        assert!(s.load().unwrap().new_tabs_visible_to_agent, "written to the file");
+
+        let untouched = s.patch(patch_from(json!({"font_size": 13}))).unwrap();
+        assert!(untouched.new_tabs_visible_to_agent, "an absent field leaves it alone");
+
+        let null = s.patch(patch_from(json!({"new_tabs_visible_to_agent": null}))).unwrap();
+        assert!(null.new_tabs_visible_to_agent, "null leaves it alone too");
+
+        let off = s.patch(patch_from(json!({"new_tabs_visible_to_agent": false}))).unwrap();
+        assert!(!off.new_tabs_visible_to_agent);
+        assert!(!s.load().unwrap().new_tabs_visible_to_agent);
+        assert_eq!(patch_from(json!({})).new_tabs_visible_to_agent, None);
     }
 
     #[test]

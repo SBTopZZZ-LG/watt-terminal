@@ -17,6 +17,14 @@ export interface TerminalFacts {
   hasSelection: boolean;
 }
 
+/** What the tab registry says about one terminal, read by the caller when the menu opens. */
+export interface TabFacts {
+  /** The chat owns the terminal (it is visible to the agent). */
+  visible: boolean;
+  /** The terminal may be closed (it is not the last one). */
+  canClose: boolean;
+}
+
 export type TextField = HTMLInputElement | HTMLTextAreaElement;
 
 /** The input types that take typed text. Other inputs (checkbox, range, button) get no menu. */
@@ -30,6 +38,8 @@ export interface MenuSnapshot {
   field: TextField | null;
   /** The transcript body, in the chat region (Select all selects its text). */
   transcript: HTMLElement | null;
+  /** The terminal's id, in the tab region (the tab the items act on). */
+  tabId: string | null;
   /** Texts for the copy items, read now so they are what the user saw. Empty when the region has none. */
   texts: { selection: string; message: string; code: string; toolInput: string; toolOutput: string; toolJson: string; link: string; chip: string };
 }
@@ -86,9 +96,14 @@ function toolTexts(row: Element): Pick<MenuSnapshot['texts'], 'toolInput' | 'too
  * The menu for a target element: its context and texts, or null when the region has no items (dividers, empty chrome,
  * buttons, a chip with no value). `origin` is the element focused when the menu opens.
  */
-export function resolveMenu(target: Element, terminal: TerminalFacts, origin: HTMLElement | null): MenuSnapshot | null {
+export function resolveMenu(
+  target: Element,
+  terminal: TerminalFacts,
+  origin: HTMLElement | null,
+  tabFacts: (id: string) => TabFacts | null,
+): MenuSnapshot | null {
   const texts = emptyTexts();
-  const base = { origin, field: null, transcript: null, texts };
+  const base = { origin, field: null, transcript: null, tabId: null, texts };
 
   if (target.closest('.xterm') !== null) {
     const ctx: MenuContext = {
@@ -100,6 +115,18 @@ export function resolveMenu(target: Element, terminal: TerminalFacts, origin: HT
       agentBusy: terminal.agentBusy,
     };
     return { ...base, ctx };
+  }
+
+  // A tab, or its close button (both sit in the same cell). The strip is not the terminal, so the terminal menu is not offered.
+  const cell = target.closest('.term-tab-cell');
+  if (cell !== null) {
+    const id = cell.querySelector('[data-tab-id]')?.getAttribute('data-tab-id') ?? null;
+    const facts = id === null ? null : tabFacts(id);
+    if (id === null || facts === null) {
+      return null;
+    }
+    const ctx: MenuContext = { ...emptyContext('tab'), tabVisible: facts.visible, tabCanClose: facts.canClose };
+    return { ...base, ctx, tabId: id };
   }
 
   if (isTextField(target)) {

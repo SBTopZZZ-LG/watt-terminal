@@ -506,10 +506,12 @@ function Entry({ item, onApprove, onAnswerQuestions }: { item: TranscriptItem; o
       return <ToolRow item={item} />;
     case 'approval': {
       const why = askedBecause(item.reason);
+      // The terminal it runs on (when the chat has two or more), then the nested shell it is for.
+      const where = [item.terminal, item.location].filter((w): w is string => w !== undefined && w !== null);
       return (
         <div className={`approval approval-${item.state}`}>
           <div className="approval-title">{approvalTitle(item.name, item.reason, item.display)}</div>
-          {item.location !== null && <div className="approval-location">on {item.location}</div>}
+          {where.length > 0 && <div className="approval-location">on {where.join(' · ')}</div>}
           {/* A send_keys card shows the decoded input (the text and the keys), escaped; the other cards show the command. */}
           {item.name === 'send_keys' ? (
             <code className="approval-text approval-keys">{displayText(item.display ?? item.text)}</code>

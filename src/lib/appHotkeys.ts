@@ -11,10 +11,13 @@
 //
 // Find comes in two keys. 'find' (Cmd+F, Ctrl+F) finds in the focus zone: the chat when focus is in the agent panel, else
 // the terminal. 'find-terminal' (Cmd+Shift+F on macOS, Ctrl+Shift+F elsewhere) always finds in the terminal.
+//
+// The terminal tabs: 'new-tab' and 'close-tab' are Cmd+Shift+T and Cmd+Shift+W on macOS, Ctrl+Shift+T and Ctrl+Shift+W
+// elsewhere. 'next-tab' and 'prev-tab' are Ctrl+Tab and Ctrl+Shift+Tab on every platform (Ctrl stays Ctrl on macOS).
 
 import { IS_MAC } from './platform';
 
-export type AppHotkey = 'find' | 'find-terminal' | 'clear' | 'zoom-in' | 'zoom-out' | 'zoom-reset' | 'settings';
+export type AppHotkey = 'find' | 'find-terminal' | 'clear' | 'zoom-in' | 'zoom-out' | 'zoom-reset' | 'settings' | 'new-tab' | 'close-tab' | 'next-tab' | 'prev-tab';
 
 /** The fields of a keyboard event that the mapping reads. A DOM KeyboardEvent satisfies this. */
 export interface HotkeyEvent {
@@ -37,6 +40,10 @@ export function appHotkeyFor(ev: HotkeyEvent, mac: boolean = IS_MAC, inTerminal 
   if (ev.type !== 'keydown' || ev.altKey) {
     return null;
   }
+  const tab = tabHotkeyFor(ev, mac);
+  if (tab !== null) {
+    return tab;
+  }
   if (mac) {
     return macHotkeyFor(ev);
   }
@@ -44,6 +51,23 @@ export function appHotkeyFor(ev: HotkeyEvent, mac: boolean = IS_MAC, inTerminal 
     return null;
   }
   return ctrlHotkeyFor(ev);
+}
+
+/** The terminal tab keys (see the header). Exactly the listed modifiers: Ctrl+Shift+Tab is not Ctrl+Tab, and Cmd+Shift+T is not Ctrl+Shift+T. */
+function tabHotkeyFor(ev: HotkeyEvent, mac: boolean): AppHotkey | null {
+  if (ev.key === 'Tab' && ev.ctrlKey && !ev.metaKey) {
+    return ev.shiftKey ? 'prev-tab' : 'next-tab';
+  }
+  const mod = mac ? ev.metaKey && !ev.ctrlKey : ev.ctrlKey && !ev.metaKey;
+  if (mod && ev.shiftKey) {
+    switch (ev.key.toLowerCase()) {
+      case 't':
+        return 'new-tab';
+      case 'w':
+        return 'close-tab';
+    }
+  }
+  return null;
 }
 
 function macHotkeyFor(ev: HotkeyEvent): AppHotkey | null {

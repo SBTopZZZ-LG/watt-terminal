@@ -11,7 +11,7 @@ import { placement } from './tooltip';
 import type { Placement, Size } from './tooltip';
 
 /** Where the right click (or the Menu key) landed. `none` is anywhere without items: dividers, empty chrome, buttons. */
-export type MenuRegion = 'terminal' | 'field' | 'chat' | 'chip' | 'none';
+export type MenuRegion = 'terminal' | 'field' | 'chat' | 'chip' | 'tab' | 'none';
 
 export type MenuItemId =
   | 'copy'
@@ -30,6 +30,9 @@ export type MenuItemId =
   | 'copy-tool-json'
   | 'copy-link'
   | 'copy-chip'
+  | 'tab-visibility'
+  | 'tab-restart'
+  | 'tab-close'
   | 'open-layout-inspector';
 
 export interface MenuItem {
@@ -65,6 +68,10 @@ export interface MenuContext {
   tool: boolean;
   /** Chat: the target is a link with an href. */
   link: boolean;
+  /** Tab: the terminal is visible to the chat (its owner is this chat). The item says what the click does. */
+  tabVisible: boolean;
+  /** Tab: the terminal can be closed (the last one cannot). */
+  tabCanClose: boolean;
 }
 
 /** A context with every flag off: the region alone decides, and each test sets what it needs. */
@@ -81,6 +88,8 @@ export function emptyContext(region: MenuRegion): MenuContext {
     code: false,
     tool: false,
     link: false,
+    tabVisible: false,
+    tabCanClose: false,
   };
 }
 
@@ -123,10 +132,19 @@ function joinGroups(groups: (MenuItem | false)[][]): MenuItem[] {
  * all, Find in terminal; then Clear terminal (only at the prompt, with the agent idle, off the alternate screen) and Scroll
  * to bottom. Field: Cut and Paste when it is writable, Copy and Cut without a selection are disabled, then Select all.
  * Chat: Copy (selection), Copy message, Select all, Find in chat; then the code, tool and link items where they apply.
- * Chip: Copy value. None: no items.
+ * Chip: Copy value. Tab: the assignment (Make visible / Hide from agent), Restart, then Close (disabled for the last
+ * terminal). None: no items.
  */
 export function menuFor(ctx: MenuContext, mac: boolean = IS_MAC): MenuItem[] {
   switch (ctx.region) {
+    case 'tab':
+      return joinGroups([
+        [
+          item('tab-visibility', ctx.tabVisible ? 'Hide from agent' : 'Make visible to agent', { mac }),
+          item('tab-restart', 'Restart', { mac }),
+        ],
+        [item('tab-close', 'Close', { disabled: !ctx.tabCanClose, mac })],
+      ]);
     case 'terminal': {
       const clearOffered = ctx.inputState === 'prompt' && !ctx.agentBusy && !ctx.altScreen;
       return joinGroups([

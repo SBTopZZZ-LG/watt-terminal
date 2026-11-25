@@ -77,6 +77,8 @@ The terminal is the main input: keys go to the shell, or to whatever program is 
 | Cmd+F | Find in the chat when focus is in the agent panel, else in the terminal (Enter / Shift+Enter step, Esc closes) |
 | Cmd+Shift+F | Find in the terminal |
 | Cmd+K | Clear scrollback (not in full-screen apps) |
+| Cmd+Shift+T / Cmd+Shift+W | New terminal / close the active one (the last one stays) |
+| Ctrl+Tab / Ctrl+Shift+Tab | Next / previous terminal |
 | Cmd+Plus / Minus / 0 | Font size up / down / reset (saved between launches) |
 | Option+Left/Right, Cmd+Left/Right, Cmd+Backspace | Word jump, line start/end, clear line |
 | Shift+Enter | Newline (Ctrl+J) in a running program such as `claude`; a plain Enter at the prompt |

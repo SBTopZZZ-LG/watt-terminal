@@ -458,7 +458,7 @@ describe('SettingsBody: focusModel', () => {
   it('the dialog takes focusModel without changing the card', () => {
     vi.stubGlobal('document', { activeElement: null });
     try {
-      const out = renderToStaticMarkup(<SettingsDialog focusModel onClose={NOOP} onChanged={NOOP} hideMarks onHideMarksChange={NOOP} queueMode="all" onQueueModeChange={NOOP} thinkingMode="auto" onThinkingModeChange={NOOP} suggestPrompts={false} onSuggestPromptsChange={NOOP} notifications onNotificationsChange={NOOP} devtools={false} onDevtoolsChange={NOOP} />);
+      const out = renderToStaticMarkup(<SettingsDialog focusModel onClose={NOOP} onChanged={NOOP} hideMarks onHideMarksChange={NOOP} queueMode="all" onQueueModeChange={NOOP} thinkingMode="auto" onThinkingModeChange={NOOP} suggestPrompts={false} onSuggestPromptsChange={NOOP} notifications onNotificationsChange={NOOP} devtools={false} onDevtoolsChange={NOOP} newTabsVisible={false} onNewTabsVisibleChange={NOOP} />);
       expect(out).toMatch(/<div class="modal-backdrop"><div class="settings-dialog" role="dialog"/);
     } finally {
       vi.unstubAllGlobals();
@@ -471,7 +471,7 @@ describe('SettingsDialog: backdrop', () => {
     // The dialog reads document.activeElement when it first renders, and the test environment is node, so stub it.
     vi.stubGlobal('document', { activeElement: null });
     try {
-      const out = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} hideMarks onHideMarksChange={NOOP} queueMode="all" onQueueModeChange={NOOP} thinkingMode="auto" onThinkingModeChange={NOOP} suggestPrompts={false} onSuggestPromptsChange={NOOP} notifications onNotificationsChange={NOOP} devtools={false} onDevtoolsChange={NOOP} />);
+      const out = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} hideMarks onHideMarksChange={NOOP} queueMode="all" onQueueModeChange={NOOP} thinkingMode="auto" onThinkingModeChange={NOOP} suggestPrompts={false} onSuggestPromptsChange={NOOP} notifications onNotificationsChange={NOOP} devtools={false} onDevtoolsChange={NOOP} newTabsVisible={false} onNewTabsVisibleChange={NOOP} />);
       // Not anchored at the start: React's server renderer puts <link rel="preload"> tags before the markup for the About images.
       expect(out).toMatch(/<div class="modal-backdrop"><div class="settings-dialog" role="dialog"/);
       expect(out).not.toContain('settings-backdrop');
@@ -485,7 +485,7 @@ describe('SettingsDialog: About tab', () => {
   it('has an About tab whose panel holds the about section, and the footer Close button is still there', () => {
     vi.stubGlobal('document', { activeElement: null });
     try {
-      const out = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} hideMarks onHideMarksChange={NOOP} queueMode="all" onQueueModeChange={NOOP} thinkingMode="auto" onThinkingModeChange={NOOP} suggestPrompts={false} onSuggestPromptsChange={NOOP} notifications onNotificationsChange={NOOP} devtools={false} onDevtoolsChange={NOOP} />);
+      const out = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} hideMarks onHideMarksChange={NOOP} queueMode="all" onQueueModeChange={NOOP} thinkingMode="auto" onThinkingModeChange={NOOP} suggestPrompts={false} onSuggestPromptsChange={NOOP} notifications onNotificationsChange={NOOP} devtools={false} onDevtoolsChange={NOOP} newTabsVisible={false} onNewTabsVisibleChange={NOOP} />);
       expect(out).toMatch(/<button[^>]*role="tab"[^>]*>(?:(?!<\/button>).)*About/);
       expect(out).toContain('class="about"');
       expect(out).toContain('Watt Terminal');
@@ -500,11 +500,11 @@ describe('SettingsDialog: Terminal tab', () => {
   it('has a Terminal tab, and its panel holds the hide-marks checkbox, checked when the setting is on', () => {
     vi.stubGlobal('document', { activeElement: null });
     try {
-      const on = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} hideMarks onHideMarksChange={NOOP} queueMode="all" onQueueModeChange={NOOP} thinkingMode="auto" onThinkingModeChange={NOOP} suggestPrompts={false} onSuggestPromptsChange={NOOP} notifications onNotificationsChange={NOOP} devtools={false} onDevtoolsChange={NOOP} />);
+      const on = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} hideMarks onHideMarksChange={NOOP} queueMode="all" onQueueModeChange={NOOP} thinkingMode="auto" onThinkingModeChange={NOOP} suggestPrompts={false} onSuggestPromptsChange={NOOP} notifications onNotificationsChange={NOOP} devtools={false} onDevtoolsChange={NOOP} newTabsVisible={false} onNewTabsVisibleChange={NOOP} />);
       expect(on).toMatch(/<button[^>]*role="tab"[^>]*>(?:(?!<\/button>).)*Terminal/);
       expect(on).toContain('Hide command separators and agent labels in the terminal');
       expect(on).toMatch(/<input type="checkbox"[^>]*checked=""[^>]*\/>Hide command separators/);
-      const off = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} hideMarks={false} onHideMarksChange={NOOP} queueMode="all" onQueueModeChange={NOOP} thinkingMode="auto" onThinkingModeChange={NOOP} suggestPrompts={false} onSuggestPromptsChange={NOOP} notifications onNotificationsChange={NOOP} devtools={false} onDevtoolsChange={NOOP} />);
+      const off = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} hideMarks={false} onHideMarksChange={NOOP} queueMode="all" onQueueModeChange={NOOP} thinkingMode="auto" onThinkingModeChange={NOOP} suggestPrompts={false} onSuggestPromptsChange={NOOP} notifications onNotificationsChange={NOOP} devtools={false} onDevtoolsChange={NOOP} newTabsVisible={false} onNewTabsVisibleChange={NOOP} />);
       expect(off).toMatch(/<input type="checkbox"[^>]*\/>Hide command separators/);
       expect(off).not.toMatch(/<input type="checkbox"[^>]*checked=""[^>]*\/>Hide command separators/);
     } finally {
@@ -517,11 +517,11 @@ describe('SettingsDialog: suggested prompts', () => {
   it('the Terminal tab holds the suggest checkbox, checked only when the setting is on', () => {
     vi.stubGlobal('document', { activeElement: null });
     try {
-      const on = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} hideMarks onHideMarksChange={NOOP} queueMode="all" onQueueModeChange={NOOP} thinkingMode="auto" onThinkingModeChange={NOOP} suggestPrompts onSuggestPromptsChange={NOOP} notifications onNotificationsChange={NOOP} devtools={false} onDevtoolsChange={NOOP} />);
+      const on = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} hideMarks onHideMarksChange={NOOP} queueMode="all" onQueueModeChange={NOOP} thinkingMode="auto" onThinkingModeChange={NOOP} suggestPrompts onSuggestPromptsChange={NOOP} notifications onNotificationsChange={NOOP} devtools={false} onDevtoolsChange={NOOP} newTabsVisible={false} onNewTabsVisibleChange={NOOP} />);
       expect(on).toContain('Suggested prompts');
       expect(on).toMatch(/<input type="checkbox"[^>]*checked=""[^>]*\/>Suggest follow-up prompts after each reply/);
       expect(on).toContain('Makes one extra model call per reply. On by default.');
-      const off = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} hideMarks onHideMarksChange={NOOP} queueMode="all" onQueueModeChange={NOOP} thinkingMode="auto" onThinkingModeChange={NOOP} suggestPrompts={false} onSuggestPromptsChange={NOOP} notifications onNotificationsChange={NOOP} devtools={false} onDevtoolsChange={NOOP} />);
+      const off = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} hideMarks onHideMarksChange={NOOP} queueMode="all" onQueueModeChange={NOOP} thinkingMode="auto" onThinkingModeChange={NOOP} suggestPrompts={false} onSuggestPromptsChange={NOOP} notifications onNotificationsChange={NOOP} devtools={false} onDevtoolsChange={NOOP} newTabsVisible={false} onNewTabsVisibleChange={NOOP} />);
       expect(off).toMatch(/<input type="checkbox"[^>]*\/>Suggest follow-up prompts after each reply/);
       expect(off).not.toMatch(/<input type="checkbox"[^>]*checked=""[^>]*\/>Suggest follow-up/);
     } finally {
@@ -534,11 +534,11 @@ describe('SettingsDialog: notifications', () => {
   it('the Terminal tab holds the notifications checkbox, checked only when the setting is on', () => {
     vi.stubGlobal('document', { activeElement: null });
     try {
-      const on = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} hideMarks onHideMarksChange={NOOP} queueMode="all" onQueueModeChange={NOOP} thinkingMode="auto" onThinkingModeChange={NOOP} suggestPrompts={false} onSuggestPromptsChange={NOOP} notifications onNotificationsChange={NOOP} devtools={false} onDevtoolsChange={NOOP} />);
+      const on = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} hideMarks onHideMarksChange={NOOP} queueMode="all" onQueueModeChange={NOOP} thinkingMode="auto" onThinkingModeChange={NOOP} suggestPrompts={false} onSuggestPromptsChange={NOOP} notifications onNotificationsChange={NOOP} devtools={false} onDevtoolsChange={NOOP} newTabsVisible={false} onNewTabsVisibleChange={NOOP} />);
       expect(on).toContain('Notifications');
       expect(on).toMatch(/<input type="checkbox"[^>]*checked=""[^>]*\/>Notify me when the agent is done or needs me while Watt is in the background/);
       expect(on).toContain('System notification plus a taskbar flash (Windows) or dock bounce (macOS). Click it to bring Watt back.');
-      const off = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} hideMarks onHideMarksChange={NOOP} queueMode="all" onQueueModeChange={NOOP} thinkingMode="auto" onThinkingModeChange={NOOP} suggestPrompts={false} onSuggestPromptsChange={NOOP} notifications={false} onNotificationsChange={NOOP} devtools={false} onDevtoolsChange={NOOP} />);
+      const off = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} hideMarks onHideMarksChange={NOOP} queueMode="all" onQueueModeChange={NOOP} thinkingMode="auto" onThinkingModeChange={NOOP} suggestPrompts={false} onSuggestPromptsChange={NOOP} notifications={false} onNotificationsChange={NOOP} devtools={false} onDevtoolsChange={NOOP} newTabsVisible={false} onNewTabsVisibleChange={NOOP} />);
       expect(off).toMatch(/<input type="checkbox"[^>]*\/>Notify me when the agent is done/);
       expect(off).not.toMatch(/<input type="checkbox"[^>]*checked=""[^>]*\/>Notify me/);
     } finally {
@@ -551,11 +551,11 @@ describe('SettingsDialog: developer', () => {
   it('the Terminal tab holds the layout inspector checkbox, checked only when the setting is on, and off by default', () => {
     vi.stubGlobal('document', { activeElement: null });
     try {
-      const on = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} hideMarks onHideMarksChange={NOOP} queueMode="all" onQueueModeChange={NOOP} thinkingMode="auto" onThinkingModeChange={NOOP} suggestPrompts={false} onSuggestPromptsChange={NOOP} notifications onNotificationsChange={NOOP} devtools onDevtoolsChange={NOOP} />);
+      const on = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} hideMarks onHideMarksChange={NOOP} queueMode="all" onQueueModeChange={NOOP} thinkingMode="auto" onThinkingModeChange={NOOP} suggestPrompts={false} onSuggestPromptsChange={NOOP} notifications onNotificationsChange={NOOP} devtools onDevtoolsChange={NOOP} newTabsVisible={false} onNewTabsVisibleChange={NOOP} />);
       expect(on).toContain('Developer');
       expect(on).toMatch(/<input type="checkbox"[^>]*checked=""[^>]*\/>Enable the layout inspector/);
       expect(on).toContain('Adds Open layout inspector to the right-click menu. Applies at once.');
-      const off = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} hideMarks onHideMarksChange={NOOP} queueMode="all" onQueueModeChange={NOOP} thinkingMode="auto" onThinkingModeChange={NOOP} suggestPrompts={false} onSuggestPromptsChange={NOOP} notifications onNotificationsChange={NOOP} devtools={false} onDevtoolsChange={NOOP} />);
+      const off = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} hideMarks onHideMarksChange={NOOP} queueMode="all" onQueueModeChange={NOOP} thinkingMode="auto" onThinkingModeChange={NOOP} suggestPrompts={false} onSuggestPromptsChange={NOOP} notifications onNotificationsChange={NOOP} devtools={false} onDevtoolsChange={NOOP} newTabsVisible={false} onNewTabsVisibleChange={NOOP} />);
       expect(off).toMatch(/<input type="checkbox"[^>]*\/>Enable the layout inspector/);
       expect(off).not.toMatch(/<input type="checkbox"[^>]*checked=""[^>]*\/>Enable the layout inspector/);
     } finally {
@@ -568,12 +568,12 @@ describe('SettingsDialog: queued messages', () => {
   it('the Terminal tab holds the queue mode radios, with the saved mode checked', () => {
     vi.stubGlobal('document', { activeElement: null });
     try {
-      const all = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} hideMarks onHideMarksChange={NOOP} queueMode="all" onQueueModeChange={NOOP} thinkingMode="auto" onThinkingModeChange={NOOP} suggestPrompts={false} onSuggestPromptsChange={NOOP} notifications onNotificationsChange={NOOP} devtools={false} onDevtoolsChange={NOOP} />);
+      const all = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} hideMarks onHideMarksChange={NOOP} queueMode="all" onQueueModeChange={NOOP} thinkingMode="auto" onThinkingModeChange={NOOP} suggestPrompts={false} onSuggestPromptsChange={NOOP} notifications onNotificationsChange={NOOP} devtools={false} onDevtoolsChange={NOOP} newTabsVisible={false} onNewTabsVisibleChange={NOOP} />);
       expect(all).toContain('When messages are sent while the agent works');
       expect(all).toContain('Send them together, at the agent&#x27;s next step (default)');
       expect(all).toMatch(/<input type="radio"(?=[^>]*value="all")(?=[^>]*checked="")[^>]*\/>Send them together/);
       expect(all).toMatch(/<input type="radio"(?![^>]*checked="")[^>]*value="one"[^>]*\/>Send them one at a time/);
-      const one = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} hideMarks onHideMarksChange={NOOP} queueMode="one" onQueueModeChange={NOOP} thinkingMode="auto" onThinkingModeChange={NOOP} suggestPrompts={false} onSuggestPromptsChange={NOOP} notifications onNotificationsChange={NOOP} devtools={false} onDevtoolsChange={NOOP} />);
+      const one = renderToStaticMarkup(<SettingsDialog onClose={NOOP} onChanged={NOOP} hideMarks onHideMarksChange={NOOP} queueMode="one" onQueueModeChange={NOOP} thinkingMode="auto" onThinkingModeChange={NOOP} suggestPrompts={false} onSuggestPromptsChange={NOOP} notifications onNotificationsChange={NOOP} devtools={false} onDevtoolsChange={NOOP} newTabsVisible={false} onNewTabsVisibleChange={NOOP} />);
       expect(one).toMatch(/<input type="radio"(?=[^>]*value="one")(?=[^>]*checked="")[^>]*\/>Send them one at a time/);
       expect(one).not.toMatch(/<input type="radio"(?=[^>]*value="all")(?=[^>]*checked="")/);
     } finally {
