@@ -1444,6 +1444,7 @@ mod tests {
             trimmed: false,
             calibrated: true,
             categories: vec![CategoryUsage { id: "user".into(), tokens: used }],
+            cached_tokens: None,
         }
     }
 

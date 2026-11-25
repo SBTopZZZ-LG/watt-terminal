@@ -960,8 +960,11 @@ impl LlmAgent {
             && let Some(actual) = reply.usage.as_ref().map(|usage| usage.prompt_tokens).filter(|&n| n > 0)
         {
             let actual = u32::try_from(actual).unwrap_or(u32::MAX);
+            // The provider's cache count, kept within the prompt it is part of. None when the provider did not report it.
+            let cached = reply.usage.and_then(|usage| usage.cached_tokens).map(|cached| cached.min(actual));
             lock_calibration(&self.calibration).observe(breakdown.total(), actual);
-            self.emit_usage(ctx, context::with_actual(&before, actual));
+            let after = ContextUsage { cached_tokens: cached, ..context::with_actual(&before, actual) };
+            self.emit_usage(ctx, after);
         }
         (result, streamed.get())
     }

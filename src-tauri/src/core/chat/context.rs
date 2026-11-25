@@ -293,6 +293,9 @@ pub struct ContextUsage {
     /// True once a reply has reported the provider's count in this conversation.
     pub calibrated: bool,
     pub categories: Vec<CategoryUsage>,
+    /// The part of the last reply's prompt (`used`) that the provider served from its cache. None when the reply did not
+    /// report it, and in a usage that is still an estimate. Missing in older saved data, which reads as None.
+    pub cached_tokens: Option<u32>,
 }
 
 /// The largest limit or count a stored usage may hold, and the most categories it may list. Anything above is taken for
@@ -318,6 +321,7 @@ impl ContextUsage {
             && self.categories.len() <= SANE_CATEGORIES
             && ids_ok
             && sum.abs_diff(u64::from(self.used)) <= 1
+            && self.cached_tokens.is_none_or(|cached| cached <= self.used)
     }
 }
 
@@ -344,6 +348,7 @@ pub fn usage(breakdown: &Breakdown, calibrator: &Calibrator, limit: Option<u32>,
         trimmed: false,
         calibrated: calibrator.observed(),
         categories,
+        cached_tokens: None,
     }
 }
 
@@ -714,6 +719,7 @@ mod tests {
                 .iter()
                 .map(|id| CategoryUsage { id: id.to_string(), tokens: 1 })
                 .collect(),
+            cached_tokens: None,
         };
         // Each of three ones scales to 10/3, which rounds to 3 each: nine, so the first largest takes the missing one.
         let actual = with_actual(&estimate, 10);
@@ -743,6 +749,7 @@ mod tests {
                 .iter()
                 .map(|(id, tokens)| CategoryUsage { id: id.to_string(), tokens: *tokens })
                 .collect(),
+            cached_tokens: None,
         }
     }
 
@@ -756,12 +763,14 @@ mod tests {
         let sixteen: Vec<(&str, u32)> = (0..16).map(|_| ("x", 1)).collect();
         assert!(stored_usage(16, None, &sixteen).is_sane(), "sixteen categories");
         assert!(stored_usage(1, None, &[("a_1_b", 1)]).is_sane(), "lower case, digits and underscores");
+        assert!(ContextUsage { cached_tokens: Some(30), ..stored_usage(30, None, &[("user", 30)]) }.is_sane(), "all cached");
     }
 
     #[test]
     fn a_damaged_usage_is_not_sane() {
         let long_id = "a".repeat(41);
         let cases = [
+            ("more cached than the prompt", ContextUsage { cached_tokens: Some(31), ..stored_usage(30, None, &[("user", 30)]) }),
             ("categories sum to less than used", stored_usage(30, None, &[("system", 10)])),
             ("categories sum to more than used", stored_usage(10, None, &[("system", 10), ("user", 10)])),
             ("used above the largest count", stored_usage(100_000_001, None, &[("other", 100_000_001)])),

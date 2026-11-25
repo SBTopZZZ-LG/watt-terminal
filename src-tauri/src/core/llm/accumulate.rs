@@ -149,9 +149,16 @@ fn first_choice(body: &Value) -> Option<&Value> {
 
 fn usage_of(body: &Value) -> Option<Usage> {
     let usage = body.get("usage").filter(|u| u.is_object())?;
+    let prompt_tokens = usage.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
+    // OpenAI shape. Cached tokens are a part of the prompt, so they are clamped to it.
+    let cached_tokens = usage
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .and_then(Value::as_u64)
+        .map(|cached| u32::try_from(cached.min(prompt_tokens)).unwrap_or(u32::MAX));
     Some(Usage {
-        prompt_tokens: usage.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0),
+        prompt_tokens,
         completion_tokens: usage.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0),
+        cached_tokens,
     })
 }
 
@@ -229,7 +236,7 @@ mod tests {
         assert_eq!(reply.tool_calls[0].name, "get_cwd");
         assert_eq!(reply.tool_calls[0].arguments, "{}");
         assert_eq!(reply.finish_reason.as_deref(), Some("tool_calls"));
-        assert_eq!(reply.usage, Some(Usage { prompt_tokens: 334, completion_tokens: 23 }));
+        assert_eq!(reply.usage, Some(Usage { prompt_tokens: 334, completion_tokens: 23, cached_tokens: Some(256) }));
         assert_eq!(reply.raw["role"], "assistant");
         assert_eq!(reply.raw["content"], Value::Null);
         assert_eq!(reply.raw["tool_calls"][0]["function"]["arguments"], "{}");
@@ -345,9 +352,28 @@ mod tests {
         ).unwrap();
         let reply = acc.finish().unwrap();
         assert_eq!(reply.text, "hi");
-        assert_eq!(reply.usage, Some(Usage { prompt_tokens: 5, completion_tokens: 2 }));
+        assert_eq!(reply.usage, Some(Usage { prompt_tokens: 5, completion_tokens: 2, cached_tokens: None }));
         assert_eq!(reply.raw["content"], "hi");
         assert!(reply.raw.get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn cached_tokens_are_read_from_prompt_tokens_details_and_clamped_to_the_prompt() {
+        let usage_of_text = |usage: &str| usage_of(&chunk(&format!(r#"{{"choices":[],"usage":{usage}}}"#)));
+        // Reported: read as is.
+        let usage = usage_of_text(r#"{"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":64}}"#);
+        assert_eq!(usage, Some(Usage { prompt_tokens: 100, completion_tokens: 5, cached_tokens: Some(64) }));
+        // Reported as 0: a known zero, not unknown.
+        let usage = usage_of_text(r#"{"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":0}}"#);
+        assert_eq!(usage.and_then(|u| u.cached_tokens), Some(0));
+        // Absent, or the details object is null: unknown.
+        let usage = usage_of_text(r#"{"prompt_tokens":100,"completion_tokens":5}"#);
+        assert_eq!(usage.and_then(|u| u.cached_tokens), None);
+        let usage = usage_of_text(r#"{"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":null}"#);
+        assert_eq!(usage.and_then(|u| u.cached_tokens), None);
+        // More cached than the prompt: clamped to the prompt.
+        let usage = usage_of_text(r#"{"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":250}}"#);
+        assert_eq!(usage, Some(Usage { prompt_tokens: 100, completion_tokens: 5, cached_tokens: Some(100) }));
     }
 
     #[test]
@@ -387,7 +413,8 @@ mod tests {
         assert_eq!(reply.tool_calls[0].arguments, "{}");
         assert_eq!(reply.reasoning, "The user wants me to use the get_cwd tool.");
         assert_eq!(reply.raw, body["choices"][0]["message"], "raw message is the provider object as returned");
-        assert_eq!(reply.usage, Some(Usage { prompt_tokens: 349, completion_tokens: 36 }));
+        // This fixture reports `cached_tokens: 0`: a known zero, not unknown.
+        assert_eq!(reply.usage, Some(Usage { prompt_tokens: 349, completion_tokens: 36, cached_tokens: Some(0) }));
     }
 
     #[test]
@@ -399,6 +426,7 @@ mod tests {
         assert_eq!(reply.reasoning, "", "reasoning_content is present but empty");
         assert_eq!(reply.tool_calls[0].id, "call_00_kmz9kf3kzjshdkcvbdxqkrnx");
         assert_eq!(reply.finish_reason.as_deref(), Some("tool_calls"));
-        assert_eq!(reply.usage, Some(Usage { prompt_tokens: 334, completion_tokens: 29 }));
+        // This fixture reports `cached_tokens: 0`: a known zero, not unknown.
+        assert_eq!(reply.usage, Some(Usage { prompt_tokens: 334, completion_tokens: 29, cached_tokens: Some(0) }));
     }
 }

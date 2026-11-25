@@ -1,7 +1,7 @@
 import { useId, useLayoutEffect, useRef, useState } from 'react';
 import type { KeyboardEvent } from 'react';
 import type { ContextUsage } from '../lib/types';
-import { detailMaxHeight, formatTokens, groupDigits, headline, level, percent, rows, segments, share } from '../lib/contextMeter';
+import { cacheHit, detailMaxHeight, formatTokens, groupDigits, headline, level, percent, rows, segments, share } from '../lib/contextMeter';
 
 interface Props {
   /** The latest request's usage. Null hides the meter altogether. */
@@ -81,6 +81,7 @@ export function ContextMeter({ usage }: Props) {
   const fill = limit === null ? 0 : Math.min(100, share(usage.used, limit));
   const action = open ? 'Hide' : 'Show';
   const title = limit === null ? `Context limit unknown. ${action} the details` : `${action} the context details`;
+  const cache = cacheHit(usage);
 
   const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
     if (e.key === 'Escape' && open) {
@@ -103,7 +104,7 @@ export function ContextMeter({ usage }: Props) {
         className={`context-meter is-${lvl}`}
         aria-expanded={open}
         aria-controls={detailId}
-        aria-label={summary}
+        aria-label={cache === null ? summary : `${summary}, ${cache.label}`}
         title={title}
         onClick={() => setOpen((o) => !o)}
       >
@@ -118,6 +119,11 @@ export function ContextMeter({ usage }: Props) {
           {limit !== null && <span className="context-meter-fill" style={{ width: `${fill}%` }} />}
         </span>
         <span className="context-meter-percent">{limit === null ? used : percent(usage.used, limit)}</span>
+        {cache !== null && (
+          <span className="context-meter-cache" title={cache.title}>
+            {cache.label}
+          </span>
+        )}
         {limit !== null && <span className="context-meter-figures">{`${used} / ${formatTokens(limit)}`}</span>}
         <svg className="context-chevron" viewBox="0 0 16 16" width="10" height="10" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
           <path d="M4 6l4 4 4-4" />

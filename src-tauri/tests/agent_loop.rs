@@ -2541,6 +2541,38 @@ fn the_calibration_carries_to_the_next_turn_of_the_conversation() {
 }
 
 #[test]
+fn the_cache_count_rides_on_the_provider_count_and_does_not_change_the_calibration() {
+    let cached_reply = |cached: u64| {
+        let mut reply = text_reply("one");
+        reply["usage"] = json!({"prompt_tokens": 1234, "completion_tokens": 3, "prompt_tokens_details": {"cached_tokens": cached}});
+        reply
+    };
+    let run = |reply: Value| {
+        let provider = serve(vec![Script::json(reply), Script::json(text_reply("two"))]);
+        let s = settings(&provider.url, false);
+        let conv = Conversation::new().unwrap();
+        let first = usages(&turn(&mut agent_for(&s, &conv, Arc::new(TurnCancel::new())), &FakeTools::default(), &auto_gate(), "first"));
+        let second = usages(&turn(&mut agent_for(&s, &conv, Arc::new(TurnCancel::new())), &FakeTools::default(), &auto_gate(), "second"));
+        (first, second)
+    };
+
+    let (first, second) = run(cached_reply(1000));
+    assert_eq!(first[0].cached_tokens, None, "the estimate has no cache count yet");
+    assert_eq!(first[1].cached_tokens, Some(1000));
+    assert_eq!(first[1].used, 1234, "the cache count does not change the provider count");
+
+    // The same conversation with no cache count in the reply: the next estimate is the same.
+    let (plain_first, plain_second) = run(with_usage(text_reply("one"), 1234));
+    assert_eq!(plain_first[1].cached_tokens, None);
+    assert_eq!(second[0].categories, plain_second[0].categories, "the calibration learns from prompt_tokens only");
+    assert_eq!(second[0].used, plain_second[0].used);
+
+    // More cached than the prompt is clamped to the prompt.
+    let (over, _) = run(cached_reply(5000));
+    assert_eq!(over[1].cached_tokens, Some(1234));
+}
+
+#[test]
 fn a_reset_conversation_starts_with_no_calibration() {
     let provider = serve(vec![Script::json(with_usage(text_reply("one"), 1234)), Script::json(text_reply("two"))]);
     let s = settings(&provider.url, false);

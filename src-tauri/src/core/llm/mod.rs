@@ -146,6 +146,9 @@ pub struct ToolCall {
 pub struct Usage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// Prompt tokens the provider served from its cache. A part of `prompt_tokens`, so at most that. None when the
+    /// provider does not report it, which is not the same as 0.
+    pub cached_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
