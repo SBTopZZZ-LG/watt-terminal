@@ -48,6 +48,7 @@ Watt is a terminal for macOS and Windows 11 where the user and an AI agent share
 ## Working practices
 
 - Read the neighbouring code and reuse its helpers first. Add tests next to what you change. Change an existing assertion only when the behaviour change is intended, and say which one and why.
+- Hooks run on every render, before any early `return` and never inside a condition, loop or `&&`/`?:` branch. `src/lib/hooksOrder.test.ts` checks all of `src/` for this (a hook after an early return crashed the UI in InputBar).
 - Verify with real command output. Report what passed, failed, was skipped and remains unverified; never claim a check passed without running it.
 - Keep changes scoped: no drive-by refactors, no new dependency without a reason, no loosening a check to get green.
 - Commit small, with imperative messages that explain the why. Don't commit `dist/`, `src-tauri/target/` or local task notes.
