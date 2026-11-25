@@ -172,16 +172,21 @@ export interface BarKeyContext {
   inputEmpty: boolean;
   hasPendingApproval: boolean;
   /**
-   * Enter may approve only when armed: the pending card has been visible in the chat body for 500ms
-   * (see App.tsx). Escape still denies on `hasPendingApproval` alone.
+   * Enter and Escape act on a pending approval only when armed: the pending card has been visible in the chat body for
+   * 500ms (see App.tsx). Otherwise they behave as with no approval pending.
    */
   canApprove: boolean;
+  /** The textarea has a non-empty selection (selectionStart !== selectionEnd). */
+  hasSelection: boolean;
+  /** Running on macOS (see platform.ts). There Cmd+C copies, and Ctrl+C is always the interrupt. */
+  mac: boolean;
 }
 
 /**
- * What a key pressed in the input bar means. Ctrl-C is always `interrupt` (the caller sends ^C to the PTY),
- * whatever the state. Enter approves the first pending approval when the input is empty and approval is armed;
- * otherwise it submits. Escape denies a pending approval, armed or not.
+ * What a key pressed in the input bar means. Ctrl-C is `interrupt` (the caller sends ^C to the PTY), whatever the state,
+ * except off macOS with text selected in the bar: then it is `none`, so the textarea copies the selection. Enter approves
+ * the first pending approval when the input is empty and approval is armed; otherwise it submits. Escape denies a pending
+ * approval when armed; otherwise it closes the bar.
  * Otherwise Escape closes the bar's focus (back to the terminal). Shift-Enter is `none`, so the textarea
  * inserts a newline. Shift+Tab is `toggle_approval` (the caller flips approve-all); Ctrl+Shift+Tab stays `none`,
  * so focus can still move on with a modifier.
@@ -192,7 +197,7 @@ export function barKeyIntent(
   ctx: BarKeyContext,
 ): BarKey {
   if (mods.ctrl && !mods.shift && key.toLowerCase() === 'c') {
-    return 'interrupt';
+    return !ctx.mac && ctx.hasSelection ? 'none' : 'interrupt';
   }
   switch (key) {
     case 'Enter':
@@ -201,7 +206,7 @@ export function barKeyIntent(
       }
       return ctx.inputEmpty && ctx.hasPendingApproval && ctx.canApprove ? 'approve_first' : 'submit';
     case 'Escape':
-      return ctx.hasPendingApproval ? 'deny_first' : 'close';
+      return ctx.hasPendingApproval && ctx.canApprove ? 'deny_first' : 'close';
     case 'ArrowUp':
       return 'history_prev';
     case 'ArrowDown':

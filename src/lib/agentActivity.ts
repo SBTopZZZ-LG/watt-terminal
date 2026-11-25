@@ -17,8 +17,11 @@ export interface ActivityLine {
  * The activity line: the newest non-empty agent message first (whitespace collapsed, capped at ~160 characters),
  * else the newest run_command/send_keys tool caption as `<name> · <caption>`. With neither, `Working…` while a side
  * command runs, `Thinking…` while the model has not produced output yet, else `Working…`.
+ * Only the current turn counts: items after the last user message. A reply from an earlier turn is not shown.
  */
-export function agentActivity(items: TranscriptItem[], thinking: boolean, sideBusy: boolean): ActivityLine {
+export function agentActivity(allItems: TranscriptItem[], thinking: boolean, sideBusy: boolean): ActivityLine {
+  const lastUser = allItems.map((i) => i.kind).lastIndexOf('user');
+  const items = allItems.slice(lastUser + 1);
   for (let i = items.length - 1; i >= 0; i--) {
     const item = items[i];
     if (item.kind === 'agent') {

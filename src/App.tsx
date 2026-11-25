@@ -165,6 +165,14 @@ export default function App() {
   const draining = useRef(false);
   const drainAgain = useRef(false);
   const [queueMode, setQueueMode] = useState<QueueMode>('all');
+  // Queued messages taken back by a Stop or a restart. The input takes them as an unqueue does (InputBar's restoreTick).
+  const [restoreTick, setRestoreTick] = useState(0);
+  const returned = useRef<QueuedMessage[]>([]);
+  // The side-command flag for the status reader, which is registered once (see applyStatus).
+  const sideBusyRef = useRef(false);
+  useEffect(() => {
+    sideBusyRef.current = sideBusy;
+  });
   // How reasoning blocks show (the Reasoning setting). Auto until the file says otherwise.
   const [thinkingMode, setThinkingMode] = useState<ThinkingMode>(DEFAULT_THINKING_MODE);
   // Bumped when the live conversation is renamed, so an open HistoryView remounts and refetches its rows.
@@ -261,7 +269,11 @@ export default function App() {
     }
     setAgentControl((c) => settleControl(c, s));
     setConversationId(s.conversation_id);
-    dispatchTranscript({ type: 'sync_busy', busy: s.agent_busy });
+    // The backend's busy also covers a side command (btw, suggest_name), which never sends `done`. While one runs, the status
+    // says nothing about the transcript's turn, so it is not synced; once it ends, the next status reads idle.
+    if (!sideBusyRef.current) {
+      dispatchTranscript({ type: 'sync_busy', busy: s.agent_busy });
+    }
     if (s.observer === 'desynced') {
       marks.observerDesynced();
     }
@@ -668,7 +680,9 @@ export default function App() {
           return;
         }
       }
-      const app = appHotkeyFor(e);
+      // In the terminal, off macOS, plain Ctrl+F is the shell's (see appHotkeys.ts); Ctrl+Shift+F still finds.
+      const inTerminal = e.target instanceof Element && e.target.closest('.xterm') != null;
+      const app = appHotkeyFor(e, undefined, inTerminal);
       if (app === null) {
         return;
       }
@@ -825,6 +839,34 @@ export default function App() {
     queueGen.current += 1;
     commitQueue([]);
     dropSuggestions();
+  };
+
+  /**
+   * Takes what is queued back into the input (a Stop, a restart): nothing is sent. InputBar restores it when the tick moves,
+   * so the queue's messages come back as an unqueue does, with their files.
+   */
+  const returnQueued = () => {
+    if (queueRef.current.length === 0) {
+      return;
+    }
+    returned.current = [...returned.current, ...queueRef.current];
+    commitQueue([]);
+    setRestoreTick((t) => t + 1);
+  };
+
+  /** The messages returned for the input to restore (see returnQueued). Read once. */
+  const takeReturned = (): QueuedMessage[] => {
+    const items = returned.current;
+    returned.current = [];
+    return items;
+  };
+
+  /**
+   * Asks the backend to cancel the running turn, then reads the status again. If the backend is already idle, the busy
+   * state follows it (applyStatus), so a turn the UI thought was running cannot stay busy.
+   */
+  const cancelRunning = () => {
+    api.cancelAgent().catch(reportError).then(() => refreshStatus());
   };
 
   /**
@@ -1068,14 +1110,17 @@ export default function App() {
       case 'stop': {
         // A side command holds no shell command: cancel it without touching the terminal.
         if (sideBusy) {
-          api.cancelAgent().catch(reportError);
+          cancelRunning();
           return { kind: 'handled' };
         }
         if (!isBusy(transcriptRef.current)) {
           dispatchTranscript({ type: 'notice', text: 'No turn is running.', muted: true });
           return { kind: 'handled' };
         }
-        api.cancelAgent().catch(reportError);
+        cancelRunning();
+        // Queued messages come back into the input, not sent. This runs after the bar clears the typed "/stop" (it is still
+        // in the bar until this returns), so the restored text is not lost with it.
+        setTimeout(returnQueued, 0);
         // ^C only when the agent holds the shell, so stopping a thinking/waiting turn never kills the
         // user's own foreground process.
         if (!locked && borderActive(agentControl)) {
@@ -1309,21 +1354,22 @@ export default function App() {
     }
     // While a turn runs, a plain message (or an unknown `/...`, which is one) waits in the queue instead of being refused.
     // Read again after any await: the turn may have ended meanwhile.
-    const queueIt = (): null => {
+    const queueIt = (queued: string): null => {
       queueSeq.current += 1;
-      commitQueue(enqueue(queueRef.current, queueSeq.current, text, attachments));
+      commitQueue(enqueue(queueRef.current, queueSeq.current, queued, attachments));
       return null;
     };
     const parsed = parseCommand(text);
     if (parsed === null) {
-      return isBusy(transcriptRef.current) ? queueIt() : sendAgent(text, attachments);
+      return isBusy(transcriptRef.current) ? queueIt(text) : sendAgent(text, attachments);
     }
     const outcome = await runCommand(parsed.name, parsed.args, text);
+    // A template expands into a message: queued as that message, like a plain one, while busy.
     if (outcome.kind === 'send') {
-      return sendAgent(outcome.text, attachments);
+      return isBusy(transcriptRef.current) ? queueIt(outcome.text) : sendAgent(outcome.text, attachments);
     }
     if (outcome.kind === 'unknown') {
-      return isBusy(transcriptRef.current) ? queueIt() : sendAgent(text, attachments);
+      return isBusy(transcriptRef.current) ? queueIt(text) : sendAgent(text, attachments);
     }
     return null;
   };
@@ -1417,9 +1463,10 @@ export default function App() {
 
   const answer = (callId: string, approve: boolean) => {
     dispatchTranscript({ type: 'approval_answering', callId, approve });
-    api.approveTool(callId, approve).catch((e) => {
-      dispatchTranscript({ type: 'approval_failed', callId, message: errorText(e) });
-    });
+    api.approveTool(callId, approve).then(
+      () => dispatchTranscript({ type: 'approval_sent', callId }),
+      (e) => dispatchTranscript({ type: 'approval_failed', callId, message: errorText(e) }),
+    );
   };
 
   /**
@@ -1647,6 +1694,8 @@ export default function App() {
     }
     setRestarting(true);
     resetForNewSession();
+    // The same conversation goes on, so what was queued comes back into the input rather than being dropped.
+    returnQueued();
     clearQueue();
     dispatchTranscript({ type: 'session_reset' });
     setAgentControl(NO_CONTROL);
@@ -1817,20 +1866,24 @@ export default function App() {
               onInterrupt={() => {
                 // A side command holds no shell command: cancel it without touching the terminal.
                 if (sideBusy) {
-                  api.cancelAgent().catch(reportError);
+                  cancelRunning();
                   return;
                 }
                 // At an idle prompt there is nothing to stop: no cancel, and no ^C into the user's shell.
                 if (!busy) {
                   return;
                 }
-                api.cancelAgent().catch(reportError);
+                cancelRunning();
+                // A stop does not send what is queued: it comes back into the input.
+                returnQueued();
                 // ^C only when the agent holds the shell, so stopping a thinking/waiting turn never kills
                 // the user's own foreground process.
                 if (!locked && borderActive(agentControl)) {
                   sendRaw(CTRL_C);
                 }
               }}
+              restoreTick={restoreTick}
+              takeReturned={takeReturned}
               onApproveFirst={approveFirst}
               onDenyFirst={denyFirst}
               onClose={closeBar}

@@ -14,7 +14,7 @@ import { carriesFiles } from '../lib/dropGuard';
 import { shouldRestoreInputFocus } from '../lib/inputFocus';
 import { showsVisionWarning } from '../lib/modelVision';
 import { visibleEscapes } from '../lib/visibleEscapes';
-import { shortcutLabel } from '../lib/platform';
+import { IS_MAC, shortcutLabel } from '../lib/platform';
 import type { AttachmentInput, CommandCatalog, QueueMode } from '../lib/types';
 import { AttachmentChips } from './AttachmentChips';
 import type { ChipItem } from './AttachmentChips';
@@ -81,6 +81,12 @@ interface Props {
   queueable: boolean;
   /** Takes a queued message back: returns it, or null when it is gone. Its text goes back into the input, selected. */
   onUnqueue: (id: number) => QueuedMessage | null;
+  /**
+   * Queued messages the app took back without a click (a Stop, or a restart): they come into the input as an unqueue
+   * does. Bumping `restoreTick` runs it; `takeReturned` gives the messages.
+   */
+  restoreTick?: number;
+  takeReturned?: () => QueuedMessage[];
   /** Follow-up prompts for the latest reply, as buttons under the field. Shown in chat mode only when the agent is idle. */
   suggestions: string[];
   /** A suggestion was clicked: it is sent as a plain message (not through the command parser). */
@@ -405,18 +411,37 @@ export function InputBar(props: Props) {
    */
   function unqueue(id: number) {
     const removed = props.onUnqueue(id);
-    if (removed === null) {
-      return;
+    if (removed !== null) {
+      restoreQueued([removed]);
     }
-    const restored: Draft[] = removed.attachments.map((input) => {
+  }
+
+  /** Puts queued messages back into the input: their texts (in order, before any text there), selected, and their files as drafts. */
+  function restoreQueued(items: QueuedMessage[]) {
+    const restored: Draft[] = items.flatMap((q) => q.attachments).map((input) => {
       draftKey.current += 1;
       return { key: draftKey.current, name: input.name, bytes: decodedSize(input.data_b64), input };
     });
     commit([...draftsRef.current, ...restored]);
-    updateText(restoreText(removed.text, textRef.current));
+    const text = items.map((q) => q.text).filter((t) => t !== '').join('\n\n');
+    updateText(restoreText(text, textRef.current));
     setError(null);
     setRestoreToken((t) => t + 1);
   }
+
+  // Queued messages the app took back (a Stop, a restart) come into the input here. Runs once per tick.
+  const restoreSeen = useRef(props.restoreTick ?? 0);
+  useEffect(() => {
+    const tick = props.restoreTick ?? 0;
+    if (tick === restoreSeen.current) {
+      return;
+    }
+    restoreSeen.current = tick;
+    const items = props.takeReturned?.() ?? [];
+    if (items.length > 0) {
+      restoreQueued(items);
+    }
+  }, [props.restoreTick]);
 
   /** Takes a menu row: the text becomes `/name` (plus a space when it takes arguments) and the menu shuts, so it does not reopen for the new text. */
   function acceptItem(item: CommandMenuItem) {
@@ -446,16 +471,9 @@ export function InputBar(props: Props) {
     } finally {
       setSending(false);
     }
+    // A local slash command returns null (it ran), so the bar clears. A refused send keeps its text and files, whether it
+    // was a plain message or a slash-looking one (`/var/log/...`, a template), so the user can retry.
     if (err) {
-      // Local slash commands already report their outcome in the transcript, so the bar clears even on
-      // error; plain messages keep their text so the user can retry.
-      if (text.trimStart().startsWith('/')) {
-        history.current.record(text);
-        clearSent(sentKey, text);
-        commit(draftsRef.current.filter((d) => !sent.has(d.key)));
-        setError(null);
-        return;
-      }
       setError(err);
       return;
     }
@@ -592,7 +610,14 @@ export function InputBar(props: Props) {
       e.key,
       { ctrl: e.ctrlKey, shift: e.shiftKey },
       // Staged attachments are not an empty input: Enter sends them rather than approving a pending call.
-      { inputEmpty: text === '' && drafts.length === 0, hasPendingApproval, canApprove: props.canApprove },
+      {
+        inputEmpty: text === '' && drafts.length === 0,
+        hasPendingApproval,
+        canApprove: props.canApprove,
+        // Off macOS, Ctrl+C with text selected copies it (see inputState.ts). The selection is read from the field itself.
+        hasSelection: e.currentTarget.selectionStart !== e.currentTarget.selectionEnd,
+        mac: IS_MAC,
+      },
     );
     switch (intent) {
       case 'interrupt':

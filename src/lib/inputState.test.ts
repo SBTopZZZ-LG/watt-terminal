@@ -194,16 +194,39 @@ describe('focusAfter', () => {
 });
 
 describe('barKeyIntent', () => {
-  const none = { inputEmpty: true, hasPendingApproval: false, canApprove: false };
+  const none = { inputEmpty: true, hasPendingApproval: false, canApprove: false, hasSelection: false, mac: true };
+  const CTRL_C = { ctrl: true, shift: false };
 
-  it('Ctrl-C is an interrupt in every state, with or without text or approvals', () => {
+  it('Ctrl-C is an interrupt in every state, with or without text or approvals, when nothing is selected', () => {
     for (const s of ALL_STATES) {
       // The key mapping does not depend on the state, so the state is taken through effectiveState to show it.
       const eff = effectiveState(model(s));
-      for (const ctx of [none, { inputEmpty: false, hasPendingApproval: true, canApprove: true }]) {
-        expect(barKeyIntent('c', { ctrl: true, shift: false }, ctx), eff).toBe('interrupt');
+      for (const mac of [true, false]) {
+        for (const ctx of [
+          { ...none, mac },
+          { inputEmpty: false, hasPendingApproval: true, canApprove: true, hasSelection: false, mac },
+        ]) {
+          expect(barKeyIntent('c', CTRL_C, ctx), `${eff} mac=${mac}`).toBe('interrupt');
+        }
       }
     }
+  });
+
+  it('off macOS, Ctrl-C with text selected in the bar is not an interrupt: it is none, so the textarea copies', () => {
+    expect(barKeyIntent('c', CTRL_C, { ...none, mac: false, hasSelection: true })).toBe('none');
+    expect(barKeyIntent('C', CTRL_C, { ...none, mac: false, hasSelection: true })).toBe('none');
+    // With approvals pending too: the copy wins over the interrupt, and the approval is left alone.
+    expect(
+      barKeyIntent('c', CTRL_C, { inputEmpty: false, hasPendingApproval: true, canApprove: true, hasSelection: true, mac: false }),
+    ).toBe('none');
+  });
+
+  it('on macOS, Ctrl-C is an interrupt even with a selection (Cmd+C copies there)', () => {
+    expect(barKeyIntent('c', CTRL_C, { ...none, mac: true, hasSelection: true })).toBe('interrupt');
+  });
+
+  it('off macOS, Ctrl-C with no selection still interrupts', () => {
+    expect(barKeyIntent('c', CTRL_C, { ...none, mac: false, hasSelection: false })).toBe('interrupt');
   });
 
   it('Ctrl-Shift-C is not an interrupt', () => {
@@ -212,37 +235,38 @@ describe('barKeyIntent', () => {
 
   it('Enter approves the first pending approval only when the input is empty and approval is armed', () => {
     expect(
-      barKeyIntent('Enter', { ctrl: false, shift: false }, { inputEmpty: true, hasPendingApproval: true, canApprove: true }),
+      barKeyIntent('Enter', { ctrl: false, shift: false }, { inputEmpty: true, hasPendingApproval: true, canApprove: true, hasSelection: false, mac: true }),
     ).toBe('approve_first');
     expect(
-      barKeyIntent('Enter', { ctrl: false, shift: false }, { inputEmpty: false, hasPendingApproval: true, canApprove: true }),
+      barKeyIntent('Enter', { ctrl: false, shift: false }, { inputEmpty: false, hasPendingApproval: true, canApprove: true, hasSelection: false, mac: true }),
     ).toBe('submit');
     expect(barKeyIntent('Enter', { ctrl: false, shift: false }, none)).toBe('submit');
   });
 
   it('Enter submits while approval is unarmed, so a fresh or hidden card cannot be approved by Enter', () => {
     expect(
-      barKeyIntent('Enter', { ctrl: false, shift: false }, { inputEmpty: true, hasPendingApproval: true, canApprove: false }),
+      barKeyIntent('Enter', { ctrl: false, shift: false }, { inputEmpty: true, hasPendingApproval: true, canApprove: false, hasSelection: false, mac: true }),
     ).toBe('submit');
   });
 
   it('Shift-Enter is not a submit or an approval: it is none, so the textarea inserts a newline', () => {
     expect(barKeyIntent('Enter', { ctrl: false, shift: true }, none)).toBe('none');
-    expect(barKeyIntent('Enter', { ctrl: false, shift: true }, { inputEmpty: false, hasPendingApproval: false, canApprove: false })).toBe(
+    expect(barKeyIntent('Enter', { ctrl: false, shift: true }, { inputEmpty: false, hasPendingApproval: false, canApprove: false, hasSelection: false, mac: true })).toBe(
       'none',
     );
-    expect(barKeyIntent('Enter', { ctrl: false, shift: true }, { inputEmpty: true, hasPendingApproval: true, canApprove: true })).toBe(
+    expect(barKeyIntent('Enter', { ctrl: false, shift: true }, { inputEmpty: true, hasPendingApproval: true, canApprove: true, hasSelection: false, mac: true })).toBe(
       'none',
     );
   });
 
-  it('Escape denies a pending approval even when unarmed, otherwise it closes the bar (focus back to the terminal)', () => {
+  it('Escape denies a pending approval only when armed, like Enter; otherwise it closes the bar (focus back to the terminal)', () => {
     expect(
-      barKeyIntent('Escape', { ctrl: false, shift: false }, { inputEmpty: true, hasPendingApproval: true, canApprove: true }),
+      barKeyIntent('Escape', { ctrl: false, shift: false }, { inputEmpty: true, hasPendingApproval: true, canApprove: true, hasSelection: false, mac: true }),
     ).toBe('deny_first');
+    // Unarmed (or hidden) card: Escape does not deny it, it behaves as with no approval pending.
     expect(
-      barKeyIntent('Escape', { ctrl: false, shift: false }, { inputEmpty: true, hasPendingApproval: true, canApprove: false }),
-    ).toBe('deny_first');
+      barKeyIntent('Escape', { ctrl: false, shift: false }, { inputEmpty: true, hasPendingApproval: true, canApprove: false, hasSelection: false, mac: true }),
+    ).toBe('close');
     expect(barKeyIntent('Escape', { ctrl: false, shift: false }, none)).toBe('close');
   });
 
@@ -282,7 +306,7 @@ describe('isFocusBarHotkey', () => {
 
   it('leaves Escape to the bar: Escape is not a focus hotkey, and the bar still closes on it', () => {
     expect(isFocusBarHotkey(press('Escape', { ctrl: true, shift: true }))).toBe(false);
-    expect(barKeyIntent('Escape', { ctrl: false, shift: false }, { inputEmpty: true, hasPendingApproval: false, canApprove: false })).toBe(
+    expect(barKeyIntent('Escape', { ctrl: false, shift: false }, { inputEmpty: true, hasPendingApproval: false, canApprove: false, hasSelection: false, mac: true })).toBe(
       'close',
     );
   });

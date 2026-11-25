@@ -142,6 +142,8 @@ export type TranscriptAction =
   /** The agent refused the message (Rust error). Drops the user item and the in-flight count. */
   | { type: 'user_failed'; clientId: number; message: string }
   | { type: 'approval_answering'; callId: string; approve: boolean }
+  /** The backend accepted the answer (approve_tool returned OK): the card shows its decision, while the command runs. */
+  | { type: 'approval_sent'; callId: string }
   | { type: 'approval_failed'; callId: string; message: string }
   /** The user's answers to a question were sent (or are being sent). The card shows the wait until its result arrives. */
   | { type: 'question_answering'; callId: string; answers: QuestionAnswerInput[] }
@@ -204,6 +206,16 @@ export function transcriptReducer(t: Transcript, action: TranscriptAction): Tran
         items: t.items.map((i) =>
           i.kind === 'approval' && i.callId === action.callId && i.state === 'pending'
             ? { ...i, state: 'answering', approve: action.approve }
+            : i,
+        ),
+      };
+    case 'approval_sent':
+      // Only a card still answering moves on; the decision stays, so the card reads Approved or Denied (tool_result settles it too).
+      return {
+        ...t,
+        items: t.items.map((i) =>
+          i.kind === 'approval' && i.callId === action.callId && i.state === 'answering'
+            ? { ...i, state: 'resolved' as const }
             : i,
         ),
       };

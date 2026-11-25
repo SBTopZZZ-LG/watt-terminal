@@ -130,6 +130,19 @@ describe('appHotkeyFor: Windows and Linux (Ctrl, not Cmd)', () => {
     expect(win('F', { ctrl: true })).toBe('find');
   });
 
+  it('leaves plain Ctrl+F to the shell inside the terminal, and Ctrl+Shift+F still finds there', () => {
+    const inTerm = (k: string, mods: Mods = {}) => appHotkeyFor(ev(k, mods), false, true);
+    expect(inTerm('f', { ctrl: true })).toBeNull();
+    expect(inTerm('F', { ctrl: true })).toBeNull();
+    expect(inTerm('f', { ctrl: true, shift: true })).toBe('find-terminal');
+    // Outside the terminal (composer, chat, body), Ctrl+F still opens find.
+    expect(appHotkeyFor(ev('f', { ctrl: true }), false, false)).toBe('find');
+  });
+
+  it('keeps Cmd+F on macOS in the terminal too', () => {
+    expect(appHotkeyFor(ev('f', { meta: true }), true, true)).toBe('find');
+  });
+
   it('leaves Ctrl+K to the shell', () => {
     expect(win('k', { ctrl: true })).toBeNull();
     expect(win('K', { ctrl: true })).toBeNull();
