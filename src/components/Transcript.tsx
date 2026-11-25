@@ -262,7 +262,7 @@ export function Transcript({
           <ThinkingModeContext.Provider value={thinkingMode}>{renderEntries(entries, onApprove, onAnswerQuestions)}</ThinkingModeContext.Provider>
           {/* Last in the body, so the follow-scroll keeps it in view. Only while a turn is in flight. */}
           {busy && (
-            <div className="agent-activity" role="status">
+            <div className="agent-activity-row" role="status">
               <BrailleSpinner />
               <span>{activityLabel({ items, thinking })}</span>
             </div>
