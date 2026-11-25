@@ -764,7 +764,7 @@ impl LlmAgent {
             // The note is for this request only: the baseline moves when a reply is accepted (see `respond`), so a retry
             // of this call says the same again.
             let note = tools_note(lock_offered(&self.offered_tools).as_ref(), &offered);
-            let request_system = match note {
+            let request_system = match &note {
                 Some(note) => format!("{system}\n\n{note}"),
                 None => system.clone(),
             };
@@ -780,9 +780,9 @@ impl LlmAgent {
                         lock_models(&self.no_vision).insert(self.model.clone());
                         let reply = self.finish_call(ctx, Ok(reply));
                         ctx.say(NO_VISION_NOTICE);
-                        return asked(reply, offered);
+                        return asked(reply, offered, note);
                     }
-                    return asked(self.finish_call(ctx, Ok(reply)), offered);
+                    return asked(self.finish_call(ctx, Ok(reply)), offered, note);
                 }
                 Err(LlmError::Cancelled) => return Asked::Ended,
                 Err(LlmError::Interrupted) => return Asked::Interrupted,
@@ -790,7 +790,7 @@ impl LlmAgent {
                     overflow_retry = false;
                     asker_error = None;
                     let Some(smaller) = self.overflow_retry_limit(&e, estimate, limit) else {
-                        return asked(self.finish_call(ctx, Err(e)), offered);
+                        return asked(self.finish_call(ctx, Err(e)), offered, note);
                     };
                     // `smaller` is below the limit this request was fitted to, which is the effective one, so it only lowers it.
                     lock_learned(&self.learned_limits).insert(self.model.clone(), smaller);
@@ -808,7 +808,7 @@ impl LlmAgent {
                     image_refused = true;
                     asker_error = Some(e);
                 }
-                Err(e) => return asked(self.finish_call(ctx, Err(asker_error.take().unwrap_or(e))), offered),
+                Err(e) => return asked(self.finish_call(ctx, Err(asker_error.take().unwrap_or(e))), offered, note),
             }
         }
     }
@@ -1001,7 +1001,8 @@ impl LlmAgent {
     /// Runs the tool calls of one reply in order and records each result. Returns why the turn must stop, if it must.
     /// The calls after a stop are not run; the caller closes them in the history. `Stop::Steered` is not a stop of the turn:
     /// a steer waits after a finished call, so the calls after it are skipped and the steer goes in at the next step (see
-    /// `respond`). A running call is never interrupted: the steer is looked at only between calls.
+    /// `respond`). A running call is never interrupted: the steer is looked at only between calls. `note` is the MCP note of the
+    /// request this reply answers (see `tools_note`): it is added once, to the first result recorded here.
     fn run_calls(
         &self,
         calls: &[ToolCall],
@@ -1009,12 +1010,17 @@ impl LlmAgent {
         commands: &mut u32,
         writes: &mut u32,
         skills_granted: &mut HashSet<String>,
+        mut note: Option<&str>,
     ) -> Option<Stop> {
         for (index, call) in calls.iter().enumerate() {
             if self.cancel.is_cancelled() {
                 return Some(Stop::Cancelled);
             }
             let (content, denied) = self.run_call(call, ctx, commands, writes, skills_granted);
+            let content = match note.take() {
+                Some(note) => format!("{content}\n{note}"),
+                None => content,
+            };
             lock(&self.history).push_tool_result(&call.id, &content);
             if self.cancel.is_cancelled() {
                 return Some(Stop::Cancelled);
@@ -1183,11 +1189,12 @@ impl Agent for LlmAgent {
             // The open commands when this request starts. One that is no longer open when the reply is acted on finished
             // while the reply was made. Empty once the redos are used up, so nothing can discard the reply then.
             let open = if redos < MAX_REDOS { ctx.open_record_ids() } else { Vec::new() };
-            let reply = match self.ask_model(ctx, finished.take().as_deref(), &open) {
-                Asked::Reply(reply, offered) if finished_among(&open, ctx).is_empty() => {
-                    // Accepted: the next request is compared with the tools this one was offered (see `tools_note`).
+            let (reply, note) = match self.ask_model(ctx, finished.take().as_deref(), &open) {
+                Asked::Reply(reply, offered, note) if finished_among(&open, ctx).is_empty() => {
+                    // Accepted: the next request is compared with the tools this one was offered (see `tools_note`). Its note,
+                    // if it had one, goes into the first result of this reply's calls (see `run_calls`).
                     *lock_offered(&self.offered_tools) = Some(offered);
-                    reply
+                    (reply, note)
                 }
                 Asked::Reply(..) | Asked::Interrupted => {
                     // Discarded whole: not pushed to the history, and what the transcript showed of it is removed. The
@@ -1223,7 +1230,9 @@ impl Agent for LlmAgent {
                 ctx.say(cap.notice());
                 return;
             }
-            if let Some(stop) = self.run_calls(&reply.tool_calls, ctx, &mut commands, &mut writes, &mut skills_granted) {
+            if let Some(stop) =
+                self.run_calls(&reply.tool_calls, ctx, &mut commands, &mut writes, &mut skills_granted, note.as_deref())
+            {
                 lock(&self.history).close_pending(stop.reason());
                 if stop == Stop::Denied {
                     ctx.say(DENIED_NOTICE);
@@ -1297,7 +1306,8 @@ fn host_tool_names(builtins: &[Value], tools: &[Value]) -> BTreeSet<String> {
 }
 
 /// The system text for a request whose host tools differ from the ones the last accepted reply was offered (`was`). None
-/// when there was no such reply, or the names are the same. Only the halves that have names are said.
+/// when there was no such reply, or the names are the same. Only the halves that have names are said. The same line also
+/// goes into the first tool result of the reply to that request, if it has calls (see `run_calls`).
 fn tools_note(was: Option<&BTreeSet<String>>, now: &BTreeSet<String>) -> Option<String> {
     let was = was?;
     let added: Vec<&str> = now.difference(was).map(String::as_str).collect();
@@ -1361,8 +1371,8 @@ impl Cap {
 
 /// What one model call came to (see `ask_model`).
 enum Asked {
-    /// The reply, ready to be acted on, with the host tool names its request offered.
-    Reply(AssistantReply, BTreeSet<String>),
+    /// The reply, ready to be acted on, with the host tool names its request offered and the MCP note it carried, if any.
+    Reply(AssistantReply, BTreeSet<String>, Option<String>),
     /// The call ended early because a command it was made with finished (see `send`). Its reply is discarded.
     Interrupted,
     /// No reply: the call was cancelled or failed, and the failure is already shown.
@@ -1370,8 +1380,8 @@ enum Asked {
 }
 
 /// The `Asked` of a call that may have no reply (see `finish_call`).
-fn asked(reply: Option<AssistantReply>, offered: BTreeSet<String>) -> Asked {
-    reply.map_or(Asked::Ended, |reply| Asked::Reply(reply, offered))
+fn asked(reply: Option<AssistantReply>, offered: BTreeSet<String>, note: Option<String>) -> Asked {
+    reply.map_or(Asked::Ended, |reply| Asked::Reply(reply, offered, note))
 }
 
 /// Why the calls of a reply stopped before all ran. `Steered` does not end the turn: the calls after it are closed and the
