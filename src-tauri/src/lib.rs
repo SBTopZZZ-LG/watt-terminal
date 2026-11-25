@@ -677,8 +677,9 @@ async fn agent_message(
     let worker = att.clone();
     let settle_cancel = cancel.clone();
     let spawned = thread::Builder::new().name("agent".into()).spawn(move || {
-        // Runs on panic too, so a crashed turn cannot leave the agent busy or in control of the shell.
-        let _end = OnDrop::new(|| worker.end_turn());
+        // Runs on panic too, so a crashed turn cannot leave the agent busy or in control of the shell. Fired below once
+        // the history is saved; after that it does nothing, so it cannot end a newer turn.
+        let mut end = OnDrop::new(|| worker.end_turn());
         let tools = SessionTools::new(&worker.session).with_cancel(cancel).with_wait_budget(limits.max_wait());
         let channels = worker.channels.clone();
         let owner = worker.clone();
@@ -698,14 +699,17 @@ async fn agent_message(
             None => base,
         };
         match llm.as_mut() {
-            Some(agent) => agent::run_turn(agent, &message, &ctx),
-            None => agent::run_turn(&mut MockAgent, &message, &ctx),
+            Some(agent) => agent::run_reply(agent, &message, &ctx),
+            None => agent::run_reply(&mut MockAgent, &message, &ctx),
         }
-        // The history is final now, and this is still before the turn is ended (the guard above). The end of a turn
-        // is saved as finished, whether it completed, was cancelled, or failed.
+        // The history is final now. The end of a turn is saved as finished, whether it completed, was cancelled, or
+        // failed. Then the turn is ended (frees the slot), and only then `Done` is sent: a message the user sends on the
+        // back of `Done` finds the agent free. The guard above is fired here, so it does not end the turn a second time.
         if let (Some(agent), Some(store), Some(state)) = (llm.as_ref(), store.as_ref(), saved.as_ref()) {
             save_conversation(store, &worker.session, state, agent.redactor(), false);
         }
+        end.fire();
+        emit(AgentEvent::Done);
     });
     if let Err(e) = spawned {
         *lock(&att.turn_cancel) = None;

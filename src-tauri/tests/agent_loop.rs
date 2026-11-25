@@ -2912,3 +2912,51 @@ fn a_nested_shell_is_not_described_twice() {
     assert!(system.contains("\nEnvironment: ") && system.contains("terminal 30 rows x 120 columns."), "{system}");
     assert!(!system.contains(", shell bash, terminal") && !system.contains("Directory: box:/home/u."), "{system}");
 }
+
+/// An agent whose reply panics, as a bug in the loop would.
+struct PanickingAgent;
+
+impl agent::Agent for PanickingAgent {
+    fn respond(&mut self, _message: &UserMessage, _ctx: &AgentCtx<'_>) {
+        panic!("reply bug");
+    }
+}
+
+#[test]
+fn a_panicking_reply_still_ends_the_turn_with_a_notice_and_done() {
+    let log: Mutex<Vec<AgentEvent>> = Mutex::new(Vec::new());
+    let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+    let gate = no_gate();
+    let tools = FakeTools::default();
+    let ctx = AgentCtx::new(&tools, &gate, &emit);
+    // Not rethrown: the caller gets back here.
+    agent::run_turn(&mut PanickingAgent, &UserMessage::text("hi"), &ctx);
+    let events = log.into_inner().unwrap();
+    assert!(
+        matches!(events.as_slice(), [AgentEvent::Notice { text }, AgentEvent::Done] if text.contains("internal error")),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn run_reply_catches_a_panic_without_emitting_done() {
+    let log: Mutex<Vec<AgentEvent>> = Mutex::new(Vec::new());
+    let emit = |ev: AgentEvent| log.lock().unwrap().push(ev);
+    let gate = no_gate();
+    let tools = FakeTools::default();
+    let ctx = AgentCtx::new(&tools, &gate, &emit);
+    agent::run_reply(&mut PanickingAgent, &UserMessage::text("hi"), &ctx);
+    let events = log.into_inner().unwrap();
+    assert!(matches!(events.as_slice(), [AgentEvent::Notice { .. }]), "{events:?}");
+}
+
+#[test]
+fn on_drop_fire_runs_once_and_the_later_drop_does_nothing() {
+    let runs = std::cell::Cell::new(0);
+    {
+        let mut guard = agent::OnDrop::new(|| runs.set(runs.get() + 1));
+        guard.fire();
+        assert_eq!(runs.get(), 1, "fire runs the closure now");
+    }
+    assert_eq!(runs.get(), 1, "the drop after fire does not run it again");
+}
