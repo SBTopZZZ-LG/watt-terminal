@@ -46,6 +46,7 @@ use crate::core::observer::{InputState, IntegrationStatus, ObserverStatus, OpenA
 use crate::core::persist::attachments::AttachmentStore;
 use crate::core::settings::LimitsSettings;
 use crate::core::skills::{self, SkillIndex};
+use crate::core::terminals::terminal_note;
 use crate::core::skills::tool as skill_tool;
 use crate::core::tools::{foreground_next_step, SessionFacts, TopLevel};
 
@@ -60,7 +61,7 @@ const ENV_MAX_TOKENS: &str = "WATT_LLM_MAX_TOKENS";
 
 /// Tool names the model may call that the loop routes by name. Anything else is an unknown tool. Must match `READ_TOOLS`
 /// in core/agent.rs.
-const READ_NAMES: [&str; 5] = ["list_commands", "get_command", "get_screen", "get_cwd", "wait"];
+const READ_NAMES: [&str; 6] = ["list_commands", "get_command", "get_screen", "get_cwd", "wait", "list_terminals"];
 /// Longest tool name echoed back in an error, so a model cannot make the history carry a huge name.
 const NAME_LIMIT: usize = 80;
 
@@ -427,6 +428,8 @@ impl Conversation {
     /// Another attached session continues this conversation: the id is copied and the history, todo list,
     /// no-vision memo, calibration, learned limits, last usage and offered tools are shared, so both conversations see the
     /// same live state. The resume note is copied, so a note no turn has taken yet is still taken once.
+    /// Not used by the app since the conversation moved to `Chat` (lib.rs): a restart keeps the chat's own conversation.
+    /// Kept as public API (tests/persistence.rs uses it).
     pub fn follow(&self) -> Self {
         Conversation {
             id: Mutex::new(lock_string(&self.id).clone()),
@@ -708,6 +711,10 @@ impl LlmAgent {
             system = format!("{system}\n\n{note}");
         }
         if let Some(note) = location_note(&top, &self.redactor) {
+            system = format!("{system}\n\n{note}");
+        }
+        // Two or more terminals: one line of their ids (none with one or none, so the prompt is unchanged).
+        if let Some(note) = terminal_note(&ctx.terminal_ids()) {
             system = format!("{system}\n\n{note}");
         }
         // The agent's own command, when it is open, is described by its note. The foreground note is for any other program.

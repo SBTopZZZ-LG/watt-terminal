@@ -136,9 +136,12 @@ export type AgentEvent =
    * backend, optional here for existing fixtures. `display` is the decoded input of a send_keys card (`echo hi⏎`), or for an
    * external tool (reason external_tool) its `server: tool`. Absent for the other cards.
    */
-  | { type: 'approval_request'; call_id: string; name: string; text: string; display?: string; reason?: ApprovalReasonCode; level?: number; location?: string }
-  /** The agent is executing an approved shell call (true) and has finished it (false). */
-  | { type: 'agent_control'; active: boolean }
+  | { type: 'approval_request'; call_id: string; name: string; text: string; display?: string; reason?: ApprovalReasonCode; level?: number; location?: string; terminal?: string }
+  /**
+   * The agent is executing an approved shell call (true) and has finished it (false). `terminal` names the terminal it holds;
+   * the backend sends it only when the chat has two or more terminals.
+   */
+  | { type: 'agent_control'; active: boolean; terminal?: string }
   /**
    * A request to integrate the shell (the request_integration tool). `asking`: the user is asked. `running`: the handshake
    * runs (`label` names the shell). `done`: it ended with `outcome`, or with `declined` when the user did not agree.
@@ -199,6 +202,23 @@ export type WireEvent = SessionEvent | AgentEvent;
 export interface StartResult {
   spawned: boolean;
   nonce: string;
+}
+
+/** A terminal as `list_tabs` gives it. `owner` is the chat it belongs to, or null when no chat sees it. */
+export interface TabInfo {
+  id: string;
+  owner: string | null;
+  state: InputState;
+  nonce: string;
+  title: string | null;
+}
+
+/** A chat as `list_chats` gives it. `tabs` are the ids of its terminals, oldest first. */
+export interface ChatInfo {
+  id: string;
+  conversation_id: string;
+  busy: boolean;
+  tabs: string[];
 }
 
 export interface SessionStats {
@@ -371,6 +391,8 @@ export interface UiState {
   notifications: boolean;
   /** Enables the layout inspector (the right-click menu's "Open layout inspector" item). Always a boolean: false when the file has no value. */
   devtools: boolean;
+  /** A new terminal joins the current chat at once. Always a boolean: false when the file has no value. */
+  new_tabs_visible_to_agent: boolean;
 }
 
 /** A change to the UI state. An absent field is left alone, `null` clears it, a value sets it. */
@@ -389,6 +411,8 @@ export interface UiStatePatch {
   notifications?: boolean;
   /** As `hide_marks`: a boolean, so `null` is ignored too. */
   devtools?: boolean;
+  /** As `hide_marks`: a boolean, so `null` is ignored too. */
+  new_tabs_visible_to_agent?: boolean;
 }
 
 // AI provider settings (src-tauri/src/core/settings). Secrets are never in these types: they are only written, as

@@ -19,6 +19,8 @@ import {
   reconcileNotifications,
   devtoolsPatch,
   reconcileDevtools,
+  newTabsVisiblePatch,
+  reconcileNewTabsVisible,
   shouldRestoreLast,
 } from './uiState';
 import type { Timers } from './uiState';
@@ -148,6 +150,19 @@ describe('patch builders', () => {
   it('devtoolsPatch carries the boolean as devtools', () => {
     expect(devtoolsPatch(true)).toEqual({ devtools: true });
     expect(devtoolsPatch(false)).toEqual({ devtools: false });
+  });
+
+  it('newTabsVisiblePatch carries the boolean as new_tabs_visible_to_agent', () => {
+    expect(newTabsVisiblePatch(true)).toEqual({ new_tabs_visible_to_agent: true });
+    expect(newTabsVisiblePatch(false)).toEqual({ new_tabs_visible_to_agent: false });
+  });
+
+  it('reconcileNewTabsVisible keeps a boolean from the file and nothing else', () => {
+    expect(reconcileNewTabsVisible(true)).toBe(true);
+    expect(reconcileNewTabsVisible(false)).toBe(false);
+    expect(reconcileNewTabsVisible(null)).toBeNull();
+    expect(reconcileNewTabsVisible(undefined)).toBeNull();
+    expect(reconcileNewTabsVisible('yes' as unknown as boolean)).toBeNull();
   });
 
   it('hideMarksPatch carries the boolean as hide_marks', () => {

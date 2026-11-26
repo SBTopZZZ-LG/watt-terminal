@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { MouseEvent, ReactNode, UIEvent, WheelEvent } from 'react';
 import { isFileWrite, previewText } from '../lib/approvalCard';
 import { copyText } from '../lib/clipboard';
@@ -24,6 +24,7 @@ import { BrailleSpinner } from './BrailleSpinner';
 import { ThinkingBlock, ThinkingModeContext } from './ThinkingBlock';
 import { ApprovalCountdown } from './ApprovalCountdown';
 import { useImageViewer } from './ImageViewer';
+import { ActiveChatContext } from '../lib/activeChat';
 import { ToolRow } from './ToolRow';
 import { chatBodyShown } from '../lib/panelLayout';
 import { settleTight } from '../lib/panelTight';
@@ -62,6 +63,8 @@ interface Props {
   hasOlder?: boolean;
   /** Loads the next older chunk, above the items. Asked for on an upward scroll near the top, and while the view has nothing to scroll. */
   onLoadOlder?: () => void;
+  /** With onNewChat, the header shows a New chat button (an icon) beside History. It is never blocked: another chat is made beside this one. */
+  onNewChat?: () => void;
 }
 
 /** The agent conversation, docked above the input bar. Collapsible, scrollable, and capped by CSS. */
@@ -85,6 +88,7 @@ export function Transcript({
   thinkingMode = 'auto',
   hasOlder = false,
   onLoadOlder,
+  onNewChat,
 }: Props) {
   const bodyRef = useRef<HTMLDivElement>(null);
   const sectionRef = useRef<HTMLElement>(null);
@@ -275,6 +279,14 @@ export function Transcript({
         </button>
         {onDock && dock && <DockButtons dock={dock} onDock={onDock} />}
         {onToggleHistory && <HistoryButton pressed={view === 'history'} onClick={onToggleHistory} />}
+        {onNewChat && (
+          <button type="button" className="transcript-new-chat" aria-label="New chat" data-tip="Starts another chat beside this one" onClick={onNewChat}>
+            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.25" aria-hidden="true">
+              <path d="M2.5 3.5h8.2a1.3 1.3 0 0 1 1.3 1.3v4.4a1.3 1.3 0 0 1-1.3 1.3H6.2L3.6 12.5v-2.0h-1.1a1.3 1.3 0 0 1-1.3-1.3V4.8a1.3 1.3 0 0 1 1.3-1.3z" />
+              <path d="M13.5 1.8v3.2M11.9 3.4h3.2" />
+            </svg>
+          </button>
+        )}
         {/* aria-disabled, not disabled: the tooltip stays reachable on hover and focus, and the click does nothing. */}
         <button
           type="button"
@@ -409,11 +421,13 @@ function useNow(ticking: boolean): number {
  */
 function MessageAttachments({ items }: { items: UserAttachment[] }) {
   const openImage = useImageViewer();
+  // The stored image is the shown chat's: its conversation is the one on screen.
+  const chat = useContext(ActiveChatContext);
   return (
     <div className="msg-attachments">
       {items.map((a, i) => {
         const name = safeText(a.name);
-        const open = a.kind === 'image' && (a.thumb !== undefined || a.sha256 !== undefined) ? () => openImage({ name, thumb: a.thumb, sha256: a.sha256, mime: a.mime }) : null;
+        const open = a.kind === 'image' && (a.thumb !== undefined || a.sha256 !== undefined) ? () => openImage({ name, thumb: a.thumb, sha256: a.sha256, mime: a.mime, chat }) : null;
         if (a.kind === 'image' && a.thumb !== undefined) {
           const thumb = <img className="msg-attach-thumb" src={a.thumb} alt={name} title={name} draggable={false} />;
           return (
@@ -506,10 +520,12 @@ function Entry({ item, onApprove, onAnswerQuestions }: { item: TranscriptItem; o
       return <ToolRow item={item} />;
     case 'approval': {
       const why = askedBecause(item.reason);
+      // The terminal it runs on (when the chat has two or more), then the nested shell it is for.
+      const where = [item.terminal, item.location].filter((w): w is string => w !== undefined && w !== null);
       return (
         <div className={`approval approval-${item.state}`}>
           <div className="approval-title">{approvalTitle(item.name, item.reason, item.display)}</div>
-          {item.location !== null && <div className="approval-location">on {item.location}</div>}
+          {where.length > 0 && <div className="approval-location">on {where.join(' · ')}</div>}
           {/* A send_keys card shows the decoded input (the text and the keys), escaped; the other cards show the command. */}
           {item.name === 'send_keys' ? (
             <code className="approval-text approval-keys">{displayText(item.display ?? item.text)}</code>

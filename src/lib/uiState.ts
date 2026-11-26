@@ -99,6 +99,16 @@ export function devtoolsPatch(on: boolean): UiStatePatch {
   return { devtools: on };
 }
 
+/** The new-tabs setting from the file, or null when the file has no boolean for it (off then applies). Nothing is migrated. */
+export function reconcileNewTabsVisible(remote: boolean | null | undefined): boolean | null {
+  return typeof remote === 'boolean' ? remote : null;
+}
+
+/** The patch that saves the new-tabs setting (new terminals are visible to the agent). */
+export function newTabsVisiblePatch(on: boolean): UiStatePatch {
+  return { new_tabs_visible_to_agent: on };
+}
+
 /** The patch that saves a panel layout. */
 export function panelPatch(layout: PanelLayout): UiStatePatch {
   return { panel: { dock: layout.dock, sizes: { ...layout.sizes }, open: layout.open } };

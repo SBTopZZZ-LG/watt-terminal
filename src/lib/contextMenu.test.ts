@@ -145,11 +145,12 @@ describe('menuFor: chip and none', () => {
   });
 
   it('never starts or ends with a separator, and never has two in a row', () => {
-    const regions: MenuRegion[] = ['terminal', 'field', 'chat', 'chip', 'none'];
+    const regions: MenuRegion[] = ['terminal', 'field', 'chat', 'chip', 'tab', 'none'];
     const flags: Partial<MenuContext>[] = [
       {},
       { hasSelection: true, writable: true, message: true, code: true, tool: true, link: true, pasteRoutesToPty: true },
       { agentBusy: true, inputState: 'running', altScreen: true, pasteRoutesToPty: false },
+      { tabVisible: true, tabCanClose: true },
     ];
     for (const region of regions) {
       for (const f of flags) {
@@ -164,6 +165,29 @@ describe('menuFor: chip and none', () => {
         }
       }
     }
+  });
+});
+
+describe('menuFor: terminal tab', () => {
+  it('offers Make visible to agent, Restart, then Close, with a separator before Close', () => {
+    expect(summary(menuFor(ctx('tab', { tabCanClose: true }), false))).toEqual(['Make visible to agent', 'Restart', '---', 'Close']);
+  });
+
+  it('says Hide from agent for a terminal the chat can see', () => {
+    expect(summary(menuFor(ctx('tab', { tabVisible: true, tabCanClose: true }), false))).toEqual(['Hide from agent', 'Restart', '---', 'Close']);
+  });
+
+  it('says Move to this chat for a terminal another chat owns', () => {
+    expect(summary(menuFor(ctx('tab', { tabOther: true, tabCanClose: true }), false))).toEqual(['Move to this chat', 'Restart', '---', 'Close']);
+  });
+
+  it('disables Close for the last terminal, and leaves Restart and the assignment enabled', () => {
+    expect(summary(menuFor(ctx('tab', { tabCanClose: false }), false))).toEqual(['Make visible to agent', 'Restart', '---', 'Close (off)']);
+  });
+
+  it('gives the item ids the handler reads', () => {
+    const ids = menuFor(ctx('tab', { tabCanClose: true }), false).map((i) => i.id);
+    expect(ids).toEqual(['tab-visibility', 'tab-restart', 'separator', 'tab-close']);
   });
 });
 

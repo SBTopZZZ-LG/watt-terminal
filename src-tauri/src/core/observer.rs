@@ -9,7 +9,8 @@ use std::collections::VecDeque;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroU16;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -663,6 +664,34 @@ struct Injection {
     sh: Option<String>,
 }
 
+/// Hands out level keys and record ids. `global` is one counter pair for the whole process, so two sessions never hand
+/// out the same key or id. `local` starts its own at the same values, for tests that build a bare `Core`.
+#[derive(Clone)]
+pub struct IdSource {
+    keys: Arc<AtomicU64>,
+    ids: Arc<AtomicU64>,
+}
+
+static GLOBAL_IDS: LazyLock<IdSource> = LazyLock::new(IdSource::local);
+
+impl IdSource {
+    pub fn local() -> Self {
+        IdSource { keys: Arc::new(AtomicU64::new(LOCAL_KEY + 1)), ids: Arc::new(AtomicU64::new(1)) }
+    }
+
+    pub fn global() -> Self {
+        GLOBAL_IDS.clone()
+    }
+
+    fn next_key(&self) -> u64 {
+        self.keys.fetch_add(1, Ordering::SeqCst)
+    }
+
+    fn next_id(&self) -> u64 {
+        self.ids.fetch_add(1, Ordering::SeqCst)
+    }
+}
+
 pub struct Core {
     parser: Parser<Collector>,
     /// Hash of the visible screen at the last `note_screen`. Compared on each call.
@@ -680,8 +709,8 @@ pub struct Core {
     scanner: Scanner,
     /// The shell levels, outermost (local) first. Never empty; the last one is the top.
     stack: Vec<Level>,
-    /// The next level key to hand out. Keys are never reused.
-    next_key: u64,
+    /// Hands out level keys and record ids. Keys are never reused.
+    ids: IdSource,
     /// The level expected by `expect_level`, if any.
     pending_level: Option<PendingLevel>,
     /// Pushes refused (not Running, depth cap) and nested events refused for want of a pending level.
@@ -721,7 +750,6 @@ pub struct Core {
     abandoned: VecDeque<String>,
     cwd: Option<Cwd>,
     records: VecDeque<Record>,
-    next_id: u64,
     /// Events raised since the last `take_events`.
     events: Vec<SessionEvent>,
     reported: Reported,
@@ -733,7 +761,12 @@ pub const MAX_RECORDS: usize = 1000;
 pub const STARTING_QUIET: Duration = Duration::from_millis(300);
 
 impl Core {
+    /// A core with its own id counters (see `IdSource::local`).
     pub fn new(nonce: &str, size: (u16, u16)) -> Self {
+        Self::with_ids(nonce, size, IdSource::local())
+    }
+
+    pub fn with_ids(nonce: &str, size: (u16, u16), ids: IdSource) -> Self {
         let parser = new_parser(size);
         Core {
             screen_hash: screen_fingerprint(parser.screen()),
@@ -745,7 +778,7 @@ impl Core {
             size,
             scanner: Scanner::new(nonce),
             stack: vec![Level::local()],
-            next_key: LOCAL_KEY + 1,
+            ids,
             pending_level: None,
             refused: 0,
             injection: None,
@@ -763,7 +796,6 @@ impl Core {
             abandoned: VecDeque::new(),
             cwd: None,
             records: VecDeque::new(),
-            next_id: 1,
             events: Vec::new(),
             reported: Reported::default(),
         }
@@ -962,8 +994,7 @@ impl Core {
         if let Some(old) = self.pending_level.take() {
             self.scanner.retire_nonce(old.key);
         }
-        let key = self.next_key;
-        self.next_key += 1;
+        let key = self.ids.next_key();
         self.scanner.add_nonce(key, nonce);
         let label: String = label.chars().take(LABEL_CAP).collect();
         self.pending_level = Some(PendingLevel { key, label, since: Instant::now() });
@@ -1244,8 +1275,7 @@ impl Core {
         // pwsh sends C from its Enter handler, before PSReadLine echoes the newline, so the cursor is still on the
         // command's last row and the output starts one row below. zsh and bash send C after the newline.
         let output_row = if self.top_sh() == Some("pwsh") { crow + 1 } else { crow };
-        let id = self.next_id;
-        self.next_id += 1;
+        let id = self.ids.next_id();
         // A record made while a nested level is on top belongs to that level: its cwd is the level's, and its location is
         // the label the level was registered with. Level 0 keeps the local cwd and shell pid.
         let (cwd, shell_pid, level, location) = match self.stack.last() {
@@ -3598,6 +3628,23 @@ mod tests {
         assert_eq!(c.foreground_age(started + Duration::from_secs(180)), Some(Duration::from_secs(180)));
         c.handle(Event::CommandEnd { exit: 0, pipestatus: vec![0] });
         assert_eq!(c.foreground_age(Instant::now()), None, "no command open after it ends");
+    }
+
+    /// Two sessions take their ids and keys from the global source (as `Session::spawn` does), so they never collide.
+    /// A local source starts at the same values a fresh process does.
+    #[test]
+    fn global_id_sources_never_hand_out_the_same_id_or_key() {
+        let (a, b) = (IdSource::global(), IdSource::global());
+        let ids = [a.next_id(), b.next_id(), a.next_id(), b.next_id()];
+        let keys = [a.next_key(), b.next_key(), a.next_key(), b.next_key()];
+        let distinct = |v: &[u64]| v.iter().collect::<std::collections::HashSet<_>>().len() == v.len();
+        assert!(distinct(&ids), "record ids collide: {ids:?}");
+        assert!(distinct(&keys), "level keys collide: {keys:?}");
+        assert!(ids.iter().all(|&id| id >= 1), "id 0 is never handed out: {ids:?}");
+        assert!(keys.iter().all(|&k| k > LOCAL_KEY), "the local key is never handed out again: {keys:?}");
+
+        assert_eq!(IdSource::local().next_id(), 1);
+        assert_eq!(IdSource::local().next_key(), LOCAL_KEY + 1);
     }
 
     /// Throughput of the observer path (`Core::apply`) on ~50 MB of `seq` output, in four settings:

@@ -179,3 +179,44 @@ describe('appHotkeyFor: Windows and Linux (Ctrl, not Cmd)', () => {
     expect(win('f', { ctrl: true, shift: true, type: 'keyup' })).toBeNull();
   });
 });
+
+describe('appHotkeyFor: terminal tabs', () => {
+  it('maps Cmd+Shift+T to new-tab and Cmd+Shift+W to close-tab on macOS, in either letter case', () => {
+    expect(appHotkeyFor(ev('t', { meta: true, shift: true }), true)).toBe('new-tab');
+    expect(appHotkeyFor(ev('T', { meta: true, shift: true }), true)).toBe('new-tab');
+    expect(appHotkeyFor(ev('w', { meta: true, shift: true }), true)).toBe('close-tab');
+    expect(appHotkeyFor(ev('W', { meta: true, shift: true }), true)).toBe('close-tab');
+  });
+
+  it('maps Ctrl+Shift+T and Ctrl+Shift+W to new-tab and close-tab off macOS', () => {
+    expect(appHotkeyFor(ev('T', { ctrl: true, shift: true }), false)).toBe('new-tab');
+    expect(appHotkeyFor(ev('w', { ctrl: true, shift: true }), false)).toBe('close-tab');
+  });
+
+  it('needs Shift for the new and close keys, and the platform modifier alone', () => {
+    expect(appHotkeyFor(ev('t', { meta: true }), true)).toBeNull();
+    expect(appHotkeyFor(ev('t', { ctrl: true }), false)).toBeNull();
+    expect(appHotkeyFor(ev('t', { ctrl: true, shift: true }), true)).toBeNull();
+    expect(appHotkeyFor(ev('w', { meta: true, ctrl: true, shift: true }), true)).toBeNull();
+    expect(appHotkeyFor(ev('t', { meta: true, shift: true, alt: true }), true)).toBeNull();
+  });
+
+  it('maps Ctrl+Tab to next-tab and Ctrl+Shift+Tab to prev-tab on every platform', () => {
+    for (const mac of [true, false]) {
+      expect(appHotkeyFor(ev('Tab', { ctrl: true }), mac)).toBe('next-tab');
+      expect(appHotkeyFor(ev('Tab', { ctrl: true, shift: true }), mac)).toBe('prev-tab');
+    }
+  });
+
+  it('leaves a plain Tab, Cmd+Tab and Cmd+Shift+Tab alone', () => {
+    expect(appHotkeyFor(ev('Tab'), true)).toBeNull();
+    expect(appHotkeyFor(ev('Tab'), false)).toBeNull();
+    expect(appHotkeyFor(ev('Tab', { meta: true }), true)).toBeNull();
+    expect(appHotkeyFor(ev('Tab', { meta: true, shift: true }), true)).toBeNull();
+    expect(appHotkeyFor(ev('Tab', { ctrl: true, meta: true }), false)).toBeNull();
+  });
+
+  it('maps the tab keys on keydown only', () => {
+    expect(appHotkeyFor(ev('Tab', { ctrl: true, type: 'keyup' }), false)).toBeNull();
+  });
+});

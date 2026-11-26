@@ -5,8 +5,9 @@
 //! one. Approval is not checked here; `agent::AgentCtx::call_tool` asks for it before calling these methods.
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::ops::Deref;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -379,6 +380,22 @@ pub trait AgentTools {
     fn send_keys(&self, _plan: &KeyPlan, _record: Option<u64>, _expected_level: Option<u64>) -> Result<SendKeysOutcome, String> {
         Err("send_keys is not available here".into())
     }
+    /// The view that a call of the tool `name` is for, when the tools are several terminals (core/terminals). `args` picks
+    /// one. The agent gates such a call on that view (its precheck, its approval card and its level are the chosen
+    /// terminal's) and runs it there. Ok(None): the tools run the call themselves. Err: the call names no terminal of this
+    /// turn, and nothing runs. Defaults to Ok(None), so a single session needs no change.
+    fn scoped(&self, _name: &str, _args: &Value) -> Result<Option<Box<dyn AgentTools + '_>>, String> {
+        Ok(None)
+    }
+    /// The id of the terminal these tools act on, when the chat has two or more (see core/terminals). Left out otherwise, so
+    /// the events of a single terminal do not change. None for a single session.
+    fn terminal_id(&self) -> Option<String> {
+        None
+    }
+    /// The ids of the terminals of the chat, the default first. Empty for a single session.
+    fn terminal_ids(&self) -> Vec<String> {
+        Vec::new()
+    }
 
     /// Calls a tool by schema name. Optional arguments take their defaults. Does not ask for approval. `expected_level` is
     /// passed to `run_command` (see there).
@@ -472,20 +489,82 @@ pub trait AgentTools {
     }
 }
 
-/// The tools over one live session. The agent makes one per turn, so the wait budget below is per turn.
+/// What one agent turn may spend: the wait time (`wait`) and the `send_keys` writes. The caps are per turn, so every view of
+/// a turn shares one `TurnBudget`, whatever terminal it is over (see core/terminals).
+pub struct TurnBudget {
+    /// The most `wait` may spend in total. Past it, `wait` returns an error without waiting.
+    wait_budget: Duration,
+    /// Time spent in `wait` so far.
+    wait_used: Mutex<Duration>,
+    /// `send_keys` calls that wrote keys so far (see `SEND_KEYS_PER_TURN`).
+    keys_sent: AtomicU32,
+}
+
+impl TurnBudget {
+    pub fn new(wait_budget: Duration) -> Self {
+        TurnBudget { wait_budget, wait_used: Mutex::new(Duration::ZERO), keys_sent: AtomicU32::new(0) }
+    }
+
+    /// Err when the turn's wait time is used up. Checked before a `wait` starts.
+    pub fn check_wait(&self) -> Result<(), String> {
+        let used = *self.wait_used.lock().unwrap_or_else(|e| e.into_inner());
+        if used >= self.wait_budget {
+            return Err(format!(
+                "wait budget for this turn is used up ({} s of waiting); stop waiting and report what you have",
+                used.as_secs()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Counts `spent` (the time a `wait` took) against the turn's wait time.
+    pub fn spend_wait(&self, spent: Duration) {
+        *self.wait_used.lock().unwrap_or_else(|e| e.into_inner()) += spent;
+    }
+
+    /// Err when the turn's `send_keys` calls that write are used up (see `SEND_KEYS_PER_TURN`).
+    pub fn check_keys(&self) -> Result<(), String> {
+        if self.keys_sent.load(Ordering::Relaxed) >= SEND_KEYS_PER_TURN {
+            return Err(format!(
+                "the send_keys limit for this turn is reached ({SEND_KEYS_PER_TURN} calls). Use wait or get_screen, or ask the user to act."
+            ));
+        }
+        Ok(())
+    }
+
+    /// Counts one `send_keys` call that wrote keys.
+    pub fn count_keys(&self) {
+        self.keys_sent.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The session a `SessionTools` acts on: borrowed for a turn's own tools, or shared (an `Arc`) for a terminal's view, which
+/// must own what it acts on (see `SessionTools::shared`).
+enum SessionHandle<'a> {
+    Borrowed(&'a Session),
+    Shared(Arc<Session>),
+}
+
+impl Deref for SessionHandle<'_> {
+    type Target = Session;
+
+    fn deref(&self) -> &Session {
+        match self {
+            SessionHandle::Borrowed(session) => session,
+            SessionHandle::Shared(session) => session.as_ref(),
+        }
+    }
+}
+
+/// The tools over one live session. The agent makes one per turn; the budget (see `TurnBudget`) is per turn too.
 pub struct SessionTools<'a> {
-    session: &'a Session,
+    session: SessionHandle<'a>,
     /// The continuation wait `run_command` uses. `WAITING_FOR_INPUT_AFTER` unless a test overrides it.
     input_wait: Duration,
     /// When set, `run_command` checks it while it waits and before it sends anything.
     cancel: Option<Arc<TurnCancel>>,
-    /// The most `wait` may spend through this value, the waiting one turn may do in total. Past it, `wait` returns an error
-    /// without waiting. The app sets the saved `limits.max_wait_minutes` (`with_wait_budget`); `new` uses the default.
-    wait_budget: Duration,
-    /// Time spent in `wait` through this value so far.
-    wait_used: Cell<Duration>,
-    /// `send_keys` calls that wrote keys, this turn (see `SEND_KEYS_PER_TURN`).
-    keys_sent: Cell<u32>,
+    /// The turn's wait and `send_keys` budget. `new` gives this view its own (the saved limits' wait budget).
+    budget: Arc<TurnBudget>,
     /// Set by `run_command` when it cleared the user's typed text, and read (and reset) by `take_typed_cleared`.
     typed_cleared: Cell<bool>,
 }
@@ -497,20 +576,27 @@ impl<'a> SessionTools<'a> {
 
     /// Like `new`, with a different continuation wait. For tests.
     pub fn with_input_wait(session: &'a Session, input_wait: Duration) -> Self {
+        SessionTools::from_handle(SessionHandle::Borrowed(session), input_wait)
+    }
+
+    fn from_handle(session: SessionHandle<'a>, input_wait: Duration) -> Self {
         SessionTools {
             session,
             input_wait,
             cancel: None,
-            wait_budget: LimitsSettings::default().max_wait(),
-            wait_used: Cell::new(Duration::ZERO),
-            keys_sent: Cell::new(0),
+            budget: Arc::new(TurnBudget::new(LimitsSettings::default().max_wait())),
             typed_cleared: Cell::new(false),
         }
     }
 
     /// Like `new`, with the per-turn wait budget of the saved limits (the app) or a shorter one (tests).
     pub fn with_wait_budget(self, budget: Duration) -> Self {
-        SessionTools { wait_budget: budget, ..self }
+        SessionTools { budget: Arc::new(TurnBudget::new(budget)), ..self }
+    }
+
+    /// Uses `budget` for this view instead of its own, so the wait and `send_keys` caps hold across the views that share it.
+    pub fn with_budget(self, budget: Arc<TurnBudget>) -> Self {
+        SessionTools { budget, ..self }
     }
 
     /// Lets the turn's cancel stop `run_command`'s wait. A cancelled call returns `NotRun { Cancelled }` within one poll.
@@ -522,6 +608,14 @@ impl<'a> SessionTools<'a> {
 
     fn cancelled(&self) -> bool {
         self.cancel.as_ref().is_some_and(|c| c.is_cancelled())
+    }
+}
+
+impl SessionTools<'static> {
+    /// The tools over a shared session, for a terminal's view (core/terminals). The view owns its session, so it can be
+    /// returned from a call and kept while the terminal leaves the chat. The continuation wait is the default one.
+    pub fn shared(session: Arc<Session>) -> Self {
+        SessionTools::from_handle(SessionHandle::Shared(session), WAITING_FOR_INPUT_AFTER)
     }
 }
 
@@ -681,16 +775,10 @@ impl AgentTools for SessionTools<'_> {
         {
             return Err(format!("no command with id {id} is running or finished in this session"));
         }
-        let used = self.wait_used.get();
-        if used >= self.wait_budget {
-            return Err(format!(
-                "wait budget for this turn is used up ({} s of waiting); stop waiting and report what you have",
-                used.as_secs()
-            ));
-        }
+        self.budget.check_wait()?;
         let started = Instant::now();
         let view = self.wait_for(seconds, ignore_updates, record, started);
-        self.wait_used.set(used + started.elapsed());
+        self.budget.spend_wait(started.elapsed());
         Ok(view)
     }
 
@@ -759,7 +847,7 @@ impl AgentTools for SessionTools<'_> {
         // The writer checks the target again, under the lock, and binds the bytes to it: a command that changed since the
         // check above is refused there, with nothing sent.
         let sent = self.session.send_keys(plan.clone(), target.record, expected_level).map_err(|e| e.to_string())?;
-        self.keys_sent.set(self.keys_sent.get() + 1);
+        self.budget.count_keys();
         match sent.record_id {
             Some(record_id) if self.settle_after_keys(record_id, before, started) => {
                 self.settle_at_prompt();
@@ -818,12 +906,7 @@ impl SessionTools<'_> {
 
     /// The per-turn cap on `send_keys` calls that write.
     fn keys_budget(&self) -> Result<(), String> {
-        if self.keys_sent.get() >= SEND_KEYS_PER_TURN {
-            return Err(format!(
-                "the send_keys limit for this turn is reached ({SEND_KEYS_PER_TURN} calls). Use wait or get_screen, or ask the user to act."
-            ));
-        }
-        Ok(())
+        self.budget.check_keys()
     }
 
     /// The command `send_keys` may type into now, read under one lock, and the password refusal. An interrupt-only
@@ -1203,11 +1286,16 @@ pub fn integration_result(outcome: &IntegrateOutcome) -> Result<Value, String> {
 pub fn schemas() -> Vec<ToolSchema> {
     vec![
         ToolSchema {
+            name: "list_terminals",
+            description: "List the terminals this chat may use, oldest first: id, title, state, cwd, location (the nested shell on top, if any) and default. Pass an id as terminal to the other terminal tools. Empty when no terminal is assigned to this chat.",
+            parameters: json!({"type": "object", "properties": {}}),
+        },
+        ToolSchema {
             name: "list_commands",
             description: "List the most recent finished commands in the session, oldest first.",
             parameters: json!({
                 "type": "object",
-                "properties": {"n": {"type": "integer", "minimum": 0, "default": DEFAULT_LIST}},
+                "properties": {"n": {"type": "integer", "minimum": 0, "default": DEFAULT_LIST}, "terminal": terminal_arg()},
             }),
         },
         ToolSchema {
@@ -1219,6 +1307,7 @@ pub fn schemas() -> Vec<ToolSchema> {
                     "id": {"type": "integer", "minimum": 1},
                     "offset": {"type": "integer", "minimum": 0, "default": 0},
                     "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT, "default": DEFAULT_LIMIT},
+                    "terminal": terminal_arg(),
                 },
                 "required": ["id"],
             }),
@@ -1230,13 +1319,14 @@ pub fn schemas() -> Vec<ToolSchema> {
                 "type": "object",
                 "properties": {
                     "lines": {"type": "integer", "minimum": 1, "maximum": MAX_SCREEN_LINES, "description": "How many of the last logical lines to return."},
+                    "terminal": terminal_arg(),
                 },
             }),
         },
         ToolSchema {
             name: "get_cwd",
             description: "Get the shell's current host and directory, or null if not known yet.",
-            parameters: json!({"type": "object", "properties": {}}),
+            parameters: json!({"type": "object", "properties": {"terminal": terminal_arg()}}),
         },
         ToolSchema {
             name: "wait",
@@ -1247,6 +1337,7 @@ pub fn schemas() -> Vec<ToolSchema> {
                     "seconds": {"type": "integer", "minimum": 1, "maximum": MAX_WAIT_SECONDS, "default": DEFAULT_WAIT_SECONDS},
                     "ignore_updates": {"type": "boolean", "default": false},
                     "id": {"type": "integer", "minimum": 1, "description": "The record_id of a command to wait for."},
+                    "terminal": terminal_arg(),
                 },
             }),
         },
@@ -1259,6 +1350,7 @@ pub fn schemas() -> Vec<ToolSchema> {
                     "command": {"type": "string", "minLength": 1},
                     "summary": {"type": "string", "minLength": 1, "maxLength": 120, "description": "A caption of at most 10 words describing what the command does, for the user; not a repeat of the command."},
                     "wait_seconds": {"type": "integer", "minimum": 1, "maximum": MAX_WAIT_SECONDS, "default": DEFAULT_RUN_WAIT_SECONDS},
+                    "terminal": terminal_arg(),
                 },
                 "required": ["command", "summary"],
             }),
@@ -1266,7 +1358,7 @@ pub fn schemas() -> Vec<ToolSchema> {
         ToolSchema {
             name: "request_integration",
             description: "Ask the user to integrate the shell in the foreground (ssh, a nested shell, su, or a container exec) so that run_command works there. Use it when get_screen shows such a shell without shell integration. The user confirms it in a dialog, unless the user chose to let the app do it. It is refused while the shell waits for a password. After it succeeds, run_command runs commands in that shell, under the approval rules of that shell.",
-            parameters: json!({"type": "object", "properties": {}}),
+            parameters: json!({"type": "object", "properties": {"terminal": terminal_arg()}}),
         },
         ToolSchema {
             name: "send_keys",
@@ -1288,10 +1380,17 @@ pub fn schemas() -> Vec<ToolSchema> {
                     "keys": {"type": "array", "items": {"type": "string"}, "description": "Named keys, in order."},
                     "id": {"type": "integer", "minimum": 1, "description": "The record_id of the command, if you want to be sure it is the one running."},
                     "summary": {"type": "string", "minLength": 1, "maxLength": 120, "description": "A caption of at most 10 words describing what the command does, for the user; not a repeat of the command."},
+                    "terminal": terminal_arg(),
                 },
             }),
         },
     ]
+}
+
+/// The optional `terminal` argument of the terminal tools (see core/terminals). Its text is fixed, so the schemas do not change
+/// between turns.
+fn terminal_arg() -> Value {
+    json!({"type": "string", "description": "Terminal id from list_terminals. Default: the chat's first terminal."})
 }
 
 /// True when the last non-blank row of a screen looks like a password or passphrase prompt. Case-insensitive.
@@ -1648,9 +1747,9 @@ mod tests {
     }
 
     #[test]
-    fn request_integration_is_offered_with_no_arguments() {
+    fn request_integration_is_offered_with_only_the_terminal_argument() {
         let schema = schemas().into_iter().find(|s| s.name == "request_integration").expect("offered");
-        assert_eq!(schema.parameters["properties"], json!({}));
+        assert_eq!(schema.parameters["properties"], json!({"terminal": terminal_arg()}));
         assert!(schema.description.contains("dialog"), "{}", schema.description);
     }
 

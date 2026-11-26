@@ -41,7 +41,9 @@ const APPROXIMATE_NOTE: &str = "Its output may be incomplete or misaligned: the 
 
 /// Shapes one tool result for the model. `ok` is whether the tool call succeeded; on failure `result` carries the
 /// error text (a string, or an object with `message` or `error`). Everything passes through `redactor`.
-pub fn project(name: &str, ok: bool, result: &Value, redactor: &Redactor) -> String {
+pub fn project(name: &str, ok: bool, tagged: &Value, redactor: &Redactor) -> String {
+    let (terminal, shown) = split_terminal(tagged);
+    let result = &shown;
     let text = if !ok {
         format!("error: {}", error_message(result, redactor))
     } else {
@@ -76,7 +78,32 @@ pub fn project(name: &str, ok: bool, result: &Value, redactor: &Redactor) -> Str
             _ => compact_json(result),
         }
     };
+    // The terminal goes on the last line: a run_command result's first line is its JSON, which the history reads.
+    let text = match terminal {
+        Some(id) => format!("{text}\nterminal: {id}"),
+        None => text,
+    };
     redactor.redact(&text)
+}
+
+/// The terminal a result came from (core/terminals tags a result of a chat with two or more terminals), and the result as
+/// one terminal's own. An object loses its `terminal` field. A wrapped result (`{"terminal", "result"}`) gives its `result`.
+fn split_terminal(tagged: &Value) -> (Option<String>, Value) {
+    let Some(fields) = tagged.as_object() else {
+        return (None, tagged.clone());
+    };
+    let Some(id) = fields.get("terminal").and_then(Value::as_str) else {
+        return (None, tagged.clone());
+    };
+    let shown = match fields.get("result") {
+        Some(wrapped) if fields.len() == 2 => wrapped.clone(),
+        _ => {
+            let mut rest = fields.clone();
+            rest.remove("terminal");
+            Value::Object(rest)
+        }
+    };
+    (Some(id.to_string()), shown)
 }
 
 fn run_command_text(v: &Value, r: &Redactor) -> String {
@@ -1347,5 +1374,21 @@ mod tests {
         assert_eq!(shown, "src/a.rs:3:let k = \"[REDACTED]\";");
         let failed = project("read_file", false, &json!("`x` does not exist"), &none());
         assert_eq!(failed, "error: `x` does not exist");
+    }
+
+    /// A result of a chat with two or more terminals names its terminal on the last line. The JSON stays on the first line,
+    /// and the tag itself is not shown as a field of the result.
+    #[test]
+    fn a_terminal_tag_goes_last_and_the_result_is_shaped_as_one_terminals() {
+        let running = json!({"outcome": "running", "reason": "timeout", "record_id": 4, "terminal": "t2"});
+        let shown = project("run_command", true, &running, &none());
+        assert_eq!(shown.lines().next().map(|l| serde_json::from_str::<Value>(l).unwrap()["record_id"].clone()), Some(json!(4)));
+        assert!(shown.ends_with("\nterminal: t2"), "{shown}");
+        assert!(!shown.contains("\"terminal\""), "{shown}");
+
+        let listed = project("list_commands", true, &json!({"terminal": "t1", "result": []}), &none());
+        assert_eq!(listed, "no finished commands\nterminal: t1");
+        let cwd = project("get_cwd", true, &json!({"terminal": "t1", "result": null}), &none());
+        assert_eq!(cwd, "unknown\nterminal: t1");
     }
 }

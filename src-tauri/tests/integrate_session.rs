@@ -1,5 +1,5 @@
 //! Integration tests for `Session::integrate_shell` (B2b). A real zsh session runs the app's own handshake: a plain
-//! `zsh -f -i` (or bash, or a container) is started as the foreground program, integrated as level 1, and then checked
+//! `zsh -f -i` (or bash, or a container) is started as the foreground program, integrated as a nested level, and then checked
 //! through the session's records, state and submit path. The docker cases are #[ignore]: they need docker and the image
 //! named in AT_TEST_IMAGE (default ubuntu:24.04).
 
@@ -66,7 +66,7 @@ fn old_bash_at(path: &str) -> Option<(u32, u32)> {
     (version.0 < 4 || (version.0 == 4 && version.1 < 4)).then_some(version)
 }
 
-/// zsh inside zsh: integrated as level 1, its commands are attributed to that level and its location, a `zsh -f -i`
+/// zsh inside zsh: integrated as a nested level, its commands are attributed to that level and its location, a `zsh -f -i`
 /// parent record is kept, and `exit` pops back to the local shell.
 // Runs zsh through common/mod.rs: no zsh on Windows, so this test is unix-only.
 #[cfg(unix)]
@@ -80,22 +80,23 @@ fn zsh_inside_zsh_is_integrated_and_its_commands_are_attributed() {
     assert!(wait_program_up(&s, NESTED_ZSH), "the nested shell never drew its prompt: {:?}", s.screen_snapshot().rows);
 
     let (key, sh) = integrate_ok(&s);
-    assert_eq!((key, sh.as_str()), (1, "zsh"));
+    assert_eq!(sh.as_str(), "zsh");
+    assert_ne!(key, 0, "the nested level has its own key, not the local shell's");
     assert!(wait_state(&s, InputState::Prompt, WAIT), "the nested level never reached a prompt: {:?}", s.state());
     assert_eq!(s.levels().len(), 2);
-    assert_eq!(s.top_key(), 1);
+    assert_eq!(s.top_key(), key);
     assert_eq!(s.location().as_deref(), Some(NESTED_ZSH));
 
     s.submit(Source::Agent { call_id: "nested-hi".into() }, "echo hi").expect("agent submit at depth 2");
-    let hi = finished(&s, "echo hi", 1);
-    assert_eq!((hi.exit_code, hi.level), (Some(0), 1));
+    let hi = finished(&s, "echo hi", key);
+    assert_eq!((hi.exit_code, hi.level), (Some(0), key));
     assert_eq!(hi.location.as_deref(), Some(NESTED_ZSH));
     assert_eq!(hi.output, "hi");
     assert!(matches!(&hi.source, Source::Agent { call_id } if call_id == "nested-hi"), "{:?}", hi.source);
     assert!(wait_state(&s, InputState::Prompt, WAIT));
 
     s.submit(Source::User, "false").expect("user submit at depth 2");
-    let fals = finished(&s, "false", 1);
+    let fals = finished(&s, "false", key);
     assert_eq!(fals.exit_code, Some(1));
     assert!(wait_state(&s, InputState::Prompt, WAIT));
 
@@ -107,7 +108,7 @@ fn zsh_inside_zsh_is_integrated_and_its_commands_are_attributed() {
         s.levels()
     );
     let exited = s.records().into_iter().find(|r| r.command == "exit").expect("the exit record");
-    assert_eq!((exited.level, exited.status), (1, RecordStatus::Incomplete), "the popped level's record closes Incomplete");
+    assert_eq!((exited.level, exited.status), (key, RecordStatus::Incomplete), "the popped level's record closes Incomplete");
 
     // The parent record is the command that started the nested shell. Its exit is the nested shell's: a bare `exit` returns
     // the status of the last command there, which was `false` (1). It is Approximate, not Complete: its output while the
@@ -155,7 +156,8 @@ fn integrate_waits_while_a_shell_is_still_starting() {
     assert!(s.records().iter().all(|r| r.exit_code.is_none()), "the refused call stopped the command: {:?}", s.records());
     assert!(wait_program_up(&s, cmd), "the shell never drew its prompt: {:?}", s.screen_snapshot().rows);
     let (key, sh) = integrate_ok(&s);
-    assert_eq!((key, sh.as_str()), (1, "zsh"));
+    assert_eq!(sh.as_str(), "zsh");
+    assert_ne!(key, 0);
 }
 
 /// bash 3.2 (macOS /bin/bash) is refused by the loader: UnsupportedShell, nothing installed, and the session still works
@@ -197,23 +199,23 @@ fn a_forged_prompt_while_a_level_is_on_top_only_counts() {
     s.submit(Source::User, NESTED_ZSH).expect("submit");
     assert!(wait_foreground(&s, ForegroundKind::Shell));
     assert!(wait_program_up(&s, NESTED_ZSH), "the nested shell never drew its prompt");
-    integrate_ok(&s);
+    let (key, _sh) = integrate_ok(&s);
     assert!(wait_state(&s, InputState::Prompt, WAIT));
     let before = s.stats().forged_events;
 
     let zero = "0".repeat(32);
     let cmd = format!(r"printf '\033]133;A;n={zero}\033\\'");
     s.submit(Source::Agent { call_id: "forge".into() }, &cmd).expect("submit");
-    let printed = finished(&s, &cmd, 1);
+    let printed = finished(&s, &cmd, key);
     assert_eq!(printed.exit_code, Some(0));
     assert_eq!(s.stats().forged_events, before + 1, "the wrong-nonce A was not counted as forged");
-    assert_eq!((s.levels().len(), s.top_key()), (2, 1), "the forged event changed the stack");
+    assert_eq!((s.levels().len(), s.top_key()), (2, key), "the forged event changed the stack");
     assert!(wait_state(&s, InputState::Prompt, WAIT));
     s.write_user(b"exit\r").expect("type exit");
     assert!(wait_until(WAIT, || (s.levels().len() == 1).then_some(())).is_some());
 }
 
-/// The docker flow: `docker run -it ... bash --noprofile --norc` as the foreground program, integrated as level 1.
+/// The docker flow: `docker run -it ... bash --noprofile --norc` as the foreground program, integrated as a nested level.
 /// `skel` sources /etc/skel/.bashrc first (ignoreboth: repeated commands are not recorded, so their E is empty).
 fn docker_bash_flow(name_tag: &str, skel: bool) {
     let image = std::env::var("AT_TEST_IMAGE").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| "ubuntu:24.04".into());
@@ -235,7 +237,8 @@ fn docker_bash_flow(name_tag: &str, skel: bool) {
 
     assert!(wait_program_up(&s, &docker), "the container shell never drew its prompt");
     let (key, sh) = integrate_ok(&s);
-    assert_eq!((key, sh.as_str()), (1, "bash"), "{image}");
+    assert_eq!(sh.as_str(), "bash", "{image}");
+    assert_ne!(key, 0, "{image}");
     assert!(wait_state(&s, InputState::Prompt, WAIT), "state {:?}", s.state());
     assert_eq!(s.location().as_deref(), Some(docker.as_str()));
 

@@ -26,4 +26,5 @@ pub mod settings;
 pub mod shim;
 pub mod skills;
 pub mod term_reply;
+pub mod terminals;
 pub mod tools;

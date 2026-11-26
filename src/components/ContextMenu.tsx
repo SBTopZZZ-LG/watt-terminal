@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useContext, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { flushSync } from 'react-dom';
 import type { Ref } from 'react';
 import { api } from '../lib/api';
@@ -6,12 +6,14 @@ import { copyText, readClipboardText } from '../lib/clipboard';
 import { edgeIndex, menuFor, menuKey, menuPlacement, stepIndex, typeaheadIndex, withLayoutInspector } from '../lib/contextMenu';
 import type { MenuItem } from '../lib/contextMenu';
 import { fieldSelectedText, resolveMenu } from '../lib/contextMenuDom';
-import type { MenuSnapshot, TerminalFacts, TextField } from '../lib/contextMenuDom';
-import { reportError } from '../lib/session';
+import type { MenuSnapshot, TabFacts, TerminalFacts, TextField } from '../lib/contextMenuDom';
+import { reportError, tabs } from '../lib/tabManager';
+import { isOwnedByChat } from '../lib/tabStrip';
 import { selectContentsOf } from '../lib/selectAll';
-import { term } from '../lib/terminal';
+import { ActiveTabContext } from '../lib/activeTab';
 import type { Placement } from '../lib/tooltip';
 import type { InputState } from '../lib/types';
+import type { Terminal } from '@xterm/xterm';
 import { pasteFromClipboard } from './TerminalView';
 
 /** The menu's id. One menu at a time, so a constant id is enough. */
@@ -33,6 +35,10 @@ export interface ContextMenuProps {
   onFindChat: () => void;
   /** The developer setting: true adds "Open layout inspector" to every menu the app opens. Read when a menu opens. */
   devtools: boolean;
+  /** Restarts a terminal's shell, as the strip's tab menu asks (App runs the chat's restart steps). */
+  onRestartTab: (id: string) => void;
+  /** The active chat: the tab items say whether the terminal is visible to it, and the visibility item assigns to it. */
+  chatId: string;
 }
 
 interface OpenMenu {
@@ -47,11 +53,25 @@ interface OpenMenu {
 }
 
 /** The terminal facts the resolver reads: the caller's, plus what the terminal itself says now. */
-function terminalFacts(t: ContextMenuProps['terminal']): TerminalFacts {
+function terminalFacts(t: ContextMenuProps['terminal'], term: Terminal | null): TerminalFacts {
   return {
     ...t,
-    altScreen: term.buffer.active.type === 'alternate',
-    hasSelection: term.hasSelection(),
+    altScreen: term !== null && term.buffer.active.type === 'alternate',
+    hasSelection: term !== null && term.hasSelection(),
+  };
+}
+
+/** What the tab registry says about a terminal, for its tab items. Null for an id with no terminal. */
+function tabFactsOf(id: string, chatId: string): TabFacts | null {
+  const tab = tabs.get(id);
+  if (tab === undefined) {
+    return null;
+  }
+  const owner = tab.getSnapshot().owner;
+  return {
+    visible: isOwnedByChat(owner, chatId),
+    elsewhere: owner !== null && !isOwnedByChat(owner, chatId),
+    canClose: tabs.getSnapshot().ids.length > 1,
   };
 }
 
@@ -67,9 +87,9 @@ function pointBelow(el: Element): { x: number; y: number } {
 }
 
 /** Focus goes back to what had it: the terminal, or the element focused when the menu opened. */
-function restoreFocus(snap: MenuSnapshot): void {
+function restoreFocus(snap: MenuSnapshot, term: Terminal | null): void {
   if (snap.ctx.region === 'terminal') {
-    term.focus();
+    term?.focus();
     return;
   }
   if (snap.origin !== null && snap.origin.isConnected) {
@@ -107,7 +127,7 @@ async function pasteIntoField(field: TextField): Promise<void> {
 }
 
 /** Runs a menu item. The menu has already closed and given focus back, so the field or the terminal is the target. */
-async function runAction(id: MenuItem['id'], snap: MenuSnapshot, props: ContextMenuProps): Promise<void> {
+async function runAction(id: MenuItem['id'], snap: MenuSnapshot, props: ContextMenuProps, term: Terminal | null): Promise<void> {
   const { texts } = snap;
   switch (id) {
     case 'copy':
@@ -116,7 +136,7 @@ async function runAction(id: MenuItem['id'], snap: MenuSnapshot, props: ContextM
       }
       return copyOrReport(texts.selection);
     case 'copy-terminal':
-      return copyOrReport(term.getSelection());
+      return copyOrReport(term?.getSelection() ?? '');
     case 'cut': {
       const field = snap.field;
       if (field === null) {
@@ -137,7 +157,7 @@ async function runAction(id: MenuItem['id'], snap: MenuSnapshot, props: ContextM
     }
     case 'paste':
       if (snap.field === null) {
-        return pasteFromClipboard();
+        return term === null ? undefined : pasteFromClipboard(term);
       }
       return pasteIntoField(snap.field);
     case 'select-all':
@@ -146,7 +166,7 @@ async function runAction(id: MenuItem['id'], snap: MenuSnapshot, props: ContextM
       } else if (snap.ctx.region === 'chat') {
         selectContentsOf(snap.transcript);
       } else {
-        term.selectAll();
+        term?.selectAll();
       }
       return;
     case 'find-terminal':
@@ -159,7 +179,7 @@ async function runAction(id: MenuItem['id'], snap: MenuSnapshot, props: ContextM
       props.onClearTerminal();
       return;
     case 'scroll-bottom':
-      term.scrollToBottom();
+      term?.scrollToBottom();
       return;
     case 'copy-message':
       return copyOrReport(texts.message);
@@ -175,6 +195,28 @@ async function runAction(id: MenuItem['id'], snap: MenuSnapshot, props: ContextM
       return copyOrReport(texts.link);
     case 'copy-chip':
       return copyOrReport(texts.chip);
+    case 'tab-visibility':
+      // The registry shows a refusal (a busy chat that would lose the terminal) and re-reads the owners.
+      if (snap.tabId !== null) {
+        // Another chat's terminal moves here; the owner is read now, as the menu may be older than the owner.
+        const owner = snap.ctx.tabOther ? (tabs.get(snap.tabId)?.getSnapshot().owner ?? null) : null;
+        if (owner !== null) {
+          await tabs.move(snap.tabId, owner, props.chatId);
+        } else {
+          await tabs.assign(snap.tabId, !snap.ctx.tabVisible, props.chatId);
+        }
+      }
+      return;
+    case 'tab-restart':
+      if (snap.tabId !== null) {
+        props.onRestartTab(snap.tabId);
+      }
+      return;
+    case 'tab-close':
+      if (snap.tabId !== null) {
+        await tabs.close(snap.tabId);
+      }
+      return;
     case 'open-layout-inspector':
       // The backend refuses unless the setting is on; a refusal is reported like any other failed action.
       return api.openDevtools();
@@ -194,8 +236,12 @@ export function ContextMenu(props: ContextMenuProps) {
   const openRef = useRef<OpenMenu | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
   const latest = useRef(props);
+  // The active terminal's xterm. Read by the listeners, which are registered once, so it is kept in a ref too.
+  const tab = useContext(ActiveTabContext);
+  const latestTerm = useRef<Terminal | null>(tab?.term ?? null);
   useEffect(() => {
     latest.current = props;
+    latestTerm.current = tab?.term ?? null;
   });
 
   const setOpen = (next: OpenMenu | null) => {
@@ -234,7 +280,7 @@ export function ContextMenu(props: ContextMenuProps) {
       return;
     }
     setOpen(null);
-    restoreFocus(cur.snap);
+    restoreFocus(cur.snap, latestTerm.current);
   };
 
   /** Closes the menu for a scroll, a resize or a window blur. Focus goes back to the origin when it is in the menu or on the body. */
@@ -247,7 +293,7 @@ export function ContextMenu(props: ContextMenuProps) {
     const lost = active === null || active === document.body || (menuRef.current?.contains(active) ?? false);
     setOpen(null);
     if (lost) {
-      restoreFocus(cur.snap);
+      restoreFocus(cur.snap, latestTerm.current);
     }
   };
 
@@ -260,8 +306,8 @@ export function ContextMenu(props: ContextMenuProps) {
     // The menu leaves the DOM before focus moves back and the action runs, so nothing that happens later (the menu's
     // removal) can move the selection the action makes, such as Select all in the chat.
     flushSync(() => setOpen(null));
-    restoreFocus(cur.snap);
-    runAction(item.id, cur.snap, latest.current).catch(reportError);
+    restoreFocus(cur.snap, latestTerm.current);
+    runAction(item.id, cur.snap, latest.current, latestTerm.current).catch(reportError);
   };
 
   const handleKey = (e: KeyboardEvent, cur: OpenMenu) => {
@@ -322,10 +368,10 @@ export function ContextMenu(props: ContextMenuProps) {
         return;
       }
       // With mouse tracking on, a right click in the terminal belongs to the app inside it. Shift keeps the menu.
-      if (!e.shiftKey && target.closest('.xterm') !== null && term.modes.mouseTrackingMode !== 'none') {
+      if (!e.shiftKey && target.closest('.xterm') !== null && (latestTerm.current?.modes.mouseTrackingMode ?? 'none') !== 'none') {
         return;
       }
-      const snap = resolveMenu(target, terminalFacts(latest.current.terminal), origin);
+      const snap = resolveMenu(target, terminalFacts(latest.current.terminal, latestTerm.current), origin, (id) => tabFactsOf(id, latest.current.chatId));
       if (snap !== null) {
         show(snap, { x: e.clientX, y: e.clientY }, false);
       }
@@ -345,7 +391,7 @@ export function ContextMenu(props: ContextMenuProps) {
         if (!(el instanceof HTMLElement)) {
           return;
         }
-        const snap = resolveMenu(el, terminalFacts(latest.current.terminal), el);
+        const snap = resolveMenu(el, terminalFacts(latest.current.terminal, latestTerm.current), el, (id) => tabFactsOf(id, latest.current.chatId));
         if (snap !== null) {
           show(snap, pointBelow(el), true);
         }

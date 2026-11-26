@@ -1,5 +1,5 @@
-// Typed wrappers around the Tauri commands in src-tauri/src/lib.rs. Every call carries the session id.
-// Tauri maps the Rust snake_case argument names to camelCase here (session_id -> sessionId).
+// Typed wrappers around the Tauri commands in src-tauri/src/lib.rs. Tab (terminal) commands carry `sessionId`, chat
+// (agent) commands carry `chatId`. Tauri maps the Rust snake_case argument names to camelCase here.
 
 import { Channel, invoke } from '@tauri-apps/api/core';
 import type {
@@ -8,6 +8,7 @@ import type {
   ApprovalSettings,
   AttachmentInput,
   AutoApproveState,
+  ChatInfo,
   CommandCatalog,
   ConversationMeta,
   DeleteResult,
@@ -32,14 +33,18 @@ import type {
   SkillsView,
   StartResult,
   Status,
+  TabInfo,
   TestResult,
   UiState,
   UiStatePatch,
   WireEvent,
 } from './types';
 
-/** Slice 1 runs one session. Every call still passes its id, so more sessions later need no call-site change. */
+/** The first terminal's id. Tab commands pass it as `sessionId`. */
 export const SESSION_ID = 'main';
+
+/** The default chat's id. Chat commands pass it as `chatId`. */
+export const CHAT_ID = 'main';
 
 export function errorText(e: unknown): string {
   if (typeof e === 'string') {
@@ -52,112 +57,148 @@ export function errorText(e: unknown): string {
 }
 
 export const api = {
-  startSession(rows: number, cols: number, onData: Channel<ArrayBuffer>, onEvents: Channel<WireEvent>) {
-    return invoke<StartResult>('start_session', { sessionId: SESSION_ID, rows, cols, onData, onEvents });
+  startSession(sessionId: string, rows: number, cols: number, onData: Channel<ArrayBuffer>, onEvents: Channel<WireEvent>) {
+    return invoke<StartResult>('start_session', { sessionId, rows, cols, onData, onEvents });
   },
   /** Starts a new shell if the session has exited (new nonce); otherwise attaches like startSession. */
-  restartSession(rows: number, cols: number, onData: Channel<ArrayBuffer>, onEvents: Channel<WireEvent>) {
-    return invoke<StartResult>('restart_session', { sessionId: SESSION_ID, rows, cols, onData, onEvents });
+  restartSession(sessionId: string, rows: number, cols: number, onData: Channel<ArrayBuffer>, onEvents: Channel<WireEvent>) {
+    return invoke<StartResult>('restart_session', { sessionId, rows, cols, onData, onEvents });
   },
-  ack(bytes: number) {
-    return invoke<void>('ack', { sessionId: SESSION_ID, bytes });
+  /** Removes a terminal and kills its shell, at any time. An agent turn that held it is not cancelled. */
+  closeSession(sessionId: string) {
+    return invoke<void>('close_session', { sessionId });
   },
-  resize(rows: number, cols: number) {
-    return invoke<void>('resize', { sessionId: SESSION_ID, rows, cols });
+  /** Sets a terminal's title. Null or blank clears it. The backend trims and caps it. */
+  setTabTitle(sessionId: string, title: string | null) {
+    return invoke<void>('set_tab_title', { sessionId, title });
   },
-  writeUser(text: string) {
-    return invoke<void>('write_user', { sessionId: SESSION_ID, text });
+  /** Every terminal, oldest first. */
+  listTabs() {
+    return invoke<TabInfo[]>('list_tabs');
+  },
+  /** Assigns a terminal to a chat (`on`), or unassigns it. Refused when another chat owns it, or when the chat is busy and would lose it. */
+  assignTab(chatId: string, sessionId: string, on: boolean) {
+    return invoke<void>('assign_tab_cmd', { chatId, sessionId, on });
+  },
+  /** Creates a chat with no terminal and a new conversation. Returns its id. */
+  createChat() {
+    return invoke<string>('create_chat');
+  },
+  /** Sets the chat's agent-events channel. Idempotent: a later call replaces the channel. */
+  attachChat(chatId: string, onEvents: Channel<WireEvent>) {
+    return invoke<void>('attach_chat', { chatId, onEvents });
+  },
+  /** Closes a chat (refused while its turn runs) and unassigns its terminals. */
+  closeChat(chatId: string) {
+    return invoke<void>('close_chat', { chatId });
+  },
+  /** Every chat, by id. */
+  listChats() {
+    return invoke<ChatInfo[]>('list_chats');
+  },
+  ack(sessionId: string, bytes: number) {
+    return invoke<void>('ack', { sessionId, bytes });
+  },
+  resize(sessionId: string, rows: number, cols: number) {
+    return invoke<void>('resize', { sessionId, rows, cols });
+  },
+  writeUser(sessionId: string, text: string) {
+    return invoke<void>('write_user', { sessionId, text });
   },
   /**
    * Sends one user message to the agent, with its attachments (images as PNG or JPEG, text documents as UTF-8). The field is
    * left out when there are none, so a text-only send is the same call as before.
    */
-  agentMessage(text: string, attachments: AttachmentInput[] = []) {
+  agentMessage(chatId: string, text: string, attachments: AttachmentInput[] = []) {
     // `sha256` is for the transcript only (see AttachmentInput), so it is not sent.
     const wire = attachments.map(({ sha256: _sha256, ...rest }) => rest);
-    return invoke<void>('agent_message', wire.length > 0 ? { sessionId: SESSION_ID, text, attachments: wire } : { sessionId: SESSION_ID, text });
+    return invoke<void>('agent_message', wire.length > 0 ? { chatId, text, attachments: wire } : { chatId, text });
   },
   /**
    * Steers a message into the running agent turn: it goes in at the turn's next step. Resolves true when accepted, false when
    * not (no agent turn running, the turn ending, or a side command running): the caller then queues it as before. `mode` is
    * the queue mode: `all` sends every waiting message together, `one` the first alone.
    */
-  steerMessage(id: number, text: string, attachments: AttachmentInput[] = [], mode: QueueMode = 'all') {
+  steerMessage(chatId: string, id: number, text: string, attachments: AttachmentInput[] = [], mode: QueueMode = 'all') {
     // As for agentMessage, `sha256` is for the transcript only, so it is not sent.
     const wire = attachments.map(({ sha256: _sha256, ...rest }) => rest);
-    const args = wire.length > 0 ? { sessionId: SESSION_ID, id, text, attachments: wire, mode } : { sessionId: SESSION_ID, id, text, mode };
+    const args = wire.length > 0 ? { chatId, id, text, attachments: wire, mode } : { chatId, id, text, mode };
     return invoke<boolean>('steer_message', args);
   },
   /** Takes a steered message back. True when it was still waiting, false when the turn had already taken it. */
-  withdrawSteer(id: number) {
-    return invoke<boolean>('withdraw_steer', { sessionId: SESSION_ID, id });
+  withdrawSteer(chatId: string, id: number) {
+    return invoke<boolean>('withdraw_steer', { chatId, id });
   },
   /** Cancels the running agent turn, if any. Harmless when none is running. */
-  cancelAgent() {
-    return invoke<void>('cancel_agent', { sessionId: SESSION_ID });
+  cancelAgent(chatId: string) {
+    return invoke<void>('cancel_agent', { chatId });
   },
   /** Clears the agent's conversation. Refused while the agent is busy. */
-  newConversation() {
-    return invoke<void>('new_conversation', { sessionId: SESSION_ID });
+  newConversation(chatId: string) {
+    return invoke<void>('new_conversation', { chatId });
   },
-  approveTool(callId: string, approve: boolean) {
-    return invoke<void>('approve_tool', { sessionId: SESSION_ID, callId, approve });
+  approveTool(chatId: string, callId: string, approve: boolean) {
+    return invoke<void>('approve_tool', { chatId, callId, approve });
   },
-  setAutoApprove(on: boolean) {
-    return invoke<void>('set_auto_approve', { sessionId: SESSION_ID, on });
+  setAutoApprove(chatId: string, on: boolean) {
+    return invoke<void>('set_auto_approve', { chatId, on });
   },
   /**
    * Answers the agent's request to integrate the shell (its `asking` event). `accept` runs the integration; anything else
    * declines it. Errors when no such request is pending (it timed out, or the turn ended).
    */
-  answerIntegration(callId: string, accept: boolean) {
-    return invoke<void>('answer_integration', { sessionId: SESSION_ID, callId, accept });
+  answerIntegration(chatId: string, callId: string, accept: boolean) {
+    return invoke<void>('answer_integration', { chatId, callId, accept });
   },
   /**
    * Answers the agent's clarification question (its `question_request` event). Errors when the answers are invalid
    * (the card stays and can retry) or no such question is pending (it already settled).
    */
-  answerQuestions(callId: string, answers: QuestionAnswerInput[]) {
-    return invoke<void>('answer_questions', { sessionId: SESSION_ID, callId, answers });
+  answerQuestions(chatId: string, callId: string, answers: QuestionAnswerInput[]) {
+    return invoke<void>('answer_questions', { chatId, callId, answers });
   },
   /** Approve-all as the shell on top sees it. Read again after a levels event or a toggle. */
-  autoApproveState() {
-    return invoke<AutoApproveState>('auto_approve_state', { sessionId: SESSION_ID });
+  autoApproveState(chatId: string) {
+    return invoke<AutoApproveState>('auto_approve_state', { chatId });
   },
   /**
    * Integrates the shell in the foreground (ssh, a nested shell, su, a container exec) as a new level. Slow: it waits for the
    * remote shell. While it runs, the terminal and the input bar take no keys.
    */
-  integrateShell() {
-    return invoke<IntegrateOutcome>('integrate_shell', { sessionId: SESSION_ID });
+  integrateShell(sessionId: string) {
+    return invoke<IntegrateOutcome>('integrate_shell', { sessionId });
   },
-  getStatus() {
-    return invoke<Status>('get_status', { sessionId: SESSION_ID });
+  /**
+   * The chat's status. The chat fields come from the chat; the shell fields from the terminal `sessionId` names, or from the
+   * chat's default terminal when none is given. Read the terminal's own status with its id, so it is not another's.
+   */
+  getStatus(chatId: string, sessionId?: string) {
+    return invoke<Status>('get_status', { chatId, sessionId: sessionId ?? null });
   },
   /** The custom slash-command templates (global and project dirs), plus the two dirs so `/help` can show them. */
-  listCommands() {
-    return invoke<CommandCatalog>('list_commands', { sessionId: SESSION_ID });
+  listCommands(sessionId: string) {
+    return invoke<CommandCatalog>('list_commands', { sessionId });
   },
   /**
    * Asks a one-off side question about the live conversation. One model call outside a turn; the answer is not
    * stored and the transcript only gets a notice. Refused while the agent is busy.
    */
-  askBtw(text: string) {
-    return invoke<string>('ask_btw', { sessionId: SESSION_ID, text });
+  askBtw(chatId: string, text: string) {
+    return invoke<string>('ask_btw', { chatId, text });
   },
   /**
    * Suggests a title for the live conversation. One model call outside a turn; nothing is stored and the
    * transcript only gets notices. Refused while the agent is busy, and when there is nothing to name yet.
    */
-  suggestName() {
-    return invoke<string>('suggest_name', { sessionId: SESSION_ID });
+  suggestName(chatId: string) {
+    return invoke<string>('suggest_name', { chatId });
   },
   /**
    * Suggests a few follow-up prompts after the latest reply. One read-only model call: it never blocks a turn or a send,
    * and nothing is stored. Empty when there is nothing to suggest. Errors reject; the caller ignores them.
    */
-  suggestPrompts() {
-    return invoke<string[]>('suggest_prompts', { sessionId: SESSION_ID });
+  suggestPrompts(chatId: string) {
+    return invoke<string[]>('suggest_prompts', { chatId });
   },
   /** Brings the main window forward, for a clicked notification. Errors reject; the caller ignores them. */
   focusMainWindow() {
@@ -168,28 +209,28 @@ export const api = {
     return invoke<void>('open_devtools');
   },
   /** Summarizes the live conversation into a new conversation and switches to it. The old one stays in history. */
-  compactConversation() {
-    return invoke<LoadedConversation>('compact_conversation', { sessionId: SESSION_ID });
+  compactConversation(chatId: string) {
+    return invoke<LoadedConversation>('compact_conversation', { chatId });
   },
   /** Copies the live conversation into a new one and switches to it. The old one stays untouched. */
-  forkConversation() {
-    return invoke<LoadedConversation>('fork_conversation', { sessionId: SESSION_ID });
+  forkConversation(chatId: string) {
+    return invoke<LoadedConversation>('fork_conversation', { chatId });
   },
   /** The live conversation as Markdown for `/export`: the stored history, so nothing is lost to the UI cap. */
-  exportConversation() {
-    return invoke<string>('export_conversation', { sessionId: SESSION_ID });
+  exportConversation(chatId: string) {
+    return invoke<string>('export_conversation', { chatId });
   },
   /** The saved conversations, most recently updated first. */
   listConversations() {
     return invoke<ConversationMeta[]>('list_conversations');
   },
   /** Opens a saved conversation as the live one. Refused while the agent is busy. */
-  loadConversation(id: string) {
-    return invoke<LoadedConversation>('load_conversation', { sessionId: SESSION_ID, id });
+  loadConversation(chatId: string, id: string) {
+    return invoke<LoadedConversation>('load_conversation', { chatId, id });
   },
   /** The full image of an attachment of the open conversation, as a PNG or JPEG data URL. Rejects when it is no longer stored. */
-  getAttachment(sha256: string, mime: string) {
-    return invoke<string>('get_attachment', { sessionId: SESSION_ID, sha256, mime });
+  getAttachment(chatId: string, sha256: string, mime: string) {
+    return invoke<string>('get_attachment', { chatId, sha256, mime });
   },
   /** Deletes a saved conversation. Refused while the agent is busy. `deleted_live` says the live conversation was reset. */
   deleteConversation(id: string) {
@@ -308,8 +349,8 @@ export const api = {
     return invoke<McpView>('mcp_set_tool_approval', { name, tool, level });
   },
   /** The skills in the user's folders and, when the session's local shell is on top, its project's. Missing folders are fine. */
-  listSkills() {
-    return invoke<SkillsView>('list_skills', { sessionId: SESSION_ID });
+  listSkills(chatId: string) {
+    return invoke<SkillsView>('list_skills', { chatId });
   },
   /** Opens the native "choose a folder" dialog. Resolves with the chosen folder as a full path, or null when the user cancels. Rejects when the dialog cannot open. */
   async pickFolder(defaultPath?: string): Promise<string | null> {

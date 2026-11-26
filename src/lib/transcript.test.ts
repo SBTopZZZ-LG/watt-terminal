@@ -256,6 +256,15 @@ describe('transcriptReducer: local actions', () => {
     expect(t.items[1]).toMatchObject({ kind: 'approval', location: null });
   });
 
+  it('an approval card carries the title of its terminal when the caller gives one; without it there is no terminal field', () => {
+    const t = run([
+      { type: 'agent_event', event: { type: 'approval_request', call_id: 'a1', name: 'run_command', text: 'pwd' }, terminal: 'Terminal 2' },
+      { type: 'agent_event', event: { type: 'approval_request', call_id: 'a2', name: 'run_command', text: 'pwd' } },
+    ]);
+    expect(t.items[0]).toMatchObject({ kind: 'approval', terminal: 'Terminal 2' });
+    expect(t.items[1]).not.toHaveProperty('terminal');
+  });
+
   it('the first pending approval is the oldest one', () => {
     const t = run([
       { type: 'agent_event', event: { type: 'approval_request', call_id: 'a1', name: 'run_command', text: 'x' } },
@@ -1224,5 +1233,14 @@ describe('transcriptReducer: paged conversations', () => {
     // After the reset the cap applies to live items again.
     const many = Array.from({ length: MAX_ITEMS + 5 }, (_, i) => ({ type: 'notice' as const, text: `n${i}` }));
     expect(run(many, reset).items).toHaveLength(MAX_ITEMS);
+  });
+});
+
+describe('transcriptReducer: replace', () => {
+  it('puts a saved transcript back as it was, whatever the live one holds', () => {
+    const saved = run([{ type: 'user_sent', clientId: 1, text: 'hi' }, { type: 'agent_event', event: { type: 'text', text: 'hello' } }]);
+    const live = run([{ type: 'notice', text: 'other chat' }, { type: 'user_sent', clientId: 2, text: 'x' }]);
+    expect(transcriptReducer(live, { type: 'replace', transcript: saved })).toBe(saved);
+    expect(isBusy(transcriptReducer(live, { type: 'replace', transcript: EMPTY_TRANSCRIPT }))).toBe(false);
   });
 });

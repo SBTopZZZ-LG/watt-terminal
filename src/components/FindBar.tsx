@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from 'react';
+import { useContext, useEffect, useRef, useState } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent } from 'react';
-import { search, SEARCH_DECORATIONS } from '../lib/terminal';
+import { ActiveTabContext } from '../lib/activeTab';
+import { SEARCH_DECORATIONS } from '../lib/tab';
 import { findLabel } from '../lib/find';
 import type { FindResults } from '../lib/find';
 
@@ -20,14 +21,19 @@ export function FindBar({ focusToken, onClose }: Props) {
   const [caseSensitive, setCaseSensitive] = useState(false);
   const [results, setResults] = useState<FindResults>({ index: -1, count: 0 });
   const inputRef = useRef<HTMLInputElement>(null);
+  const tab = useContext(ActiveTabContext);
 
   useEffect(() => {
+    if (tab === null) {
+      return;
+    }
+    const { search } = tab;
     const sub = search.onDidChangeResults((r) => setResults({ index: r.resultIndex, count: r.resultCount }));
     return () => {
       sub.dispose();
       search.clearDecorations();
     };
-  }, []);
+  }, [tab]);
 
   useEffect(() => {
     inputRef.current?.focus();
@@ -35,6 +41,10 @@ export function FindBar({ focusToken, onClose }: Props) {
   }, [focusToken]);
 
   function run(text: string, sensitive: boolean, direction: 'next' | 'prev', incremental: boolean) {
+    if (tab === null) {
+      return;
+    }
+    const { search } = tab;
     if (text === '') {
       search.clearDecorations();
       setResults({ index: -1, count: 0 });

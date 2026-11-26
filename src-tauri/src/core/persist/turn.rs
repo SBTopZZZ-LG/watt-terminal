@@ -32,6 +32,9 @@ pub struct FinishedTurn<'a> {
     pub in_turn: bool,
     /// The context usage of the conversation's last model request (see `StoredConversation::context`).
     pub context: Option<ContextUsage>,
+    /// Whether the conversation becomes the remembered last one. Only chat `main` does that, so a side chat's turns never
+    /// change what the app reopens.
+    pub remember: bool,
 }
 
 /// This machine, as the workspace needs it: the host name the shell reports, and the home directory.
@@ -93,8 +96,12 @@ fn save_turn_keeping(
     };
     let meta = persist.conversations.save(&req, redactor, now)?;
     let pruned = persist.conversations.prune(keep, Some(&id)).map(|_| ());
-    let patch = UiStatePatch { last_conversation_id: Some(Some(id)), ..UiStatePatch::default() };
-    let remembered = persist.ui.patch(patch).map(|_| ());
+    let remembered = if turn.remember {
+        let patch = UiStatePatch { last_conversation_id: Some(Some(id)), ..UiStatePatch::default() };
+        persist.ui.patch(patch).map(|_| ())
+    } else {
+        Ok(())
+    };
     pruned?;
     remembered?;
     Ok(Some(meta))
@@ -153,6 +160,7 @@ mod tests {
             cwd,
             in_turn: false,
             context: None,
+            remember: true,
         }
     }
 
@@ -186,6 +194,17 @@ mod tests {
         assert!(none.is_none());
         assert!(!tmp.path().join("data").exists(), "no conversation directory");
         assert!(!tmp.path().join("config").exists(), "no ui-state file");
+    }
+
+    #[test]
+    fn a_turn_that_is_not_remembered_leaves_the_last_conversation_alone() {
+        let tmp = TempDir::new();
+        let p = persist(&tmp);
+        let conversation = id(4);
+        let side = FinishedTurn { remember: false, ..turn(&conversation, exchange("hi"), None) };
+        let meta = save_turn(&p, side, &redactor(), env(None), 9).unwrap();
+        assert!(meta.is_some(), "the conversation is saved");
+        assert_eq!(p.ui.load().unwrap().last_conversation_id, None, "nothing is remembered");
     }
 
     #[test]

@@ -14,9 +14,18 @@ const FILES: &[(&str, &str)] = &[
     ("integration.ps1", include_str!("shim/integration.ps1")),
 ];
 
-/// `<tmp>/watt-terminal-<pid>-<session>`. Any leftover directory with that name is removed first.
-pub fn dir_for(session_id: &str) -> PathBuf {
-    let safe: String = session_id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect();
+/// `<tmp>/watt-terminal-<pid>-<name>`, where `<name>` encodes `id` injectively: ASCII letters, digits and '-' stay as they
+/// are, every other byte becomes '_' and two hex digits ('_' itself is "_5f"). So distinct ids never share a directory
+/// ("a.b" and "a_b" differ). Any leftover directory with that name is removed first (by `write_to`).
+pub fn dir_for(id: &str) -> PathBuf {
+    let mut safe = String::with_capacity(id.len());
+    for b in id.bytes() {
+        if b.is_ascii_alphanumeric() || b == b'-' {
+            safe.push(b as char);
+        } else {
+            safe.push_str(&format!("_{b:02x}"));
+        }
+    }
     std::env::temp_dir().join(format!("watt-terminal-{}-{}", std::process::id(), safe))
 }
 
@@ -51,4 +60,28 @@ fn create_private_file(path: &Path) -> io::Result<fs::File> {
 #[cfg(not(unix))]
 fn create_private_file(path: &Path) -> io::Result<fs::File> {
     fs::OpenOptions::new().write(true).create_new(true).open(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dir_names_are_injective() {
+        let ids = ["a.b", "a_b", "a_b_", "a_2eb", "a-b", "ab", "a b", "a/b", "a\\b", "", "_", "é", "a_5f", "a__b"];
+        let dirs: Vec<PathBuf> = ids.iter().map(|id| dir_for(id)).collect();
+        for (i, a) in dirs.iter().enumerate() {
+            for (j, b) in dirs.iter().enumerate() {
+                assert!(i == j || a != b, "ids {:?} and {:?} share {}", ids[i], ids[j], a.display());
+            }
+        }
+    }
+
+    #[test]
+    fn dir_is_under_temp_dir_and_named_with_pid() {
+        let dir = dir_for("7");
+        assert_eq!(dir.parent(), Some(std::env::temp_dir().as_path()));
+        let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(name, format!("watt-terminal-{}-7", std::process::id()));
+    }
 }

@@ -1,11 +1,11 @@
 //! Tauri wiring only. All logic lives in `core`; this file maps commands and channels onto it.
 //!
-//! Channels, per session: `on_data` carries raw PTY bytes (`InvokeResponseBody::Raw`, which the frontend
-//! receives as an ArrayBuffer) and must be acknowledged with `ack`. `on_events` carries JSON objects:
-//! session events (`state`, `integration`, `observer`, `cwd`, `record_started`, `record_finished`) and
-//! agent events (`text`, `text_delta`, `thinking`, `tool_call`, `tool_result`, `approval_request`,
-//! `question_request`, `integration_request`, `todo_update`, `context_usage`, `agent_control`, `notice`, `done`),
-//! told apart by `type`.
+//! Channels, per terminal (tab): `on_data` carries raw PTY bytes (`InvokeResponseBody::Raw`, which the frontend
+//! receives as an ArrayBuffer) and must be acknowledged with `ack`. `on_events` carries JSON objects of session
+//! events (`state`, `integration`, `observer`, `cwd`, `record_started`, `record_finished`).
+//! Per chat: the events channel given to `attach_chat` carries agent events (`text`, `text_delta`, `thinking`,
+//! `tool_call`, `tool_result`, `approval_request`, `question_request`, `integration_request`, `todo_update`,
+//! `context_usage`, `agent_control`, `notice`, `done`). Events are told apart by `type`.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -27,7 +27,7 @@ use crate::core::agent::{
     self, AgentCtx, AgentEvent, ApprovalGate, AutoState, MockAgent, OnDrop, Steer, SteerItem, SteerMode, TurnRules, UserMessage,
 };
 use crate::core::env::{env_setting, home_dir};
-use crate::core::approval::{self, ApprovalPolicy, ManualPolicy};
+use crate::core::approval::{self, ApprovalPolicy, ManualPolicy, SendKeysMemory};
 use crate::core::chat::agent_loop::{self, Conversation, LastUsage, LlmAgent, LlmSettings, USER_AGENT};
 use crate::core::chat::commands::{self, CommandCatalog};
 use crate::core::chat::instructions;
@@ -42,7 +42,7 @@ use crate::core::chat::todo::{Todo, TodoList};
 use crate::core::foreground::Foreground;
 use crate::core::fs_tools::Scope;
 use crate::core::llm::TurnCancel;
-use crate::core::observer::{EventSink, InputState, IntegrationStatus, LevelInfo, ObserverStatus, SessionEvent};
+use crate::core::observer::{EventSink, InputState, IntegrationStatus, LOCAL_KEY, LevelInfo, ObserverStatus, SessionEvent};
 use crate::core::persist::conversations::{self, ConversationMeta};
 use crate::core::persist::workspace::workspace_for;
 use crate::core::persist::turn::{FinishedTurn, TurnEnv, resume, save_turn};
@@ -65,12 +65,59 @@ use crate::core::settings::{
 use crate::core::mcp::config::McpLevel;
 use crate::core::mcp::service::{McpImportResult, McpServerInput, McpService, McpStatus, McpView, TurnMcp};
 use crate::core::skills::{self, Places, SkillsSettings, SkillsView};
-use crate::core::tools::SessionTools;
+use crate::core::terminals::{ChatTerminals, Terminal};
+use crate::core::tools::{AgentTools, SessionTools, TurnBudget};
 
-type Reg = Registry<Attached>;
+/// The terminals: one shell each, keyed by tab id. A tab belongs to at most one chat (`Tab::owner`).
+type Reg = Registry<Tab>;
+/// The agent conversations, keyed by chat id.
+type ChatReg = Registry<Chat>;
+/// The terminals an agent turn took control of, each with the `terminal` its control event named (None: the only one). The
+/// turn clears them all when it ends (see `Chat::end_turn`).
+type Touched = Mutex<Vec<(Arc<Tab>, Option<String>)>>;
 
-/// Counts restarts, to give each restarted shell its own shim directory name.
-static RESTARTS: AtomicU64 = AtomicU64::new(0);
+/// The first tab's id. Its chat has the same id: single-tab parity, the app's first terminal belongs to chat `main`.
+const MAIN: &str = "main";
+
+/// Counts tabs, so each has a creation order (`Tab::seq`). A chat's default terminal is its oldest.
+static TAB_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn next_tab_seq() -> u64 {
+    TAB_SEQ.fetch_add(1, Ordering::SeqCst)
+}
+
+/// Counts shell spawns, so each one gets its own shim directory name (see `next_shim_id`).
+static SHIM_IDS: AtomicU64 = AtomicU64::new(0);
+
+/// A name for the next shell's shim directory, unique in this process. A dead shell's drop removes its own directory,
+/// which must never be the one a live shell is using, so no two spawns share a name (session ids are not used).
+fn next_shim_id() -> String {
+    SHIM_IDS.fetch_add(1, Ordering::SeqCst).to_string()
+}
+
+/// Counts chats, so each new chat gets its own id (see `next_chat_id`).
+static CHAT_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// A new chat's id: "c1", "c2", ... Process-global and never reused, so a closed chat's id is never taken over by a later
+/// one. `MAIN` is never produced: it is the default chat's id.
+fn next_chat_id() -> String {
+    format!("c{}", CHAT_SEQ.fetch_add(1, Ordering::SeqCst) + 1)
+}
+
+/// The longest terminal title kept, in characters.
+const TITLE_MAX: usize = 120;
+
+/// A title as the frontend sends it: trimmed and capped. Empty (or blank) is None, which means no title.
+fn clean_title(title: Option<String>) -> Option<String> {
+    let capped: String = title?.trim().chars().take(TITLE_MAX).collect();
+    let trimmed = capped.trim_end();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Whether a chat's conversation is the one remembered as the last conversation (in the UI state). Only chat `MAIN` does.
+fn remembers_last(chat_id: &str) -> bool {
+    chat_id == MAIN
+}
 
 /// The frontend's channels for one session. Swapped on re-attach, so the session keeps running.
 #[derive(Default)]
@@ -85,12 +132,18 @@ impl Channels {
         *lock(&self.events) = Some(events);
     }
 
+    /// Sends a session event (see `EventsSink`). Agent events go to the chat's channel instead (`Chat::send_agent`).
     fn send_json<T: Serialize>(&self, ev: &T) {
-        if let Ok(v) = serde_json::to_value(ev)
-            && let Some(ch) = lock(&self.events).as_ref()
-        {
-            let _ = ch.send(v);
-        }
+        send_to(&self.events, ev);
+    }
+}
+
+/// Writes one event to a frontend events channel, when one is attached.
+fn send_to<T: Serialize>(slot: &Mutex<Option<Channel<Value>>>, ev: &T) {
+    if let Ok(v) = serde_json::to_value(ev)
+        && let Some(ch) = lock(slot).as_ref()
+    {
+        let _ = ch.send(v);
     }
 }
 
@@ -116,14 +169,56 @@ impl EventSink for EventsSink {
     }
 }
 
-/// One live session plus its per-session agent state.
-pub struct Attached {
-    session: Session,
+/// One terminal: a shell (PTY) with its frontend data and session-event channels. `owner` is the chat it belongs to.
+pub struct Tab {
+    /// The terminal's id (the tab id the frontend uses). The model names it in `terminal`.
+    id: String,
+    /// Shared with the views of agent turns (see `Terminal::view`), which may outlive a call.
+    session: Arc<Session>,
     channels: Arc<Channels>,
+    /// True while the agent holds this shell: a shell-acting call, or its own command on top (see `AgentEvent::AgentControl`).
+    agent_control: AtomicBool,
+    /// The chat this terminal belongs to, if any. Changed only by `assign_tab`.
+    owner: Mutex<Option<String>>,
+    /// Creation order (see `next_tab_seq`).
+    seq: u64,
+    /// The title shown for the terminal and given to the model, set by `set_tab_title`. None when there is none.
+    title: Mutex<Option<String>>,
+}
+
+impl Tab {
+    fn owner_id(&self) -> Option<String> {
+        lock(&self.owner).clone()
+    }
+}
+
+impl Terminal for Tab {
+    fn id(&self) -> String {
+        self.id.clone()
+    }
+
+    fn title(&self) -> Option<String> {
+        lock(&self.title).clone()
+    }
+
+    /// The tools over this terminal's session, on the turn's budget and cancel. The view owns the session, not the tab.
+    fn view(self: Arc<Self>, budget: Arc<TurnBudget>, cancel: Option<Arc<TurnCancel>>) -> Box<dyn AgentTools> {
+        let mut tools = SessionTools::shared(self.session.clone()).with_budget(budget);
+        if let Some(cancel) = cancel {
+            tools = tools.with_cancel(cancel);
+        }
+        Box::new(tools)
+    }
+}
+
+/// One agent conversation (a chat): its agent state, approvals and agent-events channel. Its terminals are the tabs
+/// whose `owner` is its id (see `chat_tabs`); the chat holds no list of them.
+pub struct Chat {
+    id: String,
+    /// The frontend's agent-events channel. Swapped on re-attach, like the tab's channels.
+    events: Mutex<Option<Channel<Value>>>,
     approvals: ApprovalGate,
     agent_busy: AtomicBool,
-    /// True while the agent is executing a shell-acting call (see `AgentEvent::AgentControl`).
-    agent_control: AtomicBool,
     /// The running turn's cancel token. Set when a turn starts, cleared when it ends. Ctrl-C and `cancel_agent` set it.
     turn_cancel: Mutex<Option<Arc<TurnCancel>>>,
     /// The conversation: its id (sent to the provider) and its history. `new_conversation` resets it.
@@ -133,16 +228,52 @@ pub struct Attached {
     project_rules_seen: Mutex<Option<(String, String)>>,
     /// The steer mailbox of the running turn: messages sent while it runs (see `steer_message`). Open only for an agent turn.
     steer: Steer,
+    /// Set by `close_chat`. A closed chat takes no turn and no terminal, so a stale handle cannot revive it.
+    closed: AtomicBool,
 }
 
-impl Attached {
-    /// Ends a turn: clears the cancel token, the control flag (telling the UI) and the busy flag. Runs even when the
-    /// turn panicked. Steers still waiting are given back first (`steer_returned`), so they arrive before the turn's `done`.
-    fn end_turn(&self) {
+impl Chat {
+    fn new(id: &str) -> io::Result<Self> {
+        Ok(Chat {
+            id: id.to_string(),
+            events: Mutex::new(None),
+            approvals: ApprovalGate::new(),
+            agent_busy: AtomicBool::new(false),
+            turn_cancel: Mutex::new(None),
+            conversation: Conversation::new()?,
+            project_rules_seen: Mutex::new(None),
+            steer: Steer::default(),
+            closed: AtomicBool::new(false),
+        })
+    }
+
+    fn attach_events(&self, events: Channel<Value>) {
+        *lock(&self.events) = Some(events);
+    }
+
+    /// Sends an agent event to the chat's channel. Session events go to the tab's channel instead (`EventsSink`).
+    fn send_agent<T: Serialize>(&self, ev: &T) {
+        send_to(&self.events, ev);
+    }
+
+    /// A restarted terminal starts with the approval state a new session had: approve-all off, no `send_keys` memory,
+    /// and the project-rules notice comes again. The conversation itself carries over (see `restart_session`).
+    fn reset_for_new_shell(&self) {
+        self.approvals.set_auto_approve(false, 0);
+        *self.approvals.send_keys_memory() = SendKeysMemory::default();
+        *lock(&self.project_rules_seen) = None;
+    }
+
+    /// Ends a turn: clears the cancel token, the control flag of every terminal the turn took control of (telling the UI,
+    /// per terminal) and the busy flag. Runs even when the turn panicked. Steers still waiting are given back first
+    /// (`steer_returned`), so they arrive before the turn's `done`. `touched` is what the turn recorded (see `Touched`).
+    fn end_turn(&self, touched: &Touched) {
         *lock(&self.turn_cancel) = None;
         self.return_steers();
-        if self.agent_control.swap(false, Ordering::SeqCst) {
-            self.channels.send_json(&AgentEvent::AgentControl { active: false });
+        for (tab, terminal) in lock(touched).drain(..) {
+            if tab.agent_control.swap(false, Ordering::SeqCst) {
+                self.send_agent(&AgentEvent::AgentControl { active: false, terminal });
+            }
         }
         self.agent_busy.store(false, Ordering::SeqCst);
     }
@@ -151,7 +282,7 @@ impl Attached {
     fn return_steers(&self) {
         let ids: Vec<u64> = self.steer.close_and_take().iter().map(|item| item.id).collect();
         if !ids.is_empty() {
-            self.channels.send_json(&AgentEvent::SteerReturned { ids });
+            self.send_agent(&AgentEvent::SteerReturned { ids });
         }
     }
 
@@ -162,18 +293,18 @@ impl Attached {
         self.return_steers();
     }
 
-    /// Whether the terminal's Ctrl-C belongs to the agent's turn, and so cancels it. Never when the agent is not
+    /// Whether the Ctrl-C typed into `tab` belongs to this chat's turn, and so cancels it. Never when the agent is not
     /// busy. Always when the agent holds the shell (a shell-acting call, or its own command on top). Otherwise
     /// only at an idle prompt of the local shell (Prompt, Continuation, Submitted with no nested levels), where
     /// Ctrl-C can only clear the line: a Ctrl-C typed into the user's own running command, the alternate screen,
     /// a nested prompt, raw mode or a dead session stays with the shell.
-    fn interrupt_cancels_turn(&self) -> bool {
+    fn interrupt_cancels_turn(&self, tab: &Tab) -> bool {
         Self::interrupt_cancels(
             self.agent_busy.load(Ordering::SeqCst),
-            self.agent_control.load(Ordering::SeqCst),
-            self.session.open_agent_records().iter().any(|r| r.on_top),
-            self.session.state(),
-            self.session.levels().len(),
+            tab.agent_control.load(Ordering::SeqCst),
+            tab.session.open_agent_records().iter().any(|r| r.on_top),
+            tab.session.state(),
+            tab.session.levels().len(),
         )
     }
 
@@ -200,6 +331,9 @@ impl Attached {
     /// the turn. Held under the turn-cancel lock, which `new_conversation` also takes, so a reset cannot land mid-start.
     fn begin_turn(&self, cancel: &Arc<TurnCancel>) -> Result<(Arc<Mutex<History>>, TodoList, String), String> {
         let mut slot = lock(&self.turn_cancel);
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(format!("no chat {}", self.id));
+        }
         if self.agent_busy.swap(true, Ordering::SeqCst) {
             return Err("the agent is still working on the previous message".into());
         }
@@ -212,8 +346,105 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn session(reg: &Reg, id: &str) -> Result<Arc<Attached>, String> {
-    reg.get(id).ok_or_else(|| format!("no session {id}"))
+fn no_session(id: &str) -> String {
+    format!("no session {id}")
+}
+
+fn tab_of(reg: &Reg, id: &str) -> Result<Arc<Tab>, String> {
+    reg.get(id).ok_or_else(|| no_session(id))
+}
+
+fn chat_of(chats: &ChatReg, id: &str) -> Result<Arc<Chat>, String> {
+    chats.get(id).ok_or_else(|| no_session(id))
+}
+
+/// The chat that `session_id` attaches to on start: the first tab (`MAIN`) belongs to chat `MAIN`. Other tabs have none.
+fn owner_for_session(session_id: &str) -> Option<&'static str> {
+    (session_id == MAIN).then_some(MAIN)
+}
+
+/// The tabs `chat_id` owns, oldest first. Generic over the tab type, so the rule is testable without a PTY.
+fn owned_tabs<T>(
+    tabs: Vec<Arc<T>>,
+    chat_id: &str,
+    owner: impl Fn(&T) -> Option<String>,
+    seq: impl Fn(&T) -> u64,
+) -> Vec<Arc<T>> {
+    let mut mine: Vec<Arc<T>> = tabs.into_iter().filter(|t| owner(t.as_ref()).as_deref() == Some(chat_id)).collect();
+    mine.sort_by_key(|t| seq(t.as_ref()));
+    mine
+}
+
+/// The terminals of a chat: the tab registry filtered by owner, oldest first. A chat with none is legal.
+fn chat_tabs(reg: &Reg, chat_id: &str) -> Vec<Arc<Tab>> {
+    owned_tabs(reg.snapshot(), chat_id, |t| t.owner_id(), |t| t.seq)
+}
+
+/// The chat's default terminal: its oldest tab. None when the chat has no tab.
+fn default_tab(reg: &Reg, chat_id: &str) -> Option<Arc<Tab>> {
+    chat_tabs(reg, chat_id).into_iter().next()
+}
+
+/// A chat and its default terminal, for the chat commands. The terminal is None for a chat with no terminal, which is a
+/// legal chat: each command takes what it needs from the terminal when there is one. Missing chat is "no session".
+fn chat_and_default(reg: &Reg, chats: &ChatReg, chat_id: &str) -> Result<(Arc<Chat>, Option<Arc<Tab>>), String> {
+    Ok((chat_of(chats, chat_id)?, default_tab(reg, chat_id)))
+}
+
+/// The approve-all level of a chat's default terminal: its shell on top. The local level when there is no terminal.
+fn top_key_of(tab: Option<&Tab>) -> u64 {
+    tab.map_or(LOCAL_KEY, |tab| tab.session.top_key())
+}
+
+/// The terminals of a chat for an agent turn (see `ChatTerminals::new`): the registry's tabs of the chat, read on every
+/// call, so a terminal assigned or unassigned during a turn is seen by the next call.
+fn chat_terminals(app: tauri::AppHandle, chat_id: String) -> impl Fn() -> Vec<Arc<dyn Terminal>> + Send + Sync + 'static {
+    move || {
+        let reg = app.state::<Reg>();
+        chat_tabs(&reg, &chat_id).into_iter().map(|tab| tab as Arc<dyn Terminal>).collect()
+    }
+}
+
+/// The chat with `id`, created when it does not exist yet.
+fn ensure_chat(chats: &ChatReg, id: &str) -> Result<(), String> {
+    chats.get_or_insert_with(id, || Chat::new(id)).map(|_| ()).map_err(io_err)
+}
+
+/// Whether `chat_id` may change a terminal's owner, and whether the owner changes. `current` is the owner now, `busy`
+/// whether the chat has a turn running. `on` assigns the terminal to the chat, else unassigns it. Ok(true) changes the
+/// owner, Ok(false) leaves it, Err refuses.
+fn owner_change(current: Option<&str>, chat_id: &str, on: bool, busy: bool) -> Result<bool, String> {
+    match current {
+        Some(owner) if owner == chat_id => {
+            if !on && busy { Err(BUSY_REFUSAL.into()) } else { Ok(!on) }
+        }
+        Some(_) if on => Err("that terminal belongs to another chat".into()),
+        Some(_) => Ok(false),
+        None => Ok(on),
+    }
+}
+
+/// Assigns a terminal to a chat (`on`) or unassigns it. Refused when another chat owns it, or when a chat with a running
+/// turn would lose it. The owner changes under the chat's turn-cancel lock, as the other chat-state changes do.
+fn assign_tab(reg: &Reg, chats: &ChatReg, chat_id: &str, tab_id: &str, on: bool) -> Result<(), String> {
+    let chat = chat_of(chats, chat_id)?;
+    let tab = tab_of(reg, tab_id)?;
+    let _turn = lock(&chat.turn_cancel);
+    if chat.closed.load(Ordering::SeqCst) {
+        return Err(no_session(chat_id));
+    }
+    let mut owner = lock(&tab.owner);
+    if owner_change(owner.as_deref(), chat_id, on, chat.agent_busy.load(Ordering::SeqCst))? {
+        *owner = on.then(|| chat_id.to_string());
+    }
+    Ok(())
+}
+
+/// The chats in lock order, by id. Code that locks several chats (the conversation deletes) takes them in this order,
+/// so two of them cannot deadlock.
+fn in_lock_order(mut chats: Vec<Arc<Chat>>) -> Vec<Arc<Chat>> {
+    chats.sort_by(|a, b| a.id.cmp(&b.id));
+    chats
 }
 
 fn io_err(e: io::Error) -> String {
@@ -316,13 +547,14 @@ struct SavedState {
     model: Option<String>,
     /// The conversation's last context usage, saved with it so a restored conversation can show its meter.
     context: LastUsage,
+    /// Whether the save remembers the conversation as the last one (see `remembers_last`).
+    remember: bool,
 }
 
-/// Saves the conversation: the whole history, todo list and last context usage, redacted, with the shell's directory.
-/// `in_turn` is true at a checkpoint inside a turn and false at the end of the turn. A failure is logged without any
-/// content and never fails the turn.
-fn save_conversation(store: &Persist, session: &Session, state: &SavedState, redactor: &Redactor, in_turn: bool) {
-    let cwd = session.cwd();
+/// Saves the conversation: the whole history, todo list and last context usage, redacted, with the shell's directory (`cwd`,
+/// None for a chat with no terminal). `in_turn` is true at a checkpoint inside a turn and false at the end of the turn. A
+/// failure is logged without any content and never fails the turn.
+fn save_conversation(store: &Persist, cwd: Option<Cwd>, state: &SavedState, redactor: &Redactor, in_turn: bool) {
     let cwd_pair = cwd.as_ref().map(|c| (c.host.as_str(), c.path.as_str()));
     let turn = FinishedTurn {
         conversation_id: &state.conversation_id,
@@ -332,6 +564,7 @@ fn save_conversation(store: &Persist, session: &Session, state: &SavedState, red
         cwd: cwd_pair,
         in_turn,
         context: lock(&state.context).clone(),
+        remember: state.remember,
     };
     let home = home_dir();
     let env = TurnEnv { local_host: local_host(), home: home.as_deref() };
@@ -341,15 +574,15 @@ fn save_conversation(store: &Persist, session: &Session, state: &SavedState, red
 }
 
 /// The checkpoint of an LLM turn (see `LlmAgent::with_checkpoint`): saves the conversation with `in_turn` set. Without
-/// a store, nothing is saved.
+/// a store, nothing is saved. `tab` is the chat's default terminal, if it has one (its directory is saved).
 fn checkpoint_saver(
     store: Option<Arc<Persist>>,
-    att: Arc<Attached>,
+    tab: Option<Arc<Tab>>,
     state: Arc<SavedState>,
 ) -> impl FnMut(&Redactor) + Send + 'static {
     move |redactor| {
         if let Some(store) = store.as_ref() {
-            save_conversation(store, &att.session, &state, redactor, true);
+            save_conversation(store, tab.as_ref().and_then(|tab| tab.session.cwd()), &state, redactor, true);
         }
     }
 }
@@ -382,13 +615,14 @@ async fn start_session(
     on_data: Channel<InvokeResponseBody>,
     on_events: Channel<Value>,
     reg: State<'_, Reg>,
+    chats: State<'_, ChatReg>,
 ) -> Result<StartResult, String> {
-    attach_or_spawn(&reg, &session_id, &session_id, rows, cols, on_data, on_events, None)
+    attach_or_spawn(&reg, &chats, &session_id, &next_shim_id(), rows, cols, on_data, on_events, None)
 }
 
-/// Starts a new shell when the session has exited: the dead session is removed and a fresh one spawned, with a new
-/// nonce and the old conversation carried over, so the transcript the frontend keeps still matches the backend.
-/// Otherwise this is start_session (idempotent).
+/// Starts a new shell when the terminal has exited: the dead tab is removed and a fresh one spawned under the same id,
+/// with a new nonce. Its chat keeps its conversation, which is told about the new shell once, so the transcript the
+/// frontend keeps still matches the backend. Otherwise this is start_session (idempotent).
 #[tauri::command]
 async fn restart_session(
     session_id: String,
@@ -397,74 +631,75 @@ async fn restart_session(
     on_data: Channel<InvokeResponseBody>,
     on_events: Channel<Value>,
     reg: State<'_, Reg>,
+    chats: State<'_, ChatReg>,
 ) -> Result<StartResult, String> {
     // Checked and removed under the registry lock, so two restarts cannot each remove the other's new session.
-    let old = reg.remove_if(&session_id, |att| att.session.state() == InputState::Exited);
-    // The old turn may still be running: keep it cancelled (its approvals are denied and its `run_command` stops
-    // waiting), then wait for it to end so the carried conversation is final. Past the bound the restart goes on
+    let old = reg.remove_if(&session_id, |tab| tab.session.state() == InputState::Exited);
+    // The owning chat's turn may still be running: keep it cancelled (its approvals are denied and its `run_command`
+    // stops waiting), then wait for it to end so the carried conversation is final. Past the bound the restart goes on
     // anyway with whatever the conversation holds.
-    let carry = match old {
+    let owner = match old {
         Some(old) => {
-            old.cancel_turn();
-            for _ in 0..200 {
-                if !old.agent_busy.load(Ordering::SeqCst) {
-                    break;
+            let owner = old.owner_id();
+            if let Some(chat) = owner.as_deref().and_then(|id| chats.get(id)) {
+                chat.cancel_turn();
+                for _ in 0..200 {
+                    if !chat.agent_busy.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(25)).await;
+                // The new shell is a new session: the next turn is told so, once (see `Conversation::note_new_shell_session`).
+                chat.conversation.note_new_shell_session();
+                chat.reset_for_new_shell();
             }
-            // The new shell is a new session: the next turn is told so, once (see `Conversation::note_new_shell_session`).
-            let conversation = old.conversation.follow();
-            conversation.note_new_shell_session();
-            Some(conversation)
+            owner
         }
         None => None,
     };
-    // A new shim directory name: the dead session's drop removes its own directory, which must not be the new one.
-    let shim_id = format!("{session_id}-{}", RESTARTS.fetch_add(1, Ordering::SeqCst));
-    attach_or_spawn(&reg, &session_id, &shim_id, rows, cols, on_data, on_events, carry)
+    attach_or_spawn(&reg, &chats, &session_id, &next_shim_id(), rows, cols, on_data, on_events, owner)
 }
 
-/// Attaches to `session_id`, spawning its shell first if there is none. `shim_id` names the shim directory on spawn.
-/// `carry` is the conversation a restarted session continues with; a fresh spawn starts a new one.
+/// Attaches to the tab `session_id`, spawning its shell first if there is none. `shim_id` names the shim directory on
+/// spawn. `owner` is the chat a restarted tab keeps; a fresh spawn has none, except `MAIN`, which joins chat `MAIN`.
 #[allow(clippy::too_many_arguments)]
 fn attach_or_spawn(
     reg: &Reg,
+    chats: &ChatReg,
     session_id: &str,
     shim_id: &str,
     rows: u16,
     cols: u16,
     on_data: Channel<InvokeResponseBody>,
     on_events: Channel<Value>,
-    carry: Option<Conversation>,
+    owner: Option<String>,
 ) -> Result<StartResult, String> {
     let mut pending = Some((on_data, on_events));
-    let (att, spawned) = reg.get_or_insert_with(session_id, || -> Result<Attached, String> {
+    let (tab, spawned) = reg.get_or_insert_with(session_id, || -> Result<Tab, String> {
         let (data, events) = pending.take().ok_or("channels already used")?;
         let channels = Arc::new(Channels::default());
         channels.attach(data, events);
         let cfg = SpawnConfig { rows, cols, real_zdotdir: None, histfile: dev_histfile() };
         let session = Session::spawn(shim_id, cfg, Box::new(RawSink(channels.clone()))).map_err(io_err)?;
         session.set_event_sink(Arc::new(EventsSink(channels.clone())));
-        let conversation = match carry {
-            Some(conversation) => conversation,
-            None => Conversation::new().map_err(io_err)?,
-        };
-        Ok(Attached {
-            session,
+        Ok(Tab {
+            id: session_id.to_string(),
+            session: Arc::new(session),
             channels,
-            approvals: ApprovalGate::new(),
-            agent_busy: AtomicBool::new(false),
             agent_control: AtomicBool::new(false),
-            turn_cancel: Mutex::new(None),
-            conversation,
-            project_rules_seen: Mutex::new(None),
-            steer: Steer::default(),
+            owner: Mutex::new(owner),
+            seq: next_tab_seq(),
+            title: Mutex::new(None),
         })
     })?;
     if let Some((data, events)) = pending.take() {
-        reattach_channels(&att.channels, data, events, || att.session.reset_flow_control());
+        reattach_channels(&tab.channels, data, events, || tab.session.reset_flow_control());
     }
-    Ok(StartResult { spawned, nonce: att.session.nonce().to_string() })
+    if let Some(chat_id) = owner_for_session(session_id) {
+        ensure_chat(chats, chat_id)?;
+        assign_tab(reg, chats, chat_id, session_id, true)?;
+    }
+    Ok(StartResult { spawned, nonce: tab.session.nonce().to_string() })
 }
 
 /// Swaps in the re-attached frontend's channels, then resets flow control so bytes the dead channel
@@ -483,33 +718,36 @@ fn reattach_channels(
 
 #[tauri::command]
 fn ack(session_id: String, bytes: usize, reg: State<'_, Reg>) -> Result<(), String> {
-    session(&reg, &session_id)?.session.ack(bytes);
+    tab_of(&reg, &session_id)?.session.ack(bytes);
     Ok(())
 }
 
 #[tauri::command]
 fn resize(session_id: String, rows: u16, cols: u16, reg: State<'_, Reg>) -> Result<(), String> {
-    session(&reg, &session_id)?.session.resize(rows, cols).map_err(io_err)
+    tab_of(&reg, &session_id)?.session.resize(rows, cols).map_err(io_err)
 }
 
 /// Keystrokes from the terminal, as text (sent as UTF-8). The terminal's Ctrl-C also cancels the running agent
-/// turn and its pending approvals, but only when it belongs to the agent (see `interrupt_cancels_turn`): a Ctrl-C
-/// typed into the user's own command stays with the shell.
+/// turn and its pending approvals, but only when it belongs to the agent (see `Chat::interrupt_cancels_turn`): a Ctrl-C
+/// typed into the user's own command stays with the shell. A terminal no chat owns is a plain shell.
 #[tauri::command]
-fn write_user(session_id: String, text: String, reg: State<'_, Reg>) -> Result<(), String> {
-    let att = session(&reg, &session_id)?;
-    let interrupt = text.contains('\u{3}') && att.interrupt_cancels_turn();
+fn write_user(session_id: String, text: String, reg: State<'_, Reg>, chats: State<'_, ChatReg>) -> Result<(), String> {
+    let tab = tab_of(&reg, &session_id)?;
+    let Some(chat) = tab.owner_id().and_then(|id| chats.get(&id)) else {
+        return tab.session.write_user(text.as_bytes()).map_err(io_err);
+    };
+    let interrupt = text.contains('\u{3}') && chat.interrupt_cancels_turn(&tab);
     if interrupt {
-        att.cancel_turn();
+        chat.cancel_turn();
     }
-    agent::user_input(&att.session, &att.approvals, &text, interrupt).map_err(io_err)
+    agent::user_input(&tab.session, &chat.approvals, &text, interrupt).map_err(io_err)
 }
 
 /// Cancels the running agent turn, if any: its pending approvals are denied and its `run_command` stops waiting.
 /// Harmless when no turn is running.
 #[tauri::command]
-fn cancel_agent(session_id: String, reg: State<'_, Reg>) -> Result<(), String> {
-    session(&reg, &session_id)?.cancel_turn();
+fn cancel_agent(chat_id: String, chats: State<'_, ChatReg>) -> Result<(), String> {
+    chat_of(&chats, &chat_id)?.cancel_turn();
     Ok(())
 }
 
@@ -583,22 +821,27 @@ fn write_images(store: Option<&Persist>, conversation_id: &str, images: &[ImageF
 /// Starts one agent turn on its own thread. Events arrive on the events channel. The model is chosen by `choose_llm`,
 /// and the approval policy by `approval_policy`. Both are read from the settings before the turn starts, so an error
 /// leaves the agent idle. `attachments` are checked first: a refused message changes nothing.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 async fn agent_message(
-    session_id: String,
+    chat_id: String,
     text: String,
     attachments: Option<Vec<AttachmentInput>>,
     app: tauri::AppHandle,
     reg: State<'_, Reg>,
+    chats: State<'_, ChatReg>,
     persist: State<'_, PersistState>,
     settings: State<'_, SettingsState>,
 ) -> Result<(), String> {
-    let att = session(&reg, &session_id)?;
-    // The project instructions come from the session's live working directory, read once before the
+    // A chat with no terminal runs its turn too. The project, the folder and the rules come from the default terminal when
+    // there is one, and are none otherwise.
+    let chat = chat_of(&chats, &chat_id)?;
+    let tab = default_tab(&reg, &chat_id);
+    // The project instructions come from the terminal's live working directory, read once before the
     // turn starts. Anything unreadable just means no rules; it never fails the turn.
-    let project_root = session_project_root(&app, &att);
+    let project_root = tab.as_deref().and_then(|tab| session_project_root(&app, tab));
     // The folder the file tools read this turn (core/fs_tools), from the same live directory.
-    let fs_scope = fs_scope_for(&app, &att, project_root.clone());
+    let fs_scope = tab.as_deref().and_then(|tab| fs_scope_for(&app, tab, project_root.clone()));
     let project_rooted_rules =
         project_root.as_ref().and_then(|root| instructions::load(root).map(|rules| (root.clone(), rules)));
     let project_rules = project_rooted_rules.as_ref().map(|(_, rules)| rules.clone());
@@ -613,16 +856,16 @@ async fn agent_message(
     })
     .await?;
     let cancel = Arc::new(TurnCancel::new());
-    let (history, todos, conversation_id) = att.begin_turn(&cancel)?;
+    let (history, todos, conversation_id) = chat.begin_turn(&cancel)?;
     // Opened for an agent turn only: side commands also take the slot through `begin_turn`, and never get a mailbox.
-    att.steer.open();
+    chat.steer.open();
     // Announced once per root and rules text: a repeat stays quiet, and no file means no notice.
     // Never stored in the history; the rules themselves ride the turn's system message only.
     if let Some((root, rules)) = project_rooted_rules.as_ref() {
         let seen = (root.display().to_string(), rules.clone());
-        if lock(&att.project_rules_seen).as_ref() != Some(&seen) {
-            *lock(&att.project_rules_seen) = Some(seen);
-            att.channels.send_json(&AgentEvent::Notice {
+        if lock(&chat.project_rules_seen).as_ref() != Some(&seen) {
+            *lock(&chat.project_rules_seen) = Some(seen);
+            chat.send_agent(&AgentEvent::Notice {
                 text: format!("Using project instructions from {}/AGENTS.md", root.display()),
             });
         }
@@ -639,7 +882,7 @@ async fn agent_message(
             Ok(client) => {
                 // The images are on disk before the message is recorded, so a saved message never names a missing file.
                 if let Err(e) = write_images(store.as_deref(), &conversation_id, &prepared.images) {
-                    att.end_turn();
+                    chat.end_turn(&Touched::default());
                     return Err(e);
                 }
                 let state = Arc::new(SavedState {
@@ -647,16 +890,17 @@ async fn agent_message(
                     history: history.clone(),
                     todos: todos.clone(),
                     model: Some(model),
-                    context: att.conversation.last_usage(),
+                    context: chat.conversation.last_usage(),
+                    remember: remembers_last(&chat.id),
                 });
-                let checkpoint = checkpoint_saver(store.clone(), att.clone(), state.clone());
+                let checkpoint = checkpoint_saver(store.clone(), tab.clone(), state.clone());
                 // The servers start on the first turn that needs them. If they cannot be read, this turn runs without MCP
                 // tools, and the user is told why.
                 if let Some(service) = mcp_service.clone() {
                     match blocking(move || service.for_turn()).await {
                         Ok(turn) => mcp_turn = Some(turn),
                         Err(e) => {
-                            att.channels.send_json(&AgentEvent::Notice {
+                            chat.send_agent(&AgentEvent::Notice {
                                 text: format!("MCP tools are not available this turn: {e}"),
                             });
                         }
@@ -668,18 +912,18 @@ async fn agent_message(
                 let live_state = state_provider(&app, skill_index.clone());
                 let mut agent = LlmAgent::new(client, llm_settings, &conversation_id, history, todos, cancel.clone())
                     // The note is taken only by a turn that calls the model: a turn that fails to start keeps it.
-                    .with_resume_note(att.conversation.take_resume_note())
+                    .with_resume_note(chat.conversation.take_resume_note())
                     .with_project_rules(project_rules)
                     .with_skills(skill_index)
                     .with_state(live_state)
                     .with_fs_scope(fs_scope)
                     .with_checkpoint(checkpoint)
                     .with_limits(limits)
-                    .with_no_vision(att.conversation.no_vision())
-                    .with_calibration(att.conversation.calibration())
-                    .with_learned_limits(att.conversation.learned_limits())
-                    .with_last_usage(att.conversation.last_usage())
-                    .with_offered_tools(att.conversation.offered_tools())
+                    .with_no_vision(chat.conversation.no_vision())
+                    .with_calibration(chat.conversation.calibration())
+                    .with_learned_limits(chat.conversation.learned_limits())
+                    .with_last_usage(chat.conversation.last_usage())
+                    .with_offered_tools(chat.conversation.offered_tools())
                     .with_extra_secrets(mcp_turn.as_ref().map_or_else(Vec::new, |turn| turn.secret_values.clone()));
                 if let Some(persist) = store.as_ref() {
                     agent = agent.with_attachments(persist.conversations.attachments().clone());
@@ -687,26 +931,42 @@ async fn agent_message(
                 (Some(agent), Some(state))
             }
             Err(e) => {
-                att.end_turn();
+                chat.end_turn(&Touched::default());
                 return Err(e);
             }
         },
     };
     let message = UserMessage { text, attachments: prepared.attachments };
-    let worker = att.clone();
+    let worker = chat.clone();
+    let worker_tab = tab.clone();
     let settle_cancel = cancel.clone();
+    let terminals = chat_terminals(app.clone(), chat_id.clone());
+    let lookup = app.clone();
+    let touched: Arc<Touched> = Arc::new(Mutex::new(Vec::new()));
     let spawned = thread::Builder::new().name("agent".into()).spawn(move || {
-        // Runs on panic too, so a crashed turn cannot leave the agent busy or in control of the shell. Fired below once
+        // Runs on panic too, so a crashed turn cannot leave the agent busy or in control of a shell. Fired below once
         // the history is saved; after that it does nothing, so it cannot end a newer turn.
-        let mut end = OnDrop::new(|| worker.end_turn());
-        let tools = SessionTools::new(&worker.session).with_cancel(cancel).with_wait_budget(limits.max_wait());
-        let channels = worker.channels.clone();
-        let owner = worker.clone();
+        let mut end = OnDrop::new(|| worker.end_turn(&touched));
+        let tools = ChatTerminals::new(terminals, limits.max_wait()).with_cancel(cancel);
+        let events = worker.clone();
+        let control = worker_tab.clone();
+        let touch = touched.clone();
         let emit = move |ev: AgentEvent| {
-            if let AgentEvent::AgentControl { active } = &ev {
-                owner.agent_control.store(*active, Ordering::SeqCst);
+            if let AgentEvent::AgentControl { active, terminal } = &ev {
+                // The control is of the terminal the event names (two or more terminals), else of the default one.
+                let target = match terminal {
+                    Some(id) => tab_of(&lookup.state::<Reg>(), id).ok(),
+                    None => control.clone(),
+                };
+                if let Some(target) = target {
+                    target.agent_control.store(*active, Ordering::SeqCst);
+                    let mut seen = lock(&touch);
+                    if *active && !seen.iter().any(|(known, _)| Arc::ptr_eq(known, &target)) {
+                        seen.push((target, terminal.clone()));
+                    }
+                }
             }
-            channels.send_json(&ev);
+            events.send_agent(&ev);
         };
         // The turn that starts the servers waits for them to connect, so their tools are offered this turn.
         if let Some(turn) = mcp_turn.as_ref() {
@@ -728,15 +988,15 @@ async fn agent_message(
         // failed. Then the turn is ended (frees the slot), and only then `Done` is sent: a message the user sends on the
         // back of `Done` finds the agent free. The guard above is fired here, so it does not end the turn a second time.
         if let (Some(agent), Some(store), Some(state)) = (llm.as_ref(), store.as_ref(), saved.as_ref()) {
-            save_conversation(store, &worker.session, state, agent.redactor(), false);
+            save_conversation(store, worker_tab.as_ref().and_then(|tab| tab.session.cwd()), state, agent.redactor(), false);
         }
         end.fire();
         emit(AgentEvent::Done);
     });
     if let Err(e) = spawned {
-        *lock(&att.turn_cancel) = None;
-        att.return_steers();
-        att.agent_busy.store(false, Ordering::SeqCst);
+        *lock(&chat.turn_cancel) = None;
+        chat.return_steers();
+        chat.agent_busy.store(false, Ordering::SeqCst);
         return Err(e.to_string());
     }
     Ok(())
@@ -749,31 +1009,31 @@ async fn agent_message(
 /// The attachments are checked and stored as `agent_message` does it.
 #[tauri::command]
 async fn steer_message(
-    session_id: String,
+    chat_id: String,
     id: u64,
     text: String,
     attachments: Option<Vec<AttachmentInput>>,
     mode: Option<String>,
-    reg: State<'_, Reg>,
+    chats: State<'_, ChatReg>,
     persist: State<'_, PersistState>,
 ) -> Result<bool, String> {
-    let att = session(&reg, &session_id)?;
+    let chat = chat_of(&chats, &chat_id)?;
     let mode = SteerMode::parse(mode.as_deref().unwrap_or("all"))?;
     let prepared = prepare(&attachments.unwrap_or_default())?;
-    if !att.steer.is_open() {
+    if !chat.steer.is_open() {
         return Ok(false);
     }
     // The images are on disk before the message can be taken into the history (see `agent_message`).
-    write_images(persist.0.as_deref(), &att.conversation.id(), &prepared.images)?;
+    write_images(persist.0.as_deref(), &chat.conversation.id(), &prepared.images)?;
     let item = SteerItem { id, text, attachments: prepared.attachments };
-    Ok(att.steer.accept(item, mode))
+    Ok(chat.steer.accept(item, mode))
 }
 
 /// Takes a steered message back before the turn takes it. True when it was still waiting, so the caller restores it to the
 /// composer. False when it was already taken into the turn (or was never accepted).
 #[tauri::command]
-fn withdraw_steer(session_id: String, id: u64, reg: State<'_, Reg>) -> Result<bool, String> {
-    Ok(session(&reg, &session_id)?.steer.withdraw(id))
+fn withdraw_steer(chat_id: String, id: u64, chats: State<'_, ChatReg>) -> Result<bool, String> {
+    Ok(chat_of(&chats, &chat_id)?.steer.withdraw(id))
 }
 
 /// Starts a new conversation: the history is cleared and the id rotated. Refused while the agent is working. Takes
@@ -781,20 +1041,20 @@ fn withdraw_steer(session_id: String, id: u64, reg: State<'_, Reg>) -> Result<bo
 /// remembered last conversation is then forgotten; a failure to forget it is logged, not returned.
 #[tauri::command]
 async fn new_conversation(
-    session_id: String,
-    reg: State<'_, Reg>,
+    chat_id: String,
+    chats: State<'_, ChatReg>,
     persist: State<'_, PersistState>,
 ) -> Result<(), String> {
-    let att = session(&reg, &session_id)?;
+    let chat = chat_of(&chats, &chat_id)?;
     {
-        let _turn = lock(&att.turn_cancel);
-        if att.agent_busy.load(Ordering::SeqCst) {
+        let _turn = lock(&chat.turn_cancel);
+        if chat.agent_busy.load(Ordering::SeqCst) {
             return Err(BUSY_REFUSAL.into());
         }
-        att.conversation.reset().map_err(io_err)?;
+        chat.conversation.reset().map_err(io_err)?;
     }
-    // Without a store there is no remembered conversation to forget.
-    if let Some(store) = persist.0.clone() {
+    // Without a store there is no remembered conversation to forget. The remembered one is chat `main`'s (see `load_conversation`).
+    if chat.id == MAIN && let Some(store) = persist.0.clone() {
         let forgot = blocking(move || store.forget_last().map_err(|e| e.to_string())).await;
         if let Err(e) = forgot {
             eprintln!("watt: the last conversation was not forgotten ({e})");
@@ -804,8 +1064,8 @@ async fn new_conversation(
 }
 
 #[tauri::command]
-fn approve_tool(session_id: String, call_id: String, approve: bool, reg: State<'_, Reg>) -> Result<(), String> {
-    if session(&reg, &session_id)?.approvals.decide(&call_id, approve) {
+fn approve_tool(chat_id: String, call_id: String, approve: bool, chats: State<'_, ChatReg>) -> Result<(), String> {
+    if chat_of(&chats, &chat_id)?.approvals.decide(&call_id, approve) {
         Ok(())
     } else {
         Err(format!("no pending approval {call_id}"))
@@ -814,8 +1074,8 @@ fn approve_tool(session_id: String, call_id: String, approve: bool, reg: State<'
 
 /// Answers the dialog for a `request_integration` call: `accept` integrates the shell, anything else declines it.
 #[tauri::command]
-fn answer_integration(session_id: String, call_id: String, accept: bool, reg: State<'_, Reg>) -> Result<(), String> {
-    if session(&reg, &session_id)?.approvals.integrations().decide(&call_id, accept) {
+fn answer_integration(chat_id: String, call_id: String, accept: bool, chats: State<'_, ChatReg>) -> Result<(), String> {
+    if chat_of(&chats, &chat_id)?.approvals.integrations().decide(&call_id, accept) {
         Ok(())
     } else {
         Err(format!("no pending integration request {call_id}"))
@@ -826,19 +1086,19 @@ fn answer_integration(session_id: String, call_id: String, accept: bool, reg: St
 /// an unknown call id means the question already settled (answered, timed out or cancelled).
 #[tauri::command]
 fn answer_questions(
-    session_id: String,
+    chat_id: String,
     call_id: String,
     answers: Vec<questions::AnswerInput>,
-    reg: State<'_, Reg>,
+    chats: State<'_, ChatReg>,
 ) -> Result<(), String> {
-    session(&reg, &session_id)?.approvals.questions().decide(&call_id, answers)
+    chat_of(&chats, &chat_id)?.approvals.questions().decide(&call_id, answers)
 }
 
 #[tauri::command]
-fn set_auto_approve(session_id: String, on: bool, reg: State<'_, Reg>) -> Result<(), String> {
-    // The shell on top is the level approve-all is tied to. The session supplies it, not the frontend.
-    let att = session(&reg, &session_id)?;
-    att.approvals.set_auto_approve(on, att.session.top_key());
+fn set_auto_approve(chat_id: String, on: bool, reg: State<'_, Reg>, chats: State<'_, ChatReg>) -> Result<(), String> {
+    // The shell on top is the level approve-all is tied to. The terminal supplies it, not the frontend.
+    let (chat, tab) = chat_and_default(&reg, &chats, &chat_id)?;
+    chat.approvals.set_auto_approve(on, top_key_of(tab.as_deref()));
     Ok(())
 }
 
@@ -852,12 +1112,13 @@ struct AutoApproveState {
 
 #[tauri::command]
 fn auto_approve_state(
-    session_id: String,
+    chat_id: String,
     reg: State<'_, Reg>,
+    chats: State<'_, ChatReg>,
     settings: State<'_, SettingsState>,
 ) -> Result<AutoApproveState, String> {
-    let att = session(&reg, &session_id)?;
-    let state = att.approvals.auto_state_across(att.session.top_key(), follows_local(settings.0.as_deref()));
+    let (chat, tab) = chat_and_default(&reg, &chats, &chat_id)?;
+    let state = chat.approvals.auto_state_across(top_key_of(tab.as_deref()), follows_local(settings.0.as_deref()));
     Ok(AutoApproveState { auto: state != AutoState::Off, suspended: state == AutoState::Suspended })
 }
 
@@ -905,9 +1166,26 @@ fn env_llm() -> LlmStatus {
     LlmStatus { enabled: env.is_some(), model: env.map(|s| s.model.clone()), provider: None, variant: None }
 }
 
+/// The terminal `get_status` reads the shell fields from: the one `session_id` names (unknown is "no session"), or else
+/// the chat's default. None when the chat has no terminal.
+fn status_shell(reg: &Reg, chat_id: &str, session_id: Option<&str>) -> Result<Option<Arc<Tab>>, String> {
+    match session_id {
+        Some(id) => tab_of(reg, id).map(Some),
+        None => Ok(default_tab(reg, chat_id)),
+    }
+}
+
 #[tauri::command]
-fn get_status(session_id: String, reg: State<'_, Reg>, settings: State<'_, SettingsState>) -> Result<Status, String> {
-    let att = session(&reg, &session_id)?;
+fn get_status(
+    chat_id: String,
+    session_id: Option<String>,
+    reg: State<'_, Reg>,
+    chats: State<'_, ChatReg>,
+    settings: State<'_, SettingsState>,
+) -> Result<Status, String> {
+    // Chat fields come from the chat, terminal fields from the terminal `session_id` names, else from its default terminal.
+    let chat = chat_of(&chats, &chat_id)?;
+    let tab = status_shell(&reg, &chat_id, session_id.as_deref())?;
     // The saved default's label reads no secret. Without a saved default the environment settings are shown. While
     // settings.json cannot be used, the agent is off and the environment settings are not shown in its place.
     let (llm, settings_state) = match settings.0.as_ref() {
@@ -923,25 +1201,30 @@ fn get_status(session_id: String, reg: State<'_, Reg>, settings: State<'_, Setti
         }
         None => (env_llm(), None),
     };
-    let levels = att.session.levels();
+    // A chat with no terminal has no shell: the shell fields are those of an exited, empty session with no levels.
+    let shell = tab.as_deref();
+    let levels = shell.map(|tab| tab.session.levels()).unwrap_or_default();
     let depth = levels.len();
     Ok(Status {
-        state: att.session.state(),
-        foreground: att.session.foreground(),
+        state: shell.map_or(InputState::Exited, |tab| tab.session.state()),
+        foreground: shell.and_then(|tab| tab.session.foreground()),
         levels: levels.into_iter().skip(1).collect(),
         depth,
-        integration: att.session.integration_status(),
-        observer: att.session.observer_status(),
-        cwd: att.session.cwd(),
-        stats: att.session.stats(),
-        auto_approve: att.approvals.auto_approve(),
-        auto_approve_suspended: att.approvals.auto_state_across(att.session.top_key(), follows_local(settings.0.as_deref()))
+        integration: shell.map_or(IntegrationStatus::Raw, |tab| tab.session.integration_status()),
+        observer: shell.map_or(ObserverStatus::Ok, |tab| tab.session.observer_status()),
+        cwd: shell.and_then(|tab| tab.session.cwd()),
+        stats: shell.map_or(
+            SessionStats { forged_events: 0, stale_events: 0, overflow_events: 0, dropped_bytes: 0 },
+            |tab| tab.session.stats(),
+        ),
+        auto_approve: chat.approvals.auto_approve(),
+        auto_approve_suspended: chat.approvals.auto_state_across(top_key_of(shell), follows_local(settings.0.as_deref()))
             == AutoState::Suspended,
-        nonces: att.session.nonces(),
-        agent_busy: att.agent_busy.load(Ordering::SeqCst),
-        agent_control: att.agent_control.load(Ordering::SeqCst),
+        nonces: shell.map(|tab| tab.session.nonces()).unwrap_or_default(),
+        agent_busy: chat.agent_busy.load(Ordering::SeqCst),
+        agent_control: shell.is_some_and(|tab| tab.agent_control.load(Ordering::SeqCst)),
         llm,
-        conversation_id: att.conversation.id(),
+        conversation_id: chat.conversation.id(),
         settings_state,
     })
 }
@@ -957,8 +1240,7 @@ fn list_commands(
     reg: State<'_, Reg>,
 ) -> Result<CommandCatalog, String> {
     let global_dir = resolve_config_dir(&app).map(|dir| dir.join("commands"));
-    let project_dir =
-        session(&reg, &session_id)?.session.cwd().and_then(|cwd| project_commands_dir(&app, &cwd));
+    let project_dir = tab_of(&reg, &session_id)?.session.cwd().and_then(|cwd| project_commands_dir(&app, &cwd));
     Ok(commands::catalog(project_dir.as_deref(), global_dir.as_deref()))
 }
 
@@ -1046,8 +1328,8 @@ fn guarded_paths(app: &tauri::AppHandle) -> Vec<PathBuf> {
 
 /// The project root of a session: the workspace of the local shell's directory. None while a nested shell is on top, since
 /// its directory is on another machine.
-fn session_project_root(app: &tauri::AppHandle, att: &Attached) -> Option<PathBuf> {
-    att.session.local_cwd().and_then(|cwd| workspace_root_for_cwd(app, &cwd))
+fn session_project_root(app: &tauri::AppHandle, tab: &Tab) -> Option<PathBuf> {
+    tab.session.local_cwd().and_then(|cwd| workspace_root_for_cwd(app, &cwd))
 }
 
 /// Whether a shell working directory is on this machine. A directory reported by another host cannot be read here.
@@ -1057,8 +1339,8 @@ fn is_local_cwd(cwd: &Cwd) -> bool {
 
 /// The folder the file tools (core/fs_tools) may read in a turn: the session's project root, else its local directory. None
 /// while a nested shell is on top (its directory is on another machine), or when the local directory is not on this machine.
-fn fs_scope_for(app: &tauri::AppHandle, att: &Attached, project_root: Option<PathBuf>) -> Option<Scope> {
-    let cwd = att.session.local_cwd().filter(is_local_cwd)?;
+fn fs_scope_for(app: &tauri::AppHandle, tab: &Tab, project_root: Option<PathBuf>) -> Option<Scope> {
+    let cwd = tab.session.local_cwd().filter(is_local_cwd)?;
     let local = PathBuf::from(&cwd.path);
     let root = project_root.unwrap_or_else(|| local.clone());
     // Watt's own folders and the secrets file: the file tools never read or write them, whatever the paths are.
@@ -1069,10 +1351,10 @@ fn fs_scope_for(app: &tauri::AppHandle, att: &Attached, project_root: Option<Pat
 /// project's folders are read when the session's local shell is on top. Read on the blocking pool; a missing folder is not
 /// an error.
 #[tauri::command]
-async fn list_skills(session_id: String, app: tauri::AppHandle, reg: State<'_, Reg>) -> Result<SkillsView, String> {
-    let att = session(&reg, &session_id)?;
+async fn list_skills(chat_id: String, app: tauri::AppHandle, reg: State<'_, Reg>, chats: State<'_, ChatReg>) -> Result<SkillsView, String> {
+    let tab = chat_and_default(&reg, &chats, &chat_id)?.1;
     blocking(move || {
-        let project_root = session_project_root(&app, &att);
+        let project_root = tab.as_deref().and_then(|tab| session_project_root(&app, tab));
         let setup = skill_setup(&app, project_root);
         let (index, layout) = setup.load();
         Ok(skills::view(&index, &layout, &setup.settings))
@@ -1113,8 +1395,8 @@ fn project_commands_dir(app: &tauri::AppHandle, cwd: &Cwd) -> Option<PathBuf> {
 /// the agent's `request_integration` tool integrates through the session instead (see `SessionTools::integrate_shell`).
 #[tauri::command]
 async fn integrate_shell(session_id: String, reg: State<'_, Reg>) -> Result<IntegrateOutcome, String> {
-    let att = session(&reg, &session_id)?;
-    blocking(move || Ok(att.session.integrate_shell())).await
+    let tab = tab_of(&reg, &session_id)?;
+    blocking(move || Ok(tab.session.integrate_shell())).await
 }
 
 /// The saved conversations, most recently updated first.
@@ -1140,12 +1422,13 @@ struct LoadedConversation {
 /// messages, so the UI is built from exactly what the backend now holds. Refused while the agent is working.
 #[tauri::command]
 async fn load_conversation(
-    session_id: String,
+    chat_id: String,
     id: String,
-    reg: State<'_, Reg>,
+    chats: State<'_, ChatReg>,
     persist: State<'_, PersistState>,
+    claims: State<'_, Claims>,
 ) -> Result<LoadedConversation, String> {
-    let att = session(&reg, &session_id)?;
+    let chat = chat_of(&chats, &chat_id)?;
     let store = persist.get()?;
     let read_store = store.clone();
     let read_id = id.clone();
@@ -1156,21 +1439,30 @@ async fn load_conversation(
     let in_turn = resumed.in_turn;
     let context = resumed.context;
     {
-        // The busy check and the restore happen under the turn-cancel lock, as `begin_turn` and `new_conversation` do.
-        let _turn = lock(&att.turn_cancel);
-        if att.agent_busy.load(Ordering::SeqCst) {
+        // The claim and the restore are one step under the claims lock, so two chats cannot both take one conversation
+        // (their histories would diverge under one id). Then the busy check, under the turn-cancel lock, as `begin_turn`
+        // and `new_conversation` do.
+        let _claim = lock(&claims.0);
+        if held_by_other(&chats.snapshot(), &chat.id, &id) {
+            return Err("that conversation is open in another chat".into());
+        }
+        let _turn = lock(&chat.turn_cancel);
+        if chat.agent_busy.load(Ordering::SeqCst) {
             return Err(BUSY_REFUSAL.into());
         }
-        att.conversation.restore(id.clone(), resumed.history, todos.clone(), in_turn);
-        att.conversation.set_last_usage(context.clone());
+        chat.conversation.restore(id.clone(), resumed.history, todos.clone(), in_turn);
+        chat.conversation.set_last_usage(context.clone());
     }
-    let remember_id = id.clone();
-    let remember = blocking(move || {
-        let patch = UiStatePatch { last_conversation_id: Some(Some(remember_id)), ..UiStatePatch::default() };
-        store.ui.patch(patch).map(|_| ()).map_err(|e| e.to_string())
-    });
-    if let Err(e) = remember.await {
-        eprintln!("watt: the last conversation was not remembered ({e})");
+    // The remembered last conversation is one value for the app, so only chat `main` writes it.
+    if chat.id == MAIN {
+        let remember_id = id.clone();
+        let remember = blocking(move || {
+            let patch = UiStatePatch { last_conversation_id: Some(Some(remember_id)), ..UiStatePatch::default() };
+            store.ui.patch(patch).map(|_| ()).map_err(|e| e.to_string())
+        });
+        if let Err(e) = remember.await {
+            eprintln!("watt: the last conversation was not remembered ({e})");
+        }
     }
     Ok(LoadedConversation { id, title, messages, todos, context })
 }
@@ -1178,10 +1470,10 @@ async fn load_conversation(
 /// One stored image of the session's open conversation, as a `data:` URL, for the image viewer. The conversation is the
 /// session's own, never the webview's choice; the address and type are checked before any file is read.
 #[tauri::command]
-async fn get_attachment(session_id: String, sha256: String, mime: String, reg: State<'_, Reg>, persist: State<'_, PersistState>) -> Result<String, String> {
-    let att = session(&reg, &session_id)?;
+async fn get_attachment(chat_id: String, sha256: String, mime: String, chats: State<'_, ChatReg>, persist: State<'_, PersistState>) -> Result<String, String> {
+    let chat = chat_of(&chats, &chat_id)?;
     let store = persist.get()?;
-    let conversation_id = att.conversation.id();
+    let conversation_id = chat.conversation.id();
     blocking(move || stored_image_url(store.conversations.attachments(), &conversation_id, &sha256, &mime)).await
 }
 
@@ -1193,6 +1485,8 @@ struct SideSave {
     todos: Vec<Todo>,
     model: Option<String>,
     context: Option<ContextUsage>,
+    /// Whether the save remembers the conversation as the last one (see `remembers_last`).
+    remember: bool,
 }
 
 /// Saves a derived conversation (compact/fork) via `save_turn`, never a raw store save: redacted, pruned and
@@ -1213,6 +1507,7 @@ fn save_side(
         cwd: pair,
         in_turn: false,
         context: save.context,
+        remember: save.remember,
     };
     let home = home_dir();
     let env = TurnEnv { local_host: local_host(), home: home.as_deref() };
@@ -1226,19 +1521,19 @@ fn save_side(
 /// it through the reserved turn's cancel token.
 #[tauri::command]
 async fn ask_btw(
-    session_id: String,
+    chat_id: String,
     text: String,
-    reg: State<'_, Reg>,
+    chats: State<'_, ChatReg>,
     settings: State<'_, SettingsState>,
 ) -> Result<String, String> {
     if text.trim().is_empty() {
         return Err("Usage: /btw <question>".into());
     }
-    let att = session(&reg, &session_id)?;
+    let chat = chat_of(&chats, &chat_id)?;
     let cancel = Arc::new(TurnCancel::new());
-    let (history, _, old_id) = att.begin_turn(&cancel)?;
+    let (history, _, old_id) = chat.begin_turn(&cancel)?;
     // Ends the turn on every return; dropped explicitly before success.
-    let end = OnDrop::new({ let att = att.clone(); move || att.end_turn() });
+    let end = OnDrop::new({ let chat = chat.clone(); move || chat.end_turn(&Touched::default()) });
     // The snapshot leaves the locks before any await.
     let snapshot = lock(&history).snapshot();
     // Reading a saved model touches the Keychain, so it runs on the blocking pool.
@@ -1265,18 +1560,18 @@ async fn ask_btw(
 /// reply or an unusable title falls back to the derived first-message title instead of failing.
 #[tauri::command]
 async fn suggest_name(
-    session_id: String,
-    reg: State<'_, Reg>,
+    chat_id: String,
+    chats: State<'_, ChatReg>,
     settings: State<'_, SettingsState>,
 ) -> Result<String, String> {
-    let att = session(&reg, &session_id)?;
+    let chat = chat_of(&chats, &chat_id)?;
     let cancel = Arc::new(TurnCancel::new());
-    let (history, _, old_id) = att.begin_turn(&cancel)?;
+    let (history, _, old_id) = chat.begin_turn(&cancel)?;
     // Ends the turn on every return; dropped explicitly before success.
-    let end = OnDrop::new({ let att = att.clone(); move || att.end_turn() });
+    let end = OnDrop::new({ let chat = chat.clone(); move || chat.end_turn(&Touched::default()) });
     // The snapshot leaves the locks before any await.
     let snapshot = lock(&history).snapshot();
-    let limit = lock(&att.conversation.last_usage()).clone().and_then(|u| u.limit);
+    let limit = lock(&chat.conversation.last_usage()).clone().and_then(|u| u.limit);
     let context = side::conversation_context(&snapshot, side::budget_chars(limit, 64));
     if context.is_empty() {
         return Err("There is nothing to name yet.".into());
@@ -1307,16 +1602,16 @@ async fn suggest_name(
 /// list, and so does an empty reply. Errors are returned, and the frontend ignores them.
 #[tauri::command]
 async fn suggest_prompts(
-    session_id: String,
-    reg: State<'_, Reg>,
+    chat_id: String,
+    chats: State<'_, ChatReg>,
     settings: State<'_, SettingsState>,
 ) -> Result<Vec<String>, String> {
-    let att = session(&reg, &session_id)?;
-    let old_id = att.conversation.id();
+    let chat = chat_of(&chats, &chat_id)?;
+    let old_id = chat.conversation.id();
     // The snapshot leaves the lock before any await.
-    let history = att.conversation.history();
+    let history = chat.conversation.history();
     let snapshot = lock(&history).snapshot();
-    let limit = lock(&att.conversation.last_usage()).clone().and_then(|u| u.limit);
+    let limit = lock(&chat.conversation.last_usage()).clone().and_then(|u| u.limit);
     let mut messages = side::conversation_context(&snapshot, side::budget_chars(limit, 200));
     if messages.is_empty() {
         return Ok(Vec::new());
@@ -1342,17 +1637,19 @@ async fn suggest_prompts(
 /// has no user message yet.
 #[tauri::command]
 async fn compact_conversation(
-    session_id: String,
+    chat_id: String,
     reg: State<'_, Reg>,
+    chats: State<'_, ChatReg>,
     persist: State<'_, PersistState>,
     settings: State<'_, SettingsState>,
 ) -> Result<LoadedConversation, String> {
-    let att = session(&reg, &session_id)?;
+    // The save records the terminal's directory, so the chat's default terminal is needed too.
+    let (chat, tab) = chat_and_default(&reg, &chats, &chat_id)?;
     let store = persist.get()?;
     let cancel = Arc::new(TurnCancel::new());
-    let (history, todos, old_id) = att.begin_turn(&cancel)?;
+    let (history, todos, old_id) = chat.begin_turn(&cancel)?;
     // Ends the turn on every return; dropped explicitly before success.
-    let end = OnDrop::new({ let att = att.clone(); move || att.end_turn() });
+    let end = OnDrop::new({ let chat = chat.clone(); move || chat.end_turn(&Touched::default()) });
     // The snapshot leaves the locks before any await.
     let snapshot = lock(&history).snapshot();
     let current_todos = lock(&todos).clone();
@@ -1385,15 +1682,22 @@ async fn compact_conversation(
     let messages = seeded.snapshot();
     // The header values resolve with the old conversation id, as the side call did.
     let redactor = llm_settings.redactor(&old_id);
-    let cwd = att.session.cwd().map(|c| (c.host, c.path));
+    let cwd = tab.as_ref().and_then(|tab| tab.session.cwd()).map(|c| (c.host, c.path));
     let saver = store.clone();
     let saver_id = new_id.clone();
     let saver_messages = messages.clone();
+    let remember = remembers_last(&chat.id);
     let saver_todos = current_todos.clone();
     let title = side::suffixed_title(&old_title, " (compacted)");
     let saved_title = blocking(move || {
-        let save =
-            SideSave { id: saver_id.clone(), messages: saver_messages, todos: saver_todos, model: Some(model), context: None };
+        let save = SideSave {
+            id: saver_id.clone(),
+            messages: saver_messages,
+            todos: saver_todos,
+            model: Some(model),
+            context: None,
+            remember,
+        };
         let meta = save_side(&saver, cwd, save, &redactor)?;
         // A rename failure keeps the derived title and still succeeds.
         match saver.conversations.rename(&saver_id, &title) {
@@ -1403,8 +1707,8 @@ async fn compact_conversation(
     })
     .await?;
     let out_todos = current_todos.clone();
-    att.conversation.adopt(new_id.clone(), seeded, current_todos);
-    att.conversation.set_last_usage(None);
+    chat.conversation.adopt(new_id.clone(), seeded, current_todos);
+    chat.conversation.set_last_usage(None);
     drop(end);
     Ok(LoadedConversation { id: new_id, title: saved_title, messages, todos: out_todos, context: None })
 }
@@ -1414,23 +1718,25 @@ async fn compact_conversation(
 /// stays untouched. Refused while busy, and when the history has no user message yet.
 #[tauri::command]
 async fn fork_conversation(
-    session_id: String,
+    chat_id: String,
     reg: State<'_, Reg>,
+    chats: State<'_, ChatReg>,
     persist: State<'_, PersistState>,
 ) -> Result<LoadedConversation, String> {
-    let att = session(&reg, &session_id)?;
+    // The save records the terminal's directory, so the chat's default terminal is needed too.
+    let (chat, tab) = chat_and_default(&reg, &chats, &chat_id)?;
     let store = persist.get()?;
     let cancel = Arc::new(TurnCancel::new());
-    let (history, todos, old_id) = att.begin_turn(&cancel)?;
+    let (history, todos, old_id) = chat.begin_turn(&cancel)?;
     // Ends the turn on every return; dropped explicitly before success.
-    let end = OnDrop::new({ let att = att.clone(); move || att.end_turn() });
+    let end = OnDrop::new({ let chat = chat.clone(); move || chat.end_turn(&Touched::default()) });
     // The snapshot leaves the locks before any await.
     let snapshot = lock(&history).snapshot();
     let current_todos = lock(&todos).clone();
     if !snapshot.iter().any(|m| m.get("role").and_then(Value::as_str) == Some("user")) {
         return Err("Nothing to fork yet.".into());
     }
-    let context = lock(&att.conversation.last_usage()).clone();
+    let context = lock(&chat.conversation.last_usage()).clone();
     let reader = store.clone();
     let reader_id = old_id.clone();
     let old_meta = blocking(move || Ok(reader.conversations.load(&reader_id).ok().map(|m| (m.title, m.model)))).await?;
@@ -1441,12 +1747,13 @@ async fn fork_conversation(
     let copier = store.clone();
     let (from, to) = (old_id.clone(), new_id.clone());
     blocking(move || copier.conversations.attachments().copy_conversation(&from, &to).map_err(io_err)).await?;
-    let cwd = att.session.cwd().map(|c| (c.host, c.path));
+    let cwd = tab.as_ref().and_then(|tab| tab.session.cwd()).map(|c| (c.host, c.path));
     let saver = store.clone();
     let saver_id = new_id.clone();
     let saver_messages = snapshot.clone();
     let saver_todos = current_todos.clone();
     let saver_context = context.clone();
+    let remember = remembers_last(&chat.id);
     let title = side::suffixed_title(&old_title, " (fork)");
     let saved_title = blocking(move || {
         // No model is configured for a fork, so nothing secret is known: the credential-shaped patterns still apply,
@@ -1458,6 +1765,7 @@ async fn fork_conversation(
             todos: saver_todos,
             model: old_model,
             context: saver_context,
+            remember,
         };
         let meta = save_side(&saver, cwd, save, &redactor)?;
         // A rename failure keeps the derived title and still succeeds.
@@ -1469,8 +1777,8 @@ async fn fork_conversation(
     .await?;
     let out_todos = current_todos.clone();
     let out_context = context.clone();
-    att.conversation.adopt(new_id.clone(), History::from_messages(snapshot.clone()), current_todos);
-    att.conversation.set_last_usage(out_context.clone());
+    chat.conversation.adopt(new_id.clone(), History::from_messages(snapshot.clone()), current_todos);
+    chat.conversation.set_last_usage(out_context.clone());
     drop(end);
     Ok(LoadedConversation { id: new_id, title: saved_title, messages: snapshot, todos: out_todos, context: out_context })
 }
@@ -1478,9 +1786,9 @@ async fn fork_conversation(
 /// The live conversation as Markdown for `/export`: the stored history (never the capped UI
 /// transcript), so nothing is lost.
 #[tauri::command]
-fn export_conversation(session_id: String, reg: State<'_, Reg>) -> Result<String, String> {
-    let att = session(&reg, &session_id)?;
-    Ok(export::markdown(&lock(&att.conversation.history()).snapshot()))
+fn export_conversation(chat_id: String, chats: State<'_, ChatReg>) -> Result<String, String> {
+    let chat = chat_of(&chats, &chat_id)?;
+    Ok(export::markdown(&lock(&chat.conversation.history()).snapshot()))
 }
 
 /// What a delete reports: whether a live conversation was among those deleted and was reset to a new one.
@@ -1492,12 +1800,13 @@ struct DeleteResult {
 /// Deletes saved conversations (`target`: one id, or `None`: all of them) and resets the live conversations that
 /// the deletion covers, as one step. Refused while any agent is busy. Every session's turn-cancel lock is held from
 /// the busy check to the end of the reset, as `begin_turn` and `new_conversation` do, so no turn starts in between.
+/// `chats` must be in lock order (see `in_lock_order`).
 /// A reset live conversation gets a new id, so a later save cannot write a deleted conversation back. The reset
 /// happens even when the file deletion fails part way, for the same reason. Returns whether a live conversation was
 /// reset.
-fn delete_saved(sessions: &[Arc<Attached>], store: &Persist, target: Option<&str>) -> Result<bool, String> {
-    let _turns: Vec<_> = sessions.iter().map(|att| lock(&att.turn_cancel)).collect();
-    if sessions.iter().any(|att| att.agent_busy.load(Ordering::SeqCst)) {
+fn delete_saved(chats: &[Arc<Chat>], store: &Persist, target: Option<&str>) -> Result<bool, String> {
+    let _turns: Vec<_> = chats.iter().map(|chat| lock(&chat.turn_cancel)).collect();
+    if chats.iter().any(|chat| chat.agent_busy.load(Ordering::SeqCst)) {
         return Err(BUSY_REFUSAL.into());
     }
     let deleted = match target {
@@ -1505,9 +1814,9 @@ fn delete_saved(sessions: &[Arc<Attached>], store: &Persist, target: Option<&str
         None => store.conversations.delete_all(),
     };
     let mut reset = false;
-    for att in sessions {
-        if target.is_none_or(|id| att.conversation.id() == id) {
-            att.conversation.reset().map_err(io_err)?;
+    for chat in chats {
+        if target.is_none_or(|id| chat.conversation.id() == id) {
+            chat.conversation.reset().map_err(io_err)?;
             reset = true;
         }
     }
@@ -1522,13 +1831,13 @@ fn delete_saved(sessions: &[Arc<Attached>], store: &Persist, target: Option<&str
 #[tauri::command]
 async fn delete_conversation(
     id: String,
-    reg: State<'_, Reg>,
+    chats: State<'_, ChatReg>,
     persist: State<'_, PersistState>,
 ) -> Result<DeleteResult, String> {
     let store = persist.get()?;
-    let sessions = reg.snapshot();
+    let chats = in_lock_order(chats.snapshot());
     blocking(move || {
-        let deleted_live = delete_saved(&sessions, &store, Some(&id))?;
+        let deleted_live = delete_saved(&chats, &store, Some(&id))?;
         let remembered = if deleted_live {
             store.forget_last().map(|_| ())
         } else {
@@ -1557,13 +1866,13 @@ async fn rename_conversation(
 /// one may have been deleted (see `delete_saved`). Refused while any agent is working.
 #[tauri::command]
 async fn delete_all_conversations(
-    reg: State<'_, Reg>,
+    chats: State<'_, ChatReg>,
     persist: State<'_, PersistState>,
 ) -> Result<DeleteResult, String> {
     let store = persist.get()?;
-    let sessions = reg.snapshot();
+    let chats = in_lock_order(chats.snapshot());
     blocking(move || {
-        let deleted_live = delete_saved(&sessions, &store, None)?;
+        let deleted_live = delete_saved(&chats, &store, None)?;
         if let Err(e) = store.forget_last() {
             eprintln!("watt: the last conversation was not forgotten ({e})");
         }
@@ -1899,6 +2208,8 @@ pub fn run() {
                 .build(),
         )
         .manage(Reg::new())
+        .manage(ChatReg::new())
+        .manage(Claims::default())
         .setup(|app| {
             let persist = resolve_persist(app.handle()).map(Arc::new);
             app.manage(PersistState(persist));
@@ -1977,7 +2288,15 @@ pub fn run() {
             mcp_set_tool_approval,
             mcp_restart,
             mcp_logs,
-            list_skills
+            list_skills,
+            close_session,
+            list_tabs,
+            set_tab_title,
+            assign_tab_cmd,
+            create_chat,
+            attach_chat,
+            close_chat,
+            list_chats
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
@@ -1995,9 +2314,151 @@ pub fn run() {
     });
 }
 
+/// Serialises the check that a conversation is not open in another chat with the restore that takes it (`load_conversation`).
+#[derive(Default)]
+struct Claims(Mutex<()>);
+
+/// Whether a chat other than `chat_id` holds the conversation `conversation_id`. The caller holds `Claims`.
+fn held_by_other(chats: &[Arc<Chat>], chat_id: &str, conversation_id: &str) -> bool {
+    chats.iter().any(|other| other.id != chat_id && other.conversation.id() == conversation_id)
+}
+
+/// A terminal as the tab list shows it (`list_tabs`).
+#[derive(Serialize)]
+struct TabInfo {
+    id: String,
+    /// The chat the terminal belongs to. None: no chat sees it.
+    owner: Option<String>,
+    state: InputState,
+    nonce: String,
+    title: Option<String>,
+}
+
+/// Every terminal, oldest first.
+#[tauri::command]
+fn list_tabs(reg: State<'_, Reg>) -> Vec<TabInfo> {
+    let mut tabs = reg.snapshot();
+    tabs.sort_by_key(|tab| tab.seq);
+    tabs.iter()
+        .map(|tab| TabInfo {
+            id: tab.id.clone(),
+            owner: tab.owner_id(),
+            state: tab.session.state(),
+            nonce: tab.session.nonce().to_string(),
+            title: lock(&tab.title).clone(),
+        })
+        .collect()
+}
+
+/// Closes a terminal: it is removed and its shell killed, whatever it runs. An agent turn that held it is not cancelled:
+/// its next call to the terminal errors. Allowed at any time.
+#[tauri::command]
+fn close_session(session_id: String, reg: State<'_, Reg>) -> Result<(), String> {
+    let tab = reg.remove(&session_id).ok_or_else(|| no_session(&session_id))?;
+    // A running turn may still hold the tab's session, so the shell is killed here, not when the last reference drops.
+    tab.session.kill();
+    Ok(())
+}
+
+/// Sets a terminal's title (trimmed, capped at `TITLE_MAX`). Empty or None clears it.
+#[tauri::command]
+fn set_tab_title(session_id: String, title: Option<String>, reg: State<'_, Reg>) -> Result<(), String> {
+    *lock(&tab_of(&reg, &session_id)?.title) = clean_title(title);
+    Ok(())
+}
+
+/// Assigns a terminal to a chat (`on`), or unassigns it. See `assign_tab`. Named apart from that fn.
+#[tauri::command]
+fn assign_tab_cmd(
+    chat_id: String,
+    session_id: String,
+    on: bool,
+    reg: State<'_, Reg>,
+    chats: State<'_, ChatReg>,
+) -> Result<(), String> {
+    assign_tab(&reg, &chats, &chat_id, &session_id, on)
+}
+
+/// A new chat with no terminal and a new conversation. Returns its id.
+#[tauri::command]
+fn create_chat(chats: State<'_, ChatReg>) -> Result<String, String> {
+    let id = next_chat_id();
+    ensure_chat(&chats, &id)?;
+    Ok(id)
+}
+
+/// Sets the chat's agent-events channel. Idempotent: a later call swaps the channel. Chat `MAIN` is created when missing,
+/// so the frontend can attach it right after `start_session`.
+#[tauri::command]
+fn attach_chat(chat_id: String, on_events: Channel<Value>, chats: State<'_, ChatReg>) -> Result<(), String> {
+    if chat_id == MAIN {
+        ensure_chat(&chats, MAIN)?;
+    }
+    chat_of(&chats, &chat_id)?.attach_events(on_events);
+    Ok(())
+}
+
+/// Closes a chat: refused while its turn runs. Its terminals are unassigned and the chat is removed. Closing `MAIN` is
+/// allowed; `start_session` of `main` makes it again.
+#[tauri::command]
+fn close_chat(chat_id: String, reg: State<'_, Reg>, chats: State<'_, ChatReg>) -> Result<(), String> {
+    let chat = chat_of(&chats, &chat_id)?;
+    // The turn-cancel lock, as `assign_tab` takes it: no terminal is assigned to the chat while it closes.
+    let _turn = lock(&chat.turn_cancel);
+    if chat.agent_busy.load(Ordering::SeqCst) {
+        return Err(BUSY_REFUSAL.into());
+    }
+    chat.closed.store(true, Ordering::SeqCst);
+    for tab in chat_tabs(&reg, &chat_id) {
+        *lock(&tab.owner) = None;
+    }
+    chats.remove(&chat_id);
+    Ok(())
+}
+
+/// A chat as the chat list shows it (`list_chats`).
+#[derive(Serialize)]
+struct ChatInfo {
+    id: String,
+    /// The live conversation's id.
+    conversation_id: String,
+    busy: bool,
+    /// The ids of the terminals the chat owns, oldest first.
+    tabs: Vec<String>,
+}
+
+/// Every chat, by id.
+#[tauri::command]
+fn list_chats(reg: State<'_, Reg>, chats: State<'_, ChatReg>) -> Vec<ChatInfo> {
+    let mut all = chats.snapshot();
+    all.sort_by(|a, b| a.id.cmp(&b.id));
+    all.iter()
+        .map(|chat| ChatInfo {
+            id: chat.id.clone(),
+            conversation_id: chat.conversation.id(),
+            busy: chat.agent_busy.load(Ordering::SeqCst),
+            tabs: chat_tabs(&reg, &chat.id).iter().map(|tab| tab.id.clone()).collect(),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shim_ids_are_distinct_per_call() {
+        let ids: Vec<String> = (0..100).map(|_| next_shim_id()).collect();
+        let distinct: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(distinct.len(), ids.len(), "shim ids collide: {ids:?}");
+    }
+
+    #[test]
+    fn status_shell_reads_the_named_terminal_or_none() {
+        let reg = Reg::new();
+        assert!(matches!(status_shell(&reg, "main", None), Ok(None)), "a chat with no terminal has no shell");
+        assert_eq!(status_shell(&reg, "main", Some("t9")).err().as_deref(), Some("no session t9"));
+    }
 
     #[test]
     fn reattach_swaps_channels_and_resets_flow_control() {
@@ -2033,7 +2494,7 @@ mod tests {
     }
 
     /// The terminal's Ctrl-C cancels the agent's turn only when it belongs to the agent (see
-    /// `Attached::interrupt_cancels_turn`). Without a busy agent it never does, whatever the shell shows.
+    /// `Chat::interrupt_cancels_turn`). Without a busy agent it never does, whatever the shell shows.
     #[test]
     fn interrupt_never_cancels_without_a_busy_agent() {
         for state in [
@@ -2047,8 +2508,8 @@ mod tests {
             InputState::Raw,
             InputState::Exited,
         ] {
-            assert!(!Attached::interrupt_cancels(false, false, false, state, 1), "idle agent at {state:?}");
-            assert!(!Attached::interrupt_cancels(false, true, true, state, 1), "idle agent at {state:?}");
+            assert!(!Chat::interrupt_cancels(false, false, false, state, 1), "idle agent at {state:?}");
+            assert!(!Chat::interrupt_cancels(false, true, true, state, 1), "idle agent at {state:?}");
         }
     }
 
@@ -2067,10 +2528,10 @@ mod tests {
             InputState::Raw,
             InputState::Exited,
         ] {
-            assert!(Attached::interrupt_cancels(true, true, false, state, 1), "agent control at {state:?}");
-            assert!(Attached::interrupt_cancels(true, true, false, state, 3), "agent control nested at {state:?}");
-            assert!(Attached::interrupt_cancels(true, false, true, state, 1), "agent command on top at {state:?}");
-            assert!(Attached::interrupt_cancels(true, false, true, state, 3), "agent command on top nested at {state:?}");
+            assert!(Chat::interrupt_cancels(true, true, false, state, 1), "agent control at {state:?}");
+            assert!(Chat::interrupt_cancels(true, true, false, state, 3), "agent control nested at {state:?}");
+            assert!(Chat::interrupt_cancels(true, false, true, state, 1), "agent command on top at {state:?}");
+            assert!(Chat::interrupt_cancels(true, false, true, state, 3), "agent command on top nested at {state:?}");
         }
     }
 
@@ -2096,10 +2557,127 @@ mod tests {
             (InputState::Exited, 1, false),
         ] {
             assert_eq!(
-                Attached::interrupt_cancels(true, false, false, state, levels),
+                Chat::interrupt_cancels(true, false, false, state, levels),
                 cancels,
                 "busy agent, no control, no command on top at {state:?} with {levels} level(s)"
             );
         }
+    }
+
+    /// Stands in for a `Tab` in the owner rules, which do not need a PTY.
+    struct Probe {
+        owner: Option<String>,
+        seq: u64,
+    }
+
+    fn probe(seq: u64, owner: Option<&str>) -> Arc<Probe> {
+        Arc::new(Probe { owner: owner.map(str::to_string), seq })
+    }
+
+    #[test]
+    fn a_chats_terminals_are_its_own_in_creation_order() {
+        let tabs = vec![probe(3, Some("main")), probe(1, Some("other")), probe(2, Some("main")), probe(0, None)];
+        let mine = owned_tabs(tabs, "main", |t| t.owner.clone(), |t| t.seq);
+        assert_eq!(mine.iter().map(|t| t.seq).collect::<Vec<_>>(), vec![2, 3]);
+    }
+
+    #[test]
+    fn the_default_terminal_is_the_oldest_one_of_the_chat() {
+        let tabs = vec![probe(7, Some("main")), probe(4, Some("main")), probe(5, Some("other"))];
+        let default = owned_tabs(tabs, "main", |t| t.owner.clone(), |t| t.seq).into_iter().next();
+        assert_eq!(default.map(|t| t.seq), Some(4));
+    }
+
+    #[test]
+    fn a_chat_without_terminals_has_no_default() {
+        let tabs = vec![probe(1, Some("other"))];
+        assert!(owned_tabs(tabs, "main", |t| t.owner.clone(), |t| t.seq).into_iter().next().is_none());
+    }
+
+    #[test]
+    fn owner_change_follows_the_assign_and_unassign_rules() {
+        // Unowned: assign takes it, even while the chat runs a turn; unassign does nothing.
+        assert_eq!(owner_change(None, "main", true, false), Ok(true));
+        assert_eq!(owner_change(None, "main", true, true), Ok(true));
+        assert_eq!(owner_change(None, "main", false, false), Ok(false));
+        // Already ours: assign again changes nothing; unassign releases it when idle, and is refused during a turn.
+        assert_eq!(owner_change(Some("main"), "main", true, false), Ok(false));
+        assert_eq!(owner_change(Some("main"), "main", false, false), Ok(true));
+        assert_eq!(owner_change(Some("main"), "main", false, true), Err(BUSY_REFUSAL.to_string()));
+        // Another chat's: assign is refused, unassign leaves it alone.
+        assert_eq!(
+            owner_change(Some("other"), "main", true, false),
+            Err("that terminal belongs to another chat".to_string())
+        );
+        assert_eq!(owner_change(Some("other"), "main", false, false), Ok(false));
+    }
+
+    #[test]
+    fn only_the_first_terminal_joins_a_chat_on_start() {
+        assert_eq!(owner_for_session("main"), Some("main"));
+        assert_eq!(owner_for_session("other"), None);
+    }
+
+    #[test]
+    fn a_chat_with_no_terminal_runs_with_no_default_and_the_local_level() {
+        let reg: Reg = Registry::new();
+        let chats: ChatReg = Registry::new();
+        ensure_chat(&chats, "main").expect("the chat");
+        let (chat, tab) = chat_and_default(&reg, &chats, "main").expect("a chat with no terminal is legal");
+        assert_eq!(chat.id, "main");
+        assert!(tab.is_none());
+        assert_eq!(top_key_of(None), LOCAL_KEY);
+        assert!(chat_and_default(&reg, &chats, "absent").is_err(), "a missing chat is still no session");
+    }
+
+    #[test]
+    fn new_chat_ids_are_distinct_and_never_the_default() {
+        let ids: Vec<String> = (0..100).map(|_| next_chat_id()).collect();
+        let distinct: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(distinct.len(), ids.len(), "chat ids collide: {ids:?}");
+        assert!(ids.iter().all(|id| id.starts_with('c') && id != MAIN), "{ids:?}");
+    }
+
+    #[test]
+    fn only_the_default_chat_remembers_the_last_conversation() {
+        assert!(remembers_last("main"));
+        assert!(!remembers_last("c1"));
+    }
+
+    #[test]
+    fn titles_are_trimmed_capped_and_blank_means_none() {
+        assert_eq!(clean_title(None), None);
+        assert_eq!(clean_title(Some("   ".into())), None);
+        assert_eq!(clean_title(Some("  zsh  ".into())), Some("zsh".to_string()));
+        let long = "x".repeat(200);
+        assert_eq!(clean_title(Some(long)).map(|t| t.chars().count()), Some(TITLE_MAX));
+        // The cap is in characters, so a multi-byte title is cut whole, and trailing space left by the cut is dropped.
+        let cut = format!("{} {}", "é".repeat(TITLE_MAX - 1), "tail");
+        assert_eq!(clean_title(Some(cut)), Some("é".repeat(TITLE_MAX - 1)));
+    }
+
+    #[test]
+    fn a_conversation_is_held_by_at_most_the_chat_that_claims_it() {
+        let main = Arc::new(Chat::new("main").unwrap());
+        let other = Arc::new(Chat::new("c1").unwrap());
+        let chats = vec![main.clone(), other.clone()];
+        assert!(held_by_other(&chats, "c1", &main.conversation.id()), "main holds its conversation");
+        assert!(!held_by_other(&chats, "main", &main.conversation.id()), "a chat does not block itself");
+        assert!(!held_by_other(&chats, "c1", "ses_unknown"), "an unheld conversation is free");
+    }
+
+    #[test]
+    fn a_closed_chat_takes_no_turn() {
+        let chat = Chat::new("c9").unwrap();
+        chat.closed.store(true, Ordering::SeqCst);
+        assert!(chat.begin_turn(&Arc::new(TurnCancel::new())).is_err());
+        assert!(!chat.agent_busy.load(Ordering::SeqCst), "a refused turn leaves the chat idle");
+    }
+
+    #[test]
+    fn chats_are_locked_in_id_order() {
+        let chats = vec![Arc::new(Chat::new("b").unwrap()), Arc::new(Chat::new("a").unwrap())];
+        let ids: Vec<String> = in_lock_order(chats).iter().map(|chat| chat.id.clone()).collect();
+        assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
     }
 }

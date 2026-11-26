@@ -1,5 +1,5 @@
 //! End to end over real ssh (B5). A local `zsh -f`-style shell (the common harness) runs `ssh` into an Ubuntu container
-//! that runs openssh-server. The app integrates the remote shell as level 1 with its own handshake, and then the agent
+//! that runs openssh-server. The app integrates the remote shell as a nested level with its own handshake, and then the agent
 //! path (submit, approvals, cwd) and the observer's recovery paths are checked against that real remote shell.
 //!
 //! The tests are #[ignore]: they need docker (colima works), network for apt on the first run, and the image named in
@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use watt_terminal_lib::core::agent::{AgentCtx, AgentEvent, ApprovalGate, DENIED, TurnRules};
 use watt_terminal_lib::core::approval::RegexPolicy;
 use watt_terminal_lib::core::foreground::ForegroundKind;
-use watt_terminal_lib::core::observer::{InputState, LevelKind};
+use watt_terminal_lib::core::observer::{InputState, LevelKind, LOCAL_KEY};
 use watt_terminal_lib::core::record::{Record, RecordStatus, RecordSummary, Source};
 use watt_terminal_lib::core::session::{IntegrateOutcome, Session, SubmitError};
 use watt_terminal_lib::core::settings::{ApprovalMode, ApprovalSettings};
@@ -345,11 +345,11 @@ fn rules(allow: &[&str]) -> RegexPolicy {
     RegexPolicy::new(&approval).expect("the rules compile")
 }
 
-/// The level-1 nonce: the one accepted nonce that is not the local shell's.
+/// The nested level's nonce: the one accepted nonce that is not the local shell's.
 fn nested_nonce(h: &Harness) -> String {
     let local = h.nonce().to_string();
     let others: Vec<String> = h.nonces().into_iter().filter(|n| *n != local).collect();
-    assert_eq!(others.len(), 1, "one nested nonce is accepted while level 1 is on top: {others:?}");
+    assert_eq!(others.len(), 1, "one nested nonce is accepted while the nested level is on top: {others:?}");
     others[0].clone()
 }
 
@@ -369,8 +369,8 @@ fn ssh_into_bash_integrates_and_the_agent_works_there() {
     let ssh = connect(&h, &remote, "tester");
     let label = expected_label(&ssh);
     let (key, sh) = integrate_remote(&h, "tester");
-    assert_eq!((key, sh.as_str()), (1, "bash"));
-    wait_at_prompt(&h, 1);
+    assert_eq!(sh.as_str(), "bash");
+    wait_at_prompt(&h, key);
     let levels = h.levels();
     assert_eq!(levels.len(), 2, "{levels:?}");
     assert_eq!(
@@ -381,18 +381,18 @@ fn ssh_into_bash_integrates_and_the_agent_works_there() {
     assert_eq!(h.location().as_deref(), Some(label.as_str()));
 
     // Commands the agent runs in the remote shell: output, exit code, level and location of each record.
-    let hi = agent_cmd(&h, "b5-hi", "echo hi", 1);
+    let hi = agent_cmd(&h, "b5-hi", "echo hi", key);
     assert_eq!((hi.exit_code, hi.output.as_str()), (Some(0), "hi"));
     assert_eq!(hi.location.as_deref(), Some(label.as_str()));
     assert!(matches!(&hi.source, Source::Agent { call_id } if call_id == "b5-hi"), "{:?}", hi.source);
 
-    let fals = typed_cmd(&h, "false", 1);
+    let fals = typed_cmd(&h, "false", key);
     assert_eq!(fals.exit_code, Some(1));
 
-    let pwd = agent_cmd(&h, "b5-pwd", "pwd", 1);
+    let pwd = agent_cmd(&h, "b5-pwd", "pwd", key);
     assert_eq!((pwd.exit_code, pwd.output.as_str()), (Some(0), "/home/tester"));
 
-    let cd = agent_cmd(&h, "b5-cd", "cd /tmp && pwd", 1);
+    let cd = agent_cmd(&h, "b5-cd", "cd /tmp && pwd", key);
     assert_eq!((cd.exit_code, cd.output.as_str()), (Some(0), "/tmp"));
     assert!(
         wait_until(WAIT, || h.cwd().filter(|c| c.path == "/tmp").map(|_| ())).is_some(),
@@ -405,11 +405,11 @@ fn ssh_into_bash_integrates_and_the_agent_works_there() {
     // Two identical commands. ignoreboth in the skel .bashrc keeps the second out of history, so its own text must still
     // name it.
     for call in ["b5-same-1", "b5-same-2"] {
-        let rec = agent_cmd(&h, call, "echo same", 1);
+        let rec = agent_cmd(&h, call, "echo same", key);
         assert_eq!((rec.command.as_str(), rec.exit_code, rec.output.as_str()), ("echo same", Some(0), "same"), "{call}");
     }
 
-    let quoted = agent_cmd(&h, "b5-quoted", r#"echo "a;b"; echo 'c d'"#, 1);
+    let quoted = agent_cmd(&h, "b5-quoted", r#"echo "a;b"; echo 'c d'"#, key);
     assert_eq!(quoted.output.lines().collect::<Vec<_>>(), ["a;b", "c d"], "{quoted:?}");
 
     assert_eq!(h.submit(Source::Agent { call_id: "b5-multi".into() }, "echo one\necho two"), Err(SubmitError::MultiLineAtBash));
@@ -419,19 +419,19 @@ fn ssh_into_bash_integrates_and_the_agent_works_there() {
     let gate_rule = Arc::new(ApprovalGate::with_timeout(CARD_WAIT));
     let (call, log) = agent_run(s.clone(), gate_rule.clone(), rules(&["echo .*"]), "echo nested-rule");
     let (call_id, reason, level, location) = wait_card(&log);
-    assert_eq!((reason, level, location.as_deref()), (Some("nested_level"), 1, Some(label.as_str())));
+    assert_eq!((reason, level, location.as_deref()), (Some("nested_level"), key, Some(label.as_str())));
     assert!(gate_rule.decide(&call_id, true), "the card was still pending");
     let result = call.join().expect("the turn thread");
     assert!(result.is_ok(), "the approved command failed: {result:?}");
     assert_eq!(run_decision(&log), Some(("manual", true)));
-    let approved = finished_by(&h, |r| r.command == "echo nested-rule" && r.level == 1);
+    let approved = finished_by(&h, |r| r.command == "echo nested-rule" && r.level == key);
     assert_eq!(approved.output, "nested-rule");
-    wait_at_prompt(&h, 1);
+    wait_at_prompt(&h, key);
 
     // Approve-all switched on in the local shell does not run anything here: the card asks with the suspended reason.
     let (denied, denied_log) = agent_run(s.clone(), gate_all.clone(), rules(&[]), "echo nested-all");
     let (call_id, reason, level, _) = wait_card(&denied_log);
-    assert_eq!((reason, level), (Some("approve_all_suspended"), 1));
+    assert_eq!((reason, level), (Some("approve_all_suspended"), key));
     assert!(gate_all.decide(&call_id, false), "the card was still pending");
     let err = denied.join().expect("the turn thread").expect_err("refused");
     assert!(err.starts_with(DENIED), "{err}");
@@ -446,7 +446,7 @@ fn ssh_into_bash_integrates_and_the_agent_works_there() {
         h.levels()
     );
     let exited = h.records().into_iter().find(|r| r.command == "exit").expect("the exit record");
-    assert_eq!((exited.level, exited.status), (1, RecordStatus::Incomplete));
+    assert_eq!((exited.level, exited.status), (key, RecordStatus::Incomplete));
     let parent = finished_by(&h, |r| r.command == ssh && r.level == 0);
     assert!(matches!(parent.status, RecordStatus::Complete | RecordStatus::Approximate), "{:?}", parent.status);
     assert!(parent.exit_code.is_some());
@@ -542,8 +542,8 @@ fn a_dropped_connection_pops_the_remote_level_and_the_local_shell_works() {
     let h = start();
     let ssh = connect(&h, &remote, "tester");
     let (key, _) = integrate_remote(&h, "tester");
-    assert_eq!(key, 1);
-    wait_at_prompt(&h, 1);
+    assert_ne!(key, LOCAL_KEY, "the remote shell is not the local level");
+    wait_at_prompt(&h, key);
 
     // The sshd session process of user tester (not the main sshd) is killed with SIGKILL.
     let out = docker(&["exec", &remote.container.0, "pkill", "-KILL", "-x", "-u", "tester", "sshd"]);
@@ -571,8 +571,8 @@ fn exec_into_an_unhooked_shell_is_not_reported_as_a_prompt() {
     let h = start();
     let _ssh = connect(&h, &remote, "tester");
     let (key, _) = integrate_remote(&h, "tester");
-    assert_eq!(key, 1);
-    wait_at_prompt(&h, 1);
+    assert_ne!(key, LOCAL_KEY, "the remote shell is not the local level");
+    wait_at_prompt(&h, key);
 
     h.submit(Source::User, "exec bash --norc").expect("submit exec");
     thread::sleep(Duration::from_secs(5));
@@ -622,18 +622,18 @@ fn forged_and_retired_prompt_markers_from_the_remote_side_change_nothing() {
     let h = start();
     let _ssh = connect(&h, &remote, "tester");
     let (key, _) = integrate_remote(&h, "tester");
-    assert_eq!(key, 1);
-    wait_at_prompt(&h, 1);
+    assert_ne!(key, LOCAL_KEY, "the remote shell is not the local level");
+    wait_at_prompt(&h, key);
     let remote_nonce = nested_nonce(&h);
     let forged_before = h.stats().forged_events;
 
     let unknown = "f".repeat(32);
     let cmd = format!(r"printf '\033]133;A;n={unknown}\033\\'");
-    let printed = agent_cmd(&h, "b5-forge", &cmd, 1);
+    let printed = agent_cmd(&h, "b5-forge", &cmd, key);
     assert_eq!(printed.exit_code, Some(0));
     assert_eq!(h.stats().forged_events, forged_before + 1, "the unknown-nonce A was not counted as forged");
-    assert_eq!((h.levels().len(), h.top_key()), (2, 1), "the forged marker changed the stack");
-    wait_at_prompt(&h, 1);
+    assert_eq!((h.levels().len(), h.top_key()), (2, key), "the forged marker changed the stack");
+    wait_at_prompt(&h, key);
 
     h.write_user(b"exit\r").expect("type exit");
     assert!(
@@ -663,12 +663,12 @@ fn ssh_into_zsh_integrates_and_the_agent_works_there() {
     let ssh = connect(&h, &remote, "tester2");
     let label = expected_label(&ssh);
     let (key, sh) = integrate_remote(&h, "tester2");
-    assert_eq!((key, sh.as_str()), (1, "zsh"));
-    wait_at_prompt(&h, 1);
+    assert_eq!(sh.as_str(), "zsh");
+    wait_at_prompt(&h, key);
 
-    let hi = agent_cmd(&h, "b5-zsh-hi", "echo hi", 1);
+    let hi = agent_cmd(&h, "b5-zsh-hi", "echo hi", key);
     assert_eq!((hi.exit_code, hi.output.as_str(), hi.location.as_deref()), (Some(0), "hi", Some(label.as_str())));
-    let fals = typed_cmd(&h, "false", 1);
+    let fals = typed_cmd(&h, "false", key);
     assert_eq!(fals.exit_code, Some(1));
 
     h.write_user(b"exit\r").expect("type exit");

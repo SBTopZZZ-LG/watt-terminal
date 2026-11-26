@@ -334,6 +334,9 @@ pub enum AgentEvent {
         level: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         location: Option<String>,
+        /// The terminal the command runs in, when the chat has two or more (see `AgentTools::terminal_id`). Left out otherwise.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        terminal: Option<String>,
     },
     /// A `request_integration` call. `phase` is `asking` (the user's answer is awaited, see `answer_integration`), `running`
     /// (the handshake is typing into the shell) or `done` (`outcome` is what the handshake gave, or `declined`). `label` is the
@@ -362,8 +365,13 @@ pub enum AgentEvent {
     Thinking { active: bool },
     /// The agent is in control of the shell: an approved `run_command` or `send_keys` is executing. Sent true before
     /// the call and false after it. A denied call sends nothing. A call the tool refuses (for example, the shell is
-    /// busy) is bracketed too, but the bracket is immediate.
-    AgentControl { active: bool },
+    /// busy) is bracketed too, but the bracket is immediate. `terminal` is the terminal the control is of, when the chat has
+    /// two or more (see `AgentTools::terminal_id`); left out otherwise.
+    AgentControl {
+        active: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        terminal: Option<String>,
+    },
     /// The conversation's todo list was replaced by a successful `todo_write`. `items` is the whole list.
     TodoUpdate { items: Vec<Todo> },
     /// The context usage of a model request: emitted before the request is sent, and again with the provider's own count
@@ -508,18 +516,19 @@ fn new_call_id() -> String {
 }
 
 /// Tools that never change the shell. `read_tool` accepts only these. Must match `READ_NAMES` in core/chat/agent_loop.rs.
-const READ_TOOLS: [&str; 5] = ["list_commands", "get_command", "get_screen", "get_cwd", "wait"];
+const READ_TOOLS: [&str; 6] = ["list_commands", "get_command", "get_screen", "get_cwd", "wait", "list_terminals"];
 
 /// Built-in tools that may run without a gate decision: the read tools, `todo_write`, `ask_user` and the file tools
 /// (core/fs_tools). None of them touches the shell. `skill` is not here: it has its own gate (`call_skill`), so a call that
 /// reaches this path is refused. Any other name needs a gate decision: a gated built-in, or a host tool
 /// (core/external_tools). Must match the names routed in core/chat/agent_loop.rs (`run_call`).
-const BUILTIN_UNGATED: [&str; 11] = [
+const BUILTIN_UNGATED: [&str; 12] = [
     "list_commands",
     "get_command",
     "get_screen",
     "get_cwd",
     "wait",
+    "list_terminals",
     "todo_write",
     "ask_user",
     "read_file",
@@ -543,6 +552,8 @@ pub struct TurnRules {
 
 /// What an agent may use during one turn: the approval gate, the approval policy, the turn's rules, and a way to report
 /// events. The tools are private: the only route to them is `call_tool` (approval-gated) or `read_tool` (read-only names).
+/// Every field is a shared reference or `Copy`, so a copy with other tools is cheap (see `gate_and_execute`).
+#[derive(Clone, Copy)]
 pub struct AgentCtx<'a> {
     tools: &'a dyn AgentTools,
     approvals: &'a ApprovalGate,
@@ -626,6 +637,11 @@ impl<'a> AgentCtx<'a> {
         self.tools.top_level()
     }
 
+    /// The ids of the chat's terminals at this moment (see `AgentTools::terminal_ids`). Read per model call.
+    pub fn terminal_ids(&self) -> Vec<String> {
+        self.tools.terminal_ids()
+    }
+
     /// The agent's own open commands at this moment (see `AgentTools::open_agent_records`). Read per model call.
     pub fn open_agent_records(&self) -> Vec<OpenAgentRecord> {
         self.tools.open_agent_records()
@@ -658,7 +674,7 @@ impl<'a> AgentCtx<'a> {
         self.tools.finished_summary(id)
     }
 
-    /// Calls a read-only tool (`list_commands`, `get_command`, `get_screen`, `get_cwd`, `wait`) and reports the call
+    /// Calls a read-only tool (`list_commands`, `get_command`, `get_screen`, `get_cwd`, `wait`, `list_terminals`) and reports the call
     /// and its result. Never asks for approval. Any other name is refused without running.
     pub fn read_tool(&self, name: &str, args: Value) -> Result<Value, String> {
         if !READ_TOOLS.contains(&name) {
@@ -730,6 +746,7 @@ impl<'a> AgentCtx<'a> {
                         reason: Some(reason.code()),
                         level: top.key,
                         location: top.location.clone(),
+                        terminal: self.tools.terminal_id(),
                     })
                 });
                 if !approved {
@@ -804,6 +821,7 @@ impl<'a> AgentCtx<'a> {
                 reason: Some(reason.code()),
                 level: top.key,
                 location: top.location.clone(),
+                terminal: self.tools.terminal_id(),
             })
         });
         if !approved {
@@ -908,8 +926,24 @@ impl<'a> AgentCtx<'a> {
     }
 
     /// Applies the gate to one call and runs it if allowed. Returns the decision label, the reason (see
-    /// `AgentEvent::ToolResult`) and the result.
+    /// `AgentEvent::ToolResult`) and the result. A call for one terminal of several (see `AgentTools::scoped`) is gated on
+    /// that terminal's view, so the precheck, the card and the level are the terminal's own.
     fn gate_and_execute(
+        &self,
+        call_id: &str,
+        name: &str,
+        args: &Value,
+        gated: bool,
+    ) -> (&'static str, Option<&'static str>, Result<Value, String>) {
+        match self.tools.scoped(name, args) {
+            Ok(Some(view)) => AgentCtx { tools: &*view, ..*self }.gate_on_tools(call_id, name, args, gated),
+            Ok(None) => self.gate_on_tools(call_id, name, args, gated),
+            Err(refusal) => ("refused", None, Err(refusal)),
+        }
+    }
+
+    /// `gate_and_execute` on `self.tools`: the gate and the call, as they are for a single session.
+    fn gate_on_tools(
         &self,
         call_id: &str,
         name: &str,
@@ -959,6 +993,7 @@ impl<'a> AgentCtx<'a> {
                         reason: Some(reason.code()),
                         level: top.key,
                         location: top.location.clone(),
+                        terminal: self.tools.terminal_id(),
                     })
                 });
                 if !approved {
@@ -1050,6 +1085,7 @@ impl<'a> AgentCtx<'a> {
                         reason: Some(reason.code()),
                         level: top.key,
                         location: top.location.clone(),
+                        terminal: self.tools.terminal_id(),
                     })
                 });
                 if !approved {
@@ -1077,12 +1113,12 @@ impl<'a> AgentCtx<'a> {
     /// of the shell (see `execute`). The tool checks the target again under its lock, and refuses with nothing sent if the
     /// command changed.
     fn execute_send_keys(&self, plan: &KeyPlan, record: Option<u64>, level: u64) -> Result<Value, String> {
-        self.emit(AgentEvent::AgentControl { active: true });
+        self.emit(AgentEvent::AgentControl { active: true, terminal: self.tools.terminal_id() });
         let result = self
             .tools
             .send_keys(plan, record, Some(level))
             .and_then(|outcome| serde_json::to_value(outcome).map_err(|e| e.to_string()));
-        self.emit(AgentEvent::AgentControl { active: false });
+        self.emit(AgentEvent::AgentControl { active: false, terminal: self.tools.terminal_id() });
         result
     }
 
@@ -1211,6 +1247,7 @@ impl<'a> AgentCtx<'a> {
                         reason: Some(reason.code()),
                         level: top.key,
                         location: top.location.clone(),
+                        terminal: self.tools.terminal_id(),
                     })
                 });
                 if !approved {
@@ -1233,11 +1270,11 @@ impl<'a> AgentCtx<'a> {
     fn execute(&self, name: &str, args: &Value, gated: bool, level: Option<u64>) -> Result<Value, String> {
         let controls_shell = gated && matches!(name, "run_command" | "send_keys");
         if controls_shell {
-            self.emit(AgentEvent::AgentControl { active: true });
+            self.emit(AgentEvent::AgentControl { active: true, terminal: self.tools.terminal_id() });
         }
         let result = self.tools.call(name, args, level);
         if controls_shell {
-            self.emit(AgentEvent::AgentControl { active: false });
+            self.emit(AgentEvent::AgentControl { active: false, terminal: self.tools.terminal_id() });
         }
         // The user sees that their typed text was cleared, so the command's clean line is not a surprise.
         if name == "run_command" && result.as_ref().is_ok_and(|v| v["typed_text_cleared"] == json!(true)) {
@@ -1669,6 +1706,38 @@ mod tests {
         assert_eq!(wire(AgentEvent::SteerReturned { ids: vec![4] }), json!({"type": "steer_returned", "ids": [4]}));
     }
 
+    /// The terminal of a control or an approval card is on the wire only when the chat has two or more (`Some`).
+    #[test]
+    fn the_terminal_is_on_the_wire_only_when_it_is_set() {
+        let wire = |e: AgentEvent| serde_json::to_value(&e).unwrap();
+        assert_eq!(
+            wire(AgentEvent::AgentControl { active: true, terminal: None }),
+            json!({"type": "agent_control", "active": true})
+        );
+        assert_eq!(
+            wire(AgentEvent::AgentControl { active: false, terminal: Some("t2".into()) }),
+            json!({"type": "agent_control", "active": false, "terminal": "t2"})
+        );
+        let card = |terminal: Option<&str>| AgentEvent::ApprovalRequest {
+            call_id: "c1".into(),
+            name: "run_command".into(),
+            text: "pwd".into(),
+            display: None,
+            reason: None,
+            level: 0,
+            location: None,
+            terminal: terminal.map(str::to_string),
+        };
+        assert_eq!(
+            wire(card(None)),
+            json!({"type": "approval_request", "call_id": "c1", "name": "run_command", "text": "pwd", "level": 0})
+        );
+        assert_eq!(
+            wire(card(Some("t1"))),
+            json!({"type": "approval_request", "call_id": "c1", "name": "run_command", "text": "pwd", "level": 0, "terminal": "t1"})
+        );
+    }
+
     #[test]
     fn serialized_events_use_the_wire_names() {
         let wire = |e: AgentEvent| serde_json::to_value(&e).unwrap();
@@ -1681,6 +1750,7 @@ mod tests {
                 reason: None,
                 level: 0,
                 location: None,
+                terminal: None,
             }),
             json!({"type": "approval_request", "call_id": "c1", "name": "run_command", "text": "pwd", "level": 0})
         );
@@ -1694,6 +1764,7 @@ mod tests {
                 reason: Some("nested_level"),
                 level: 2,
                 location: Some("ssh ubuntu@lidia".into()),
+                terminal: None,
             }),
             json!({"type": "approval_request", "call_id": "c1", "name": "run_command", "text": "pwd", "reason": "nested_level", "level": 2, "location": "ssh ubuntu@lidia"})
         );
@@ -1718,6 +1789,7 @@ mod tests {
                 reason: Some("gate_chars"),
                 level: 0,
                 location: None,
+                terminal: None,
             }),
             json!({"type": "approval_request", "call_id": "c1", "name": "run_command", "text": "ls | wc", "reason": "gate_chars", "level": 0})
         );
@@ -1951,7 +2023,7 @@ mod tests {
                 AgentEvent::ToolCall { name, .. } => format!("call {name}"),
                 AgentEvent::ToolResult { name, .. } => format!("result {name}"),
                 AgentEvent::ApprovalRequest { .. } => "approval".to_string(),
-                AgentEvent::AgentControl { active } => format!("control {active}"),
+                AgentEvent::AgentControl { active, .. } => format!("control {active}"),
                 other => format!("{other:?}"),
             })
             .collect()
