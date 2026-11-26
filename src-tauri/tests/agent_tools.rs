@@ -166,7 +166,7 @@ fn control_events(log: &Log) -> Vec<bool> {
         .unwrap()
         .iter()
         .filter_map(|e| match e {
-            AgentEvent::AgentControl { active } => Some(*active),
+            AgentEvent::AgentControl { active, terminal: _ } => Some(*active),
             _ => None,
         })
         .collect()
@@ -312,7 +312,17 @@ fn send_keys_is_refused_at_a_prompt_and_the_schemas_list_every_tool() {
     let names: Vec<&str> = schemas().iter().map(|t| t.name).collect();
     assert_eq!(
         names,
-        ["list_commands", "get_command", "get_screen", "get_cwd", "wait", "run_command", "request_integration", "send_keys"]
+        [
+            "list_terminals",
+            "list_commands",
+            "get_command",
+            "get_screen",
+            "get_cwd",
+            "wait",
+            "run_command",
+            "request_integration",
+            "send_keys"
+        ]
     );
 }
 

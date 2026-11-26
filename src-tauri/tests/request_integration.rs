@@ -176,12 +176,14 @@ fn auto_integrates_the_nested_shell_without_asking() {
     assert!(text.starts_with("Integrated zsh -f -i (zsh"), "{text}");
     assert!(text.ends_with("You can now use run_command in this shell."), "{text}");
     assert_eq!(phases(&events), ["running", "done"], "no dialog");
-    assert_eq!((s.levels().len(), s.top_key()), (2, 1));
+    let key = s.top_key();
+    assert_ne!(key, 0, "the nested level has its own key");
+    assert_eq!(s.levels().len(), 2);
     assert!(wait_state(&s, InputState::Prompt, WAIT), "state {:?}", s.state());
 
     s.submit(Source::Agent { call_id: "nested-hi".into() }, "echo hi").expect("agent submit at depth 2");
     assert!(wait_until(WAIT, || {
-        s.records().iter().find(|r| r.command == "echo hi" && r.level == 1 && r.exit_code.is_some()).map(|_| ())
+        s.records().iter().find(|r| r.command == "echo hi" && r.level == key && r.exit_code.is_some()).map(|_| ())
     })
     .is_some());
     assert!(wait_state(&s, InputState::Prompt, WAIT));

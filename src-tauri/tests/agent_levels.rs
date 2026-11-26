@@ -1,6 +1,6 @@
 //! Agent calls in a nested shell (B3): the approval card is bound to the shell it was made for, an allow rule asks there,
 //! approve-all is tied to the level it was switched on in, and the nested shell's own cwd reaches the tools. The nested
-//! shell is a real `zsh -f -i`, integrated as level 1 by the app's own handshake (see tests/integrate_session.rs).
+//! shell is a real `zsh -f -i`, integrated as a nested level by the app's own handshake (see tests/integrate_session.rs).
 //! Harness: common/mod.rs. The unit tests of the same rules are in core/agent.rs and core/approval.rs.
 
 // Every test runs a real zsh (nested `zsh -f -i`) through common/mod.rs: no zsh on Windows.

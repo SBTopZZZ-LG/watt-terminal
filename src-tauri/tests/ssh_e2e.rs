@@ -1,5 +1,5 @@
 //! End to end over real ssh (B5). A local `zsh -f`-style shell (the common harness) runs `ssh` into an Ubuntu container
-//! that runs openssh-server. The app integrates the remote shell as level 1 with its own handshake, and then the agent
+//! that runs openssh-server. The app integrates the remote shell as a nested level with its own handshake, and then the agent
 //! path (submit, approvals, cwd) and the observer's recovery paths are checked against that real remote shell.
 //!
 //! The tests are #[ignore]: they need docker (colima works), network for apt on the first run, and the image named in
@@ -345,11 +345,11 @@ fn rules(allow: &[&str]) -> RegexPolicy {
     RegexPolicy::new(&approval).expect("the rules compile")
 }
 
-/// The level-1 nonce: the one accepted nonce that is not the local shell's.
+/// The nested level's nonce: the one accepted nonce that is not the local shell's.
 fn nested_nonce(h: &Harness) -> String {
     let local = h.nonce().to_string();
     let others: Vec<String> = h.nonces().into_iter().filter(|n| *n != local).collect();
-    assert_eq!(others.len(), 1, "one nested nonce is accepted while level 1 is on top: {others:?}");
+    assert_eq!(others.len(), 1, "one nested nonce is accepted while the nested level is on top: {others:?}");
     others[0].clone()
 }
 
